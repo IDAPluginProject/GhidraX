@@ -326,6 +326,9 @@ class Cover:
     def getNumBlocks(self) -> int:
         return len(self._cover)
 
+    def containsBlock(self, blk: int) -> bool:
+        return blk in self._cover
+
     def __iter__(self):
         return iter(self._cover.items())
 

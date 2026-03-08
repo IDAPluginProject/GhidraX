@@ -217,5 +217,8 @@ class DynamicHash:
     def getSlotIndex(self) -> int:
         return self._slot if hasattr(self, '_slot') else -1
 
+    def getMethodIndex(self) -> int:
+        return self._method if hasattr(self, '_method') else 0
+
     def __repr__(self) -> str:
         return f"DynamicHash(hash=0x{self._hash:x})"

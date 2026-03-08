@@ -290,6 +290,9 @@ class ConstSequence:
             i = j
         return found
 
+    def getNumStrings(self) -> int:
+        return len(self._strings)
+
     def analyzeFunction(self, fd) -> bool:
         """Analyze all basic blocks in a function for constant sequences."""
         if fd is None:

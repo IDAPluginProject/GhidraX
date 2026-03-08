@@ -637,3 +637,15 @@ class RuleSubfloatConvert:
 
     def applyOp(self, op, data) -> int:
         return 0
+
+    def getNumReplaced(self) -> int:
+        return 0
+
+    def isTerminalOp(self, op) -> bool:
+        return False
+
+    def traceBackwardSubfloat(self, op) -> bool:
+        return False
+
+    def traceForwardSubfloat(self, op) -> bool:
+        return False

@@ -841,6 +841,33 @@ class Database:
     def getScopeMap(self) -> dict:
         return self._scopeMap
 
+    def getNextScopeId(self) -> int:
+        return self._nextScopeId
+
+    def isReadOnly(self) -> bool:
+        return getattr(self, '_readonly', False)
+
+    def setReadOnly(self, val: bool) -> None:
+        self._readonly = val
+
+    def deleteSubScopes(self, scope) -> None:
+        pass
+
+    def findByName(self, nm: str):
+        for s in self._scopeMap.values():
+            if hasattr(s, 'getName') and s.getName() == nm:
+                return s
+        return None
+
+    def queryScopesBy(self, addr) -> list:
+        result = []
+        for s in self._scopeMap.values():
+            result.append(s)
+        return result
+
+    def getScopeById(self, uid: int):
+        return self._scopeMap.get(uid, None)
+
     def __repr__(self) -> str:
         n = len(self._scopeMap)
         return f"Database({n} scopes)"

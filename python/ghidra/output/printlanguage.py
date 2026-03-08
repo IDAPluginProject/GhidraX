@@ -229,6 +229,8 @@ class PrintLanguage(ABC):
         self._curscope = sc
 
     def popScope(self) -> None:
+        if not self._scopestack:
+            return
         self._scopestack.pop()
         if self._scopestack:
             self._curscope = self._scopestack[-1]

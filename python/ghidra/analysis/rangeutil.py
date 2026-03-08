@@ -849,3 +849,17 @@ class ValueSetSolver:
 
     def getNumReads(self) -> int:
         return len(self._readNodes)
+
+    def getValueSet(self, i: int):
+        keys = list(self._valueNodes.keys())
+        return self._valueNodes[keys[i]] if i < len(keys) else None
+
+    def getReadNode(self, i: int):
+        keys = list(self._readNodes.keys())
+        return self._readNodes[keys[i]] if i < len(keys) else None
+
+    def finalizeValueSets(self) -> None:
+        pass
+
+    def iterateValueSets(self) -> None:
+        pass

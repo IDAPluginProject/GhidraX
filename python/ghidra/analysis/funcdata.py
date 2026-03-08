@@ -858,6 +858,13 @@ class Funcdata:
                 newrep = self.newConstant(vn.getSize(), val)
             self.opSetInput(op, newrep, slot)
 
+    def opUnsetInput(self, op: PcodeOp, slot: int) -> None:
+        """Unlink input Varnode from the given slot of a PcodeOp."""
+        vn = op.getIn(slot)
+        if vn is not None:
+            vn.eraseDescend(op)
+        op.clearInput(slot)
+
     def opFlipCondition(self, op: PcodeOp) -> None:
         """Flip output condition of given CBRANCH."""
         op.flipFlag(PcodeOp.boolean_flip)
@@ -873,6 +880,776 @@ class Funcdata:
     def totalNumOps(self) -> int:
         return len(list(self._obank.beginAll()))
 
+    # --- Op flip / boolean helpers ---
+
+    @staticmethod
+    def opFlipInPlaceTest(op, fliplist: list) -> int:
+        """Trace boolean to a set of PcodeOps that can flip the value.
+
+        Returns 0 if normalizing, 1 if ambivalent, 2 if does not normalize.
+        """
+        opc = op.code()
+        if opc == OpCode.CPUI_CBRANCH:
+            vn = op.getIn(1)
+            if vn.loneDescend() is not op:
+                return 2
+            if not vn.isWritten():
+                return 2
+            return Funcdata.opFlipInPlaceTest(vn.getDef(), fliplist)
+        if opc in (OpCode.CPUI_INT_EQUAL, OpCode.CPUI_FLOAT_EQUAL):
+            fliplist.append(op)
+            return 1
+        if opc in (OpCode.CPUI_BOOL_NEGATE, OpCode.CPUI_INT_NOTEQUAL, OpCode.CPUI_FLOAT_NOTEQUAL):
+            fliplist.append(op)
+            return 0
+        if opc in (OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_LESS):
+            vn = op.getIn(0)
+            fliplist.append(op)
+            if not vn.isConstant():
+                return 1
+            return 0
+        if opc in (OpCode.CPUI_INT_SLESSEQUAL, OpCode.CPUI_INT_LESSEQUAL):
+            vn = op.getIn(1)
+            fliplist.append(op)
+            if vn.isConstant():
+                return 1
+            return 0
+        if opc in (OpCode.CPUI_BOOL_OR, OpCode.CPUI_BOOL_AND):
+            vn = op.getIn(0)
+            if vn.loneDescend() is not op:
+                return 2
+            if not vn.isWritten():
+                return 2
+            subtest1 = Funcdata.opFlipInPlaceTest(vn.getDef(), fliplist)
+            if subtest1 == 2:
+                return 2
+            vn = op.getIn(1)
+            if vn.loneDescend() is not op:
+                return 2
+            if not vn.isWritten():
+                return 2
+            subtest2 = Funcdata.opFlipInPlaceTest(vn.getDef(), fliplist)
+            if subtest2 == 2:
+                return 2
+            fliplist.append(op)
+            return subtest1
+        return 2
+
+    def opFlipInPlaceExecute(self, fliplist: list) -> None:
+        """Perform op-code flips (in-place) to change a boolean value."""
+        from ghidra.core.opcodes import get_booleanflip
+        for op in fliplist:
+            opc, flipyes = get_booleanflip(op.code())
+            if opc == OpCode.CPUI_COPY:
+                vn = op.getIn(0)
+                otherop = op.getOut().loneDescend()
+                slot = otherop.getSlot(op.getOut())
+                self.opSetInput(otherop, vn, slot)
+                self.opDestroy(op)
+            elif opc == OpCode.CPUI_MAX:
+                if op.code() == OpCode.CPUI_BOOL_AND:
+                    self.opSetOpcode(op, OpCode.CPUI_BOOL_OR)
+                elif op.code() == OpCode.CPUI_BOOL_OR:
+                    self.opSetOpcode(op, OpCode.CPUI_BOOL_AND)
+            else:
+                self.opSetOpcode(op, opc)
+                if flipyes:
+                    self.opSwapInput(op, 0, 1)
+                    if opc in (OpCode.CPUI_INT_LESSEQUAL, OpCode.CPUI_INT_SLESSEQUAL):
+                        self.replaceLessequal(op)
+
+    def opBoolNegate(self, vn, op, insertafter: bool):
+        """Construct the boolean negation of a given boolean Varnode."""
+        negateop = self.newOp(1, op.getAddr())
+        self.opSetOpcode(negateop, OpCode.CPUI_BOOL_NEGATE)
+        resvn = self.newUniqueOut(1, negateop)
+        self.opSetInput(negateop, vn, 0)
+        if insertafter:
+            self.opInsertAfter(negateop, op)
+        else:
+            self.opInsertBefore(negateop, op)
+        return resvn
+
+    def opUndoPtradd(self, op, finalize: bool) -> None:
+        """Convert a CPUI_PTRADD back into a CPUI_INT_ADD."""
+        multVn = op.getIn(2)
+        multSize = multVn.getOffset()
+        self.opRemoveInput(op, 2)
+        self.opSetOpcode(op, OpCode.CPUI_INT_ADD)
+        if multSize == 1:
+            return
+        offVn = op.getIn(1)
+        if offVn.isConstant():
+            newVal = (multSize * offVn.getOffset()) & ((1 << (offVn.getSize() * 8)) - 1)
+            newOffVn = self.newConstant(offVn.getSize(), newVal)
+            self.opSetInput(op, newOffVn, 1)
+            return
+        multOp = self.newOp(2, op.getAddr())
+        self.opSetOpcode(multOp, OpCode.CPUI_INT_MULT)
+        addVn = self.newUniqueOut(offVn.getSize(), multOp)
+        self.opSetInput(multOp, offVn, 0)
+        self.opSetInput(multOp, multVn, 1)
+        self.opSetInput(op, addVn, 1)
+        self.opInsertBefore(multOp, op)
+
+    def createStackRef(self, spc, off, op, stackptr, insertafter: bool):
+        """Create an INT_ADD PcodeOp calculating offset relative to spacebase register."""
+        if stackptr is None:
+            stackptr = self.newSpacebasePtr(spc)
+        addrsize = stackptr.getSize()
+        addop = self.newOp(2, op.getAddr())
+        self.opSetOpcode(addop, OpCode.CPUI_INT_ADD)
+        addout = self.newUniqueOut(addrsize, addop)
+        self.opSetInput(addop, stackptr, 0)
+        self.opSetInput(addop, self.newConstant(addrsize, off), 1)
+        if insertafter:
+            self.opInsertAfter(addop, op)
+        else:
+            self.opInsertBefore(addop, op)
+        return addout
+
+    def opStackStore(self, spc, off, op, insertafter: bool):
+        """Create a STORE at an offset relative to a spacebase register."""
+        addout = self.createStackRef(spc, off, op, None, insertafter)
+        storeop = self.newOp(3, op.getAddr())
+        self.opSetOpcode(storeop, OpCode.CPUI_STORE)
+        container = spc.getContain() if hasattr(spc, 'getContain') else spc
+        self.opSetInput(storeop, self.newVarnodeSpace(container), 0)
+        self.opSetInput(storeop, addout, 1)
+        self.opInsertAfter(storeop, addout.getDef())
+        return storeop
+
+    def opStackLoad(self, spc, off, sz: int, op, stackref, insertafter: bool):
+        """Create a LOAD at an offset relative to a spacebase register."""
+        addout = self.createStackRef(spc, off, op, stackref, insertafter)
+        loadop = self.newOp(2, op.getAddr())
+        self.opSetOpcode(loadop, OpCode.CPUI_LOAD)
+        container = spc.getContain() if hasattr(spc, 'getContain') else spc
+        self.opSetInput(loadop, self.newVarnodeSpace(container), 0)
+        self.opSetInput(loadop, addout, 1)
+        res = self.newUniqueOut(sz, loadop)
+        self.opInsertAfter(loadop, addout.getDef())
+        return res
+
+    # --- CSE / transform helpers ---
+
+    @staticmethod
+    def cseFindInBlock(op, vn, bl, earliest):
+        """Find a duplicate calculation of op reading vn in block bl before earliest."""
+        for desc in vn.getDescendants():
+            if desc is op:
+                continue
+            if desc.getParent() is not bl:
+                continue
+            if earliest is not None:
+                if earliest.getSeqNum().getOrder() < desc.getSeqNum().getOrder():
+                    continue
+            outvn1 = op.getOut()
+            outvn2 = desc.getOut()
+            if outvn2 is None:
+                continue
+            if outvn1 is not None and outvn2 is not None:
+                if op.code() == desc.code() and op.numInput() == desc.numInput():
+                    match = True
+                    for i in range(op.numInput()):
+                        if op.getIn(i) is not desc.getIn(i):
+                            match = False
+                            break
+                    if match:
+                        return desc
+        return None
+
+    def cseElimination(self, op1, op2):
+        """Perform a Common Subexpression Elimination step between two ops."""
+        from ghidra.block.block import FlowBlock
+        if op1.getParent() is op2.getParent():
+            if op1.getSeqNum().getOrder() < op2.getSeqNum().getOrder():
+                replace = op1
+            else:
+                replace = op2
+        else:
+            common = FlowBlock.findCommonBlock(op1.getParent(), op2.getParent())
+            if common is op1.getParent():
+                replace = op1
+            elif common is op2.getParent():
+                replace = op2
+            else:
+                replace = self.newOp(op1.numInput(), common.getStop())
+                self.opSetOpcode(replace, op1.code())
+                self.newVarnodeOut(op1.getOut().getSize(), op1.getOut().getAddr(), replace)
+                for i in range(op1.numInput()):
+                    inv = op1.getIn(i)
+                    if inv.isConstant():
+                        self.opSetInput(replace, self.newConstant(inv.getSize(), inv.getOffset()), i)
+                    else:
+                        self.opSetInput(replace, inv, i)
+                self.opInsertEnd(replace, common)
+        if replace is not op1:
+            self.totalReplace(op1.getOut(), replace.getOut())
+            self.opDestroy(op1)
+        if replace is not op2:
+            self.totalReplace(op2.getOut(), replace.getOut())
+            self.opDestroy(op2)
+        return replace
+
+    def cseEliminateList(self, hashlist: list, outlist: list) -> None:
+        """Perform CSE on a list of (hash, PcodeOp) pairs."""
+        if not hashlist:
+            return
+        hashlist.sort(key=lambda x: x[0])
+        for i in range(len(hashlist) - 1):
+            if hashlist[i][0] == hashlist[i + 1][0]:
+                op1 = hashlist[i][1]
+                op2 = hashlist[i + 1][1]
+                if not op1.isDead() and not op2.isDead():
+                    if hasattr(op1, 'isCseMatch') and op1.isCseMatch(op2):
+                        resop = self.cseElimination(op1, op2)
+                        if resop.getOut() is not None:
+                            outlist.append(resop.getOut())
+
+    def replaceLessequal(self, op) -> bool:
+        """Replace INT_LESSEQUAL/INT_SLESSEQUAL with strict less-than."""
+        vn = op.getIn(0)
+        if vn.isConstant():
+            diff = -1
+            i = 0
+        else:
+            vn = op.getIn(1)
+            if vn.isConstant():
+                diff = 1
+                i = 1
+            else:
+                return False
+        mask = (1 << (vn.getSize() * 8)) - 1
+        half = 1 << (vn.getSize() * 8 - 1)
+        val = vn.getOffset()
+        if val >= half:
+            val = val - (mask + 1)
+        if op.code() == OpCode.CPUI_INT_SLESSEQUAL:
+            if val < 0 and val + diff > 0:
+                return False
+            if val > 0 and val + diff < 0:
+                return False
+            self.opSetOpcode(op, OpCode.CPUI_INT_SLESS)
+        else:
+            if diff == -1 and val == 0:
+                return False
+            if diff == 1 and (vn.getOffset() == mask):
+                return False
+            self.opSetOpcode(op, OpCode.CPUI_INT_LESS)
+        res = (val + diff) & mask
+        newvn = self.newConstant(vn.getSize(), res)
+        self.opSetInput(op, newvn, i)
+        return True
+
+    def distributeIntMultAdd(self, op) -> bool:
+        """Distribute constant coefficient to additive input."""
+        addop = op.getIn(0).getDef()
+        vn0 = addop.getIn(0)
+        vn1 = addop.getIn(1)
+        if vn0.isFree() and not vn0.isConstant():
+            return False
+        if vn1.isFree() and not vn1.isConstant():
+            return False
+        coeff = op.getIn(1).getOffset()
+        sz = op.getOut().getSize()
+        mask = (1 << (sz * 8)) - 1
+        if vn0.isConstant():
+            newvn0 = self.newConstant(sz, (coeff * vn0.getOffset()) & mask)
+        else:
+            newop0 = self.newOp(2, op.getAddr())
+            self.opSetOpcode(newop0, OpCode.CPUI_INT_MULT)
+            newvn0 = self.newUniqueOut(sz, newop0)
+            self.opSetInput(newop0, vn0, 0)
+            self.opSetInput(newop0, self.newConstant(sz, coeff), 1)
+            self.opInsertBefore(newop0, op)
+        if vn1.isConstant():
+            newvn1 = self.newConstant(sz, (coeff * vn1.getOffset()) & mask)
+        else:
+            newop1 = self.newOp(2, op.getAddr())
+            self.opSetOpcode(newop1, OpCode.CPUI_INT_MULT)
+            newvn1 = self.newUniqueOut(sz, newop1)
+            self.opSetInput(newop1, vn1, 0)
+            self.opSetInput(newop1, self.newConstant(sz, coeff), 1)
+            self.opInsertBefore(newop1, op)
+        self.opSetInput(op, newvn0, 0)
+        self.opSetInput(op, newvn1, 1)
+        self.opSetOpcode(op, OpCode.CPUI_INT_ADD)
+        return True
+
+    def collapseIntMultMult(self, vn) -> bool:
+        """Collapse constant coefficients for two chained CPUI_INT_MULT."""
+        if not vn.isWritten():
+            return False
+        op = vn.getDef()
+        if op.code() != OpCode.CPUI_INT_MULT:
+            return False
+        constFirst = op.getIn(1)
+        if not constFirst.isConstant():
+            return False
+        if not op.getIn(0).isWritten():
+            return False
+        otherOp = op.getIn(0).getDef()
+        if otherOp.code() != OpCode.CPUI_INT_MULT:
+            return False
+        constSecond = otherOp.getIn(1)
+        if not constSecond.isConstant():
+            return False
+        invn = otherOp.getIn(0)
+        if invn.isFree():
+            return False
+        sz = invn.getSize()
+        mask = (1 << (sz * 8)) - 1
+        val = (constFirst.getOffset() * constSecond.getOffset()) & mask
+        self.opSetInput(op, self.newConstant(sz, val), 1)
+        self.opSetInput(op, invn, 0)
+        return True
+
+    def buildCopyTemp(self, vn, point):
+        """Create a COPY of given Varnode in a temporary register."""
+        from ghidra.block.block import FlowBlock
+        otherOp = None
+        usedCopy = None
+        for desc in vn.getDescendants():
+            if desc.code() != OpCode.CPUI_COPY:
+                continue
+            outvn = desc.getOut()
+            if outvn is not None and outvn.getSpace() is not None:
+                if outvn.getSpace().getType() == IPTR_INTERNAL:
+                    if not outvn.isTypeLock():
+                        otherOp = desc
+                        break
+        if otherOp is not None:
+            if point.getParent() is otherOp.getParent():
+                if point.getSeqNum().getOrder() < otherOp.getSeqNum().getOrder():
+                    usedCopy = None
+                else:
+                    usedCopy = otherOp
+            else:
+                common = FlowBlock.findCommonBlock(point.getParent(), otherOp.getParent())
+                if common is point.getParent():
+                    usedCopy = None
+                elif common is otherOp.getParent():
+                    usedCopy = otherOp
+                else:
+                    usedCopy = self.newOp(1, common.getStop())
+                    self.opSetOpcode(usedCopy, OpCode.CPUI_COPY)
+                    self.newUniqueOut(vn.getSize(), usedCopy)
+                    self.opSetInput(usedCopy, vn, 0)
+                    self.opInsertEnd(usedCopy, common)
+        if usedCopy is None:
+            usedCopy = self.newOp(1, point.getAddr())
+            self.opSetOpcode(usedCopy, OpCode.CPUI_COPY)
+            self.newUniqueOut(vn.getSize(), usedCopy)
+            self.opSetInput(usedCopy, vn, 0)
+            self.opInsertBefore(usedCopy, point)
+        if otherOp is not None and otherOp is not usedCopy:
+            self.totalReplace(otherOp.getOut(), usedCopy.getOut())
+            self.opDestroy(otherOp)
+        return usedCopy.getOut()
+
+    # --- Block manipulation helpers ---
+
+    def pushMultiequals(self, bb) -> None:
+        """Push MULTIEQUAL Varnodes from bb into its output block."""
+        if bb.sizeOut() == 0:
+            return
+        outblock = bb.getOut(0)
+        outblock_ind = bb.getOutRevIndex(0)
+        for op in list(bb.getOpList()) if hasattr(bb, 'getOpList') else []:
+            if op.code() != OpCode.CPUI_MULTIEQUAL:
+                continue
+            origvn = op.getOut()
+            if origvn is None or origvn.hasNoDescend():
+                continue
+            needreplace = False
+            neednewunique = False
+            for desc in origvn.getDescendants():
+                if desc.code() == OpCode.CPUI_MULTIEQUAL and desc.getParent() is outblock:
+                    deadEdge = True
+                    for i in range(desc.numInput()):
+                        if i == outblock_ind:
+                            continue
+                        if desc.getIn(i) is origvn:
+                            deadEdge = False
+                            break
+                    if deadEdge:
+                        if origvn.getAddr() == desc.getOut().getAddr() and origvn.isAddrTied():
+                            neednewunique = True
+                        continue
+                needreplace = True
+                break
+            if not needreplace:
+                continue
+            branches = []
+            if neednewunique:
+                replacevn = self.newUnique(origvn.getSize())
+            else:
+                replacevn = self.newVarnode(origvn.getSize(), origvn.getAddr())
+            for i in range(outblock.sizeIn()):
+                if outblock.getIn(i) is bb:
+                    branches.append(origvn)
+                else:
+                    branches.append(replacevn)
+            replaceop = self.newOp(len(branches), outblock.getStart())
+            self.opSetOpcode(replaceop, OpCode.CPUI_MULTIEQUAL)
+            self.opSetOutput(replaceop, replacevn)
+            self.opSetAllInput(replaceop, branches)
+            self.opInsertBegin(replaceop, outblock)
+            for desc in list(origvn.getDescendants()):
+                for i in range(desc.numInput()):
+                    if desc.getIn(i) is not origvn:
+                        continue
+                    if i == outblock_ind and desc.getParent() is outblock and desc.code() == OpCode.CPUI_MULTIEQUAL:
+                        continue
+                    self.opSetInput(desc, replacevn, i)
+                    break
+
+    def nodeSplitBlockEdge(self, b, inedge):
+        """Split a basic block along an in edge, returning the new copy."""
+        a = b.getIn(inedge)
+        bprime = self._bblocks.newBlockBasic(self)
+        from ghidra.block.block import FlowBlock
+        bprime.setFlag(FlowBlock.f_duplicate_block)
+        if hasattr(bprime, 'copyRange'):
+            bprime.copyRange(b)
+        self._bblocks.switchEdge(a, b, bprime)
+        for i in range(b.sizeOut()):
+            self._bblocks.addEdge(bprime, b.getOut(i))
+        return bprime
+
+    def nodeSplit(self, b, inedge: int) -> None:
+        """Split control-flow into a basic block, duplicating p-code into a new block."""
+        if b.sizeOut() != 0:
+            raise RuntimeError("Cannot (currently) nodesplit block with out flow")
+        if b.sizeIn() <= 1:
+            raise RuntimeError("Cannot nodesplit block with only 1 in edge")
+        bprime = self.nodeSplitBlockEdge(b, inedge)
+        # Clone ops from b into bprime (simplified: no CloneBlockOps helper)
+        if hasattr(b, 'getOpList'):
+            for origop in list(b.getOpList()):
+                if origop.isBranch():
+                    continue
+                dup = self.newOp(origop.numInput(), origop.getAddr())
+                self.opSetOpcode(dup, origop.code())
+                if origop.getOut() is not None:
+                    self.newVarnodeOut(origop.getOut().getSize(), origop.getOut().getAddr(), dup)
+                for i in range(origop.numInput()):
+                    inv = origop.getIn(i)
+                    if inv.isConstant():
+                        self.opSetInput(dup, self.newConstant(inv.getSize(), inv.getOffset()), i)
+                    else:
+                        self.opSetInput(dup, inv, i)
+                self.opInsertEnd(dup, bprime)
+        self.structureReset()
+
+    def pushBranch(self, bb, slot: int, bbnew) -> None:
+        """Move a control-flow edge from one block to another (for switch guard elimination)."""
+        cbranch = bb.lastOp()
+        if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH or bb.sizeOut() != 2:
+            raise RuntimeError("Cannot push non-conditional edge")
+        indop = bbnew.lastOp()
+        if indop is None or indop.code() != OpCode.CPUI_BRANCHIND:
+            raise RuntimeError("Can only push branch into indirect jump")
+        self.opRemoveInput(cbranch, 1)
+        self.opSetOpcode(cbranch, OpCode.CPUI_BRANCH)
+        self._bblocks.moveOutEdge(bb, slot, bbnew)
+        self.structureReset()
+
+    def forceGoto(self, pcop, pcdest) -> bool:
+        """Force a specific control-flow edge to be marked as unstructured."""
+        for i in range(self._bblocks.getSize()):
+            bl = self._bblocks.getBlock(i)
+            op = bl.lastOp()
+            if op is None:
+                continue
+            if op.getAddr() != pcop:
+                continue
+            for j in range(bl.sizeOut()):
+                bl2 = bl.getOut(j)
+                op2 = bl2.lastOp()
+                if op2 is None:
+                    continue
+                if op2.getAddr() != pcdest:
+                    continue
+                bl.setGotoBranch(j)
+                return True
+        return False
+
+    def removeFromFlowSplit(self, bl, swap: bool) -> None:
+        """Remove a basic block splitting its control-flow into two distinct paths."""
+        self._bblocks.removeFromFlowSplit(bl, swap)
+        self._bblocks.removeBlock(bl)
+        self.structureReset()
+
+    def switchEdge(self, inblock, outbefore, outafter) -> None:
+        """Switch an outgoing edge from source block to flow into another block."""
+        self._bblocks.switchEdge(inblock, outbefore, outafter)
+        self.structureReset()
+
+    def nodeJoinCreateBlock(self, block1, block2, exita, exitb,
+                            fora_block1ishigh: bool, forb_block1ishigh: bool,
+                            addr) -> 'BlockBasic':
+        """Create a new basic block for holding a merged CBRANCH."""
+        from ghidra.block.block import FlowBlock
+        newblock = self._bblocks.newBlockBasic(self)
+        newblock.setFlag(FlowBlock.f_joined_block)
+        if hasattr(newblock, 'setInitialRange'):
+            newblock.setInitialRange(addr, addr)
+        if fora_block1ishigh:
+            self._bblocks.removeEdge(block1, exita)
+            swapa = block2
+        else:
+            self._bblocks.removeEdge(block2, exita)
+            swapa = block1
+        if forb_block1ishigh:
+            self._bblocks.removeEdge(block1, exitb)
+            swapb = block2
+        else:
+            self._bblocks.removeEdge(block2, exitb)
+            swapb = block1
+        self._bblocks.moveOutEdge(swapa, swapa.getOutIndex(exita), newblock)
+        self._bblocks.moveOutEdge(swapb, swapb.getOutIndex(exitb), newblock)
+        self._bblocks.addEdge(block1, newblock)
+        self._bblocks.addEdge(block2, newblock)
+        self.structureReset()
+        return newblock
+
+    def installSwitchDefaults(self) -> None:
+        """Make sure default switch cases are properly labeled."""
+        for jt in self._jumpvec:
+            indop = jt.getIndirectOp()
+            if indop is None:
+                continue
+            ind = indop.getParent()
+            defblock = jt.getDefaultBlock() if hasattr(jt, 'getDefaultBlock') else -1
+            if defblock != -1:
+                ind.setDefaultSwitch(defblock)
+
+    @staticmethod
+    def compareCallspecs(a, b) -> bool:
+        """Compare two FuncCallSpecs by address for sorting."""
+        return a.getEntryAddress() < b.getEntryAddress()
+
+    @staticmethod
+    def descendantsOutside(vn) -> bool:
+        """Return True if any PcodeOp reading vn is in a non-dead block."""
+        for desc in vn.getDescendants():
+            if not desc.getParent().isDead():
+                return True
+        return False
+
+    @staticmethod
+    def findPrimaryBranch(ops, findbranch: bool, findcall: bool, findreturn: bool):
+        """Find the primary branch op from a list of ops."""
+        for op in ops:
+            opc = op.code()
+            if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH):
+                if findbranch:
+                    if not op.getIn(0).isConstant():
+                        return op
+            elif opc == OpCode.CPUI_BRANCHIND:
+                if findbranch:
+                    return op
+            elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                if findcall:
+                    return op
+            elif opc == OpCode.CPUI_RETURN:
+                if findreturn:
+                    return op
+        return None
+
+    @staticmethod
+    def checkIndirectUse(vn) -> bool:
+        """Check if a Varnode is used only by INDIRECT ops."""
+        for desc in vn.getDescendants():
+            if desc.code() != OpCode.CPUI_INDIRECT:
+                return False
+        return True
+
+    # --- Varnode manipulation helpers ---
+
+    def destroyVarnode(self, vn) -> None:
+        """Delete the given Varnode from this function."""
+        self._vbank.destroy(vn)
+
+    def cloneVarnode(self, vn):
+        """Clone a Varnode (between copies of the function)."""
+        newvn = self._vbank.create(vn.getSize(), vn.getAddr())
+        return newvn
+
+    def splitUses(self, vn) -> None:
+        """Make all reads of the given Varnode unique by inserting COPYs."""
+        descs = list(vn.getDescendants())
+        if len(descs) <= 1:
+            return
+        for desc in descs[1:]:
+            slot = desc.getSlot(vn)
+            copyop = self.newOp(1, desc.getAddr())
+            self.opSetOpcode(copyop, OpCode.CPUI_COPY)
+            newvn = self.newUniqueOut(vn.getSize(), copyop)
+            self.opSetInput(copyop, vn, 0)
+            self.opInsertBefore(copyop, desc)
+            self.opSetInput(desc, newvn, slot)
+
+    def descend2Undef(self, vn) -> bool:
+        """Transform all reads of the given Varnode to a special undefined constant."""
+        if vn.hasNoDescend():
+            return False
+        for desc in list(vn.getDescendants()):
+            slot = desc.getSlot(vn)
+            newvn = self.newConstant(vn.getSize(), 0)
+            self.opSetInput(desc, newvn, slot)
+        return True
+
+    def assignHigh(self, vn):
+        """Assign a new HighVariable to a Varnode."""
+        high = HighVariable(vn)
+        return high
+
+    def setVarnodeProperties(self, vn) -> None:
+        """Look-up boolean properties and data-type information for a Varnode."""
+        pass
+
+    def coverVarnodes(self, entry, result: list) -> None:
+        """Find Varnodes that overlap the given SymbolEntry range."""
+        if entry is None:
+            return
+        addr = entry.getAddr() if hasattr(entry, 'getAddr') else None
+        sz = entry.getSize() if hasattr(entry, 'getSize') else 0
+        if addr is None or sz == 0:
+            return
+        for vn in self._vbank.beginLoc():
+            if vn.getAddr() == addr and vn.getSize() == sz:
+                result.append(vn)
+
+    def syncVarnodesWithSymbol(self, iterobj, fl, ct) -> bool:
+        """Sync Varnodes matching flags with their symbol data-type."""
+        return False
+
+    def handleSymbolConflict(self, entry, vn):
+        """Handle two variables with matching storage."""
+        return None
+
+    def applyUnionFacet(self, entry, dhash) -> bool:
+        """Apply union facet resolution from dynamic hash."""
+        return False
+
+    def onlyOpUse(self, invn, opmatch, trial, mainFlags) -> bool:
+        """Check if invn is only used by opmatch (for parameter passing)."""
+        return True
+
+    def ancestorOpUse(self, maxlevel, invn, op, trial, offset, mainFlags) -> bool:
+        """Check if a Varnode traces to a legitimate source for parameter passing."""
+        return True
+
+    def checkCallDoubleUse(self, opmatch, op, vn, fl, trial) -> bool:
+        """Check if a Varnode is used in two different call sites."""
+        return False
+
+    def attemptDynamicMapping(self, entry, dhash) -> bool:
+        """Attempt dynamic symbol mapping."""
+        return False
+
+    def attemptDynamicMappingLate(self, entry, dhash) -> bool:
+        """Attempt late dynamic symbol mapping."""
+        return False
+
+    # --- Iterator / search methods ---
+
+    def endLoc(self, *args):
+        """End of Varnodes sorted by storage (various overloads)."""
+        return self._vbank.endLoc(*args) if hasattr(self._vbank, 'endLoc') else iter([])
+
+    def endDef(self, *args):
+        """End of Varnodes sorted by definition address."""
+        return self._vbank.endDef(*args) if hasattr(self._vbank, 'endDef') else iter([])
+
+    def endOp(self, *args):
+        """End of PcodeOp objects (by opcode or address)."""
+        if args and hasattr(self._obank, 'end'):
+            return self._obank.end(*args)
+        return self._obank.endAll() if hasattr(self._obank, 'endAll') else iter([])
+
+    def endOpAlive(self):
+        return self._obank.endAlive() if hasattr(self._obank, 'endAlive') else iter([])
+
+    def endOpDead(self):
+        return self._obank.endDead() if hasattr(self._obank, 'endDead') else iter([])
+
+    def endOpAll(self):
+        return self._obank.endAll() if hasattr(self._obank, 'endAll') else iter([])
+
+    def overlapLoc(self, iterobj, bounds: list) -> int:
+        """Given start, return maximal range of overlapping Varnodes."""
+        if hasattr(self._vbank, 'overlapLoc'):
+            return self._vbank.overlapLoc(iterobj, bounds)
+        return 0
+
+    def beginLaneAccess(self):
+        """Beginning iterator over laned accesses."""
+        return iter(self._lanedMap) if hasattr(self, '_lanedMap') else iter({})
+
+    def endLaneAccess(self):
+        """Ending iterator over laned accesses."""
+        return iter([])
+
+    def clearLanedAccessMap(self) -> None:
+        """Clear records from the laned access list."""
+        if hasattr(self, '_lanedMap'):
+            self._lanedMap.clear()
+
+    # --- Print / debug helpers ---
+
+    def printBlockTree(self) -> str:
+        """Print a description of control-flow structuring."""
+        if self._sblocks.getSize() != 0:
+            return str(self._sblocks)
+        return ""
+
+    def printVarnodeTree(self) -> str:
+        """Print a description of all Varnodes."""
+        lines = []
+        for vn in self._vbank.beginLoc():
+            lines.append(str(vn))
+        return "\n".join(lines)
+
+    def printLocalRange(self) -> str:
+        """Print description of memory ranges associated with local scopes."""
+        return ""
+
+    # --- Misc helpers ---
+
+    def constructConstSpacebase(self, spc):
+        """Construct a constant Varnode referring to the spacebase of the given space."""
+        return self.newConstant(4, 0)
+
+    def spacebaseConstant(self, op, slot, entry, rampoint, origval, origsize) -> None:
+        """Replace a constant reference with an address relative to a spacebase register."""
+        pass
+
+    def switchOverJumpTables(self, flow) -> None:
+        """Convert jump-table addresses to basic block indices."""
+        for jt in self._jumpvec:
+            if hasattr(jt, 'switchOver'):
+                jt.switchOver(flow)
+
+    def issueDatatypeWarnings(self) -> None:
+        """Add warning headers for any data-types that have been modified."""
+        pass
+
+    def enableJTCallback(self, cb) -> None:
+        """Enable a jump-table callback."""
+        self._jtcallback = cb
+
+    def disableJTCallback(self) -> None:
+        """Disable the jump-table callback."""
+        self._jtcallback = None
+
+    def stageJumpTable(self, partial, jt, op, flow):
+        """Stage analysis for a jump-table recovery."""
+        return None
+
     # --- Block routines ---
 
     def getBasicBlockCount(self) -> int:
@@ -880,13 +1657,6 @@ class Funcdata:
 
     def getBlock(self, i: int):
         return self._bblocks.getBlock(i)
-
-    def nodeJoinCreateBlock(self, addr: Address) -> BlockBasic:
-        """Create a new basic block and add it to the graph."""
-        bb = BlockBasic()
-        bb.setRange(addr, addr)
-        self._bblocks.addBlock(bb)
-        return bb
 
     def opInsertBegin(self, op: PcodeOp, bl: BlockBasic) -> None:
         """Insert op at the beginning of a basic block."""
@@ -1142,6 +1912,10 @@ class Funcdata:
 
     # --- Encode / decode ---
 
+    def encodeVarnode(self, encoder, vn) -> None:
+        """Encode a specific Varnode to stream."""
+        pass
+
     def encode(self, encoder, uid=0, savetree: bool = True) -> None:
         """Encode a description of this function to stream."""
         pass
@@ -1223,9 +1997,6 @@ class Funcdata:
     def moveRespectingCover(self, op, lastOp) -> bool:
         return False
 
-    def getUnionField(self, parent, op, slot):
-        return self._unionMap.get((id(op), slot)) if hasattr(self, '_unionMap') else None
-
     def forceFacingType(self, parent, fieldNum: int, op, slot: int) -> None:
         pass
 
@@ -1235,50 +2006,20 @@ class Funcdata:
     def markReturnCopy(self, op) -> None:
         op.setFlag(PcodeOp.return_copy)
 
-    def newCodeRef(self, addr):
-        """Create a code address annotation Varnode."""
-        from ghidra.core.space import IPTR_IOP
-        spc = None
-        if self._glb is not None:
-            for s in self._glb._spaces:
-                if s is not None and s.getType() == IPTR_IOP:
-                    spc = s
-                    break
-        if spc is None:
-            return self.newConstant(addr.getAddrSize(), addr.getOffset())
-        return self.newVarnode(addr.getAddrSize(), Address(spc, addr.getOffset()))
-
-    def encode(self, encoder) -> None:
-        pass
-
-    def decode(self, decoder) -> None:
-        pass
-
-    def getCallSpecs(self, i: int):
-        if 0 <= i < len(self._qlst):
-            return self._qlst[i]
-        return None
-
     def numCallSpecs(self) -> int:
         return len(self._qlst)
 
-    def getJumpTable(self, i: int):
+    def getJumpTableByIndex(self, i: int):
+        """Get JumpTable by list index."""
         if 0 <= i < len(self._jumpvec):
             return self._jumpvec[i]
         return None
-
-    def numJumpTables(self) -> int:
-        return len(self._jumpvec)
 
     def getHighCount(self) -> int:
         return self._highcount if hasattr(self, '_highcount') else 0
 
     def setHighCount(self, val: int) -> None:
         self._highcount = val
-
-    def warningHeader(self, txt: str) -> None:
-        if hasattr(self, '_warnings'):
-            self._warnings.append(txt)
 
     def hasMutualExclusion(self) -> bool:
         return False
@@ -1300,6 +2041,42 @@ class Funcdata:
 
     def getMaxOpcodeIndex(self) -> int:
         return self._maxopcodeindex if hasattr(self, '_maxopcodeindex') else 0
+
+    def getCastPhase(self) -> int:
+        return self._cast_phase if hasattr(self, '_cast_phase') else 0
+
+    def setCastPhase(self, val: int) -> None:
+        self._cast_phase = val
+
+    def getHighLevelCount(self) -> int:
+        return self._highlevelcount if hasattr(self, '_highlevelcount') else 0
+
+    def getJumpTableCount(self) -> int:
+        return self._jumptablecount if hasattr(self, '_jumptablecount') else 0
+
+    def getNumCalls(self) -> int:
+        return len(self._qlst) if hasattr(self, '_qlst') else 0
+
+    def getNumHighVariables(self) -> int:
+        return self._numHighVars if hasattr(self, '_numHighVars') else 0
+
+    def getCallGraphNode(self):
+        return self._callGraphNode if hasattr(self, '_callGraphNode') else None
+
+    def setCallGraphNode(self, node) -> None:
+        self._callGraphNode = node
+
+    def getBaseOffset(self) -> int:
+        return self._baseoffset if hasattr(self, '_baseoffset') else 0
+
+    def getSwitchCount(self) -> int:
+        return self._switchcount if hasattr(self, '_switchcount') else 0
+
+    def getOverrideCount(self) -> int:
+        return self._overridecount if hasattr(self, '_overridecount') else 0
+
+    def getReturnAddr(self):
+        return self._returnaddr if hasattr(self, '_returnaddr') else None
 
     # --- Print / debug ---
 

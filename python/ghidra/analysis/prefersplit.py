@@ -140,6 +140,9 @@ class PreferSplitManager:
     def encode(self, encoder) -> None:
         pass
 
+    def fillinAddress(self, fd) -> None:
+        pass
+
     def clear(self) -> None:
         self._records.clear()
         self._tempsplits.clear()

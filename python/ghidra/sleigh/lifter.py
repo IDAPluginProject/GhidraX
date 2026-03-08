@@ -162,6 +162,54 @@ class Lifter:
 
         return fd
 
+    def pcode_text(self, entry: int, size: int) -> str:
+        """Lift a function and return human-readable PCode text.
+
+        Format per instruction:
+            0x401000: PUSH EBP
+              (register, EBP, 4) = COPY (register, ESP, 4)
+              ...
+        """
+        from ghidra.sleigh.arch_map import get_opcode_name
+
+        native_results = self._native.pcode_range(entry, entry + size)
+        if not native_results:
+            return f"// No PCode generated for 0x{entry:X} (size={size})\n"
+
+        lines = []
+        for insn in native_results:
+            # Instruction header: address + assembly
+            lines.append(f"  0x{insn.addr:X}: {insn.mnemonic} {insn.body}")
+            # PCode ops
+            for op in insn.ops:
+                opc_name = get_opcode_name(op.opcode)
+                # Format output
+                if op.has_output:
+                    out = self._fmt_varnode(op.output)
+                    out_str = f"{out} = "
+                else:
+                    out_str = ""
+                # Format inputs
+                ins = ", ".join(self._fmt_varnode(v) for v in op.inputs)
+                lines.append(f"    {out_str}{opc_name} {ins}")
+            lines.append("")  # blank line between instructions
+
+        return "\n".join(lines)
+
+    def _fmt_varnode(self, vn) -> str:
+        """Format a native Varnode for display, resolving register names."""
+        if vn.space == "register":
+            regname = self._native.get_register_name("register", vn.offset, vn.size)
+            if regname:
+                return regname
+            return f"reg[0x{vn.offset:x}:{vn.size}]"
+        elif vn.space == "const":
+            return f"0x{vn.offset:x}:{vn.size}"
+        elif vn.space == "unique":
+            return f"u_0x{vn.offset:x}:{vn.size}"
+        else:
+            return f"({vn.space}, 0x{vn.offset:x}, {vn.size})"
+
     def lift_and_print(self, name: str, entry: int, size: int) -> str:
         """Lift a function and generate C-like output. End-to-end pipeline."""
         import io

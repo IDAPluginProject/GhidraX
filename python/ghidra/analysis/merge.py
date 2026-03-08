@@ -1068,6 +1068,12 @@ class Merge:
     def getTestCount(self) -> int:
         return self._testcount if hasattr(self, '_testcount') else 0
 
+    def getStackAffectingOps(self) -> list:
+        return self._stackAffectingOps if hasattr(self, '_stackAffectingOps') else []
+
+    def getNumHighMerges(self) -> int:
+        return self._numHighMerges if hasattr(self, '_numHighMerges') else 0
+
     def collectInputs(self, high: HighVariable, oplist: list, op: PcodeOp) -> None:
         """Collect Varnode instances from a HighVariable that are inputs to a given PcodeOp."""
         while True:

@@ -186,6 +186,9 @@ class JumpAssistOp(UserPcodeOp):
     def setCalcSize(self, val: int) -> None:
         self.calcsize = val
 
+    def setIndex2Case(self, val: int) -> None:
+        self.index2case = val
+
     def decode(self, decoder) -> None:
         pass
 
@@ -216,3 +219,6 @@ class DatatypeUserOp(UserPcodeOp):
 
     def setOutType(self, t) -> None:
         self.outType = t
+
+    def addInType(self, t) -> None:
+        self.inTypes.append(t)

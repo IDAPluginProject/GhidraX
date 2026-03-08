@@ -10,6 +10,12 @@ build/
 *.egg
 .eggs/
 
+# Keep the built sleigh_native .pyd in the python package
+!python/ghidra/sleigh/*.pyd
+
+# Keep SLA spec files
+!specs/*.sla
+
 # Virtual environments
 .venv/
 venv/
@@ -29,7 +35,6 @@ Thumbs.db
 Desktop.ini
 
 # C++ build artifacts
-cpp/
 cpp/build/
 cpp/CMakeFiles/
 cpp/CMakeCache.txt
@@ -41,6 +46,7 @@ cpp/Makefile
 *.exp
 *.ilk
 *.pdb
+*.idb
 
 # Test artifacts
 .pytest_cache/

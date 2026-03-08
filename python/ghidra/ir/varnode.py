@@ -225,9 +225,19 @@ class Varnode:
 
     def setFlags(self, fl: int) -> None:
         self._flags |= fl
+        if self._high is not None:
+            if hasattr(self._high, 'flagsDirty'):
+                self._high.flagsDirty()
+            if (fl & Varnode.coverdirty) != 0 and hasattr(self._high, 'coverDirty'):
+                self._high.coverDirty()
 
     def clearFlags(self, fl: int) -> None:
         self._flags &= ~fl
+        if self._high is not None:
+            if hasattr(self._high, 'flagsDirty'):
+                self._high.flagsDirty()
+            if (fl & Varnode.coverdirty) != 0 and hasattr(self._high, 'coverDirty'):
+                self._high.coverDirty()
 
     def isAnnotation(self) -> bool:
         return (self._flags & Varnode.annotation) != 0
@@ -475,7 +485,11 @@ class Varnode:
 
     def setDef(self, op: PcodeOp) -> None:
         self._def = op
-        self._flags |= Varnode.written
+        if op is None:
+            self.setFlags(Varnode.coverdirty)
+            self.clearFlags(Varnode.written)
+        else:
+            self.setFlags(Varnode.coverdirty | Varnode.written)
 
     def setHigh(self, tv: HighVariable, mg: int = 0) -> None:
         self._high = tv
@@ -693,7 +707,11 @@ class Varnode:
             self._high.symbolDirty()
 
     def addDescend(self, op: PcodeOp) -> None:
+        if self.isFree() and not self.isSpacebase():
+            if len(self._descend) > 0:
+                raise RuntimeError("Free varnode has multiple descendants")
         self._descend.append(op)
+        self.setFlags(Varnode.coverdirty)
 
     def eraseDescend(self, op: PcodeOp) -> None:
         try:
@@ -858,7 +876,8 @@ class Varnode:
         """Get Address when this Varnode first comes into scope."""
         if self.isWritten():
             return self._def.getAddr()
-        return fd.getAddress()
+        addr = fd.getAddress()
+        return addr + (-1)
 
     def getLocalType(self, blockup_ref: list = None):
         """Calculate type of Varnode based on local information."""
@@ -1165,6 +1184,28 @@ class Varnode:
     def __hash__(self) -> int:
         return id(self)
 
+    def printRawNoMarkup(self) -> tuple:
+        """Print a simple identifier without markup. Returns (text, expectedSize)."""
+        spc = self._loc.getSpace()
+        if spc is None:
+            return (f"?{self._loc.getOffset():#x}", self._size)
+        trans = spc.getTrans() if hasattr(spc, 'getTrans') else None
+        if trans is not None and hasattr(trans, 'getRegisterName'):
+            name = trans.getRegisterName(spc, self._loc.getOffset(), self._size)
+            if name:
+                point = trans.getRegister(name) if hasattr(trans, 'getRegister') else None
+                if point is not None:
+                    off = self._loc.getOffset() - point.offset
+                    expect = point.size
+                    txt = name
+                    if off != 0:
+                        txt += f"+{off}"
+                    return (txt, expect)
+        shortcut = spc.getShortcut() if hasattr(spc, 'getShortcut') else spc.getName()[0]
+        expect = trans.getDefaultSize() if trans is not None and hasattr(trans, 'getDefaultSize') else self._size
+        txt = f"{shortcut}{self._loc.getOffset():#x}"
+        return (txt, expect)
+
     def printRaw(self) -> str:
         """Print a simple identifier for the Varnode."""
         if self.isConstant():
@@ -1193,27 +1234,34 @@ def varnode_compare_loc_def(a: Varnode, b: Varnode) -> bool:
         return a.getAddr() < b.getAddr()
     if a.getSize() != b.getSize():
         return a.getSize() < b.getSize()
-    a_flags = a.getFlags() & (Varnode.input | Varnode.written)
-    b_flags = b.getFlags() & (Varnode.input | Varnode.written)
-    if a_flags != b_flags:
-        return a_flags < b_flags
-    if a.isWritten() and b.isWritten():
-        return a.getDef().getSeqNum() < b.getDef().getSeqNum()
+    f1 = a.getFlags() & (Varnode.input | Varnode.written)
+    f2 = b.getFlags() & (Varnode.input | Varnode.written)
+    if f1 != f2:
+        return ((f1 - 1) & 0xFFFFFFFF) < ((f2 - 1) & 0xFFFFFFFF)
+    if f1 == Varnode.written:
+        if a.getDef().getSeqNum() != b.getDef().getSeqNum():
+            return a.getDef().getSeqNum() < b.getDef().getSeqNum()
+    elif f1 == 0:  # both free
+        return a.getCreateIndex() < b.getCreateIndex()
     return False
 
 
 def varnode_compare_def_loc(a: Varnode, b: Varnode) -> bool:
     """Compare two Varnodes by definition then location."""
-    a_flags = a.getFlags() & (Varnode.input | Varnode.written)
-    b_flags = b.getFlags() & (Varnode.input | Varnode.written)
-    if a_flags != b_flags:
-        return a_flags < b_flags
-    if a.isWritten() and b.isWritten():
+    f1 = a.getFlags() & (Varnode.input | Varnode.written)
+    f2 = b.getFlags() & (Varnode.input | Varnode.written)
+    if f1 != f2:
+        return ((f1 - 1) & 0xFFFFFFFF) < ((f2 - 1) & 0xFFFFFFFF)
+    if f1 == Varnode.written:
         if a.getDef().getSeqNum() != b.getDef().getSeqNum():
             return a.getDef().getSeqNum() < b.getDef().getSeqNum()
     if a.getAddr() != b.getAddr():
         return a.getAddr() < b.getAddr()
-    return a.getSize() < b.getSize()
+    if a.getSize() != b.getSize():
+        return a.getSize() < b.getSize()
+    if f1 == 0:  # both free
+        return a.getCreateIndex() < b.getCreateIndex()
+    return False
 
 
 # =========================================================================
@@ -1228,11 +1276,22 @@ class VarnodeBank:
       - def_tree: sorted by definition then location
     """
 
-    def __init__(self) -> None:
+    def __init__(self, manage=None) -> None:
+        self._manage = manage  # AddrSpaceManager
         self._loc_tree: List[Varnode] = []  # Sorted by location
         self._def_tree: List[Varnode] = []  # Sorted by definition
         self._create_index: int = 0
+        self._uniq_space = None
+        self._uniqbase: int = 0
         self._uniq_id: int = 0
+        if manage is not None:
+            if hasattr(manage, 'getUniqueSpace'):
+                self._uniq_space = manage.getUniqueSpace()
+            if self._uniq_space is not None and hasattr(self._uniq_space, 'getTrans'):
+                trans = self._uniq_space.getTrans()
+                if hasattr(trans, 'getUniqueStart'):
+                    self._uniqbase = trans.getUniqueStart(0)  # ANALYSIS=0
+            self._uniq_id = self._uniqbase
 
     def clear(self) -> None:
         self._loc_tree.clear()
@@ -1341,24 +1400,71 @@ class VarnodeBank:
     def replace(self, oldvn: Varnode, newvn: Varnode) -> None:
         """Replace every read of oldvn with newvn."""
         for op in list(oldvn._descend):
+            if hasattr(op, 'output') and op.output is newvn:
+                continue  # Cannot be input to your own definition
             i = op.getSlot(oldvn)
+            oldvn.eraseDescend(op)
+            if hasattr(op, 'clearInput'):
+                op.clearInput(i)
             newvn.addDescend(op)
             op.setInput(newvn, i)
-        oldvn._descend.clear()
         oldvn.setFlags(Varnode.coverdirty)
         newvn.setFlags(Varnode.coverdirty)
 
+    def xref(self, vn: Varnode) -> Varnode:
+        """Insert a Varnode into the sorted lists, handling duplicates."""
+        # Check for existing match in loc_tree
+        for existing in self._loc_tree:
+            if (existing.getAddr() == vn.getAddr() and
+                    existing.getSize() == vn.getSize() and
+                    existing.getFlags() & (Varnode.input | Varnode.written) ==
+                    vn.getFlags() & (Varnode.input | Varnode.written)):
+                if vn.isWritten() and existing.isWritten():
+                    if existing.getDef() is not None and vn.getDef() is not None:
+                        if existing.getDef().getSeqNum() == vn.getDef().getSeqNum():
+                            self.replace(vn, existing)
+                            return existing
+                elif not vn.isWritten() and not vn.isFree():
+                    self.replace(vn, existing)
+                    return existing
+        vn.setFlags(Varnode.insert)
+        self._loc_tree.append(vn)
+        self._def_tree.append(vn)
+        return vn
+
     def setInput(self, vn: Varnode) -> Varnode:
         """Mark a Varnode as an input to the function."""
+        if not vn.isFree():
+            raise RuntimeError("Making input out of varnode which is not free")
+        if vn.isConstant():
+            raise RuntimeError("Making input out of constant varnode")
+        try:
+            self._loc_tree.remove(vn)
+        except ValueError:
+            pass
+        try:
+            self._def_tree.remove(vn)
+        except ValueError:
+            pass
         vn.setInput()
-        vn.setFlags(Varnode.insert)
-        return vn
+        return self.xref(vn)
 
     def setDef(self, vn: Varnode, op) -> Varnode:
         """Change Varnode to be defined by the given PcodeOp."""
+        if not vn.isFree():
+            raise RuntimeError("Defining varnode which is not free")
+        if vn.isConstant():
+            raise RuntimeError("Assignment to constant")
+        try:
+            self._loc_tree.remove(vn)
+        except ValueError:
+            pass
+        try:
+            self._def_tree.remove(vn)
+        except ValueError:
+            pass
         vn.setDef(op)
-        vn.setFlags(Varnode.insert)
-        return vn
+        return self.xref(vn)
 
     def find(self, s: int, loc: Address, pc: Address = None, uniq: int = None) -> Optional[Varnode]:
         """Find a Varnode given (loc, size) and optionally the defining address."""
@@ -1496,35 +1602,61 @@ class VarnodeBank:
         bounds.extend(group)
         return flags
 
+    def verifyIntegrity(self) -> None:
+        """Check tree order is still accurate (debug method)."""
+        if not self._loc_tree:
+            return
+        # Check every loc_tree entry exists in def_tree
+        def_set = set(id(v) for v in self._def_tree)
+        for vn in self._loc_tree:
+            if id(vn) not in def_set:
+                raise RuntimeError("Varbank loc missing in def")
+        # Check every def_tree entry exists in loc_tree
+        loc_set = set(id(v) for v in self._loc_tree)
+        for vn in self._def_tree:
+            if id(vn) not in loc_set:
+                raise RuntimeError("Varbank def missing in loc")
+
 
 # =========================================================================
 # Free functions
 # =========================================================================
 
 def contiguous_test(vn1: Varnode, vn2: Varnode) -> bool:
-    """Test if Varnodes are pieces of a whole (contiguous in storage)."""
-    if vn1.getSpace() is not vn2.getSpace():
+    """Test if vn1 contains the high part and vn2 the low part of a single value.
+
+    Both must be written via CPUI_SUBPIECE from the same whole Varnode,
+    with vn2 extracting byte 0 and vn1 extracting starting at vn2.getSize().
+    """
+    from ghidra.core.opcodes import OpCode
+    if vn1.isInput() or vn2.isInput():
         return False
-    if vn1.getOffset() + vn1.getSize() == vn2.getOffset():
-        return True
-    if vn2.getOffset() + vn2.getSize() == vn1.getOffset():
-        return True
-    return False
+    if not vn1.isWritten() or not vn2.isWritten():
+        return False
+    op1 = vn1.getDef()
+    op2 = vn2.getDef()
+    if op1.code() != OpCode.CPUI_SUBPIECE:
+        return False
+    if op2.code() != OpCode.CPUI_SUBPIECE:
+        return False
+    vnwhole = op1.getIn(0)
+    if op2.getIn(0) is not vnwhole:
+        return False
+    if op2.getIn(1).getOffset() != 0:
+        return False  # Must be least significant
+    if op1.getIn(1).getOffset() != vn2.getSize():
+        return False  # Must be contiguous
+    return True
 
 
 def findContiguousWhole(data, vn1: Varnode, vn2: Varnode) -> Optional[Varnode]:
     """Retrieve the whole Varnode given pieces.
 
-    If vn1 and vn2 are contiguous, look for an input Varnode covering both.
+    Assuming vn1, vn2 have passed contiguous_test(), return the Varnode
+    containing the whole value.
     """
-    if vn1.getSpace() is not vn2.getSpace():
-        return None
-    # Order by offset
-    if vn1.getOffset() > vn2.getOffset():
-        vn1, vn2 = vn2, vn1
-    if vn1.getOffset() + vn1.getSize() != vn2.getOffset():
-        return None
-    whole_size = vn1.getSize() + vn2.getSize()
-    whole_addr = vn1.getAddr()
-    # Look for a covering input varnode
-    return data.findCoveringInput(whole_size, whole_addr)
+    from ghidra.core.opcodes import OpCode
+    if vn1.isWritten():
+        if vn1.getDef().code() == OpCode.CPUI_SUBPIECE:
+            return vn1.getDef().getIn(0)
+    return None

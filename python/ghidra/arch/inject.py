@@ -136,3 +136,9 @@ class PcodeInjectLibrary:
         """Manually register a callother fixup from a p-code snippet."""
         payload = InjectPayload(useropname, InjectPayload.CALLOTHERFIXUP_TYPE)
         return self.registerPayload(payload)
+
+    def getExePcodePayload(self, nm: str):
+        idx = self._exePcodeMap.get(nm, -1)
+        if idx >= 0 and idx < len(self._payloads):
+            return self._payloads[idx]
+        return None

@@ -687,3 +687,15 @@ class JumpBasicOverride(JumpModel):
 
     def clear(self):
         self._addrOverride.clear()
+
+    def getNumOverrides(self) -> int:
+        return len(self._addrOverride)
+
+    def addOverride(self, addr) -> None:
+        self._addrOverride.append(addr)
+
+    def getOverride(self, i: int):
+        return self._addrOverride[i]
+
+    def encode(self, encoder) -> None:
+        pass

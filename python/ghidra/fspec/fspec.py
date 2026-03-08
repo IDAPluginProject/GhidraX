@@ -1621,5 +1621,62 @@ class FuncCallSpecs:
     def isInputLocked(self) -> bool:
         return self.proto.isInputLocked()
 
+    def isOutputLocked(self) -> bool:
+        return self.proto.isOutputLocked()
+
+    def getInputErrors(self) -> list:
+        return []
+
+    def getOutputErrors(self) -> list:
+        return []
+
+    def setInputBestfit(self, val: bool) -> None:
+        self._inputbestfit = val
+
+    def setOutputBestfit(self, val: bool) -> None:
+        self._outputbestfit = val
+
+    def hasInputErrors(self) -> bool:
+        return False
+
+    def hasOutputErrors(self) -> bool:
+        return False
+
+    def getParamshiftApplied(self) -> bool:
+        return self._paramshift_applied if hasattr(self, '_paramshift_applied') else False
+
+    def setParamshiftApplied(self, val: bool) -> None:
+        self._paramshift_applied = val
+
+    def getIsTailCall(self) -> bool:
+        return self._isTailCall if hasattr(self, '_isTailCall') else False
+
+    def setIsTailCall(self, val: bool) -> None:
+        self._isTailCall = val
+
+    def isCalculatedBool(self) -> bool:
+        return self._calculatedBool if hasattr(self, '_calculatedBool') else False
+
+    def setCalculatedBool(self, val: bool) -> None:
+        self._calculatedBool = val
+
+    def getCallOp(self):
+        return self._callop if hasattr(self, '_callop') else None
+
+    def setCallOp(self, op) -> None:
+        self._callop = op
+
+    def getNumInputTrials(self) -> int:
+        return self._numInputTrials if hasattr(self, '_numInputTrials') else 0
+
+    def getNumOutputTrials(self) -> int:
+        return self._numOutputTrials if hasattr(self, '_numOutputTrials') else 0
+
+    def isOverride(self) -> bool:
+        return self._isOverride if hasattr(self, '_isOverride') else False
+
+    def setOverride(self, val: bool) -> None:
+        self._isOverride = val
+
     def __repr__(self) -> str:
         return f"FuncCallSpecs({self.name!r} @ {self.entryaddress})"

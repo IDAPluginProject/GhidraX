@@ -4,12 +4,15 @@ Ghidra Decompiler Plugin for IDA 9.0
 
 Press Alt+F1 on any function to decompile it using the PyGhidra engine
 and display pseudocode in a custom viewer window (like Hex-Rays).
+Press Alt+F2 on any function to display raw PCode in a viewer.
+
+Architecture is auto-detected from the IDA database (x86/x64/ARM/MIPS/PPC).
 
 Requirements:
 - IDA 9.0+ with IDAPython
-- PyGhidra engine (d:\BIGAI\pyghidra\python)
+- PyGhidra engine
 - sleigh_native.pyd built for your Python version
-- x86.sla specification file
+- Matching .sla specification file(s)
 
 Installation:
 - Copy this file to IDA's plugins/ directory
@@ -25,6 +28,7 @@ import ida_funcs
 import ida_bytes
 import ida_segment
 import ida_idaapi
+import ida_ida
 import ida_name
 import ida_ua
 import idautils
@@ -35,11 +39,9 @@ PYGHIDRA_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 if PYGHIDRA_PATH not in sys.path:
     sys.path.insert(0, PYGHIDRA_PATH)
 
-# SLA file path
-SLA_PATH = r"d:\BIGAI\XGhidra\native\specs\x86.sla"
-
 PLUGIN_NAME = "Ghidra Decompiler"
-PLUGIN_HOTKEY = "Alt+F1"
+PLUGIN_HOTKEY_DECOMPILE = "Alt+F1"
+PLUGIN_HOTKEY_PCODE = "Alt+F2"
 PLUGIN_COMMENT = "Decompile current function using Ghidra engine"
 
 
@@ -174,11 +176,28 @@ def get_function_bytes(func_ea):
 
 def get_arch_info():
     """Determine architecture parameters from the IDA database."""
-    info = ida_idaapi.get_inf_structure()
-    procname = info.procname.lower()
-    bitness = 64 if info.is_64bit() else (32 if info.is_32bit() else 16)
-    is_be = info.is_be()
+    procname = ida_ida.inf_get_procname().lower()
+    if ida_ida.inf_is_64bit():
+        bitness = 64
+    elif not ida_ida.inf_is_16bit():
+        bitness = 32
+    else:
+        bitness = 16
+    is_be = ida_ida.inf_is_be()
     return procname, bitness, is_be
+
+
+def create_lifter(start_addr, data):
+    """Create a Lifter with correct SLA and context for the current binary."""
+    from ghidra.sleigh.lifter import Lifter
+    from ghidra.sleigh.arch_map import resolve_arch
+
+    procname, bitness, is_be = get_arch_info()
+    arch_info = resolve_arch(procname, bitness, is_be)
+
+    lifter = Lifter(arch_info["sla_path"], arch_info["context"])
+    lifter.set_image(start_addr, data)
+    return lifter
 
 
 def decompile_function(func_ea):
@@ -187,52 +206,48 @@ def decompile_function(func_ea):
     if data is None or size == 0:
         return None, "No function at this address"
 
-    procname, bitness, is_be = get_arch_info()
-
     try:
-        from ghidra.sleigh.lifter import Lifter
-        from ghidra.arch.architecture import Architecture
-
-        # Create the lifter with the SLA file
-        lifter = Lifter(SLA_PATH)
-
-        # Set up context for x86
-        if 'x86' in procname or '80386' in procname or 'metapc' in procname:
-            if bitness == 32:
-                lifter.native.set_context_default('addrsize', 1)
-                lifter.native.set_context_default('opsize', 1)
-            elif bitness == 64:
-                lifter.native.set_context_default('longMode', 1)
-                lifter.native.set_context_default('addrsize', 2)
-                lifter.native.set_context_default('opsize', 2)
-
-        # Lift the function to P-code
-        fd = lifter.lift_function(data, start_addr)
-        if fd is None:
-            return None, "Failed to lift function to P-code"
-
-        # Create architecture and run decompilation pipeline
-        arch = Architecture()
-        arch.init()
-        fd.setArch(arch)
-
-        # Run the full decompilation pipeline
-        c_code = arch.decompileFunction(fd)
+        lifter = create_lifter(start_addr, data)
 
         # Get the function name from IDA
         func_name = ida_name.get_name(func_ea)
         if not func_name:
             func_name = f"sub_{func_ea:X}"
 
-        # Replace the generic function name with the IDA name
-        if c_code:
-            c_code = c_code.replace("func_unknown", func_name)
-            c_code = c_code.replace("FUN_", func_name + "_")
+        # Lift and decompile to C code (end-to-end pipeline)
+        c_code = lifter.lift_and_print(func_name, start_addr, size)
+
+        if not c_code or not c_code.strip():
+            return None, "Decompilation produced no output"
 
         return c_code, None
 
     except Exception as e:
         return None, f"Decompilation error: {str(e)}\n{traceback.format_exc()}"
+
+
+def get_pcode_text(func_ea):
+    """Lift the function at func_ea and return formatted PCode text."""
+    data, start_addr, size = get_function_bytes(func_ea)
+    if data is None or size == 0:
+        return None, "No function at this address"
+
+    try:
+        lifter = create_lifter(start_addr, data)
+
+        func_name = ida_name.get_name(func_ea)
+        if not func_name:
+            func_name = f"sub_{func_ea:X}"
+
+        procname, bitness, _ = get_arch_info()
+        header = f"// PCode for {func_name} @ 0x{func_ea:X}\n"
+        header += f"// Arch: {procname} {bitness}-bit, Size: {size} bytes\n\n"
+
+        pcode = lifter.pcode_text(start_addr, size)
+        return header + pcode, None
+
+    except Exception as e:
+        return None, f"PCode lift error: {str(e)}\n{traceback.format_exc()}"
 
 
 def show_decompiled(func_ea):
@@ -272,8 +287,38 @@ def show_decompiled(func_ea):
         ida_kernwin.warning("Failed to create decompiler viewer")
 
 
+def show_pcode(func_ea):
+    """Lift and show PCode in a custom viewer."""
+    ida_kernwin.show_wait_box("Lifting to PCode with Ghidra SLEIGH...")
+    try:
+        pcode_text, error = get_pcode_text(func_ea)
+    finally:
+        ida_kernwin.hide_wait_box()
+
+    if error:
+        ida_kernwin.warning(f"Ghidra PCode: {error}")
+        return
+
+    func_name = ida_name.get_name(func_ea)
+    if not func_name:
+        func_name = f"sub_{func_ea:X}"
+
+    title = f"PCode: {func_name}"
+    lines = pcode_text.split('\n')
+
+    widget = ida_kernwin.find_widget(title)
+    if widget:
+        ida_kernwin.close_widget(widget, 0)
+
+    viewer = GhidraDecompilerViewer(title, lines, func_ea)
+    if viewer.Create():
+        viewer.Show()
+    else:
+        ida_kernwin.warning("Failed to create PCode viewer")
+
+
 class GhidraDecompilerHandler(ida_kernwin.action_handler_t):
-    """Action handler for the Ghidra decompile action."""
+    """Action handler for the Ghidra decompile action (Alt+F1)."""
 
     def activate(self, ctx):
         ea = ida_kernwin.get_screen_ea()
@@ -282,6 +327,22 @@ class GhidraDecompilerHandler(ida_kernwin.action_handler_t):
             ida_kernwin.warning("No function at current address")
             return 0
         show_decompiled(func.start_ea)
+        return 1
+
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+
+class GhidraPcodeHandler(ida_kernwin.action_handler_t):
+    """Action handler for the Ghidra PCode viewer action (Alt+F2)."""
+
+    def activate(self, ctx):
+        ea = ida_kernwin.get_screen_ea()
+        func = ida_funcs.get_func(ea)
+        if func is None:
+            ida_kernwin.warning("No function at current address")
+            return 0
+        show_pcode(func.start_ea)
         return 1
 
     def update(self, ctx):
@@ -297,30 +358,38 @@ class GhidraDecompilerPlugin(ida_idaapi.plugin_t):
     wanted_name = PLUGIN_NAME
     wanted_hotkey = ""
 
-    ACTION_NAME = "ghidra:decompile"
-    ACTION_LABEL = "Decompile with Ghidra"
-    ACTION_SHORTCUT = PLUGIN_HOTKEY
+    ACTION_DECOMPILE = "ghidra:decompile"
+    ACTION_PCODE = "ghidra:pcode"
 
     def init(self):
-        # Register the action
-        action_desc = ida_kernwin.action_desc_t(
-            self.ACTION_NAME,
-            self.ACTION_LABEL,
+        # Register decompile action (Alt+F1)
+        ida_kernwin.register_action(ida_kernwin.action_desc_t(
+            self.ACTION_DECOMPILE,
+            "Decompile with Ghidra",
             GhidraDecompilerHandler(),
-            self.ACTION_SHORTCUT,
-            PLUGIN_COMMENT,
+            PLUGIN_HOTKEY_DECOMPILE,
+            "Decompile current function using Ghidra engine",
             -1
-        )
-        ida_kernwin.register_action(action_desc)
+        ))
+
+        # Register PCode action (Alt+F2)
+        ida_kernwin.register_action(ida_kernwin.action_desc_t(
+            self.ACTION_PCODE,
+            "Show PCode (Ghidra)",
+            GhidraPcodeHandler(),
+            PLUGIN_HOTKEY_PCODE,
+            "Lift current function to PCode using Ghidra SLEIGH",
+            -1
+        ))
 
         # Add to Edit menu
         ida_kernwin.attach_action_to_menu(
-            "Edit/Plugins/",
-            self.ACTION_NAME,
-            ida_kernwin.SETMENU_APP
-        )
+            "Edit/Plugins/", self.ACTION_DECOMPILE, ida_kernwin.SETMENU_APP)
+        ida_kernwin.attach_action_to_menu(
+            "Edit/Plugins/", self.ACTION_PCODE, ida_kernwin.SETMENU_APP)
 
-        print(f"[{PLUGIN_NAME}] Loaded. Press {PLUGIN_HOTKEY} to decompile.")
+        print(f"[{PLUGIN_NAME}] Loaded. "
+              f"{PLUGIN_HOTKEY_DECOMPILE}=Decompile, {PLUGIN_HOTKEY_PCODE}=PCode")
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
@@ -330,7 +399,8 @@ class GhidraDecompilerPlugin(ida_idaapi.plugin_t):
             show_decompiled(func.start_ea)
 
     def term(self):
-        ida_kernwin.unregister_action(self.ACTION_NAME)
+        ida_kernwin.unregister_action(self.ACTION_DECOMPILE)
+        ida_kernwin.unregister_action(self.ACTION_PCODE)
         print(f"[{PLUGIN_NAME}] Unloaded.")
 
 
@@ -346,3 +416,4 @@ if __name__ == "__main__":
         show_decompiled(func.start_ea)
     else:
         print("No function at current address")
+

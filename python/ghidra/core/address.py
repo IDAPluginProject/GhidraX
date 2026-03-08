@@ -99,19 +99,31 @@ def signbit_negative(val: int, size: int) -> bool:
 
 
 def uintb_negate(val: int, size: int) -> int:
-    """Negate the *sized* value (two's complement)."""
+    """Invert bits of the *sized* value."""
     mask = calc_mask(size)
-    return ((~val) + 1) & mask
+    return (~val) & mask
 
 
 def sign_extend_sized(val: int, sizein: int, sizeout: int) -> int:
-    """Sign-extend a value between two byte sizes."""
-    mask_in = calc_mask(sizein)
-    val &= mask_in
-    if signbit_negative(val, sizein):
-        mask_out = calc_mask(sizeout)
-        val |= (mask_out ^ mask_in)
-    return val
+    """Sign-extend a value between two byte sizes.
+
+    Takes the first *sizein* bytes of *val* and sign-extends to *sizeout* bytes,
+    keeping any more significant bytes zero.
+    """
+    sizein = min(sizein, 8)
+    sizeout = min(sizeout, 8)
+    # Simulate C++ intb sval = in; sval <<= (sizeof(intb)-sizein)*8;
+    sval = val & 0xFFFFFFFFFFFFFFFF
+    sval = (sval << ((8 - sizein) * 8)) & 0xFFFFFFFFFFFFFFFF
+    # Convert to signed 64-bit for arithmetic right shift
+    if sval >= (1 << 63):
+        sval -= (1 << 64)
+    # uintb res = (uintb)(sval >> (sizeout - sizein) * 8);
+    sval >>= (sizeout - sizein) * 8
+    res = sval & 0xFFFFFFFFFFFFFFFF
+    # res >>= (sizeof(uintb) - sizeout)*8;
+    res >>= (8 - sizeout) * 8
+    return res
 
 
 def byte_swap(val: int, size: int) -> int:
@@ -515,6 +527,8 @@ class RangeProperties:
         self.seenLast: bool = False
 
     def decode(self, decoder: Decoder) -> None:
+        """Decode this from a stream."""
+        elem_id = decoder.openElement()
         while True:
             attrib_id = decoder.getNextAttributeId()
             if attrib_id == 0:
@@ -529,6 +543,7 @@ class RangeProperties:
             elif attrib_id == ATTRIB_NAME.id:
                 self.spaceName = decoder.readString()
                 self.isRegister = True
+        decoder.closeElement(elem_id)
 
 
 # =========================================================================
@@ -547,11 +562,21 @@ class Range:
 
     @classmethod
     def from_properties(cls, props: RangeProperties, manage: AddrSpaceManager) -> Range:
+        """Construct range out of basic properties."""
+        if props.isRegister:
+            trans = manage.getDefaultCodeSpace().getTrans()
+            point = trans.getRegister(props.spaceName)
+            return cls(point.space, point.offset, (point.offset - 1) + point.size)
         spc = manage.getSpaceByName(props.spaceName)
-        r = cls(spc, props.first, props.last)
+        if spc is None:
+            raise LowlevelError("Undefined space: " + props.spaceName)
+        first = props.first
+        last = props.last
         if not props.seenLast:
-            r.last = spc.getHighest()
-        return r
+            last = spc.getHighest()
+        if first > spc.getHighest() or last > spc.getHighest() or last < first:
+            raise LowlevelError("Illegal range tag")
+        return cls(spc, first, last)
 
     def getSpace(self) -> Optional[AddrSpace]:
         return self.spc
@@ -567,6 +592,19 @@ class Range:
 
     def getLastAddr(self) -> Address:
         return Address(self.spc, self.last)
+
+    def getLastAddrOpen(self, manage: AddrSpaceManager) -> Address:
+        """Get address of first byte after this Range."""
+        curspc = self.spc
+        curlast = self.last
+        if curlast == curspc.getHighest():
+            curspc = manage.getNextSpaceInOrder(curspc)
+            curlast = 0
+        else:
+            curlast += 1
+        if curspc is None:
+            return Address.from_extreme(Address.m_maximal)
+        return Address(curspc, curlast)
 
     def contains(self, addr: Address) -> bool:
         if self.spc is not addr.getSpace():
@@ -592,8 +630,9 @@ class Range:
         return hash((id(self.spc), self.first, self.last))
 
     def printBounds(self) -> str:
+        """Print this Range to a stream."""
         sname = self.spc.getName() if self.spc else "?"
-        return f"[{sname}:{self.first:#x},{self.last:#x}]"
+        return f"{sname}: {self.first:x}-{self.last:x}"
 
     def encode(self, encoder: Encoder) -> None:
         encoder.openElement(ELEM_RANGE)
@@ -602,7 +641,12 @@ class Range:
         encoder.writeUnsignedInteger(ATTRIB_LAST, self.last)
         encoder.closeElement(ELEM_RANGE)
 
-    def decode(self, decoder: Decoder) -> None:
+    def decodeFromAttributes(self, decoder: Decoder) -> None:
+        """Reconstruct from attributes that may not be part of a <range> element."""
+        self.spc = None
+        seen_last = False
+        self.first = 0
+        self.last = 0
         while True:
             attrib_id = decoder.getNextAttributeId()
             if attrib_id == 0:
@@ -613,6 +657,27 @@ class Range:
                 self.first = decoder.readUnsignedInteger()
             elif attrib_id == ATTRIB_LAST.id:
                 self.last = decoder.readUnsignedInteger()
+                seen_last = True
+            elif attrib_id == ATTRIB_NAME.id:
+                manage = decoder.getAddrSpaceManager()
+                trans = manage.getDefaultCodeSpace().getTrans()
+                point = trans.getRegister(decoder.readString())
+                self.spc = point.space
+                self.first = point.offset
+                self.last = (point.offset - 1) + point.size
+                return
+        if self.spc is None:
+            raise LowlevelError("No address space indicated in range tag")
+        if not seen_last:
+            self.last = self.spc.getHighest()
+        if self.first > self.spc.getHighest() or self.last > self.spc.getHighest() or self.last < self.first:
+            raise LowlevelError("Illegal range tag")
+
+    def decode(self, decoder: Decoder) -> None:
+        """Reconstruct this object from a <range> or <register> element."""
+        elem_id = decoder.openElement()
+        self.decodeFromAttributes(decoder)
+        decoder.closeElement(elem_id)
 
 
 # =========================================================================
@@ -694,6 +759,10 @@ class RangeList:
 
     def inRange(self, addr: Address, size: int) -> bool:
         """Check if [addr, addr+size) is contained in some range."""
+        if addr.isInvalid():
+            return True
+        if not self._ranges:
+            return False
         for r in self._ranges:
             if r.spc is addr.getSpace():
                 if r.first <= addr.getOffset() and (addr.getOffset() + size - 1) <= r.last:
@@ -701,11 +770,50 @@ class RangeList:
         return False
 
     def longestFit(self, addr: Address, maxsize: int) -> int:
+        """Find size of biggest contiguous region containing given address."""
+        if addr.isInvalid():
+            return 0
+        if not self._ranges:
+            return 0
+        offset = addr.getOffset()
+        spc = addr.getSpace()
+        sizeres = 0
+        # Find the first range whose first <= offset and last >= offset
+        found = False
         for r in self._ranges:
-            if r.spc is addr.getSpace() and r.first <= addr.getOffset() <= r.last:
-                avail = r.last - addr.getOffset() + 1
-                return min(avail, maxsize)
-        return 0
+            if r.spc is not spc:
+                if found:
+                    break
+                continue
+            if r.first > offset:
+                break
+            if r.last >= offset:
+                found = True
+                sizeres += (r.last + 1 - offset)
+                offset = r.last + 1
+                if sizeres >= maxsize:
+                    break
+            elif not found:
+                continue
+        return sizeres
+
+    def getLastSignedRange(self, spaceid: AddrSpace) -> Optional[Range]:
+        """Get the last Range viewing offsets as signed."""
+        midway = spaceid.getHighest() // 2
+        # Look for biggest "positive" range (offset <= midway)
+        best = None
+        for r in self._ranges:
+            if r.spc is not spaceid:
+                continue
+            if r.first <= midway:
+                best = r
+        if best is not None:
+            return best
+        # No positive ranges, find biggest negative range
+        for r in reversed(self._ranges):
+            if r.spc is spaceid:
+                return r
+        return None
 
     def printBounds(self) -> str:
         return " ".join(r.printBounds() for r in self._ranges)
@@ -717,11 +825,10 @@ class RangeList:
         encoder.closeElement(ELEM_RANGELIST)
 
     def decode(self, decoder: Decoder) -> None:
+        """Decode this RangeList from a <rangelist> element."""
         elem_id = decoder.openElement(ELEM_RANGELIST)
         while decoder.peekElement() != 0:
             r = Range()
-            sub_id = decoder.openElement(ELEM_RANGE)
             r.decode(decoder)
-            decoder.closeElement(sub_id)
             self.insertRange(r.spc, r.first, r.last)
         decoder.closeElement(elem_id)

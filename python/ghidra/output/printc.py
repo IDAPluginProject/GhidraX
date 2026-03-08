@@ -2796,6 +2796,48 @@ class PrintC(PrintLanguage):
     def emitGlobalVarDeclsAsComments(self, fd) -> None:
         pass
 
+    def emitStructDefinition(self, ct) -> None:
+        pass
+
+    def emitTypedefDefinition(self, ct) -> None:
+        pass
+
+    def emitVarDecl(self, sym) -> None:
+        pass
+
+    def emitVarDeclStatement(self, sym) -> None:
+        pass
+
+    def emitStatement(self, inst) -> None:
+        pass
+
+    def emitFunctionDeclaration(self, fd) -> None:
+        pass
+
+    def pushPartialCopy(self, op) -> None:
+        pass
+
+    def pushMismatchCopy(self, op) -> None:
+        pass
+
+    def emitInlineExpression(self, op) -> None:
+        pass
+
+    def emitLocalScopeDecls(self, scope, cat: int) -> None:
+        pass
+
+    def pushAnnotatedLocation(self, addr, vn, op) -> None:
+        pass
+
+    def pushCharLiteral(self, val: int, ct, vn=None, op=None) -> None:
+        pass
+
+    def adjustComparisonOperators(self, op, ct) -> None:
+        pass
+
+    def emitBlockGraph(self, bl) -> None:
+        pass
+
     def emitEnumDefinition(self, ct):
         """Emit an enum type definition: typedef enum { ... } Name;"""
         if ct is None or self._emit is None:
