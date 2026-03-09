@@ -2491,6 +2491,46 @@ class PrintC(PrintLanguage):
         elif nm in ("cplusplus", "//"):
             self.setCPlusPlusStyleComments()
 
+    def setNULLPrinting(self, val: bool) -> None:
+        """Toggle the printing of a 'NULL' token."""
+        self.option_NULL = val
+
+    def setInplaceOps(self, val: bool) -> None:
+        """Toggle the printing of in-place operators."""
+        self.option_inplace_ops = val
+
+    def setConvention(self, val: bool) -> None:
+        """Toggle whether calling conventions are printed."""
+        self.option_convention = val
+
+    def setNoCastPrinting(self, val: bool) -> None:
+        """Toggle whether casts should not be printed."""
+        self.option_nocasts = val
+
+    def setDisplayUnplaced(self, val: bool) -> None:
+        """Toggle whether unplaced comments are displayed in the header."""
+        self.option_unplaced = val
+
+    def setHideImpliedExts(self, val: bool) -> None:
+        """Toggle whether implied extensions are hidden."""
+        self.option_hide_exts = val
+
+    def setBraceFormatFunction(self, style: int) -> None:
+        """Set how function declarations are formatted."""
+        self._option_brace_func = style
+
+    def setBraceFormatIfElse(self, style: int) -> None:
+        """Set how if/else blocks are formatted."""
+        self._option_brace_ifelse = style
+
+    def setBraceFormatLoop(self, style: int) -> None:
+        """Set how loop blocks are formatted."""
+        self._option_brace_loop = style
+
+    def setBraceFormatSwitch(self, style: int) -> None:
+        """Set how switch blocks are formatted."""
+        self._option_brace_switch = style
+
     def setCStyleComments(self):
         self.setCommentDelimeter("/* ", " */", False)
 
