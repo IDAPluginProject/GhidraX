@@ -127,17 +127,21 @@ class Lifter:
         bb.setInitialRange(Address(code_spc, entry),
                            Address(code_spc, entry + size - 1))
 
-        # Varnode cache: (space_name, offset, size) -> Varnode
-        vn_cache: Dict[Tuple[str, int, int], Varnode] = {}
+        # Cache for defined (output) varnodes: (space_name, offset, size) -> Varnode
+        # Only outputs are cached; inputs always get a fresh varnode because
+        # free varnodes in Ghidra's model can have at most one descendant.
+        defined_vn: Dict[Tuple[str, int, int], Varnode] = {}
 
-        def get_or_create_vn(space_name: str, offset: int, sz: int) -> Varnode:
-            key = (space_name, offset, sz)
-            if key in vn_cache:
-                return vn_cache[key]
+        def make_vn(space_name: str, offset: int, sz: int) -> Varnode:
             spc = self._get_space(space_name)
-            vn = fd.newVarnode(sz, Address(spc, offset))
-            vn_cache[key] = vn
-            return vn
+            return fd.newVarnode(sz, Address(spc, offset))
+
+        def get_input_vn(space_name: str, offset: int, sz: int) -> Varnode:
+            key = (space_name, offset, sz)
+            vn = defined_vn.get(key)
+            if vn is not None:
+                return vn
+            return make_vn(space_name, offset, sz)
 
         # Convert each native PcodeResult -> Python PcodeOps
         for insn in native_results:
@@ -147,15 +151,16 @@ class Lifter:
                 op = fd.newOp(num_in, Address(code_spc, insn.addr))
                 op.setOpcodeEnum(opc)
 
-                # Output
+                # Output — register in cache so later inputs can find it
                 if native_op.has_output:
                     o = native_op.output
-                    out_vn = get_or_create_vn(o.space, o.offset, o.size)
+                    out_vn = make_vn(o.space, o.offset, o.size)
                     fd.opSetOutput(op, out_vn)
+                    defined_vn[(o.space, o.offset, o.size)] = out_vn
 
-                # Inputs
+                # Inputs — look up defined varnodes, else create fresh
                 for i, inp in enumerate(native_op.inputs):
-                    in_vn = get_or_create_vn(inp.space, inp.offset, inp.size)
+                    in_vn = get_input_vn(inp.space, inp.offset, inp.size)
                     fd.opSetInput(op, in_vn, i)
 
                 fd.opInsertEnd(op, bb)
