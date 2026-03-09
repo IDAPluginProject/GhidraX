@@ -827,6 +827,32 @@ class Architecture(AddrSpaceManager):
     def getSymbolDatabase(self):
         return self.symboltab
 
+    def address(self, spc_name: str, offset: int):
+        """Construct an Address from space name and offset."""
+        spc = self.getSpaceByName(spc_name)
+        if spc is None:
+            raise RuntimeError("Unknown space: " + spc_name)
+        from ghidra.core.address import Address
+        return Address(spc, offset)
+
+    def nan(self) -> bool:
+        """Return True if NaN operations should be ignored."""
+        return self.nan_ignore_all
+
+    def pool(self):
+        """Get the constant pool (cpool) database."""
+        return self.cpool
+
+    def setDebugStream(self, s) -> None:
+        """Establish the debug console stream."""
+        self._debugstream = s
+
+    def printDebug(self, message: str) -> None:
+        """Print message to the debug stream."""
+        s = getattr(self, '_debugstream', None)
+        if s is not None:
+            s.write(message + '\n')
+
     def __repr__(self) -> str:
         return f"Architecture({self.archid!r})"
 

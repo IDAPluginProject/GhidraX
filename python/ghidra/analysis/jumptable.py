@@ -392,6 +392,36 @@ class JumpTable:
         """Decode this jump-table from a stream."""
         pass
 
+    def setOverride(self, addrtable: list, naddr, h: int, sv: int) -> None:
+        """Force a manual override of the jump-table addresses."""
+        self.addresstable = list(addrtable)
+        self.switchVarConsume = sv
+        self.jmodel = JumpModelTrivial(self)
+
+    def getIndexByBlock(self, bl, i: int) -> int:
+        """Get the i-th address table index that targets the given block."""
+        blstart = bl.getStart() if hasattr(bl, 'getStart') else None
+        if blstart is None:
+            return -1
+        count = 0
+        for idx, addr in enumerate(self.addresstable):
+            if addr == blstart:
+                if count == i:
+                    return idx
+                count += 1
+        return -1
+
+    def addBlockToSwitch(self, bl, lab: int) -> None:
+        """Force a given basic-block to be a switch destination."""
+        addr = bl.getStart() if hasattr(bl, 'getStart') else Address()
+        self.addresstable.append(addr)
+        self.label.append(lab)
+
+    def matchModel(self, fd) -> None:
+        """Try to match JumpTable model to the existing function."""
+        if self.jmodel is None:
+            self.jmodel = JumpModelTrivial(self)
+
     def clear(self) -> None:
         self.addresstable.clear()
         self.label.clear()
