@@ -75,13 +75,14 @@ def _get_search_dirs() -> list:
     ]
 
     for root in roots:
-        # Scan Ghidra/Processors/<proc>/data/languages/ (standard Ghidra layout)
-        proc_dir = os.path.join(root, "Ghidra", "Processors")
-        if os.path.isdir(proc_dir):
-            for proc in os.listdir(proc_dir):
-                lang_dir = os.path.join(proc_dir, proc, "data", "languages")
-                if os.path.isdir(lang_dir) and lang_dir not in dirs:
-                    dirs.append(lang_dir)
+        # Scan {Ghidra,specroot}/Processors/<proc>/data/languages/
+        for specdir_name in ("Ghidra", "specroot"):
+            proc_dir = os.path.join(root, specdir_name, "Processors")
+            if os.path.isdir(proc_dir):
+                for proc in os.listdir(proc_dir):
+                    lang_dir = os.path.join(proc_dir, proc, "data", "languages")
+                    if os.path.isdir(lang_dir) and lang_dir not in dirs:
+                        dirs.append(lang_dir)
         # Legacy flat specs/ directory
         rel_specs = os.path.join(root, "specs")
         if os.path.isdir(rel_specs) and rel_specs not in dirs:

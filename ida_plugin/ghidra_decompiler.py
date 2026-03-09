@@ -215,26 +215,31 @@ def _get_native_decompiler():
         import ghidra.sleigh.decompiler_native as _dnmod
         from ghidra.sleigh.decompiler_native import DecompilerNative
         _native_decompiler = DecompilerNative()
-        # Find Ghidra spec directory (standard layout: Ghidra/Processors/<proc>/data/languages/)
+        # Find spec language directories
+        # Supports: Ghidra/Processors/*/data/languages/ and specroot/Processors/*/data/languages/
         mod_dir = os.path.dirname(os.path.abspath(_dnmod.__file__))
-        candidates = [
-            os.path.normpath(os.path.join(mod_dir, "..", "..", "..")),  # source: python/ghidra/sleigh -> root
-            os.path.normpath(os.path.join(mod_dir, "..", "..")),        # deployed: ghidra/sleigh -> pyghidra
-            os.path.normpath(os.path.join(PYGHIDRA_PATH, "..")),
+        search_roots = [
+            os.path.normpath(os.path.join(mod_dir, "..", "..", "..")),  # source layout
+            os.path.normpath(os.path.join(mod_dir, "..", "..")),        # deployed layout
             PYGHIDRA_PATH,
-            os.environ.get("PYGHIDRA_GHIDRA_ROOT", ""),
         ]
+        env_root = os.environ.get("PYGHIDRA_GHIDRA_ROOT", "")
+        if env_root:
+            search_roots.append(env_root)
         found = False
-        for candidate in candidates:
-            if not candidate:
-                continue
-            ghidra_proc = os.path.join(candidate, "Ghidra", "Processors")
-            if os.path.isdir(ghidra_proc):
-                _native_decompiler.add_ghidra_root(candidate)
-                found = True
+        for root in search_roots:
+            for specdir_name in ("Ghidra", "specroot"):
+                proc_dir = os.path.join(root, specdir_name, "Processors")
+                if os.path.isdir(proc_dir):
+                    for proc in os.listdir(proc_dir):
+                        lang_dir = os.path.join(proc_dir, proc, "data", "languages")
+                        if os.path.isdir(lang_dir):
+                            _native_decompiler.add_spec_path(lang_dir)
+                            found = True
+            if found:
                 break
         if not found:
-            print(f"[{PLUGIN_NAME}] WARNING: Ghidra/Processors/ not found. Searched: {candidates}")
+            print(f"[{PLUGIN_NAME}] WARNING: No spec languages directories found. Searched: {search_roots}")
         _native_decompiler.initialize()
     return _native_decompiler
 

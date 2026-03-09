@@ -87,19 +87,19 @@ if errorlevel 8 (
 )
 echo       OK
 
-:: --- Step 3: Copy Ghidra spec directory (standard layout) ---
-echo [3/4] Copying Ghidra specification files ...
-set "GHIDRA_SPECS_DST=%GHIDRA_PKG_DST%\Ghidra"
-if exist "%SRC_DIR%Ghidra" (
-    robocopy "%SRC_DIR%Ghidra" "%GHIDRA_SPECS_DST%" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
+:: --- Step 3: Copy Ghidra spec files (as specroot/ to avoid ghidra/ case conflict) ---
+echo [3/4] Copying specification files ...
+set "SPECS_DST=%GHIDRA_PKG_DST%\specroot"
+if exist "%SRC_DIR%Ghidra\Processors" (
+    robocopy "%SRC_DIR%Ghidra\Processors" "%SPECS_DST%\Processors" /E /NFL /NDL /NJH /NJS /NC /NS /NP >nul
     if errorlevel 8 (
-        echo [ERROR] Failed to copy Ghidra specs
+        echo [ERROR] Failed to copy spec files
         goto :error
     )
-    echo       OK - copied to %GHIDRA_SPECS_DST%
+    echo       OK - copied to %SPECS_DST%
 ) else (
-    echo [WARN] Ghidra/ directory not found in %SRC_DIR%
-    echo        The decompiler needs Ghidra/<proc>/data/languages/ spec files.
+    echo [WARN] Ghidra\Processors\ not found in %SRC_DIR%
+    echo        The decompiler needs spec files to function.
 )
 
 :: --- Step 4: Patch plugin to use deployed path ---
