@@ -46,6 +46,45 @@ class InjectPayload:
         pass
 
 
+class InjectPayloadSleigh(InjectPayload):
+    """An injection payload built by the SLEIGH engine.
+
+    The p-code ops for the injection are described using SLEIGH syntax.
+    """
+
+    def __init__(self, src: str = "", nm: str = "", tp: int = 0) -> None:
+        super().__init__(nm, tp)
+        self.source: str = src
+        self.parsestring: str = ""
+        self.tpl = None  # ConstructTpl
+
+    def inject(self, context, emit) -> None:
+        """Inject p-code into the given context and emitter."""
+        pass
+
+    def decode(self, decoder) -> None:
+        """Decode this payload from a stream."""
+        pass
+
+    def printTemplate(self, s) -> None:
+        """Print the p-code template to stream."""
+        s.write(self.parsestring)
+
+    def getSource(self) -> str:
+        """Return a description of the document containing the SLEIGH syntax."""
+        return self.source
+
+    @staticmethod
+    def checkParameterRestrictions(con, inputlist: list, output: list, source: str) -> None:
+        """Check that the parameters for injection are valid."""
+        pass
+
+    @staticmethod
+    def setupParameters(con, walker, inputlist: list, output: list, source: str) -> None:
+        """Set up injection parameters in the parsing context."""
+        pass
+
+
 class InjectContext:
     """Context for a particular p-code injection site."""
 
