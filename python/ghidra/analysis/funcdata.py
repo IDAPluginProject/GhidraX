@@ -2092,6 +2092,72 @@ class Funcdata:
                     lines.append(f"    {op.printRaw()}")
         return "\n".join(lines)
 
+    def find(self, addr) -> Optional[Varnode]:
+        """Find a Varnode by address."""
+        return self._vbank.find(addr) if hasattr(self._vbank, 'find') else None
+
+    # --- Debug methods (C++ OPACTION_DEBUG) ---
+
+    def debugActivate(self) -> None:
+        """Activate debug mode for the current action application."""
+        pass
+
+    def debugDeactivate(self) -> None:
+        """Deactivate debug mode."""
+        pass
+
+    def debugEnable(self) -> None:
+        """Enable the debug console."""
+        pass
+
+    def debugDisable(self) -> None:
+        """Disable the debug console."""
+        pass
+
+    def debugBreak(self) -> bool:
+        """Check if a debug breakpoint has been hit."""
+        return False
+
+    def debugHandleBreak(self) -> None:
+        """Handle a debug breakpoint."""
+        pass
+
+    def debugSetBreak(self, addr) -> None:
+        """Set a debug breakpoint at the given address."""
+        pass
+
+    def debugSetRange(self, addr1, addr2) -> None:
+        """Set a debug address range."""
+        pass
+
+    def debugCheckRange(self, vn) -> bool:
+        """Check if a Varnode falls in the debug range."""
+        return False
+
+    def debugPrintRange(self, count: int) -> None:
+        """Print the debug range."""
+        pass
+
+    def debugModCheck(self, op) -> bool:
+        """Check if an op modification should trigger debug output."""
+        return False
+
+    def debugModClear(self) -> None:
+        """Clear the modification check state."""
+        pass
+
+    def debugModPrint(self, actionname: str) -> None:
+        """Print a debug message for a modification."""
+        pass
+
+    def debugClear(self) -> None:
+        """Clear all debug state."""
+        pass
+
+    def debugSize(self) -> int:
+        """Return the number of debug records."""
+        return 0
+
     def __repr__(self) -> str:
         return (f"Funcdata({self._name!r} @ {self._baseaddr}, "
                 f"varnodes={self._vbank.size()}, "
