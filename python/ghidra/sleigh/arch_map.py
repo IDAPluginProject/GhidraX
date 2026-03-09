@@ -20,26 +20,26 @@ from typing import Dict, Optional
 
 ARCH_TABLE = [
     # x86 family
-    {"match": ("metapc", 64, False), "sla": "x86-64.sla",  "context": {}},
-    {"match": ("metapc", 32, False), "sla": "x86.sla",     "context": {"addrsize": 1, "opsize": 1}},
-    {"match": ("metapc", 16, False), "sla": "x86.sla",     "context": {}},
+    {"match": ("metapc", 64, False), "sla": "x86-64.sla",  "target": "x86:LE:64:default", "context": {}},
+    {"match": ("metapc", 32, False), "sla": "x86.sla",     "target": "x86:LE:32:default", "context": {"addrsize": 1, "opsize": 1}},
+    {"match": ("metapc", 16, False), "sla": "x86.sla",     "target": "x86:LE:16:Real Mode", "context": {}},
 
-    # ARM family (for future SLA files)
-    {"match": ("arm",    64, False), "sla": "AARCH64.sla",  "context": {}},
-    {"match": ("arm",    32, False), "sla": "ARM8_le.sla",  "context": {}},
-    {"match": ("arm",    32, True),  "sla": "ARM8_be.sla",  "context": {}},
+    # ARM family
+    {"match": ("arm",    64, False), "sla": "AARCH64.sla",  "target": "AARCH64:LE:64:v8A", "context": {}},
+    {"match": ("arm",    32, False), "sla": "ARM8_le.sla",  "target": "ARM:LE:32:v8", "context": {}},
+    {"match": ("arm",    32, True),  "sla": "ARM8_be.sla",  "target": "ARM:BE:32:v8", "context": {}},
 
-    # MIPS family (for future SLA files)
-    {"match": ("mips",   64, False), "sla": "mips64le.sla", "context": {}},
-    {"match": ("mips",   64, True),  "sla": "mips64be.sla", "context": {}},
-    {"match": ("mips",   32, False), "sla": "mips32le.sla", "context": {}},
-    {"match": ("mips",   32, True),  "sla": "mips32be.sla", "context": {}},
+    # MIPS family
+    {"match": ("mips",   64, False), "sla": "mips64le.sla", "target": "MIPS:LE:64:default", "context": {}},
+    {"match": ("mips",   64, True),  "sla": "mips64be.sla", "target": "MIPS:BE:64:default", "context": {}},
+    {"match": ("mips",   32, False), "sla": "mips32le.sla", "target": "MIPS:LE:32:default", "context": {}},
+    {"match": ("mips",   32, True),  "sla": "mips32be.sla", "target": "MIPS:BE:32:default", "context": {}},
 
-    # PowerPC (for future SLA files)
-    {"match": ("ppc",    64, True),  "sla": "ppc_64_be.sla", "context": {}},
-    {"match": ("ppc",    32, True),  "sla": "ppc_32_be.sla", "context": {}},
-    {"match": ("ppc",    64, False), "sla": "ppc_64_le.sla", "context": {}},
-    {"match": ("ppc",    32, False), "sla": "ppc_32_le.sla", "context": {}},
+    # PowerPC
+    {"match": ("ppc",    64, True),  "sla": "ppc_64_be.sla", "target": "PowerPC:BE:64:default", "context": {}},
+    {"match": ("ppc",    32, True),  "sla": "ppc_32_be.sla", "target": "PowerPC:BE:32:default", "context": {}},
+    {"match": ("ppc",    64, False), "sla": "ppc_64_le.sla", "target": "PowerPC:LE:64:default", "context": {}},
+    {"match": ("ppc",    32, False), "sla": "ppc_32_le.sla", "target": "PowerPC:LE:32:default", "context": {}},
 ]
 
 
@@ -117,6 +117,7 @@ def resolve_arch(procname: str, bitness: int, is_be: bool) -> Dict:
                 )
             return {
                 "sla_path": sla_path,
+                "target": entry.get("target", ""),
                 "context": dict(entry["context"]),
             }
 

@@ -154,10 +154,9 @@ public:
         Address funcEntry(arch.getDefaultCodeSpace(), entry);
         Funcdata *fd = arch.symboltab->getGlobalScope()->findFunction(funcEntry);
         if (fd == nullptr) {
-            // Create a new function symbol
             string funcname = "func_" + to_string(entry);
             arch.symboltab->getGlobalScope()->addFunction(funcEntry, funcname);
-            fd = arch.symboltab->getGlobalScope()->findFunction(funcEntry)->getFunction();
+            fd = arch.symboltab->getGlobalScope()->findFunction(funcEntry);
             if (fd == nullptr) {
                 return "// ERROR: Could not create function at 0x" + to_string(entry);
             }

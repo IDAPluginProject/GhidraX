@@ -200,22 +200,42 @@ def create_lifter(start_addr, data):
     return lifter
 
 
+def _get_native_decompiler():
+    """Get or create the singleton native decompiler instance."""
+    global _native_decompiler
+    if '_native_decompiler' not in globals() or _native_decompiler is None:
+        from ghidra.sleigh.decompiler_native import DecompilerNative
+        _native_decompiler = DecompilerNative()
+        # Add specs directory to search path
+        specs_dir = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "specs"))
+        if os.path.isdir(specs_dir):
+            _native_decompiler.add_spec_path(specs_dir)
+        _native_decompiler.initialize()
+    return _native_decompiler
+
+
 def decompile_function(func_ea):
-    """Decompile the function at func_ea using the PyGhidra engine."""
+    """Decompile the function at func_ea using the native Ghidra C++ decompiler."""
     data, start_addr, size = get_function_bytes(func_ea)
     if data is None or size == 0:
         return None, "No function at this address"
 
     try:
-        lifter = create_lifter(start_addr, data)
+        from ghidra.sleigh.arch_map import resolve_arch
 
-        # Get the function name from IDA
-        func_name = ida_name.get_name(func_ea)
-        if not func_name:
-            func_name = f"sub_{func_ea:X}"
+        procname, bitness, is_be = get_arch_info()
+        arch_info = resolve_arch(procname, bitness, is_be)
 
-        # Lift and decompile to C code (end-to-end pipeline)
-        c_code = lifter.lift_and_print(func_name, start_addr, size)
+        decomp = _get_native_decompiler()
+        c_code = decomp.decompile(
+            arch_info["sla_path"],
+            arch_info["target"],
+            bytes(data),
+            start_addr,
+            start_addr,
+            size
+        )
 
         if not c_code or not c_code.strip():
             return None, "Decompilation produced no output"

@@ -113,12 +113,15 @@ set(DECOMP_SRC
     transform.cc
     # Userop
     userop.cc
-    # Signatures (if present and not server-dependent)
-    # signature.cc
     # Grammar
     grammar.cc
-    # Interface (decompiler library, not console)
-    ifacedecomp.cc
+    # Signatures
+    signature.cc
+    # Call graph
+    callgraph.cc
+    # Type operations
+    typeop.cc
+    # Decompiler library init
     libdecomp.cc
     # Multiprecision
     multiprecision.cc
