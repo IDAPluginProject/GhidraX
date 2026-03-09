@@ -127,6 +127,27 @@ class UserOpManage:
         """Manually define a CALLOTHER fixup."""
         pass
 
+    def getSegmentOp(self, i: int = 0):
+        """Get the i-th SegmentOp (if any)."""
+        for op in self._useroplist:
+            if op is not None and isinstance(op, SegmentOp):
+                if i == 0:
+                    return op
+                i -= 1
+        return None
+
+    def numSegmentOps(self) -> int:
+        """Return the number of SegmentOps registered."""
+        return sum(1 for op in self._useroplist if op is not None and isinstance(op, SegmentOp))
+
+    def registerBuiltin(self, glb) -> None:
+        """Register built-in user ops (volatile read/write, etc.)."""
+        pass
+
+    def decodeVolatile(self, decoder, glb) -> None:
+        """Decode volatile read/write ops from a stream."""
+        pass
+
 
 class SegmentOp(UserPcodeOp):
     """A user-op representing a segment calculation."""
