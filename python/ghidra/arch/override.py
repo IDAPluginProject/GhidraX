@@ -11,6 +11,20 @@ from typing import Dict, List, Optional
 
 from ghidra.core.address import Address
 
+# ElementId constants (matching C++ override.cc)
+ELEM_DEADCODEDELAY = 218
+ELEM_FLOW = 219
+ELEM_FORCEGOTO = 220
+ELEM_INDIRECTOVERRIDE = 221
+ELEM_MULTISTAGEJUMP = 222
+ELEM_OVERRIDE = 223
+ELEM_PROTOOVERRIDE = 224
+
+# Attribute constants
+ATTRIB_SPACE = "space"
+ATTRIB_DELAY = "delay"
+ATTRIB_TYPE = "type"
+
 
 class Override:
     """Container of commands that override the decompiler's default behavior for a function.
@@ -126,6 +140,116 @@ class Override:
     def applyForceGoto(self, data) -> None:
         """Apply forced goto overrides."""
         pass
+
+    def printRaw(self, s, glb=None) -> None:
+        """Dump a description of the overrides to stream."""
+        for targetpc, destpc in self._forcegoto.items():
+            s.write(f"override forcegoto at {targetpc:#x} to {destpc}\n")
+        for i, delay in enumerate(self._deadcodedelay):
+            if delay >= 0:
+                spc_name = glb.getSpace(i).getName() if glb and hasattr(glb, 'getSpace') else f"space_{i}"
+                s.write(f"override deadcodedelay for {spc_name} to {delay}\n")
+        for callpoint, directcall in self._indirectover.items():
+            s.write(f"override indirect at {callpoint:#x} to call directly to {directcall}\n")
+        for callpoint, proto in self._protoover.items():
+            s.write(f"override prototype at {callpoint:#x}\n")
+        for addr in self._multistagejump:
+            s.write(f"multistage jump at {addr}\n")
+        for addr, tp in self._flowoverride.items():
+            s.write(f"override flow at {addr:#x} to {Override.typeToString(tp)}\n")
+
+    def generateOverrideMessages(self, glb=None) -> list:
+        """Create warning messages that describe current overrides."""
+        messagelist = []
+        for i, delay in enumerate(self._deadcodedelay):
+            if delay >= 0:
+                spc_name = glb.getSpace(i).getName() if glb and hasattr(glb, 'getSpace') else f"space_{i}"
+                messagelist.append(
+                    f"Restarted to delay deadcode elimination for space: {spc_name}")
+        return messagelist
+
+    def encode(self, encoder, glb=None) -> None:
+        """Encode the override commands to a stream."""
+        if (not self._forcegoto and not self._deadcodedelay and
+                not self._indirectover and not self._protoover and
+                not self._multistagejump and not self._flowoverride):
+            return
+        encoder.openElement(ELEM_OVERRIDE)
+        for targetpc, destpc in self._forcegoto.items():
+            encoder.openElement(ELEM_FORCEGOTO)
+            Address(None, targetpc).encode(encoder) if isinstance(targetpc, int) else targetpc.encode(encoder)
+            destpc.encode(encoder)
+            encoder.closeElement(ELEM_FORCEGOTO)
+        for i, delay in enumerate(self._deadcodedelay):
+            if delay < 0:
+                continue
+            encoder.openElement(ELEM_DEADCODEDELAY)
+            if glb and hasattr(glb, 'getSpace'):
+                encoder.writeSpace(ATTRIB_SPACE, glb.getSpace(i))
+            encoder.writeSignedInteger(ATTRIB_DELAY, delay)
+            encoder.closeElement(ELEM_DEADCODEDELAY)
+        for callpoint, directcall in self._indirectover.items():
+            encoder.openElement(ELEM_INDIRECTOVERRIDE)
+            Address(None, callpoint).encode(encoder) if isinstance(callpoint, int) else callpoint.encode(encoder)
+            directcall.encode(encoder)
+            encoder.closeElement(ELEM_INDIRECTOVERRIDE)
+        for callpoint, proto in self._protoover.items():
+            encoder.openElement(ELEM_PROTOOVERRIDE)
+            Address(None, callpoint).encode(encoder) if isinstance(callpoint, int) else callpoint.encode(encoder)
+            if hasattr(proto, 'encode'):
+                proto.encode(encoder)
+            encoder.closeElement(ELEM_PROTOOVERRIDE)
+        for addr in self._multistagejump:
+            encoder.openElement(ELEM_MULTISTAGEJUMP)
+            addr.encode(encoder)
+            encoder.closeElement(ELEM_MULTISTAGEJUMP)
+        for addr, tp in self._flowoverride.items():
+            encoder.openElement(ELEM_FLOW)
+            encoder.writeString(ATTRIB_TYPE, Override.typeToString(tp))
+            Address(None, addr).encode(encoder) if isinstance(addr, int) else addr.encode(encoder)
+            encoder.closeElement(ELEM_FLOW)
+        encoder.closeElement(ELEM_OVERRIDE)
+
+    def decode(self, decoder, glb=None) -> None:
+        """Decode override commands from a stream."""
+        elemId = decoder.openElement(ELEM_OVERRIDE)
+        while True:
+            subId = decoder.openElement()
+            if subId == 0:
+                break
+            if subId == ELEM_INDIRECTOVERRIDE:
+                callpoint = Address.decode(decoder)
+                directcall = Address.decode(decoder)
+                self.insertIndirectOverride(callpoint, directcall)
+            elif subId == ELEM_PROTOOVERRIDE:
+                callpoint = Address.decode(decoder)
+                from ghidra.fspec.fspec import FuncProto
+                fp = FuncProto()
+                if glb is not None:
+                    fp.setInternal(glb.defaultfp, glb.types.getTypeVoid() if glb.types else None)
+                fp.decode(decoder, glb)
+                self.insertProtoOverride(callpoint, fp)
+            elif subId == ELEM_FORCEGOTO:
+                targetpc = Address.decode(decoder)
+                destpc = Address.decode(decoder)
+                self.insertForceGoto(targetpc, destpc)
+            elif subId == ELEM_DEADCODEDELAY:
+                delay = decoder.readSignedInteger(ATTRIB_DELAY)
+                spc = decoder.readSpace(ATTRIB_SPACE)
+                if delay < 0:
+                    raise RuntimeError("Bad deadcodedelay tag")
+                self.insertDeadcodeDelay(spc, delay)
+            elif subId == ELEM_MULTISTAGEJUMP:
+                callpoint = Address.decode(decoder)
+                self.insertMultistageJump(callpoint)
+            elif subId == ELEM_FLOW:
+                tp = Override.stringToType(decoder.readString(ATTRIB_TYPE))
+                addr = Address.decode(decoder)
+                if tp == Override.NONE or addr.isInvalid():
+                    raise RuntimeError("Bad flowoverride tag")
+                self.insertFlowOverride(addr, tp)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     @staticmethod
     def typeToString(tp: int) -> str:
