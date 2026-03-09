@@ -123,9 +123,9 @@ class Lifter:
             return fd
 
         # Create one basic block for now (simplified - no branch analysis)
-        bb = fd.nodeJoinCreateBlock(Address(code_spc, entry))
-        bb.setRange(Address(code_spc, entry),
-                    Address(code_spc, entry + size - 1))
+        bb = fd.getBasicBlocks().newBlockBasic(fd)
+        bb.setInitialRange(Address(code_spc, entry),
+                           Address(code_spc, entry + size - 1))
 
         # Varnode cache: (space_name, offset, size) -> Varnode
         vn_cache: Dict[Tuple[str, int, int], Varnode] = {}
