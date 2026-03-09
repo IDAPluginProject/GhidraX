@@ -1482,6 +1482,12 @@ class BlockCopy(FlowBlock):
         FlowBlock.encodeHeader(self, encoder)
         encoder.writeSignedInteger(ATTRIB_ALTINDEX, self._copy.getIndex() if self._copy else 0)
 
+    def printRaw(self, s) -> None:
+        s.write(f"BlockCopy(copy of {self._copy.getIndex() if self._copy else '?'})")
+
+    def printRawImpliedGoto(self, s) -> None:
+        s.write("implied goto")
+
 
 # =========================================================================
 # BlockGoto  (inherits BlockGraph)
@@ -1537,6 +1543,9 @@ class BlockGoto(BlockGraph):
             encoder.writeUnsignedInteger(ATTRIB_TYPE, self._gototype)
             encoder.closeElement(ELEM_TARGET)
 
+    def printRaw(self, s) -> None:
+        s.write(f"BlockGoto(target={self._gototarget.getIndex() if self._gototarget else '?'})")
+
 
 # =========================================================================
 # BlockMultiGoto  (inherits BlockGraph)
@@ -1567,7 +1576,13 @@ class BlockMultiGoto(BlockGraph):
     def printHeader(self, s) -> None:
         s.write("Multi goto block "); FlowBlock.printHeader(self, s)
 
+    def addEdge(self, bl) -> None:
+        self._gotoedges.append(bl)
+
     def nextFlowAfter(self, bl): return None
+
+    def printRaw(self, s) -> None:
+        s.write(f"BlockMultiGoto({len(self._gotoedges)} gotos)")
 
     def encodeBody(self, encoder) -> None:
         BlockGraph.encodeBody(self, encoder)
@@ -1658,6 +1673,9 @@ class BlockCondition(BlockGraph):
         from ghidra.core.opcodes import OpCode
         s.write(f"Condition block({'&&' if self._opc == OpCode.CPUI_BOOL_AND else '||'}) ")
         FlowBlock.printHeader(self, s)
+
+    def isComplex(self) -> bool:
+        return True
 
     def nextFlowAfter(self, bl): return None
 
