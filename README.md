@@ -2,6 +2,14 @@
 
 A Python port of Ghidra's decompiler core, with a native SLEIGH instruction decoder compiled as a `.pyd` extension module.
 
+## Development Rules
+
+- The original C++ implementation under `cpp/` is the absolute source of truth for behavior and semantics.
+- Any logic fix in Python, bindings, tests, or surrounding glue should be backed by corresponding evidence in the original C++ source.
+- When Python behavior diverges from C++, prefer aligning Python to C++ unless the project intentionally documents the deviation.
+- When writing Python code, prefer using type hints wherever practical.
+- See [`AGENTS.md`](AGENTS.md) for the project-level Windsurf/Cascade rule set.
+
 ## Project Structure
 
 ```
