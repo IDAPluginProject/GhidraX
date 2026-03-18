@@ -11,11 +11,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, List
 import io
 
+from ghidra.core.error import LowlevelError, RecovError
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import calc_mask
-from ghidra.output.prettyprint import Emit, EmitMarkup, SyntaxHighlight
+from ghidra.output.prettyprint import Emit, EmitMarkup, PendPrint, SyntaxHighlight
 from ghidra.output.printlanguage import (
-    PrintLanguage, OpToken, Atom, ReversePolish,
+    PrintLanguage, PrintLanguageCapability, OpToken, Atom, ReversePolish,
     OPEN_PAREN, CLOSE_PAREN,
     syntax, vartoken, functoken, optoken, typetoken, fieldtoken, casetoken, blanktoken,
 )
@@ -43,6 +44,18 @@ _PS = OpToken.postsurround
 _PR = OpToken.presurround
 _SP = OpToken.space
 _HF = OpToken.hiddenfunction
+
+
+class PendingBrace(PendPrint):
+    def __init__(self, style: int) -> None:
+        self._indent_id = -1
+        self._style = style
+
+    def getIndentId(self) -> int:
+        return self._indent_id
+
+    def callback(self, emit: Emit) -> None:
+        self._indent_id = emit.openBraceIndent(PrintC.OPEN_CURLY, self._style)
 
 
 class PrintC(PrintLanguage):
@@ -133,6 +146,7 @@ class PrintC(PrintLanguage):
     KEYWORD_DEFAULT = "default"
     KEYWORD_RETURN = "return"
     KEYWORD_NEW = "new"
+    typePointerRelToken = "ADJ"
 
     def __init__(self, glb=None, nm: str = "c-language") -> None:
         super().__init__(glb, nm)
@@ -780,10 +794,14 @@ class PrintC(PrintLanguage):
             self.pushAtom(Atom("annotation", vartoken, SyntaxHighlight.special_color, op, vn))
 
     def genericFunctionName(self, addr):
-        return f"func_{addr.getOffset():x}" if addr is not None else "func_unknown"
+        if addr is None:
+            return "func_unknown"
+        if hasattr(addr, 'printRaw'):
+            return f"func_{addr.printRaw()}"
+        return f"func_{addr.getOffset():x}"
 
     def genericTypeName(self, ct):
-        from ghidra.types.datatype import TYPE_INT, TYPE_UINT, TYPE_UNKNOWN, TYPE_FLOAT
+        from ghidra.types.datatype import TYPE_INT, TYPE_UINT, TYPE_UNKNOWN, TYPE_SPACEBASE, TYPE_FLOAT
         if ct is None:
             return "BADTYPE"
         meta = ct.getMetatype()
@@ -793,6 +811,8 @@ class PrintC(PrintLanguage):
             return f"unkuint{ct.getSize()}"
         elif meta == TYPE_UNKNOWN:
             return f"unkbyte{ct.getSize()}"
+        elif meta == TYPE_SPACEBASE:
+            return "BADSPACEBASE"
         elif meta == TYPE_FLOAT:
             return f"unkfloat{ct.getSize()}"
         return "BADTYPE"
@@ -1289,7 +1309,7 @@ class PrintC(PrintLanguage):
                     if fld is not None and hasattr(fld, 'name'):
                         self.pushOp(PrintC.object_member, op)
                         self.pushVn(vn, op, self._mods)
-                        self.pushAtom(Atom(fld.name, fieldtoken, SyntaxHighlight.no_color, ct, fld.ident if hasattr(fld, 'ident') else 0, op))
+                        self.pushAtom(Atom(fld.name, fieldtoken, SyntaxHighlight.no_color, op, ct))
                         return
         self.opTypeCast(op)
     def opCast(self, op):         self.opTypeCast(op)
@@ -1305,14 +1325,19 @@ class PrintC(PrintLanguage):
         self.pushVn(op.getIn(0), op, m)
     def opPtrsub(self, op):
         """Emit PTRSUB: struct/union field access via -> or . syntax."""
-        from ghidra.types.datatype import TYPE_PTR, TYPE_STRUCT, TYPE_UNION, TYPE_SPACEBASE, TYPE_ARRAY
+        from ghidra.types.datatype import TYPE_PTR, TYPE_PTRREL, TYPE_STRUCT, TYPE_UNION, TYPE_SPACEBASE, TYPE_ARRAY
         in0 = op.getIn(0)
         in1const = op.getIn(1).getOffset()
         ptype = in0.getHighTypeReadFacing(op) if hasattr(in0, 'getHighTypeReadFacing') else in0.getType()
-        if ptype is None or ptype.getMetatype() != TYPE_PTR:
+        if ptype is None or ptype.getMetatype() not in (TYPE_PTR, TYPE_PTRREL):
             self.opFunc(op)
             return
-        ct = ptype.getPtrTo() if hasattr(ptype, 'getPtrTo') else None
+        ptrel = None
+        if hasattr(ptype, 'isFormalPointerRel') and ptype.isFormalPointerRel() and hasattr(ptype, 'evaluateThruParent') and ptype.evaluateThruParent(in1const):
+            ptrel = ptype
+            ct = ptype.getParent() if hasattr(ptype, 'getParent') else None
+        else:
+            ct = ptype.getPtrTo() if hasattr(ptype, 'getPtrTo') else None
         if ct is None:
             self.opFunc(op)
             return
@@ -1320,10 +1345,18 @@ class PrintC(PrintLanguage):
         valueon = (self._mods & (PrintLanguage.print_load_value | PrintLanguage.print_store_value)) != 0
         meta = ct.getMetatype()
         if meta == TYPE_STRUCT or meta == TYPE_UNION:
-            fieldname = f"field_0x{int(in1const):x}"
+            suboff = int(in1const)
+            if ptrel is not None and hasattr(ptrel, 'getAddressOffset'):
+                suboff += ptrel.getAddressOffset()
+                suboff &= calc_mask(ptype.getSize())
+                if suboff == 0:
+                    self.pushTypePointerRel(op)
+                    self.pushVn(in0, op, m)
+                    return
+            fieldname = f"field_0x{suboff:x}"
             if hasattr(ct, 'findTruncation'):
                 newoff = [0]
-                fld = ct.findTruncation(int(in1const), 0, op, 0, newoff)
+                fld = ct.findTruncation(suboff, 0, op, 0, newoff)
                 if fld is not None and hasattr(fld, 'name'):
                     fieldname = fld.name
             if not valueon:
@@ -1334,10 +1367,14 @@ class PrintC(PrintLanguage):
                 else:
                     self.pushOp(PrintC.addressof, op)
                     self.pushOp(PrintC.pointer_member, op)
+                if ptrel is not None:
+                    self.pushTypePointerRel(op)
                 self.pushVn(in0, op, m)
                 self.pushAtom(Atom(fieldname, fieldtoken, SyntaxHighlight.no_color, op, ct))
             else:
                 self.pushOp(PrintC.pointer_member, op)
+                if ptrel is not None:
+                    self.pushTypePointerRel(op)
                 self.pushVn(in0, op, m)
                 self.pushAtom(Atom(fieldname, fieldtoken, SyntaxHighlight.no_color, op, ct))
         elif meta == TYPE_SPACEBASE:
@@ -1353,10 +1390,14 @@ class PrintC(PrintLanguage):
             if valueon:
                 # Array with load/store value: use subscript syntax arr[0]
                 self.pushOp(PrintC.subscript, op)
+                if ptrel is not None:
+                    self.pushTypePointerRel(op)
                 self.pushVn(in0, op, m)
                 self.push_integer(int(in1const), ct.getSize(), False, syntax, None, None)
             else:
                 self.pushOp(PrintC.dereference, op)
+                if ptrel is not None:
+                    self.pushTypePointerRel(op)
                 self.pushVn(in0, op, m)
         else:
             self.opFunc(op)
@@ -1606,6 +1647,10 @@ class PrintC(PrintLanguage):
         self.recurse()
         return True
 
+    def pushTypePointerRel(self, op) -> None:
+        self.pushOp(PrintC.function_call, op)
+        self.pushAtom(Atom(self.typePointerRelToken, optoken, SyntaxHighlight.funcname_color, op))
+
     def emitStatement(self, op):
         """Emit a single statement terminated by semicolon."""
         if self._emit is None:
@@ -1638,14 +1683,67 @@ class PrintC(PrintLanguage):
         """Emit all the variable declarations for a given scope."""
         if self._emit is None or symScope is None:
             return False
-        emitted = False
-        if hasattr(symScope, 'getSymbolList'):
-            for sym in symScope.getSymbolList():
-                if cat >= 0 and hasattr(sym, 'getCategory') and sym.getCategory() != cat:
+        from ghidra.database.database import FunctionSymbol, LabSymbol
+        notempty = False
+        if cat >= 0:
+            sz = symScope.getCategorySize(cat) if hasattr(symScope, 'getCategorySize') else 0
+            for i in range(sz):
+                sym = symScope.getCategorySymbol(cat, i) if hasattr(symScope, 'getCategorySymbol') else None
+                if sym is None:
                     continue
+                name = sym.getName() if hasattr(sym, 'getName') else ""
+                if len(name) == 0:
+                    continue
+                if hasattr(sym, 'isNameUndefined') and sym.isNameUndefined():
+                    continue
+                notempty = True
                 self.emitVarDeclStatement(sym)
-                emitted = True
-        return emitted
+            return notempty
+        entries = symScope.begin() if hasattr(symScope, 'begin') else []
+        for entry in entries:
+            if entry is None:
+                continue
+            if hasattr(entry, 'isPiece') and entry.isPiece():
+                continue
+            sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+            if sym is None:
+                continue
+            if hasattr(sym, 'getCategory') and sym.getCategory() != cat:
+                continue
+            name = sym.getName() if hasattr(sym, 'getName') else ""
+            if len(name) == 0:
+                continue
+            if isinstance(sym, FunctionSymbol) or isinstance(sym, LabSymbol):
+                continue
+            if hasattr(sym, 'isMultiEntry') and sym.isMultiEntry():
+                firstWhole = sym.getFirstWholeMap() if hasattr(sym, 'getFirstWholeMap') else None
+                if firstWhole is not entry:
+                    continue
+            notempty = True
+            self.emitVarDeclStatement(sym)
+        dynamicEntries = symScope.beginDynamic() if hasattr(symScope, 'beginDynamic') else []
+        for entry in dynamicEntries:
+            if entry is None:
+                continue
+            if hasattr(entry, 'isPiece') and entry.isPiece():
+                continue
+            sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+            if sym is None:
+                continue
+            if hasattr(sym, 'getCategory') and sym.getCategory() != cat:
+                continue
+            name = sym.getName() if hasattr(sym, 'getName') else ""
+            if len(name) == 0:
+                continue
+            if isinstance(sym, FunctionSymbol) or isinstance(sym, LabSymbol):
+                continue
+            if hasattr(sym, 'isMultiEntry') and sym.isMultiEntry():
+                firstWhole = sym.getFirstWholeMap() if hasattr(sym, 'getFirstWholeMap') else None
+                if firstWhole is not entry:
+                    continue
+            notempty = True
+            self.emitVarDeclStatement(sym)
+        return notempty
 
     def emitVarDeclStatement(self, sym):
         """Emit a variable declaration as a full statement."""
@@ -1680,6 +1778,8 @@ class PrintC(PrintLanguage):
         for inst in ops:
             if inst.notPrinted():
                 continue
+            if inst.code() == OpCode.CPUI_MULTIEQUAL:
+                continue
             if hasattr(inst, 'isBranch') and inst.isBranch():
                 if self.isSet(PrintLanguage.no_branch):
                     continue
@@ -1708,7 +1808,12 @@ class PrintC(PrintLanguage):
                 id_ = self._emit.beginStatement(lastop)
                 self._emit.print(self.KEYWORD_GOTO, SyntaxHighlight.keyword_color)
                 self._emit.spaces(1)
-                if bb.sizeOut() >= 1:
+                if bb.sizeOut() == 2:
+                    if hasattr(lastop, 'isFallthruTrue') and lastop.isFallthruTrue():
+                        self.emitLabel(bb.getOut(1))
+                    else:
+                        self.emitLabel(bb.getOut(0))
+                elif bb.sizeOut() >= 1:
                     self.emitLabel(bb.getOut(0))
                 self._emit.print(self.SEMICOLON)
                 self._emit.endStatement(id_)
@@ -1752,20 +1857,37 @@ class PrintC(PrintLanguage):
 
     def emitLabel(self, bl):
         """Emit a label for a control-flow block."""
+        from ghidra.block.block import FlowBlock
         leaf = bl.getFrontLeaf() if hasattr(bl, 'getFrontLeaf') else bl
         if leaf is None:
+            leaf = bl
+        bb = leaf.subBlock(0) if hasattr(leaf, 'subBlock') else None
+        if bb is None and hasattr(leaf, 'getEntryAddr'):
+            bb = leaf
+        if bb is None:
             return
-        addr = leaf.getEntryAddr() if hasattr(leaf, 'getEntryAddr') else leaf.getStart()
+        addr = bb.getEntryAddr() if hasattr(bb, 'getEntryAddr') else (bb.getStart() if hasattr(bb, 'getStart') else None)
+        if addr is None:
+            return
         spc = addr.getSpace() if not addr.isInvalid() else None
         off = addr.getOffset() if not addr.isInvalid() else 0
-        if hasattr(leaf, 'isJoined') and leaf.isJoined():
+        if not (hasattr(bb, 'hasSpecialLabel') and bb.hasSpecialLabel()):
+            if hasattr(bb, 'getType') and bb.getType() == FlowBlock.t_basic:
+                fd = bb.getFuncdata() if hasattr(bb, 'getFuncdata') else None
+                symScope = fd.getScopeLocal() if fd is not None and hasattr(fd, 'getScopeLocal') else None
+                sym = symScope.queryCodeLabel(addr) if symScope is not None and hasattr(symScope, 'queryCodeLabel') else None
+                if sym is not None:
+                    name = sym.getDisplayName() if hasattr(sym, 'getDisplayName') else (sym.getName() if hasattr(sym, 'getName') else '')
+                    self._emit.tagLabel(name, SyntaxHighlight.no_color, spc, off)
+                    return
+        if hasattr(bb, 'isJoined') and bb.isJoined():
             prefix = "joined_"
-        elif hasattr(leaf, 'isDuplicated') and leaf.isDuplicated():
+        elif hasattr(bb, 'isDuplicated') and bb.isDuplicated():
             prefix = "dup_"
         else:
             prefix = "code_"
-        label = f"{prefix}{off:x}"
-        self._emit.tagLabel(label, SyntaxHighlight.no_color, spc, off)
+        raw = addr.printRaw() if hasattr(addr, 'printRaw') else f"{off:#x}"
+        self._emit.tagLabel(f"{prefix}{raw}", SyntaxHighlight.no_color, spc, off)
 
     def emitLabelStatement(self, bl):
         """Emit a label statement if the block is a jump target."""
@@ -1778,7 +1900,7 @@ class PrintC(PrintLanguage):
             if not (hasattr(bl, 'isUnstructuredTarget') and bl.isUnstructuredTarget()):
                 return
             from ghidra.block.block import FlowBlock
-            if bl.getType() != FlowBlock.BlockType.t_copy:
+            if bl.getType() != FlowBlock.t_copy:
                 return
         self._emit.tagLine(0)
         self.emitLabel(bl)
@@ -1881,16 +2003,33 @@ class PrintC(PrintLanguage):
             self.popMod()
             self._emit.closeParen(CLOSE_PAREN, id_)
 
+    def _unwrapConditionBlock(self, bl):
+        from ghidra.block.block import FlowBlock
+        cur = bl
+        while cur is not None and hasattr(cur, 'getType') and cur.getType() == FlowBlock.t_copy:
+            if hasattr(cur, 'subBlock'):
+                sub = cur.subBlock(0)
+            elif hasattr(cur, 'getBlock'):
+                sub = cur.getBlock(0)
+            else:
+                sub = None
+            if sub is None:
+                break
+            cur = sub
+        return cur
+
     def emitBlockIf(self, bl):
         """Emit an if/else construct with else-if chain merging."""
         from ghidra.block.block import FlowBlock
 
-        isPendingBrace = self.isSet(PrintLanguage.pending_brace)
+        pendingBrace = PendingBrace(getattr(self, '_option_brace_ifelse', 0))
+
+        if self.isSet(PrintLanguage.pending_brace):
+            self._emit.setPendingPrint(pendingBrace)
 
         self.pushMod()
         self.unsetMod(PrintLanguage.no_branch | PrintLanguage.only_branch | PrintLanguage.pending_brace)
 
-        # Emit condition block body (no branch)
         self.pushMod()
         self.setMod(PrintLanguage.no_branch)
         condBlock = bl.getBlock(0)
@@ -1898,8 +2037,8 @@ class PrintC(PrintLanguage):
         self.popMod()
         self.emitCommentBlockTree(condBlock)
 
-        # For else-if: if pending_brace was set, emit on same line instead of new line
-        if isPendingBrace:
+        if self._emit.hasPendingPrint(pendingBrace):
+            self._emit.cancelPendingPrint()
             self._emit.spaces(1)
         else:
             self._emit.tagLine()
@@ -1908,56 +2047,43 @@ class PrintC(PrintLanguage):
         self._emit.tagOp(self.KEYWORD_IF, SyntaxHighlight.keyword_color, op)
         self._emit.spaces(1)
 
-        # Emit the branch condition
         self.pushMod()
         self.setMod(PrintLanguage.only_branch)
         condBlock.emit(self)
         self.popMod()
 
-        # Check for goto target (simplified if-goto)
         gotoTarget = bl.getGotoTarget() if hasattr(bl, 'getGotoTarget') else None
         if gotoTarget is not None:
             self._emit.spaces(1)
             gotoType = bl.getGotoType() if hasattr(bl, 'getGotoType') else FlowBlock.f_goto_goto
             self.emitGotoStatement(condBlock, gotoTarget, gotoType)
         else:
-            # Emit true block with braces
             self.setMod(PrintLanguage.no_branch)
-            self._emit.spaces(1)
-            self._emit.print(self.OPEN_CURLY)
-            indent_id = self._emit.indentlevel
-            self._emit.indentlevel += self._emit.indentincrement
+            indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_ifelse', 0))
             id1 = self._emit.beginBlock(bl.getBlock(1))
             bl.getBlock(1).emit(self)
             self._emit.endBlock(id1)
-            self._emit.indentlevel = indent_id
-            self._emit.tagLine()
-            self._emit.print(self.CLOSE_CURLY)
+            self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id)
 
-            # Emit else block if present
             if bl.getSize() == 3:
-                self._emit.spaces(1)
+                self._emit.tagLine()
                 self._emit.print(self.KEYWORD_ELSE, SyntaxHighlight.keyword_color)
                 elseBlock = bl.getBlock(2)
-                # Check for else-if merging
-                if elseBlock.getType() == FlowBlock.BlockType.t_if:
-                    # Emit as "else if" — set pending_brace so next emitBlockIf merges
+                if elseBlock.getType() == FlowBlock.t_if:
                     self.setMod(PrintLanguage.pending_brace)
                     id2 = self._emit.beginBlock(elseBlock)
                     elseBlock.emit(self)
                     self._emit.endBlock(id2)
                 else:
-                    self._emit.spaces(1)
-                    self._emit.print(self.OPEN_CURLY)
-                    self._emit.indentlevel += self._emit.indentincrement
+                    indent_id2 = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_ifelse', 0))
                     id2 = self._emit.beginBlock(elseBlock)
                     elseBlock.emit(self)
                     self._emit.endBlock(id2)
-                    self._emit.indentlevel = indent_id
-                    self._emit.tagLine()
-                    self._emit.print(self.CLOSE_CURLY)
+                    self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id2)
 
         self.popMod()
+        if pendingBrace.getIndentId() >= 0:
+            self._emit.closeBraceIndent(self.CLOSE_CURLY, pendingBrace.getIndentId())
 
     def emitForLoop(self, bl):
         """Emit block as a for loop: for(init; cond; iter) { body }"""
@@ -1965,6 +2091,7 @@ class PrintC(PrintLanguage):
         self.unsetMod(PrintLanguage.no_branch | PrintLanguage.only_branch)
         self.emitAnyLabelStatement(bl)
         condBlock = bl.getBlock(0)
+        self.emitCommentBlockTree(condBlock)
         op = condBlock.lastOp() if hasattr(condBlock, 'lastOp') else None
         self._emit.tagLine()
         self._emit.tagOp(self.KEYWORD_FOR, SyntaxHighlight.keyword_color, op)
@@ -1993,21 +2120,17 @@ class PrintC(PrintLanguage):
         self.popMod()
         self._emit.closeParen(CLOSE_PAREN, id1)
         # Body
-        self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        indent_id = self._emit.indentlevel
-        self._emit.indentlevel += self._emit.indentincrement
+        indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_loop', 0))
         self.setMod(PrintLanguage.no_branch)
         id2 = self._emit.beginBlock(bl.getBlock(1))
         bl.getBlock(1).emit(self)
         self._emit.endBlock(id2)
-        self._emit.indentlevel = indent_id
-        self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id)
         self.popMod()
 
     def emitBlockWhileDo(self, bl):
-        """Emit a while loop (or for loop if iterator op exists)."""
+        """Emit a while loop."""
+        from ghidra.block.block import FlowBlock
         if hasattr(bl, 'getIterateOp') and bl.getIterateOp() is not None:
             self.emitForLoop(bl)
             return
@@ -2024,21 +2147,18 @@ class PrintC(PrintLanguage):
             # while(true) { body; if(cond) break; }
             self._emit.tagLine()
             self._emit.tagOp(self.KEYWORD_WHILE, SyntaxHighlight.keyword_color, op)
-            id1 = self._emit.openParen(OPEN_PAREN)
+            id_ = self._emit.openParen(OPEN_PAREN)
             self._emit.spaces(1)
             self._emit.print(self.KEYWORD_TRUE, SyntaxHighlight.const_color)
             self._emit.spaces(1)
-            self._emit.closeParen(CLOSE_PAREN, id1)
-            self._emit.spaces(1)
-            self._emit.print(self.OPEN_CURLY)
-            indent_id = self._emit.indentlevel
-            self._emit.indentlevel += self._emit.indentincrement
-            # Emit condition body (no branch)
+            self._emit.closeParen(CLOSE_PAREN, id_)
+            indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_loop', 0))
             self.pushMod()
             self.setMod(PrintLanguage.no_branch)
             condBlock.emit(self)
             self.popMod()
             # Emit "if (cond) break;"
+            self.emitCommentBlockTree(condBlock)
             self._emit.tagLine()
             self._emit.tagOp(self.KEYWORD_IF, SyntaxHighlight.keyword_color, op)
             self._emit.spaces(1)
@@ -2047,7 +2167,6 @@ class PrintC(PrintLanguage):
             condBlock.emit(self)
             self.popMod()
             self._emit.spaces(1)
-            from ghidra.block.block import FlowBlock
             self.emitGotoStatement(condBlock, None, FlowBlock.f_break_goto)
         else:
             # Normal: while(condition) { body }
@@ -2061,19 +2180,14 @@ class PrintC(PrintLanguage):
             condBlock.emit(self)
             self.popMod()
             self._emit.closeParen(CLOSE_PAREN, id1)
-            self._emit.spaces(1)
-            self._emit.print(self.OPEN_CURLY)
-            indent_id = self._emit.indentlevel
-            self._emit.indentlevel += self._emit.indentincrement
+            indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_loop', 0))
 
         self.setMod(PrintLanguage.no_branch)
         id2 = self._emit.beginBlock(bl.getBlock(1))
         bl.getBlock(1).emit(self)
         self._emit.endBlock(id2)
 
-        self._emit.indentlevel = indent_id
-        self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id)
         self.popMod()
 
     def emitBlockDoWhile(self, bl):
@@ -2083,21 +2197,16 @@ class PrintC(PrintLanguage):
         self.emitAnyLabelStatement(bl)
         self._emit.tagLine()
         self._emit.print(self.KEYWORD_DO, SyntaxHighlight.keyword_color)
-        self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        indent_id = self._emit.indentlevel
-        self._emit.indentlevel += self._emit.indentincrement
+        indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_loop', 0))
 
         self.pushMod()
-        self.setMod(PrintLanguage.no_branch)
         id2 = self._emit.beginBlock(bl.getBlock(0))
+        self.setMod(PrintLanguage.no_branch)
         bl.getBlock(0).emit(self)
         self._emit.endBlock(id2)
         self.popMod()
 
-        self._emit.indentlevel = indent_id
-        self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id)
         self._emit.spaces(1)
 
         op = bl.getBlock(0).lastOp() if hasattr(bl.getBlock(0), 'lastOp') else None
@@ -2116,18 +2225,13 @@ class PrintC(PrintLanguage):
         self.emitAnyLabelStatement(bl)
         self._emit.tagLine()
         self._emit.print(self.KEYWORD_DO, SyntaxHighlight.keyword_color)
-        self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        indent_id = self._emit.indentlevel
-        self._emit.indentlevel += self._emit.indentincrement
+        indent_id = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_loop', 0))
 
         id1 = self._emit.beginBlock(bl.getBlock(0))
         bl.getBlock(0).emit(self)
         self._emit.endBlock(id1)
 
-        self._emit.indentlevel = indent_id
-        self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, indent_id)
         self._emit.spaces(1)
 
         op = bl.getBlock(0).lastOp() if hasattr(bl.getBlock(0), 'lastOp') else None
@@ -2171,7 +2275,7 @@ class PrintC(PrintLanguage):
         """Emit a switch block."""
         self.pushMod()
         self.unsetMod(PrintLanguage.no_branch | PrintLanguage.only_branch)
-        self.emitAnyLabelStatement(bl)
+        # self.emitAnyLabelStatement(bl)
 
         # Emit switch header
         self.pushMod()
@@ -2179,7 +2283,7 @@ class PrintC(PrintLanguage):
         switchBlock = bl.getSwitchBlock() if hasattr(bl, 'getSwitchBlock') else bl.getBlock(0)
         switchBlock.emit(self)
         self.popMod()
-        self.emitCommentBlockTree(switchBlock)
+        # self.emitCommentBlockTree(switchBlock)
 
         self._emit.tagLine()
         self.pushMod()
@@ -2188,14 +2292,13 @@ class PrintC(PrintLanguage):
         self.popMod()
 
         self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        indent_id = self._emit.indentlevel
+        self._emit.openBrace(self.OPEN_CURLY, getattr(self, '_option_brace_switch', 0))
 
         ncases = bl.getNumCaseBlocks() if hasattr(bl, 'getNumCaseBlocks') else bl.getSize() - 1
         for i in range(ncases):
             self.emitSwitchCase(i, bl)
             gotype = bl.getGotoType(i) if hasattr(bl, 'getGotoType') else 0
-            self._emit.indentlevel = indent_id + self._emit.indentincrement
+            indent_id = self._emit.startIndent()
             if gotype != 0:
                 self._emit.tagLine()
                 casebl = bl.getCaseBlock(i) if hasattr(bl, 'getCaseBlock') else bl.getBlock(i + 1)
@@ -2210,7 +2313,7 @@ class PrintC(PrintLanguage):
                     from ghidra.block.block import FlowBlock
                     self.emitGotoStatement(casebl, None, FlowBlock.f_break_goto)
                 self._emit.endBlock(id2)
-            self._emit.indentlevel = indent_id
+            self._emit.stopIndent(indent_id)
 
         self._emit.tagLine()
         self._emit.print(self.CLOSE_CURLY)
@@ -2259,6 +2362,11 @@ class PrintC(PrintLanguage):
         """Emit a complete function declaration and body."""
         if self._emit is None:
             return
+        modsave = self._mods
+        if not fd.isProcStarted():
+            raise RecovError("Function not decompiled")
+        if (not self.isSet(PrintLanguage.flat)) and fd.hasNoStructBlocks():
+            raise RecovError("Function not fully decompiled. No structure present.")
         try:
             # Set up comment sorter
             from ghidra.database.comment import CommentSorter
@@ -2277,31 +2385,27 @@ class PrintC(PrintLanguage):
 
             self._emit.tagLine()
             self.emitFunctionDeclaration(fd)
-            self._emit.tagLine()
-            self._emit.print(self.OPEN_CURLY)
-            self._emit.indentlevel += self._emit.indentincrement
+            id_ = self._emit.openBraceIndent(self.OPEN_CURLY, getattr(self, '_option_brace_func', 0))
 
             self.emitLocalVarDecls(fd)
 
-            sblocks = fd.getStructure()
             if self.isSet(PrintLanguage.flat):
                 self.emitBlockGraph(fd.getBasicBlocks())
-            elif sblocks.getSize() == 0:
-                self.emitBlockGraph(fd.getBasicBlocks())
             else:
-                self.emitBlockGraph(sblocks)
+                self.emitBlockGraph(fd.getStructure())
 
             # Pop scope that was pushed in emitFunctionDeclaration
             self.popScope()
 
-            self._emit.indentlevel -= self._emit.indentincrement
-            self._emit.tagLine()
-            self._emit.print(self.CLOSE_CURLY)
+            self._emit.closeBraceIndent(self.CLOSE_CURLY, id_)
             self._emit.tagLine()
             self._emit.endFunction(id1)
-        except Exception:
+        except LowlevelError:
             self.clear()
             raise
+        finally:
+            self._emit.flush()
+            self._mods = modsave
 
     def emitCommentFuncHeader(self, fd):
         """Emit function header comments."""
@@ -2333,6 +2437,25 @@ class PrintC(PrintLanguage):
             if (self._instr_comment_type & comm.getType()) == 0:
                 continue
             self.emitLineComment(-1, comm)
+
+    def emitCommentBlockTree(self, bl):
+        """Emit comments associated with a control-flow subtree."""
+        if bl is None or not hasattr(self, '_commsorter'):
+            return
+        from ghidra.block.block import FlowBlock
+        btype = bl.getType() if hasattr(bl, 'getType') else None
+        if btype == FlowBlock.t_copy and hasattr(bl, 'subBlock'):
+            bl = bl.subBlock(0)
+            btype = bl.getType() if hasattr(bl, 'getType') else None
+        if btype == FlowBlock.t_plain:
+            return
+        if btype != FlowBlock.t_basic:
+            if hasattr(bl, 'getSize') and hasattr(bl, 'subBlock'):
+                for i in range(bl.getSize()):
+                    self.emitCommentBlockTree(bl.subBlock(i))
+            return
+        self._commsorter.setupBlockList(bl)
+        self.emitCommentGroup(None)
 
     def emitLineComment(self, indent, comm):
         """Emit a single comment line."""
@@ -2371,6 +2494,7 @@ class PrintC(PrintLanguage):
 
         # Function name with scope
         id1 = self._emit.openGroup()
+        self.emitSymbolScope(fd.getSymbol() if hasattr(fd, 'getSymbol') else None)
         self._emit.tagFuncName(fd.getDisplayName(),
                                SyntaxHighlight.funcname_color, fd, None)
 
@@ -2380,7 +2504,7 @@ class PrintC(PrintLanguage):
         self._emit.spaces(0, PrintC.function_call.bump)
 
         # Push scope for parameter resolution
-        localScope = fd.getLocalScope() if hasattr(fd, 'getLocalScope') else None
+        localScope = fd.getScopeLocal() if hasattr(fd, 'getScopeLocal') else (fd.getLocalScope() if hasattr(fd, 'getLocalScope') else None)
         if localScope is not None:
             self.pushScope(localScope)
         self.emitPrototypeInputs(proto)
@@ -2388,173 +2512,6 @@ class PrintC(PrintLanguage):
         self._emit.closeGroup(id1)
 
         self._emit.endFuncProto(id_)
-
-    def emitPrototypeInputs(self, proto):
-        """Emit the parameter list of a function prototype with names."""
-        nparams = proto.numParams()
-        if nparams == 0 and not (hasattr(proto, 'isDotdotdot') and proto.isDotdotdot()):
-            self._emit.print(self.KEYWORD_VOID, SyntaxHighlight.keyword_color)
-            return
-        for i in range(nparams):
-            if i > 0:
-                self._emit.print(self.COMMA)
-                self._emit.spaces(1)
-            param = proto.getParam(i)
-            if param.getType() is not None:
-                self.pushTypeStart(param.getType(), False)
-                nm = param.getName() if hasattr(param, 'getName') else f"param_{i}"
-                self.pushAtom(Atom(nm, vartoken, SyntaxHighlight.param_color))
-                self.pushTypeEnd(param.getType())
-                self.recurse()
-            else:
-                nm = param.getName() if hasattr(param, 'getName') else f"param_{i}"
-                self._emit.tagVariable(nm, SyntaxHighlight.param_color, None, None)
-        if hasattr(proto, 'isDotdotdot') and proto.isDotdotdot():
-            if nparams > 0:
-                self._emit.print(self.COMMA)
-                self._emit.spaces(1)
-            self._emit.print(self.DOTDOTDOT, SyntaxHighlight.no_color)
-
-    def emitLocalVarDecls(self, fd):
-        """Emit local variable declarations for a function.
-
-        Iterates over all HighVariables in the function and emits
-        declarations for those that have names and are not parameters.
-        """
-        if self._emit is None:
-            return
-        notempty = False
-        # Iterate over all varnodes to find named high variables
-        seen_highs = set()
-        vbank = fd.getVarnodeBank() if hasattr(fd, 'getVarnodeBank') else None
-        if vbank is not None and hasattr(vbank, 'allVarnodes'):
-            for vn in vbank.allVarnodes():
-                high = vn.getHigh()
-                if high is None:
-                    continue
-                hid = id(high)
-                if hid in seen_highs:
-                    continue
-                seen_highs.add(hid)
-                sym = high.getSymbol() if hasattr(high, 'getSymbol') else None
-                if sym is None:
-                    continue
-                # Skip parameters (they're in the prototype)
-                if hasattr(sym, 'getCategory'):
-                    cat = sym.getCategory()
-                    if cat == 0:  # function_parameter
-                        continue
-                nm = sym.getName() if hasattr(sym, 'getName') else ""
-                if not nm:
-                    continue
-                self.emitVarDeclStatement(sym)
-                notempty = True
-        if notempty:
-            self._emit.tagLine()
-
-    def docSingleGlobal(self, sym):
-        """Emit declaration for a single global symbol."""
-        if self._emit is None:
-            return
-        id_ = self._emit.beginDocument()
-        self.emitVarDeclStatement(sym)
-        self._emit.tagLine()
-        self._emit.endDocument(id_)
-
-    def emitCommentBlockTree(self, bl):
-        """Emit comments within a control-flow subtree."""
-        if bl is None or not hasattr(self, '_commsorter'):
-            return
-        from ghidra.block.block import FlowBlock
-        btype = bl.getType()
-        if btype == FlowBlock.BlockType.t_copy:
-            sub = bl.subBlock(0) if hasattr(bl, 'subBlock') else None
-            if sub is not None:
-                bl = sub
-                btype = bl.getType()
-        if btype == FlowBlock.BlockType.t_plain:
-            return
-        if btype != FlowBlock.BlockType.t_basic:
-            if hasattr(bl, 'getSize'):
-                for i in range(bl.getSize()):
-                    sub = bl.subBlock(i) if hasattr(bl, 'subBlock') else (bl.getBlock(i) if hasattr(bl, 'getBlock') else None)
-                    if sub is not None:
-                        self.emitCommentBlockTree(sub)
-            return
-        self._commsorter.setupBlockList(bl)
-        self.emitCommentGroup(None)
-
-    def setCommentStyle(self, nm):
-        """Set comment style: 'c' for /* */ or 'cplusplus' for //."""
-        if nm in ("c", "/*"):
-            self.setCStyleComments()
-        elif nm in ("cplusplus", "//"):
-            self.setCPlusPlusStyleComments()
-
-    def setNULLPrinting(self, val: bool) -> None:
-        """Toggle the printing of a 'NULL' token."""
-        self.option_NULL = val
-
-    def setInplaceOps(self, val: bool) -> None:
-        """Toggle the printing of in-place operators."""
-        self.option_inplace_ops = val
-
-    def setConvention(self, val: bool) -> None:
-        """Toggle whether calling conventions are printed."""
-        self.option_convention = val
-
-    def setNoCastPrinting(self, val: bool) -> None:
-        """Toggle whether casts should not be printed."""
-        self.option_nocasts = val
-
-    def setDisplayUnplaced(self, val: bool) -> None:
-        """Toggle whether unplaced comments are displayed in the header."""
-        self.option_unplaced = val
-
-    def setHideImpliedExts(self, val: bool) -> None:
-        """Toggle whether implied extensions are hidden."""
-        self.option_hide_exts = val
-
-    def setBraceFormatFunction(self, style: int) -> None:
-        """Set how function declarations are formatted."""
-        self._option_brace_func = style
-
-    def setBraceFormatIfElse(self, style: int) -> None:
-        """Set how if/else blocks are formatted."""
-        self._option_brace_ifelse = style
-
-    def setBraceFormatLoop(self, style: int) -> None:
-        """Set how loop blocks are formatted."""
-        self._option_brace_loop = style
-
-    def setBraceFormatSwitch(self, style: int) -> None:
-        """Set how switch blocks are formatted."""
-        self._option_brace_switch = style
-
-    def setCStyleComments(self):
-        self.setCommentDelimeter("/* ", " */", False)
-
-    def setCPlusPlusStyleComments(self):
-        self.setCommentDelimeter("// ", "", True)
-
-    def initializeFromArchitecture(self):
-        """Initialize architecture-specific aspects of the printer."""
-        if self._castStrategy is not None and self._glb is not None:
-            if hasattr(self._glb, 'types') and self._glb.types is not None:
-                self._castStrategy.setTypeFactory(self._glb.types)
-        if self._glb is not None and hasattr(self._glb, 'types') and self._glb.types is not None:
-            tf = self._glb.types
-            sizeOfLong = tf.getSizeOfLong() if hasattr(tf, 'getSizeOfLong') else 4
-            sizeOfInt = tf.getSizeOfInt() if hasattr(tf, 'getSizeOfInt') else 4
-            if sizeOfLong == sizeOfInt:
-                self.sizeSuffix = "LL"
-            else:
-                self.sizeSuffix = "L"
-
-    def adjustTypeOperators(self):
-        """Set type operators for C language (vs Java)."""
-        PrintC.scope.print1 = "::"
-        PrintC.shift_right.print1 = ">>"
 
     def emitPrototypeOutput(self, proto, fd=None):
         """Emit the output data-type of a function prototype."""
@@ -2574,6 +2531,67 @@ class PrintC(PrintLanguage):
             self._emit.tagType("void", SyntaxHighlight.type_color, None)
         self._emit.endReturnType(id_)
 
+    def emitPrototypeInputs(self, proto):
+        """Emit the parameter list of a function prototype with names."""
+        nparams = proto.numParams()
+        if nparams == 0:
+            self._emit.print(self.KEYWORD_VOID, SyntaxHighlight.keyword_color)
+        else:
+            printComma = False
+            for i in range(nparams):
+                param = proto.getParam(i)
+                if param is None:
+                    continue
+                sym = param.getSymbol() if hasattr(param, 'getSymbol') else getattr(param, '_symbol', None)
+                is_this = False
+                if hasattr(param, 'isThisPointer'):
+                    is_this = param.isThisPointer()
+                elif sym is not None and hasattr(sym, 'isThisPointer'):
+                    is_this = sym.isThisPointer()
+                if self.isSet(PrintLanguage.hide_thisparam) and is_this:
+                    continue
+                if printComma:
+                    self._emit.print(self.COMMA)
+                printComma = True
+                if sym is not None:
+                    self.emitVarDecl(sym)
+                else:
+                    ptype = param.getType() if hasattr(param, 'getType') else None
+                    self.pushTypeStart(ptype, True)
+                    self.pushAtom(Atom(self.EMPTY_STRING, blanktoken, SyntaxHighlight.no_color))
+                    self.pushTypeEnd(ptype)
+                    self.recurse()
+        if hasattr(proto, 'isDotdotdot') and proto.isDotdotdot():
+            if nparams != 0:
+                self._emit.print(self.COMMA)
+            self._emit.print(self.DOTDOTDOT, SyntaxHighlight.no_color)
+
+    def emitLocalVarDecls(self, fd):
+        """Emit local variable declarations for a function."""
+        if self._emit is None or fd is None:
+            return
+        from ghidra.database.database import Symbol
+        notempty = False
+        localScope = fd.getScopeLocal() if hasattr(fd, 'getScopeLocal') else None
+        if self.emitScopeVarDecls(localScope, Symbol.no_category):
+            notempty = True
+        if localScope is not None and hasattr(localScope, 'childrenBegin'):
+            for child in localScope.childrenBegin():
+                if self.emitScopeVarDecls(child, Symbol.no_category):
+                    notempty = True
+        if notempty:
+            self._emit.tagLine()
+
+    def docSingleGlobal(self, sym):
+        """Emit declaration for a single global symbol."""
+        if self._emit is None:
+            return
+        id_ = self._emit.beginDocument()
+        self.emitVarDeclStatement(sym)
+        self._emit.tagLine()
+        self._emit.endDocument(id_)
+        self._emit.flush()
+
     def docAllGlobals(self):
         """Emit all global variable declarations."""
         if self._emit is None or self._glb is None:
@@ -2586,17 +2604,19 @@ class PrintC(PrintLanguage):
                 self._emitGlobalVarDeclsRecursive(globalScope)
         self._emit.tagLine()
         self._emit.endDocument(id_)
+        self._emit.flush()
 
     def _emitGlobalVarDeclsRecursive(self, scope):
         """Emit variable declarations for all symbols in scope and children."""
         if scope is None:
             return
-        if hasattr(scope, 'getSymbols'):
-            for sym in scope.getSymbols():
-                nm = sym.getName() if hasattr(sym, 'getName') else ""
-                if not nm:
-                    continue
-                self.emitVarDeclStatement(sym)
+        if hasattr(scope, 'isGlobal') and not scope.isGlobal():
+            return
+        from ghidra.database.database import Symbol
+        self.emitScopeVarDecls(scope, Symbol.no_category)
+        if hasattr(scope, 'childrenBegin'):
+            for child in scope.childrenBegin():
+                self._emitGlobalVarDeclsRecursive(child)
 
     def docTypeDefinitions(self, typegrp=None):
         """Emit struct and enum type definitions."""
@@ -2628,139 +2648,93 @@ class PrintC(PrintLanguage):
             self.emitStructDefinition(ct)
         elif hasattr(ct, 'isEnumType') and ct.isEnumType():
             self.emitEnumDefinition(ct)
+        else:
+            self.clear()
+            raise LowlevelError("Unsupported typedef")
 
     def emitStructDefinition(self, ct):
         """Emit a struct type definition: typedef struct { ... } Name;"""
         if ct is None or self._emit is None:
             return
         nm = ct.getName() if hasattr(ct, 'getName') else ""
-        if not nm:
-            return
+        if len(nm) == 0:
+            self.clear()
+            raise LowlevelError("Trying to save unnamed structure")
         self._emit.tagLine()
         self._emit.print("typedef struct", SyntaxHighlight.keyword_color)
-        self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        self._emit.indentlevel += self._emit.indentincrement
-        if hasattr(ct, 'beginField') and hasattr(ct, 'endField'):
-            first = True
-            for fld in ct.beginField():
-                if not first:
-                    self._emit.print(self.COMMA)
-                self._emit.tagLine()
-                self.pushTypeStart(fld.type if hasattr(fld, 'type') else None, False)
-                fnm = fld.name if hasattr(fld, 'name') else "field"
-                self.pushAtom(Atom(fnm, syntax, SyntaxHighlight.var_color))
-                self.pushTypeEnd(fld.type if hasattr(fld, 'type') else None)
-                self.recurse()
-                first = False
-        self._emit.indentlevel -= self._emit.indentincrement
+        id_ = self._emit.openBraceIndent(self.OPEN_CURLY, Emit.same_line)
         self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        fields = list(ct.beginField()) if hasattr(ct, 'beginField') else []
+        for i, fld in enumerate(fields):
+            fld_type = fld.type if hasattr(fld, 'type') else None
+            self.pushTypeStart(fld_type, False)
+            self.pushAtom(Atom(fld.name if hasattr(fld, 'name') else "field", syntax, SyntaxHighlight.var_color))
+            self.pushTypeEnd(fld_type)
+            self.recurse()
+            if i + 1 < len(fields):
+                self._emit.print(self.COMMA)
+                self._emit.tagLine()
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, id_)
         self._emit.spaces(1)
-        dispnm = ct.getDisplayName() if hasattr(ct, 'getDisplayName') else nm
-        self._emit.print(dispnm)
+        self._emit.print(ct.getDisplayName() if hasattr(ct, 'getDisplayName') else nm)
         self._emit.print(self.SEMICOLON)
 
-    def emitBlockDispatch(self, bl) -> None:
-        pass
+    def setCommentStyle(self, nm):
+        """Set comment style: 'c' for /* */ or 'cplusplus' for //."""
+        if nm in ("c", "/*"):
+            self.setCStyleComments()
+        elif nm in ("cplusplus", "//"):
+            self.setCPlusPlusStyleComments()
 
-    def emitBlockCopy(self, bl) -> None:
-        if bl is not None and hasattr(bl, 'getRef'):
-            ref = bl.getRef()
-            if ref is not None and hasattr(ref, 'emit'):
-                ref.emit(self)
+    def setNULLPrinting(self, val: bool) -> None:
+        self.option_NULL = val
 
-    def emitBlockInfLoop(self, bl) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("while", SyntaxHighlight.keyword_color)
-        self._emit.print("(true)")
-        self._emit.spaces(1)
-        self._emit.print("{")
-        if bl is not None and hasattr(bl, 'getBlock'):
-            body = bl.getBlock(0)
-            if body is not None and hasattr(body, 'emit'):
-                body.emit(self)
-        self._emit.tagLine()
-        self._emit.print("}")
+    def setInplaceOps(self, val: bool) -> None:
+        self.option_inplace_ops = val
 
-    def emitBlockDoWhile(self, bl) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("do", SyntaxHighlight.keyword_color)
-        self._emit.spaces(1)
-        self._emit.print("{")
-        if bl is not None and hasattr(bl, 'getBlock'):
-            body = bl.getBlock(0)
-            if body is not None and hasattr(body, 'emit'):
-                body.emit(self)
-        self._emit.tagLine()
-        self._emit.print("}")
-        self._emit.spaces(1)
-        self._emit.print("while", SyntaxHighlight.keyword_color)
-        self._emit.print("(...)")
-        self._emit.print(";")
+    def setConvention(self, val: bool) -> None:
+        self.option_convention = val
 
-    def emitBlockCondition(self, bl) -> None:
-        if bl is not None and hasattr(bl, 'getBlock'):
-            b0 = bl.getBlock(0)
-            if b0 is not None and hasattr(b0, 'emit'):
-                b0.emit(self)
+    def setNoCastPrinting(self, val: bool) -> None:
+        self.option_nocasts = val
 
-    def emitBlockSwitch(self, bl) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("switch", SyntaxHighlight.keyword_color)
-        self._emit.print("(...)")
-        self._emit.spaces(1)
-        self._emit.print("{")
-        self._emit.print("}")
+    def setDisplayUnplaced(self, val: bool) -> None:
+        self.option_unplaced = val
 
-    def emitBlockLs(self, bl) -> None:
-        if bl is None:
-            return
-        for i in range(bl.getSize()):
-            sub = bl.getBlock(i)
-            if sub is not None and hasattr(sub, 'emit'):
-                sub.emit(self)
+    def setHideImpliedExts(self, val: bool) -> None:
+        self.option_hide_exts = val
 
-    def emitBlockIf(self, bl) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("if", SyntaxHighlight.keyword_color)
-        self._emit.print("(...)")
-        self._emit.spaces(1)
-        self._emit.print("{")
-        self._emit.print("}")
+    def setBraceFormatFunction(self, style: int) -> None:
+        self._option_brace_func = style
 
-    def emitBlockGoto(self, bl) -> None:
-        if self._emit is None:
-            return
-        if bl is not None and hasattr(bl, 'getBlock'):
-            body = bl.getBlock(0)
-            if body is not None and hasattr(body, 'emit'):
-                body.emit(self)
-        if bl is not None and hasattr(bl, 'gotoPrints') and bl.gotoPrints():
-            self._emit.tagLine()
-            self._emit.print("goto", SyntaxHighlight.keyword_color)
-            self._emit.print(";")
+    def setBraceFormatIfElse(self, style: int) -> None:
+        self._option_brace_ifelse = style
 
-    def emitBlockWhileDo(self, bl) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("while", SyntaxHighlight.keyword_color)
-        self._emit.print("(...)")
-        self._emit.spaces(1)
-        self._emit.print("{")
-        self._emit.print("}")
+    def setBraceFormatLoop(self, style: int) -> None:
+        self._option_brace_loop = style
 
-    def opHiddenFunc(self, op) -> None:
-        pass
+    def setBraceFormatSwitch(self, style: int) -> None:
+        self._option_brace_switch = style
+
+    def setCStyleComments(self):
+        self.setCommentDelimeter("/* ", " */", False)
+
+    def setCPlusPlusStyleComments(self):
+        self.setCommentDelimeter("// ", "", True)
+
+    def initializeFromArchitecture(self):
+        """Initialize architecture-specific aspects of the printer."""
+        if self._castStrategy is not None and self._glb is not None:
+            if hasattr(self._glb, 'types') and self._glb.types is not None:
+                self._castStrategy.setTypeFactory(self._glb.types)
+        if self._glb is not None and hasattr(self._glb, 'types') and self._glb.types is not None:
+            tf = self._glb.types
+            sizeOfLong = tf.getSizeOfLong() if hasattr(tf, 'getSizeOfLong') else 4
+            sizeOfInt = tf.getSizeOfInt() if hasattr(tf, 'getSizeOfInt') else 4
+            if sizeOfLong == sizeOfInt:
+                self.sizeSuffix = "LL"
+            else:
+                self.sizeSuffix = "L"
 
     def getHeaderComment(self, fd) -> str:
         return ""
@@ -2768,11 +2742,9 @@ class PrintC(PrintLanguage):
     def getDefaultCast(self):
         return self._castStrategy
 
-    def adjustTypeOperators(self) -> None:
-        pass
-
     def setMarkup(self, markup) -> None:
         self._markup = markup
+        super().setMarkup(markup)
 
     def opUnimplemented(self, op) -> None:
         self.pushOp(self.function_call, op)
@@ -2783,13 +2755,10 @@ class PrintC(PrintLanguage):
         self.pushAtom(Atom("CONCAT", functoken, SyntaxHighlight.funcname_color, op))
 
     def opLzcount(self, op) -> None:
-        self.pushOp(self.function_call, op)
-        self.pushAtom(Atom("LZCOUNT", functoken, SyntaxHighlight.funcname_color, op))
-        in0 = op.getIn(0)
-        self.pushVn(in0, op, self._mods)
+        self.opUnimplemented(op)
 
     def opPopcount(self, op) -> None:
-        self.pushOp(self.function_call, op)
+        self.opUnimplemented(op)
         self.pushAtom(Atom("POPCOUNT", functoken, SyntaxHighlight.funcname_color, op))
         in0 = op.getIn(0)
         self.pushVn(in0, op, self._mods)
@@ -2811,17 +2780,6 @@ class PrintC(PrintLanguage):
     def emitPrototypeReturnType(self, proto) -> None:
         if proto is None or self._emit is None:
             return
-        outtype = proto.getOutputType() if hasattr(proto, 'getOutputType') else None
-        if outtype is not None:
-            self.emitTypeNameToken(outtype)
-            self._emit.spaces(1)
-
-    def emitCommentLine(self, text: str) -> None:
-        if self._emit is None:
-            return
-        self._emit.tagLine()
-        self._emit.print("// ", SyntaxHighlight.comment_color)
-        self._emit.print(text, SyntaxHighlight.comment_color)
 
     def checkForLabelOverride(self, op) -> bool:
         return False
@@ -2829,29 +2787,10 @@ class PrintC(PrintLanguage):
     def isSetToken(self) -> bool:
         return len(self._nodepend) > 0 if hasattr(self, '_nodepend') else False
 
-    def opExtractOp(self, op) -> None:
-        self.pushOp(self.function_call, op)
-        self.pushAtom(Atom("EXTRACT", functoken, SyntaxHighlight.funcname_color, op))
-
     def emitGlobalVarDeclsAsComments(self, fd) -> None:
         pass
 
-    def emitStructDefinition(self, ct) -> None:
-        pass
-
     def emitTypedefDefinition(self, ct) -> None:
-        pass
-
-    def emitVarDecl(self, sym) -> None:
-        pass
-
-    def emitVarDeclStatement(self, sym) -> None:
-        pass
-
-    def emitStatement(self, inst) -> None:
-        pass
-
-    def emitFunctionDeclaration(self, fd) -> None:
         pass
 
     def pushPartialCopy(self, op) -> None:
@@ -2875,41 +2814,46 @@ class PrintC(PrintLanguage):
     def adjustComparisonOperators(self, op, ct) -> None:
         pass
 
-    def emitBlockGraph(self, bl) -> None:
-        pass
-
     def emitEnumDefinition(self, ct):
         """Emit an enum type definition: typedef enum { ... } Name;"""
         if ct is None or self._emit is None:
             return
         nm = ct.getName() if hasattr(ct, 'getName') else ""
-        if not nm:
-            return
+        if len(nm) == 0:
+            self.clear()
+            raise LowlevelError("Trying to save unnamed enumeration")
+        self.pushMod()
+        from ghidra.types.datatype import TYPE_INT
+        sign = (ct.getMetatype() == TYPE_INT) if hasattr(ct, 'getMetatype') else False
         self._emit.tagLine()
         self._emit.print("typedef enum", SyntaxHighlight.keyword_color)
-        self._emit.spaces(1)
-        self._emit.print(self.OPEN_CURLY)
-        self._emit.indentlevel += self._emit.indentincrement
-        if hasattr(ct, 'beginEnum'):
-            self.pushMod()
-            sign = False
-            if hasattr(ct, 'getMetatype'):
-                from ghidra.types.datatype import TYPE_INT
-                sign = (ct.getMetatype() == TYPE_INT)
-            for val, name in ct.beginEnum():
-                self._emit.tagLine()
-                self._emit.print(name, SyntaxHighlight.const_color)
-                self._emit.spaces(1)
-                self._emit.print(self.EQUALSIGN, SyntaxHighlight.no_color)
-                self._emit.spaces(1)
-                self.push_integer(val, ct.getSize(), sign, syntax, None, None)
-                self.recurse()
-                self._emit.print(self.SEMICOLON)
-            self.popMod()
-        self._emit.indentlevel -= self._emit.indentincrement
+        id_ = self._emit.openBraceIndent(self.OPEN_CURLY, Emit.same_line)
         self._emit.tagLine()
-        self._emit.print(self.CLOSE_CURLY)
+        enums = list(ct.beginEnum()) if hasattr(ct, 'beginEnum') else []
+        for i, (val, name) in enumerate(enums):
+            self._emit.print(name, SyntaxHighlight.const_color)
+            self._emit.spaces(1)
+            self._emit.print(self.EQUALSIGN, SyntaxHighlight.no_color)
+            self._emit.spaces(1)
+            self.push_integer(val, ct.getSize(), sign, syntax, None, None)
+            self.recurse()
+            self._emit.print(self.SEMICOLON)
+            if i + 1 < len(enums):
+                self._emit.tagLine()
+        self.popMod()
+        self._emit.closeBraceIndent(self.CLOSE_CURLY, id_)
         self._emit.spaces(1)
-        dispnm = ct.getDisplayName() if hasattr(ct, 'getDisplayName') else nm
-        self._emit.print(dispnm)
+        self._emit.print(ct.getDisplayName() if hasattr(ct, 'getDisplayName') else nm)
         self._emit.print(self.SEMICOLON)
+
+
+class PrintCCapability(PrintLanguageCapability):
+    def __init__(self) -> None:
+        super().__init__("c-language", True)
+
+    def buildLanguage(self, glb):
+        return PrintC(glb, self.name)
+
+
+printCCapability = PrintCCapability()
+printCCapability.initialize()

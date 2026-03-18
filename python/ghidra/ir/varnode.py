@@ -1117,27 +1117,33 @@ class Varnode:
         return lines
 
     def encode(self, encoder) -> None:
-        """Encode a description of this to a stream."""
-        encoder.openElement('addr')
+        """Encode a description of this to a stream.
+
+        C++ ref: ``Varnode::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_ADDR, ATTRIB_REF, ATTRIB_GRP,
+            ATTRIB_PERSISTS, ATTRIB_ADDRTIED, ATTRIB_UNAFF,
+            ATTRIB_INPUT, ATTRIB_VOLATILE,
+        )
+        encoder.openElement(ELEM_ADDR)
         spc = self._loc.getSpace()
         if spc is not None:
-            encoder.writeString('space', spc.getName())
-        encoder.writeUnsignedInteger('offset', self._loc.getOffset())
-        encoder.writeSignedInteger('size', self._size)
-        encoder.writeUnsignedInteger('ref', self._create_index)
+            spc.encodeAttributes(encoder, self._loc.getOffset(), self._size)
+        encoder.writeUnsignedInteger(ATTRIB_REF, self._create_index)
         if self._mergegroup != 0:
-            encoder.writeSignedInteger('grp', self._mergegroup)
+            encoder.writeSignedInteger(ATTRIB_GRP, self._mergegroup)
         if self.isPersist():
-            encoder.writeBool('persists', True)
+            encoder.writeBool(ATTRIB_PERSISTS, True)
         if self.isAddrTied():
-            encoder.writeBool('addrtied', True)
+            encoder.writeBool(ATTRIB_ADDRTIED, True)
         if self.isUnaffected():
-            encoder.writeBool('unaff', True)
+            encoder.writeBool(ATTRIB_UNAFF, True)
         if self.isInput():
-            encoder.writeBool('input', True)
+            encoder.writeBool(ATTRIB_INPUT, True)
         if self.isVolatile():
-            encoder.writeBool('volatile', True)
-        encoder.closeElement('addr')
+            encoder.writeBool(ATTRIB_VOLATILE, True)
+        encoder.closeElement(ELEM_ADDR)
 
     @staticmethod
     def comparePointers(a: Varnode, b: Varnode) -> bool:

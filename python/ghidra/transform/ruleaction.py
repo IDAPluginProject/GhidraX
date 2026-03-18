@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional, List, TYPE_CHECKING
 
 from ghidra.core.opcodes import OpCode
+from ghidra.core.error import LowlevelError
 from ghidra.core.address import calc_mask, pcode_left, pcode_right, leastsigbit_set, signbit_negative
 from ghidra.transform.action import Rule, ActionGroupList
 
@@ -206,7 +207,10 @@ class RuleAndMask(Rule):
         return [int(OpCode.CPUI_INT_AND)]
 
     def applyOp(self, op, data) -> int:
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         if size > 8:
             return 0
         mask1 = op.getIn(0).getNZMask()
@@ -218,7 +222,7 @@ class RuleAndMask(Rule):
 
         if andmask == 0:
             vn = data.newConstant(size, 0)
-        elif (andmask & op.getOut().getConsume()) == 0:
+        elif (andmask & outvn.getConsume()) == 0:
             vn = data.newConstant(size, 0)
         elif andmask == mask1:
             if not op.getIn(1).isConstant():
@@ -254,7 +258,10 @@ class RuleOrCollapse(Rule):
         return [int(OpCode.CPUI_INT_OR)]
 
     def applyOp(self, op, data) -> int:
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         vn = op.getIn(1)
         if vn is None or not vn.isConstant():
             return 0
@@ -421,11 +428,14 @@ class RuleTrivialArith(Rule):
 
     def applyOp(self, op, data) -> int:
         opc = op.code()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
         in1 = op.getIn(1)
         if in1 is None or not in1.isConstant():
             return 0
         val = in1.getOffset()
-        size = op.getOut().getSize()
+        size = outvn.getSize()
         mask = calc_mask(size)
         trivial_slot = -1
 
@@ -509,6 +519,9 @@ class RuleDoubleShift(Rule):
 
     def applyOp(self, op, data) -> int:
         opc = op.code()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
         if not op.getIn(1).isConstant():
             return 0
         vn = op.getIn(0)
@@ -525,11 +538,11 @@ class RuleDoubleShift(Rule):
         if basevn.isFree():
             return 0
         total = c1 + c2
-        size_bits = op.getOut().getSize() * 8
+        size_bits = outvn.getSize() * 8
         if total >= size_bits:
             # Shift eliminates all bits
             data.opSetOpcode(op, OpCode.CPUI_COPY)
-            data.opSetInput(op, data.newConstant(op.getOut().getSize(), 0), 0)
+            data.opSetInput(op, data.newConstant(outvn.getSize(), 0), 0)
             data.opRemoveInput(op, 1)
             return 1
         data.opSetInput(op, basevn, 0)
@@ -560,11 +573,19 @@ class RuleCollapseConstants(Rule):
     # Applies to all opcodes (no getOpList)
 
     def applyOp(self, op, data) -> int:
-        from ghidra.core.opbehavior import OpBehavior, EvaluationError
         out = op.getOut()
-        if out is None:
+        if out is None or not op.isCollapsible():
             return 0
         opc = op.code()
+        # Skip ops that must not be constant-folded (matches C++ truth)
+        if opc in (OpCode.CPUI_COPY, OpCode.CPUI_LOAD, OpCode.CPUI_STORE,
+                    OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH, OpCode.CPUI_BRANCHIND,
+                    OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CALLOTHER,
+                    OpCode.CPUI_RETURN, OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INDIRECT,
+                    OpCode.CPUI_CAST, OpCode.CPUI_PTRADD, OpCode.CPUI_PTRSUB,
+                    OpCode.CPUI_NEW, OpCode.CPUI_SEGMENTOP, OpCode.CPUI_CPOOLREF,
+                    OpCode.CPUI_INSERT, OpCode.CPUI_EXTRACT):
+            return 0
         # Need all constant inputs for binary/unary ops
         numinput = op.numInput()
         if numinput == 0:
@@ -574,37 +595,17 @@ class RuleCollapseConstants(Rule):
             inv = op.getIn(i)
             if inv is None or not inv.isConstant():
                 return 0
-        # Skip special ops
-        if opc in (OpCode.CPUI_COPY, OpCode.CPUI_LOAD, OpCode.CPUI_STORE,
-                    OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH, OpCode.CPUI_BRANCHIND,
-                    OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CALLOTHER,
-                    OpCode.CPUI_RETURN, OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INDIRECT,
-                    OpCode.CPUI_CAST, OpCode.CPUI_PTRADD, OpCode.CPUI_PTRSUB,
-                    OpCode.CPUI_NEW, OpCode.CPUI_SEGMENTOP, OpCode.CPUI_CPOOLREF,
-                    OpCode.CPUI_INSERT, OpCode.CPUI_EXTRACT):
-            return 0
-        # Try to evaluate
-        behaviors = OpBehavior.registerInstructions()
-        beh = behaviors[int(opc)] if int(opc) < len(behaviors) else None
-        if beh is None or beh.isSpecial():
-            return 0
+        marked_input = [False]
         try:
             sizeout = out.getSize()
-            if numinput == 1:
-                sizein = op.getIn(0).getSize()
-                in1 = op.getIn(0).getOffset()
-                result = beh.evaluateUnary(sizeout, sizein, in1)
-            elif numinput == 2:
-                sizein = op.getIn(0).getSize()
-                in1 = op.getIn(0).getOffset()
-                in2 = op.getIn(1).getOffset()
-                result = beh.evaluateBinary(sizeout, sizein, in1, in2)
-            else:
-                return 0
-        except (EvaluationError, Exception):
+            result = op.collapse(marked_input)
+        except LowlevelError:
+            data.opMarkNoCollapse(op)
             return 0
         result &= calc_mask(sizeout)
         newvn = data.newConstant(sizeout, result)
+        if marked_input[0]:
+            op.collapseConstantSymbol(newvn)
         for i in range(numinput - 1, 0, -1):
             data.opRemoveInput(op, i)
         data.opSetInput(op, newvn, 0)
@@ -735,7 +736,10 @@ class RuleXorCollapse(Rule):
     def applyOp(self, op, data) -> int:
         if op.getIn(0) is not op.getIn(1):
             return 0
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         data.opSetOpcode(op, OpCode.CPUI_COPY)
         data.opSetInput(op, data.newConstant(size, 0), 0)
         data.opRemoveInput(op, 1)
@@ -797,11 +801,14 @@ class RuleShift2Mult(Rule):
         return [int(OpCode.CPUI_INT_LEFT)]
 
     def applyOp(self, op, data) -> int:
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
         vn = op.getIn(1)
         if vn is None or not vn.isConstant():
             return 0
         sa = vn.getOffset()
-        size = op.getOut().getSize()
+        size = outvn.getSize()
         if sa == 0 or sa >= size * 8:
             return 0
         mult_val = (1 << sa) & calc_mask(size)
@@ -948,13 +955,16 @@ class RuleIdentityEl(Rule):
 
     def applyOp(self, op, data) -> int:
         opc = op.code()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
         # Check if input 0 is the identity element (after TermOrder, constants are in slot 1)
         # But we also need to check slot 0 in case TermOrder hasn't run
         for slot in [0, 1]:
             vn = op.getIn(slot)
             if vn is None or not vn.isConstant(): continue
             val = vn.getOffset()
-            size = op.getOut().getSize()
+            size = outvn.getSize()
             mask = calc_mask(size)
             is_identity = False
             if opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB, OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_OR):
@@ -1346,8 +1356,10 @@ class RuleDoubleArithShift(Rule):
         c2 = op.getIn(1).getOffset()
         basevn = op2.getIn(0)
         if basevn.isFree(): return 0
+        outvn = op.getOut()
+        if outvn is None: return 0
         total = c1 + c2
-        size_bits = op.getOut().getSize() * 8
+        size_bits = outvn.getSize() * 8
         if total >= size_bits:
             total = size_bits - 1  # Arithmetic shift saturates
         data.opSetInput(op, basevn, 0)
@@ -1385,7 +1397,9 @@ class RuleLeftRight(Rule):
         if sa_right != sa_left: return 0
         basevn = op2.getIn(0)
         if basevn.isFree(): return 0
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None: return 0
+        size = outvn.getSize()
         mask = calc_mask(size) >> sa_right
         data.opSetOpcode(op, OpCode.CPUI_INT_AND)
         data.opSetInput(op, basevn, 0)

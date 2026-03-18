@@ -446,6 +446,25 @@ class ParamEntry:
             return -1
         return addr.getOffset() - self.addressbase
 
+    def getAddrBySlot(self, slot: int, sz: int, align: int = 1,
+                      justifyRight: bool = False) -> Address:
+        """Get an address for a parameter given current slot consumption.
+
+        C++ ref: ``ParamEntry::getAddrBySlot``
+        """
+        if self.spaceid is None:
+            return Address()
+        if self.alignment == 0:
+            # Exclusion entry (register)
+            return Address(self.spaceid, self.addressbase)
+        # Stack-like entry: slot tracks consumed bytes
+        off = self.addressbase + slot
+        if align > 1:
+            rem = off % align
+            if rem != 0:
+                off += (align - rem)
+        return Address(self.spaceid, off)
+
     def encode(self, encoder) -> None:
         pass
 
@@ -501,6 +520,98 @@ class ParamListStandard(ParamList):
             if e.containedBy(loc, size):
                 return True
         return False
+
+    p_standard = 1
+    p_standard_out = 2
+    p_register = 3
+    p_register_out = 4
+
+    def isBigEndian(self) -> bool:
+        """Return True if the parameter list is big-endian."""
+        if self.spacebase is not None:
+            return self.spacebase.isBigEndian()
+        if self.entry:
+            spc = self.entry[0].getSpace()
+            if spc is not None:
+                return spc.isBigEndian()
+        return False
+
+    def getType(self) -> int:
+        """Return the list type (input vs output, register vs standard)."""
+        return getattr(self, '_listtype', ParamListStandard.p_standard)
+
+    def extractTiles(self, tiles: list, tp: 'TypeClass') -> None:
+        """Extract ParamEntry objects matching the given type class.
+
+        C++ ref: ``ParamListStandard::extractTiles``
+        """
+        tiles.clear()
+        for e in self.entry:
+            if e.getType() == tp and e.isExclusion():
+                tiles.append(e)
+
+    def getStackEntry(self) -> Optional['ParamEntry']:
+        """Return the ParamEntry representing stack storage, or None.
+
+        C++ ref: ``ParamListStandard::getStackEntry``
+        """
+        for e in self.entry:
+            if not e.isExclusion():
+                return e
+        return None
+
+    def assignAddress(self, dt, proto, pos: int, tlist, status: list, res) -> int:
+        """Assign address for a parameter by running through model rules.
+
+        C++ ref: ``ParamListStandard::assignAddress``
+        """
+        from ghidra.fspec.modelrules import AssignAction
+        for rule in getattr(self, 'modelRules', []):
+            resp = rule.assignAddress(dt, proto, pos, tlist, status, res)
+            if resp != AssignAction.fail:
+                return resp
+        return self.assignAddressFallback(dt.getMetatype(), dt, True, status, res)
+
+    def assignAddressFallback(self, resource_type, dt, noFallback: bool,
+                              status: list, res) -> int:
+        """Fallback address assignment from a specific resource list.
+
+        C++ ref: ``ParamListStandard::assignAddressFallback``
+        """
+        from ghidra.fspec.modelrules import AssignAction
+        for e in self.entry:
+            if e.getType() != resource_type:
+                continue
+            grp = e.getGroup()
+            if status[grp] != 0:
+                continue
+            if e.isExclusion():
+                if e.getSize() >= dt.getSize():
+                    res.addr = Address(e.getSpace(), e.getBase())
+                    res.type = dt
+                    res.flags = 0
+                    status[grp] = -1
+                    return AssignAction.success
+            else:
+                addr = e.getAddrBySlot(status[grp], dt.getSize(), dt.getAlignment())
+                if not addr.isInvalid():
+                    res.addr = addr
+                    res.type = dt
+                    res.flags = 0
+                    status[grp] = status[grp] + dt.getSize()
+                    return AssignAction.success
+        if not noFallback:
+            se = self.getStackEntry()
+            if se is not None:
+                grp = se.getGroup()
+                addr = se.getAddrBySlot(status[grp], dt.getSize(), dt.getAlignment())
+                if not addr.isInvalid():
+                    res.addr = addr
+                    res.type = dt
+                    res.flags = 0
+                    status[grp] = status[grp] + dt.getSize()
+                    return AssignAction.success
+        return AssignAction.fail
 
     def fillinMap(self, active) -> None:
         pass

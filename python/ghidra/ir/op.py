@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
 
 from ghidra.core.address import Address, SeqNum
+from ghidra.core.error import LowlevelError
 from ghidra.core.opcodes import OpCode
 
 if TYPE_CHECKING:
@@ -113,7 +114,26 @@ class PcodeOp:
         return len(self._inrefs)
 
     def getEvalType(self) -> int:
-        return self._flags & (PcodeOp.unary | PcodeOp.binary | PcodeOp.special | PcodeOp.ternary)
+        eval_type = self._flags & (PcodeOp.unary | PcodeOp.binary | PcodeOp.special | PcodeOp.ternary)
+        if eval_type != 0:
+            return eval_type
+        behave = self._opcode.behave if self._opcode is not None and hasattr(self._opcode, 'behave') else None
+        if behave is None:
+            from ghidra.core.opbehavior import OpBehavior
+            behaviors = OpBehavior.registerInstructions()
+            if int(self._opcode_enum) < len(behaviors):
+                behave = behaviors[int(self._opcode_enum)]
+        if behave is None:
+            return 0
+        if behave.isSpecial():
+            return PcodeOp.special
+        if behave.isUnary():
+            return PcodeOp.unary
+        if len(self._inrefs) == 3:
+            return PcodeOp.ternary
+        if len(self._inrefs) == 2:
+            return PcodeOp.binary
+        return 0
 
     def getHaltType(self) -> int:
         return self._flags & (PcodeOp.halt | PcodeOp.badinstruction | PcodeOp.unimplemented |
@@ -163,13 +183,23 @@ class PcodeOp:
         return (self._flags & PcodeOp.booloutput) != 0
 
     def isBranch(self) -> bool:
-        return (self._flags & PcodeOp.branch) != 0
+        if (self._flags & PcodeOp.branch) != 0:
+            return True
+        return self._opcode_enum in (
+            OpCode.CPUI_BRANCH,
+            OpCode.CPUI_CBRANCH,
+            OpCode.CPUI_BRANCHIND,
+        )
 
     def isCallOrBranch(self) -> bool:
-        return (self._flags & (PcodeOp.branch | PcodeOp.call)) != 0
+        if (self._flags & (PcodeOp.branch | PcodeOp.call)) != 0:
+            return True
+        return self.isBranch() or self.isCall()
 
     def isFlowBreak(self) -> bool:
-        return (self._flags & (PcodeOp.branch | PcodeOp.returns)) != 0
+        if (self._flags & (PcodeOp.branch | PcodeOp.returns)) != 0:
+            return True
+        return self.isBranch() or self._opcode_enum == OpCode.CPUI_RETURN
 
     def isBooleanFlip(self) -> bool:
         return (self._flags & PcodeOp.boolean_flip) != 0
@@ -418,13 +448,73 @@ class PcodeOp:
         return getattr(self, '_insertiter', None)
 
     def getNZMaskLocal(self, clipsize: int) -> int:
-        return 0  # Stub
+        from ghidra.transform.nzmask import getNZMaskLocal as calc_nzmask_local
+        return calc_nzmask_local(self, bool(clipsize))
 
-    def collapse(self, trialVn):
-        return None  # Stub
+    def _setMarkedInput(self, markedInput, val: bool) -> None:
+        if markedInput is None:
+            return
+        if isinstance(markedInput, list):
+            if markedInput:
+                markedInput[0] = val
+            else:
+                markedInput.append(val)
+        elif isinstance(markedInput, dict):
+            markedInput['value'] = val
+        elif hasattr(markedInput, 'value'):
+            markedInput.value = val
+
+    def collapse(self, markedInput=None):
+        from ghidra.core.opbehavior import OpBehavior
+
+        vn0 = self.getIn(0)
+        outvn = self.getOut()
+        if vn0 is None or outvn is None:
+            raise LowlevelError("Invalid constant collapse")
+
+        marked = vn0.getSymbolEntry() is not None
+        behaviors = OpBehavior.registerInstructions()
+        beh = behaviors[int(self._opcode_enum)] if int(self._opcode_enum) < len(behaviors) else None
+        if beh is None:
+            raise LowlevelError("Invalid constant collapse")
+
+        eval_type = self.getEvalType()
+        if eval_type == PcodeOp.unary:
+            res = beh.evaluateUnary(outvn.getSize(), vn0.getSize(), vn0.getOffset())
+        elif eval_type == PcodeOp.binary:
+            vn1 = self.getIn(1)
+            if vn1 is None:
+                raise LowlevelError("Invalid constant collapse")
+            if vn1.getSymbolEntry() is not None:
+                marked = True
+            res = beh.evaluateBinary(outvn.getSize(), vn0.getSize(), vn0.getOffset(), vn1.getOffset())
+        else:
+            raise LowlevelError("Invalid constant collapse")
+
+        self._setMarkedInput(markedInput, marked)
+        return res
 
     def collapseConstantSymbol(self, vn):
-        pass  # Stub
+        if vn is None:
+            return
+        copyVn = None
+        opc = self.code()
+        if opc == OpCode.CPUI_SUBPIECE:
+            if self.getIn(1) is None or self.getIn(1).getOffset() != 0:
+                return
+            copyVn = self.getIn(0)
+        elif opc in (OpCode.CPUI_COPY, OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_NEGATE, OpCode.CPUI_INT_2COMP,
+                     OpCode.CPUI_INT_LEFT, OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT):
+            copyVn = self.getIn(0)
+        elif opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_MULT, OpCode.CPUI_INT_AND, OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR):
+            copyVn = self.getIn(0)
+            if copyVn is not None and copyVn.getSymbolEntry() is None:
+                copyVn = self.getIn(1)
+        else:
+            return
+        if copyVn is None or copyVn.getSymbolEntry() is None:
+            return
+        vn.copySymbolIfValid(copyVn)
 
     def printDebug(self) -> str:
         return self.printRaw()
@@ -446,17 +536,63 @@ class PcodeOp:
         return self  # Simplified
 
     def encode(self, encoder) -> None:
-        """Encode a description of this op to stream."""
-        if encoder is not None and hasattr(encoder, 'openElement'):
-            encoder.openElement('op')
-            encoder.writeSignedInteger('code', int(self._opcode_enum))
-            self._start.encode(encoder)
-            if self._output is not None:
-                self._output.encode(encoder)
-            for inp in self._inrefs:
-                if inp is not None:
-                    inp.encode(encoder)
-            encoder.closeElement('op')
+        """Encode a description of this op to stream.
+
+        C++ ref: ``PcodeOp::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_OP, ELEM_VOID, ELEM_ADDR, ELEM_IOP, ELEM_SPACEID,
+            ATTRIB_CODE, ATTRIB_REF, ATTRIB_VALUE, ATTRIB_NAME,
+        )
+        from ghidra.core.space import IPTR_IOP, IPTR_CONSTANT
+        from ghidra.core.opcodes import OpCode
+        encoder.openElement(ELEM_OP)
+        encoder.writeSignedInteger(ATTRIB_CODE, int(self._opcode_enum))
+        self._start.encode(encoder)
+        if self._output is None:
+            encoder.openElement(ELEM_VOID)
+            encoder.closeElement(ELEM_VOID)
+        else:
+            encoder.openElement(ELEM_ADDR)
+            encoder.writeUnsignedInteger(ATTRIB_REF, self._output.getCreateIndex())
+            encoder.closeElement(ELEM_ADDR)
+        for i, vn in enumerate(self._inrefs):
+            if vn is None:
+                encoder.openElement(ELEM_VOID)
+                encoder.closeElement(ELEM_VOID)
+            elif vn.getSpace() is not None and vn.getSpace().getType() == IPTR_IOP:
+                if i == 1 and self._opcode_enum == OpCode.CPUI_INDIRECT:
+                    indop = PcodeOp.getOpFromConst(vn.getAddr())
+                    if indop is not None:
+                        encoder.openElement(ELEM_IOP)
+                        encoder.writeUnsignedInteger(ATTRIB_VALUE, indop.getSeqNum().getTime())
+                        encoder.closeElement(ELEM_IOP)
+                    else:
+                        encoder.openElement(ELEM_VOID)
+                        encoder.closeElement(ELEM_VOID)
+                else:
+                    encoder.openElement(ELEM_VOID)
+                    encoder.closeElement(ELEM_VOID)
+            elif vn.getSpace() is not None and vn.getSpace().getType() == IPTR_CONSTANT:
+                if i == 0 and self._opcode_enum in (OpCode.CPUI_STORE, OpCode.CPUI_LOAD):
+                    spc = vn.getSpaceFromConst()
+                    if spc is not None:
+                        encoder.openElement(ELEM_SPACEID)
+                        encoder.writeSpace(ATTRIB_NAME, spc)
+                        encoder.closeElement(ELEM_SPACEID)
+                    else:
+                        encoder.openElement(ELEM_ADDR)
+                        encoder.writeUnsignedInteger(ATTRIB_REF, vn.getCreateIndex())
+                        encoder.closeElement(ELEM_ADDR)
+                else:
+                    encoder.openElement(ELEM_ADDR)
+                    encoder.writeUnsignedInteger(ATTRIB_REF, vn.getCreateIndex())
+                    encoder.closeElement(ELEM_ADDR)
+            else:
+                encoder.openElement(ELEM_ADDR)
+                encoder.writeUnsignedInteger(ATTRIB_REF, vn.getCreateIndex())
+                encoder.closeElement(ELEM_ADDR)
+        encoder.closeElement(ELEM_OP)
 
     def setAllInput(self, newInputs: list) -> None:
         """Replace all inputs with the given list."""

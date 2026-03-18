@@ -27,7 +27,7 @@ from ghidra.database.stringmanage import StringManager, StringManagerUnicode
 from ghidra.database.cpool import ConstantPool, ConstantPoolInternal
 from ghidra.fspec.fspec import ProtoModel, FuncProto
 from ghidra.ir.typeop import TypeOp, registerTypeOps
-from ghidra.output.printlanguage import PrintLanguage
+from ghidra.output.printlanguage import PrintLanguage, PrintLanguageCapability
 from ghidra.output.printc import PrintC
 from ghidra.output.prettyprint import EmitMarkup
 from ghidra.transform.action import ActionDatabase
@@ -185,7 +185,7 @@ class Architecture(AddrSpaceManager):
         self.extra_pop: int = 0
 
         # Build default print language
-        pc = PrintC(self, "c-language")
+        pc = PrintLanguageCapability.getDefault().buildLanguage(self)
         self.printlist.append(pc)
         self.print_ = pc
 
@@ -302,33 +302,22 @@ class Architecture(AddrSpaceManager):
                 if hasattr(pl, 'adjustTypeOperators'):
                     pl.adjustTypeOperators()
                 return
-        # Create new PrintC
-        pc = PrintC(self, nm)
-        if self.print_ is not None:
-            if hasattr(self.print_, 'emitsMarkup'):
-                printMarkup = self.print_.emitsMarkup()
-            else:
-                printMarkup = False
-            if hasattr(self.print_, 'getOutputStream'):
-                t = self.print_.getOutputStream()
-                if t is not None and hasattr(pc, 'setOutputStream'):
-                    pc.setOutputStream(t)
-        else:
-            printMarkup = False
-        emit = EmitMarkup()
-        pc.setEmitter(emit)
-        if self.types is not None:
-            cs = CastStrategyC()
-            cs.setTypeFactory(self.types)
-            pc.setCastStrategy(cs)
-        if hasattr(pc, 'initializeFromArchitecture'):
-            pc.initializeFromArchitecture()
-        if printMarkup and hasattr(pc, 'setMarkup'):
-            pc.setMarkup(True)
-        self.printlist.append(pc)
-        self.print_ = pc
-        if hasattr(pc, 'adjustTypeOperators'):
-            pc.adjustTypeOperators()
+        capability = PrintLanguageCapability.findCapability(nm)
+        if capability is None:
+            raise LowlevelError("Unknown print language: " + nm)
+        printMarkup = self.print_.emitsMarkup() if self.print_ is not None and hasattr(self.print_, 'emitsMarkup') else False
+        t = self.print_.getOutputStream() if self.print_ is not None and hasattr(self.print_, 'getOutputStream') else None
+        pl = capability.buildLanguage(self)
+        if t is not None and hasattr(pl, 'setOutputStream'):
+            pl.setOutputStream(t)
+        if hasattr(pl, 'initializeFromArchitecture'):
+            pl.initializeFromArchitecture()
+        if printMarkup and hasattr(pl, 'setMarkup'):
+            pl.setMarkup(True)
+        self.printlist.append(pl)
+        self.print_ = pl
+        if hasattr(pl, 'adjustTypeOperators'):
+            pl.adjustTypeOperators()
 
     def getPrintLanguage(self) -> Optional[PrintLanguage]:
         return self.print_
@@ -600,8 +589,7 @@ class Architecture(AddrSpaceManager):
     def buildAction(self, store=None) -> None:
         """Build the Action framework with the universal decompilation pipeline."""
         self.parseExtraRules(store)
-        from ghidra.transform.universal import universalAction
-        universalAction(self.allacts, self)
+        self.allacts.universalAction(self)
         self.allacts.resetDefaults()
 
     def buildContext(self, store=None) -> None:

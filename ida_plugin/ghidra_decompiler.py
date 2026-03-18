@@ -208,19 +208,16 @@ def create_lifter(start_addr, data):
     return lifter
 
 
-def _get_native_decompiler():
-    """Get or create the singleton native decompiler instance."""
-    global _native_decompiler
-    if '_native_decompiler' not in globals() or _native_decompiler is None:
-        import ghidra.sleigh.decompiler_native as _dnmod
-        from ghidra.sleigh.decompiler_native import DecompilerNative
-        _native_decompiler = DecompilerNative()
+def _get_decompiler():
+    """Get or create the singleton decompiler instance (pure Python pipeline)."""
+    global _decompiler_instance
+    if '_decompiler_instance' not in globals() or _decompiler_instance is None:
+        from ghidra.sleigh.decompiler_python import DecompilerPython
+        _decompiler_instance = DecompilerPython()
         # Find spec language directories
         # Supports: Ghidra/Processors/*/data/languages/ and specroot/Processors/*/data/languages/
-        mod_dir = os.path.dirname(os.path.abspath(_dnmod.__file__))
         search_roots = [
-            os.path.normpath(os.path.join(mod_dir, "..", "..", "..")),  # source layout
-            os.path.normpath(os.path.join(mod_dir, "..", "..")),        # deployed layout
+            os.path.normpath(os.path.join(PYGHIDRA_PATH, "..")),  # source layout
             PYGHIDRA_PATH,
         ]
         env_root = os.environ.get("PYGHIDRA_GHIDRA_ROOT", "")
@@ -234,18 +231,22 @@ def _get_native_decompiler():
                     for proc in os.listdir(proc_dir):
                         lang_dir = os.path.join(proc_dir, proc, "data", "languages")
                         if os.path.isdir(lang_dir):
-                            _native_decompiler.add_spec_path(lang_dir)
+                            _decompiler_instance.add_spec_path(lang_dir)
                             found = True
             if found:
                 break
         if not found:
             print(f"[{PLUGIN_NAME}] WARNING: No spec languages directories found. Searched: {search_roots}")
-        _native_decompiler.initialize()
-    return _native_decompiler
+        _decompiler_instance.initialize()
+    return _decompiler_instance
 
 
 def decompile_function(func_ea):
-    """Decompile the function at func_ea using the native Ghidra C++ decompiler."""
+    """Decompile the function at func_ea using the pure Python Ghidra pipeline.
+
+    Pipeline: sleigh_native(C++) -> Lifter -> Python IR -> [FlowInfo] -> [Heritage] -> [Rules] -> output
+    Each [Module] is enabled progressively as it is verified.
+    """
     data, start_addr, size = get_function_bytes(func_ea)
     if data is None or size == 0:
         return None, "No function at this address"
@@ -256,7 +257,7 @@ def decompile_function(func_ea):
         procname, bitness, is_be = get_arch_info()
         arch_info = resolve_arch(procname, bitness, is_be)
 
-        decomp = _get_native_decompiler()
+        decomp = _get_decompiler()
         c_code = decomp.decompile(
             arch_info["sla_path"],
             arch_info["target"],
@@ -268,6 +269,11 @@ def decompile_function(func_ea):
 
         if not c_code or not c_code.strip():
             return None, "Decompilation produced no output"
+
+        # Append any warnings from the Python pipeline
+        errors = decomp.get_errors()
+        if errors:
+            c_code += f"\n// Pipeline warnings:\n// {errors.strip()}"
 
         return c_code, None
 

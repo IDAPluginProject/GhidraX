@@ -1,11 +1,16 @@
 # PyGhidra Progress
 
-## Completed Modules (39 Python + sleigh_native.pyd)
+## Completed Modules (44 Python + sleigh_native.pyd)
 
-### core/ (14 files)
+### core/ (18 files)
 - address.py, error.py, expression.py, float_format.py, globalcontext.py
 - int128.py, marshal.py, opbehavior.py, opcodes.py, pcoderaw.py
 - space.py, translate.py, types.py
+- compression.py (zlib wrapper — compression.hh/crc32.hh port)
+- capability.py (CapabilityPoint static registration — capability.hh port)
+- filemanage.py (FileManage path/dir utilities — filemanage.cc port via pathlib) — 27 tests
+- libdecomp.py (startDecompilerLibrary/shutdownDecompilerLibrary — libdecomp.cc port) — 7 tests
+- float_format.py **C++ faithful rewrite**: extractExpSig, createFloat, roundToNearestEven, convertEncoding, top-aligned fractional codes — 69 tests
 
 ### ir/ (5 files)
 - cover.py, op.py, typeop.py (with push() dispatch), variable.py, varnode.py
@@ -32,18 +37,34 @@
 ### types/ (2 files)
 - datatype.py (TypeFactory, 18 metatypes), cast.py (CastStrategyC/Java)
 
-### fspec/ (2 files)
-- fspec.py (FuncProto, ProtoModel, FuncCallSpecs), paramactive.py
+### fspec/ (3 files)
+- fspec.py (FuncProto, ProtoModel, FuncCallSpecs, ParamListStandard extended), paramactive.py
+- modelrules.py (PrimitiveExtractor, DatatypeFilter hierarchy, QualifierFilter hierarchy, AssignAction hierarchy, ModelRule)
 
-### arch/ (2 files)
+### arch/ (3 files)
 - architecture.py, loadimage.py
+- loadimage_xml.py (LoadImageXml XML-backed binary image — loadimage_xml.cc port)
 
 ### sleigh/ (4 files + .pyd)
 - lifter.py, slaformat.py, sleigh.py, sleighbase.py
 - sleigh_native.cp314-win_amd64.pyd (pybind11, zlib static)
 
-### emulate/ (2 files)
+### emulate/ (3 files)
 - emulate.py, memstate.py
+- emulateutil.py (EmulatePcodeOp, EmulateSnippet, PcodeEmitCache)
+
+### analysis/ — new additions
+- callgraph.py (CallGraph, CallGraphNode, CallGraphEdge) — full callgraph.cc port with cycle detection, leaf-first walk
+
+### fspec/ — new additions
+- paramid.py (ParamMeasure, ParamIDAnalysis, ParamRank, ParamIDIO) — full paramid.cc port
+
+### core/ — new additions
+- int128.py extended with: subtract128, uless128, ulessequal128, udiv128, count_leading_zeros (full multiprecision.cc port)
+
+### transform/ — new additions
+- transform.py (LanedRegister, LanedIterator, LaneDescription, TransformVar, TransformOp, TransformManager)
+- condexe.py (ConditionalExecution, RuleOrPredicate, _MultiPredicate) — full C++ faithful port
 
 ## End-to-End Pipeline
 ```
@@ -173,7 +194,27 @@ x86 binary → sleigh_native.pyd → P-code → Funcdata → 136 rules + 62 Acti
 - [x] Funcdata.clear(): clears _qlst_map/_override/_unionMap on restart
 - [x] opPtrsub ARRAY: subscript [] syntax when print_load/store_value set
 
-### Low Priority (Ghidra-specific interfaces)
-- [ ] ghidra_arch/context/translate/process
-- [ ] database_ghidra, comment_ghidra, cpool_ghidra
-- [ ] consolemain (CLI frontend)
+### Phase 3: Console / CLI (Ghidra Binary Protocol) — SCAFFOLDING DONE
+- [x] console/__init__.py — package
+- [x] console/protocol.py — binary framing (alignment bursts 0x00..0x01+code), 18 burst constants,
+      read/write string/bool/bytes streams, query/response helpers, exception passing
+- [x] console/ghidra_arch.py — ArchitectureGhidra (extends Architecture), 15+ query methods
+      (getBytes, getRegister, getMappedSymbols, getDataType, getComments, getPcode, etc.),
+      build*() overrides for all Ghidra-backed subsystems
+- [x] console/subsystems.py — 9 Ghidra-backed subsystem proxies:
+      LoadImageGhidra, ScopeGhidra, TypeFactoryGhidra, CommentDatabaseGhidra,
+      GhidraStringManager, ConstantPoolGhidra, GhidraTranslate, ContextGhidra,
+      PcodeInjectLibraryGhidra
+- [x] console/ghidra_process.py — 7 command handlers (RegisterProgram, DeregisterProgram,
+      FlushNative, DecompileAt, StructureGraph, SetAction, SetOptions) + dispatch loop
+- [x] console/consolemain.py — main entry point (binary stdin/stdout, Windows O_BINARY)
+- [x] tests/test_console_protocol.py — 30 tests (burst R/W, string/bool/bytes streams,
+      query responses, exception framing, command map, constants, XML helpers)
+- [x] console/interface.py — IfaceStatus, IfaceCommand, IfaceCommandDummy, IfaceCapability,
+      IfaceBaseCommand + 6 built-in commands (Quit/History/Openfile/OpenfileAppend/Closefile/Echo)
+      — 40 tests
+- [x] console/ifaceterm.py — IfaceTerm (terminal-based concrete IfaceStatus with readline,
+      script stacking, mainloop) — 17 tests
+- [ ] Full XML response parsing in subsystems (symbols, types, comments, pcode)
+- [ ] Funcdata.encode() for syntax tree serialization
+- [ ] End-to-end Ghidra client integration test

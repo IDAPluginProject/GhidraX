@@ -610,44 +610,49 @@ class HighVariable:
                 return
 
     def encode(self, encoder) -> None:
-        """Encode this variable to stream as a <high> element."""
-        if encoder is None or not hasattr(encoder, 'openElement'):
-            return
+        """Encode this variable to stream as a <high> element.
+
+        C++ ref: ``HighVariable::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_HIGH, ELEM_ADDR, ATTRIB_REPREF, ATTRIB_CLASS,
+            ATTRIB_TYPELOCK, ATTRIB_SYMREF, ATTRIB_OFFSET, ATTRIB_REF,
+        )
+        from ghidra.database.database import Symbol
         vn = self.getNameRepresentative()
-        encoder.openElement('high')
-        if vn is not None:
-            encoder.writeUnsignedInteger('repref', vn.getCreateIndex())
+        encoder.openElement(ELEM_HIGH)
+        encoder.writeUnsignedInteger(ATTRIB_REPREF, vn.getCreateIndex())
         if self.isSpacebase() or self.isImplied():
-            encoder.writeString('class', 'other')
+            encoder.writeString(ATTRIB_CLASS, "other")
         elif self.isPersist() and self.isAddrTied():
-            encoder.writeString('class', 'global')
+            encoder.writeString(ATTRIB_CLASS, "global")
         elif self.isConstant():
-            encoder.writeString('class', 'constant')
+            encoder.writeString(ATTRIB_CLASS, "constant")
         elif not self.isPersist() and self._symbol is not None:
-            cat = self._symbol.getCategory() if hasattr(self._symbol, 'getCategory') else None
-            if cat == 'function_parameter':
-                encoder.writeString('class', 'param')
-            elif hasattr(self._symbol, 'getScope') and hasattr(self._symbol.getScope(), 'isGlobal') and self._symbol.getScope().isGlobal():
-                encoder.writeString('class', 'global')
+            cat = self._symbol.getCategory() if hasattr(self._symbol, 'getCategory') else -1
+            if cat == Symbol.function_parameter:
+                encoder.writeString(ATTRIB_CLASS, "param")
+            elif hasattr(self._symbol, 'getScope') and self._symbol.getScope().isGlobal():
+                encoder.writeString(ATTRIB_CLASS, "global")
             else:
-                encoder.writeString('class', 'local')
+                encoder.writeString(ATTRIB_CLASS, "local")
         else:
-            encoder.writeString('class', 'other')
+            encoder.writeString(ATTRIB_CLASS, "other")
         if self.isTypeLock():
-            encoder.writeBool('typelock', True)
+            encoder.writeBool(ATTRIB_TYPELOCK, True)
         if self._symbol is not None:
             if hasattr(self._symbol, 'getId'):
-                encoder.writeUnsignedInteger('symref', self._symbol.getId())
+                encoder.writeUnsignedInteger(ATTRIB_SYMREF, self._symbol.getId())
             if self._symboloffset >= 0:
-                encoder.writeSignedInteger('offset', self._symboloffset)
+                encoder.writeSignedInteger(ATTRIB_OFFSET, self._symboloffset)
         tp = self.getType()
         if tp is not None and hasattr(tp, 'encodeRef'):
             tp.encodeRef(encoder)
         for inst_vn in self._inst:
-            encoder.openElement('addr')
-            encoder.writeUnsignedInteger('ref', inst_vn.getCreateIndex())
-            encoder.closeElement('addr')
-        encoder.closeElement('high')
+            encoder.openElement(ELEM_ADDR)
+            encoder.writeUnsignedInteger(ATTRIB_REF, inst_vn.getCreateIndex())
+            encoder.closeElement(ELEM_ADDR)
+        encoder.closeElement(ELEM_HIGH)
 
     @staticmethod
     def compareName(vn1, vn2) -> bool:

@@ -161,6 +161,17 @@ def string2metatype(s: str) -> MetaType:
     return _map.get(s, TYPE_UNKNOWN)
 
 
+def string2typeclass(s: str) -> TypeClass:
+    _map = {
+        "general": TypeClass.TYPECLASS_GENERAL,
+        "float": TypeClass.TYPECLASS_FLOAT,
+        "ptr": TypeClass.TYPECLASS_PTR,
+        "hiddenret": TypeClass.TYPECLASS_HIDDENRET,
+        "vector": TypeClass.TYPECLASS_VECTOR,
+    }
+    return _map.get(s, TypeClass.TYPECLASS_GENERAL)
+
+
 def metatype2typeclass(meta: MetaType) -> TypeClass:
     if meta == TYPE_FLOAT:
         return TypeClass.TYPECLASS_FLOAT
@@ -973,6 +984,60 @@ class TypeFactory:
 
     def getSizeOfPointer(self) -> int:
         return self._sizeOfPointer
+
+    def decodeType(self, decoder) -> Optional[Datatype]:
+        """Decode a type reference from a stream and resolve it.
+
+        C++ ref: ``TypeFactory::decodeType``
+
+        The stream should contain a type reference element (e.g. <type> or <typeref>)
+        with name/id/metatype/size attributes. We try to resolve by id first, then
+        by name, and finally create a placeholder if not found.
+        """
+        elemId = decoder.openElement()
+        name = ""
+        type_id = 0
+        size = 0
+        metatype = TYPE_UNKNOWN
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_NAME.id:
+                name = decoder.readString()
+            elif attribId == ATTRIB_ID.id:
+                type_id = decoder.readUnsignedInteger()
+            elif attribId == ATTRIB_SIZE.id:
+                size = decoder.readSignedInteger()
+            elif attribId == ATTRIB_METATYPE.id:
+                mt_str = decoder.readString()
+                metatype = string2metatype(mt_str)
+        decoder.closeElement(elemId)
+
+        # Resolve by id
+        if type_id != 0:
+            dt = self.findById(type_id)
+            if dt is not None:
+                return dt
+        # Resolve by name
+        if name:
+            dt = self.findByName(name)
+            if dt is not None:
+                return dt
+        # Create placeholder
+        if size > 0:
+            return self.getBase(size, metatype, name or f"unk_{size}")
+        return self.getBase(1, TYPE_UNKNOWN, name or "undefined")
+
+    def decodeTypeWithCodeFlags(self, decoder, isConstructor: bool,
+                                isDestructor: bool) -> Optional[Datatype]:
+        """Decode a type with constructor/destructor flags.
+
+        C++ ref: ``TypeFactory::decodeTypeWithCodeFlags``
+        """
+        dt = self.decodeType(decoder)
+        # In a full implementation, the flags would modify the TypeCode
+        return dt
 
     def __repr__(self) -> str:
         return f"TypeFactory({len(self._typeById)} types)"

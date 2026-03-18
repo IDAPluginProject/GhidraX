@@ -160,19 +160,26 @@ ATTRIB_FIRST = AttributeId("first", 27)
 ATTRIB_LAST = AttributeId("last", 28)
 ATTRIB_UNIQ = AttributeId("uniq", 29)
 
+# From varnode.cc
+ATTRIB_ADDRTIED = AttributeId("addrtied", 30)
+ATTRIB_GRP = AttributeId("grp", 31)
+ATTRIB_INPUT = AttributeId("input", 32)
+ATTRIB_PERSISTS = AttributeId("persists", 33)
+ATTRIB_UNAFF = AttributeId("unaff", 34)
+
 # From translate.cc
-ATTRIB_CODE = AttributeId("code", 30)
-ATTRIB_CONTAIN = AttributeId("contain", 31)
-ATTRIB_DEFAULTSPACE = AttributeId("defaultspace", 32)
-ATTRIB_UNIQBASE = AttributeId("uniqbase", 33)
+ATTRIB_CODE = AttributeId("code", 43)
+ATTRIB_CONTAIN = AttributeId("contain", 44)
+ATTRIB_DEFAULTSPACE = AttributeId("defaultspace", 45)
+ATTRIB_UNIQBASE = AttributeId("uniqbase", 46)
 
 # From space.cc
-ATTRIB_BASE = AttributeId("base", 34)
-ATTRIB_DEADCODEDELAY = AttributeId("deadcodedelay", 35)
-ATTRIB_DELAY = AttributeId("delay", 36)
-ATTRIB_LOGICALSIZE = AttributeId("logicalsize", 37)
-ATTRIB_PHYSICAL = AttributeId("physical", 38)
-ATTRIB_PIECE = AttributeId("piece", 39)
+ATTRIB_BASE = AttributeId("base", 89)
+ATTRIB_DEADCODEDELAY = AttributeId("deadcodedelay", 90)
+ATTRIB_DELAY = AttributeId("delay", 91)
+ATTRIB_LOGICALSIZE = AttributeId("logicalsize", 92)
+ATTRIB_PHYSICAL = AttributeId("physical", 93)
+ATTRIB_PIECE = AttributeId("piece", 94)
 
 # Well-known ElementIds
 ELEM_UNKNOWN = ElementId("unknown", 0)
@@ -186,17 +193,178 @@ ELEM_SEQNUM = ElementId("seqnum", 15)
 ELEM_VARNODE = ElementId("varnode", 16)
 
 # From translate.cc
-ELEM_OP = ElementId("op", 17)
-ELEM_SLEIGH = ElementId("sleigh", 18)
-ELEM_SPACE = ElementId("space", 19)
-ELEM_SPACEID = ElementId("spaceid", 20)
-ELEM_SPACES = ElementId("spaces", 21)
-ELEM_SPACE_BASE = ElementId("space_base", 22)
-ELEM_SPACE_OTHER = ElementId("space_other", 23)
-ELEM_SPACE_OVERLAY = ElementId("space_overlay", 24)
-ELEM_SPACE_UNIQUE = ElementId("space_unique", 25)
-ELEM_TRUNCATE_SPACE = ElementId("truncate_space", 26)
+ELEM_OP = ElementId("op", 27)
+ELEM_SLEIGH = ElementId("sleigh", 28)
+ELEM_SPACE = ElementId("space", 29)
+ELEM_SPACEID = ElementId("spaceid", 30)
+ELEM_SPACES = ElementId("spaces", 31)
+ELEM_SPACE_BASE = ElementId("space_base", 32)
+ELEM_SPACE_OTHER = ElementId("space_other", 33)
+ELEM_SPACE_OVERLAY = ElementId("space_overlay", 34)
+ELEM_SPACE_UNIQUE = ElementId("space_unique", 35)
+ELEM_TRUNCATE_SPACE = ElementId("truncate_space", 36)
 
+# From marshal.cc (common elements)
+ELEM_DATA = ElementId("data", 1)
+ELEM_INPUT = ElementId("input", 2)
+ELEM_OFF = ElementId("off", 3)
+ELEM_OUTPUT = ElementId("output", 4)
+ELEM_RETURNADDRESS = ElementId("returnaddress", 5)
+ELEM_SYMBOL = ElementId("symbol", 6)
+ELEM_TARGET = ElementId("target", 7)
+ELEM_VAL = ElementId("val", 8)
+ELEM_VALUE = ElementId("value", 9)
+ELEM_VOID = ElementId("void", 10)
+
+# From database.cc
+ATTRIB_CAT = AttributeId("cat", 61)
+ATTRIB_FIELD = AttributeId("field", 62)
+ATTRIB_MERGE = AttributeId("merge", 63)
+ATTRIB_SCOPEIDBYNAME = AttributeId("scopeidbyname", 64)
+ATTRIB_VOLATILE = AttributeId("volatile", 65)
+
+# From variable.cc
+ATTRIB_CLASS = AttributeId("class", 66)
+ATTRIB_REPREF = AttributeId("repref", 67)
+ATTRIB_SYMREF = AttributeId("symref", 68)
+
+# From block.cc
+ATTRIB_ALTINDEX = AttributeId("altindex", 75)
+ATTRIB_DEPTH = AttributeId("depth", 76)
+ATTRIB_END = AttributeId("end", 77)
+ATTRIB_OPCODE = AttributeId("opcode", 78)
+ATTRIB_REV = AttributeId("rev", 79)
+ELEM_COLLISION = ElementId("collision", 67)
+ELEM_DB = ElementId("db", 68)
+ELEM_EQUATESYMBOL = ElementId("equatesymbol", 69)
+ELEM_EXTERNREFSYMBOL = ElementId("externrefsymbol", 70)
+ELEM_FACETSYMBOL = ElementId("facetsymbol", 71)
+ELEM_FUNCTIONSHELL = ElementId("functionshell", 72)
+ELEM_HASH = ElementId("hash", 73)
+ELEM_HOLE = ElementId("hole", 74)
+ELEM_LABELSYM = ElementId("labelsym", 75)
+ELEM_MAPSYM = ElementId("mapsym", 76)
+ELEM_PARENT = ElementId("parent", 77)
+ELEM_PROPERTY_CHANGEPOINT = ElementId("property_changepoint", 78)
+ELEM_RANGEEQUALSSYMBOLS = ElementId("rangeequalssymbols", 79)
+ELEM_SCOPE = ElementId("scope", 80)
+ELEM_SYMBOLLIST = ElementId("symbollist", 81)
+
+# From variable.cc
+ELEM_HIGH = ElementId("high", 82)
+
+# From block.cc
+ELEM_BHEAD = ElementId("bhead", 102)
+ELEM_BLOCK = ElementId("block", 103)
+ELEM_BLOCKEDGE = ElementId("blockedge", 104)
+ELEM_EDGE = ElementId("edge", 105)
+
+# From op.cc
+ELEM_IOP = ElementId("iop", 113)
+ELEM_UNIMPL = ElementId("unimpl", 114)
+
+# From funcdata.cc
+ATTRIB_NOCODE = AttributeId("nocode", 84)
+ELEM_AST = ElementId("ast", 115)
+ELEM_FUNCTION = ElementId("function", 116)
+ELEM_HIGHLIST = ElementId("highlist", 117)
+ELEM_JUMPTABLELIST = ElementId("jumptablelist", 118)
+ELEM_VARNODES = ElementId("varnodes", 119)
+
+# From fspec.cc
+ELEM_PROTOTYPE = ElementId("prototype", 169)
+
+# From comment.cc
+ELEM_COMMENT = ElementId("comment", 86)
+ELEM_COMMENTDB = ElementId("commentdb", 87)
+ELEM_TEXT = ElementId("text", 88)
+
+# From cpool.cc
+ATTRIB_A = AttributeId("a", 80)
+ATTRIB_B = AttributeId("b", 81)
+ATTRIB_LENGTH = AttributeId("length", 82)
+ATTRIB_TAG = AttributeId("tag", 83)
+ELEM_CONSTANTPOOL = ElementId("constantpool", 109)
+ELEM_CPOOLREC = ElementId("cpoolrec", 110)
+ELEM_REF = ElementId("ref", 111)
+ELEM_TOKEN = ElementId("token", 112)
+
+# From globalcontext.cc
+ELEM_CONTEXT_DATA = ElementId("context_data", 120)
+ELEM_CONTEXT_POINTS = ElementId("context_points", 121)
+ELEM_CONTEXT_POINTSET = ElementId("context_pointset", 122)
+ELEM_CONTEXT_SET = ElementId("context_set", 123)
+ELEM_SET = ElementId("set", 124)
+ELEM_TRACKED_POINTSET = ElementId("tracked_pointset", 125)
+ELEM_TRACKED_SET = ElementId("tracked_set", 126)
+
+# From jumptable.cc
+ATTRIB_LABEL = AttributeId("label", 131)
+ATTRIB_NUM = AttributeId("num", 132)
+
+# From pcodeinject.cc
+ELEM_INST = ElementId("inst", 98)
+
+# From override.cc
+ELEM_OVERRIDE = ElementId("override", 223)
+
+# From varmap.cc
+ELEM_LOCALDB = ElementId("localdb", 228)
+
+# From architecture.cc
+ATTRIB_REVERSEJUSTIFY = AttributeId("reversejustify", 111)
+ELEM_RULE = ElementId("rule", 153)
+
+# From fspec.cc
+ATTRIB_MAXSIZE = AttributeId("maxsize", 120)
+ATTRIB_MINSIZE = AttributeId("minsize", 121)
+ATTRIB_POINTERMAX = AttributeId("pointermax", 124)
+ATTRIB_SEPARATEFLOAT = AttributeId("separatefloat", 125)
+ATTRIB_STACKSHIFT = AttributeId("stackshift", 126)
+ATTRIB_STRATEGY = AttributeId("strategy", 127)
+ATTRIB_VOIDLOCK = AttributeId("voidlock", 129)
+ELEM_GROUP = ElementId("group", 160)
+ELEM_INTERNALLIST = ElementId("internallist", 161)
+
+# From marshal.cc (high-numbered)
+ATTRIB_STORAGE = AttributeId("storage", 149)
+ATTRIB_STACKSPILL = AttributeId("stackspill", 150)
+
+# From modelrules.cc
+ATTRIB_SIZES = AttributeId("sizes", 151)
+ATTRIB_MAX_PRIMITIVES = AttributeId("maxprimitives", 153)
+ATTRIB_REVERSESIGNIF = AttributeId("reversesignif", 154)
+ATTRIB_MATCHSIZE = AttributeId("matchsize", 155)
+ATTRIB_AFTER_BYTES = AttributeId("afterbytes", 156)
+ATTRIB_AFTER_STORAGE = AttributeId("afterstorage", 157)
+ATTRIB_FILL_ALTERNATE = AttributeId("fillalternate", 158)
+ELEM_DATATYPE = ElementId("datatype", 273)
+ELEM_CONSUME = ElementId("consume", 274)
+ELEM_CONSUME_EXTRA = ElementId("consume_extra", 275)
+ELEM_CONVERT_TO_PTR = ElementId("convert_to_ptr", 276)
+ELEM_GOTO_STACK = ElementId("goto_stack", 277)
+ELEM_JOIN = ElementId("join", 278)
+ELEM_DATATYPE_AT = ElementId("datatype_at", 279)
+ELEM_POSITION = ElementId("position", 280)
+ELEM_VARARGS = ElementId("varargs", 281)
+ELEM_HIDDEN_RETURN = ElementId("hidden_return", 282)
+ELEM_JOIN_PER_PRIMITIVE = ElementId("join_per_primitive", 283)
+ELEM_JOIN_DUAL_CLASS = ElementId("join_dual_class", 285)
+ELEM_EXTRA_STACK = ElementId("extra_stack", 287)
+ELEM_CONSUME_REMAINING = ElementId("consume_remaining", 288)
+
+# from transform.cc
+ATTRIB_VECTOR_LANE_SIZES = AttributeId("vector_lane_sizes", 130)
+
+# from loadimage_xml.cc
+ATTRIB_ARCH = AttributeId("arch", 135)
+ELEM_BINARYIMAGE = ElementId("binaryimage", 230)
+ELEM_BYTECHUNK = ElementId("bytechunk", 231)
+
+# from paramid.cc
+ELEM_PARAMMEASURES = ElementId("parammeasures", 106)
+ELEM_PROTO = ElementId("proto", 107)
+ELEM_RANK = ElementId("rank", 108)
 
 # =========================================================================
 # Decoder (abstract base)
@@ -524,3 +692,490 @@ class XmlEncode(Encoder):
 
     def writeOpcode(self, attribId: AttributeId, opc: OpCode) -> None:
         self._stream.write(f' {attribId.name}="{get_opname(opc)}"')
+
+
+# =========================================================================
+# PackedFormat constants — mirrors C++ PackedFormat namespace
+# =========================================================================
+
+class _PF:
+    """PackedFormat constants."""
+    HEADER_MASK = 0xC0
+    ELEMENT_START = 0x40
+    ELEMENT_END = 0x80
+    ATTRIBUTE = 0xC0
+    HEADEREXTEND_MASK = 0x20
+    ELEMENTID_MASK = 0x1F
+    RAWDATA_MASK = 0x7F
+    RAWDATA_BITSPERBYTE = 7
+    RAWDATA_MARKER = 0x80
+    TYPECODE_SHIFT = 4
+    LENGTHCODE_MASK = 0x0F
+    TYPECODE_BOOLEAN = 1
+    TYPECODE_SIGNEDINT_POSITIVE = 2
+    TYPECODE_SIGNEDINT_NEGATIVE = 3
+    TYPECODE_UNSIGNEDINT = 4
+    TYPECODE_ADDRESSSPACE = 5
+    TYPECODE_SPECIALSPACE = 6
+    TYPECODE_STRING = 7
+    SPECIALSPACE_STACK = 0
+    SPECIALSPACE_JOIN = 1
+    SPECIALSPACE_FSPEC = 2
+    SPECIALSPACE_IOP = 3
+    SPECIALSPACE_SPACEBASE = 4
+
+
+# =========================================================================
+# PackedDecode – binary packed format decoder
+# =========================================================================
+
+class PackedDecode(Decoder):
+    """A byte-based decoder for Ghidra's packed binary format.
+
+    C++ ref: ``PackedDecode`` in marshal.hh / marshal.cc
+    """
+
+    def __init__(self, spc_manager: Optional[AddrSpaceManager] = None) -> None:
+        super().__init__(spc_manager)
+        self._buf: bytes = b""
+        self._pos: int = 0          # endPos equivalent — next element boundary
+        self._startPos: int = 0     # start of current element's attributes
+        self._curPos: int = 0       # current attribute scan position
+        self._attributeRead: bool = True
+
+    # ------------------------------------------------------------------
+    # Ingestion
+    # ------------------------------------------------------------------
+
+    def ingestStream(self, s: str) -> None:
+        if isinstance(s, (bytes, bytearray)):
+            self._buf = bytes(s)
+        else:
+            self._buf = s.encode("latin-1")
+        self._pos = 0
+
+    def ingestBytes(self, data: bytes) -> None:
+        """Ingest raw packed bytes (convenience for protocol layer)."""
+        # Append an ELEMENT_END sentinel so reads past the end don't crash
+        self._buf = bytes(data) + bytes([_PF.ELEMENT_END])
+        self._pos = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _getByte(self, pos: int) -> int:
+        if pos >= len(self._buf):
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Unexpected end of packed stream")
+        return self._buf[pos]
+
+    def _readInteger(self, length: int) -> int:
+        """Read a variable-length integer (7 bits per byte, MSB first)."""
+        val = 0
+        for _ in range(length):
+            val <<= _PF.RAWDATA_BITSPERBYTE
+            val |= (self._buf[self._curPos] & _PF.RAWDATA_MASK)
+            self._curPos += 1
+        return val
+
+    def _readHeaderId(self, pos: int) -> tuple[int, int]:
+        """Read element/attribute id from header byte at pos. Returns (id, new_pos)."""
+        header = self._buf[pos]
+        eid = header & _PF.ELEMENTID_MASK
+        pos += 1
+        if header & _PF.HEADEREXTEND_MASK:
+            eid <<= _PF.RAWDATA_BITSPERBYTE
+            eid |= (self._buf[pos] & _PF.RAWDATA_MASK)
+            pos += 1
+        return eid, pos
+
+    def _skipAttribute(self) -> None:
+        """Skip the attribute at _curPos (header + type + data)."""
+        header = self._buf[self._curPos]
+        self._curPos += 1
+        if header & _PF.HEADEREXTEND_MASK:
+            self._curPos += 1  # skip extension byte
+        typeByte = self._buf[self._curPos]
+        self._curPos += 1
+        attribType = typeByte >> _PF.TYPECODE_SHIFT
+        if attribType == _PF.TYPECODE_BOOLEAN or attribType == _PF.TYPECODE_SPECIALSPACE:
+            return
+        length = typeByte & _PF.LENGTHCODE_MASK
+        if attribType == _PF.TYPECODE_STRING:
+            length = self._readInteger(length)  # string length in bytes
+        self._curPos += length
+
+    def _findMatchingAttribute(self, attribId: AttributeId) -> None:
+        """Scan from _startPos to find the attribute with the given id."""
+        self._curPos = self._startPos
+        while True:
+            if self._curPos >= len(self._buf):
+                break
+            header = self._buf[self._curPos]
+            if (header & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
+                break
+            eid = header & _PF.ELEMENTID_MASK
+            nextPos = self._curPos + 1
+            if header & _PF.HEADEREXTEND_MASK:
+                eid <<= _PF.RAWDATA_BITSPERBYTE
+                eid |= (self._buf[nextPos] & _PF.RAWDATA_MASK)
+            if eid == attribId.id:
+                return  # found — _curPos points to start of this attribute
+            self._skipAttribute()
+        from ghidra.core.error import DecoderError
+        raise DecoderError(f"Attribute {attribId.name} is not present")
+
+    def _readTypeByte(self) -> int:
+        """Consume attribute header + return type byte. Sets _attributeRead."""
+        header = self._buf[self._curPos]
+        self._curPos += 1
+        if header & _PF.HEADEREXTEND_MASK:
+            self._curPos += 1
+        typeByte = self._buf[self._curPos]
+        self._curPos += 1
+        return typeByte
+
+    # ------------------------------------------------------------------
+    # Decoder interface
+    # ------------------------------------------------------------------
+
+    def peekElement(self) -> int:
+        if self._pos >= len(self._buf):
+            return 0
+        header = self._buf[self._pos]
+        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_START:
+            return 0
+        eid, _ = self._readHeaderId(self._pos)
+        return eid
+
+    def openElement(self, elemId: Optional[ElementId] = None) -> int:
+        if self._pos >= len(self._buf):
+            if elemId is not None:
+                from ghidra.core.error import DecoderError
+                raise DecoderError(f"Expecting <{elemId.name}> but reached end of stream")
+            return 0
+        header = self._buf[self._pos]
+        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_START:
+            if elemId is not None:
+                from ghidra.core.error import DecoderError
+                raise DecoderError(f"Expecting <{elemId.name}> but did not scan an element")
+            return 0
+        eid, newPos = self._readHeaderId(self._pos)
+        self._pos = newPos
+        self._startPos = self._pos
+        self._curPos = self._pos
+        # Skip over all attributes to find the end position
+        while self._curPos < len(self._buf):
+            h = self._buf[self._curPos]
+            if (h & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
+                break
+            self._skipAttribute()
+        self._pos = self._curPos  # endPos = past all attributes
+        self._curPos = self._startPos
+        self._attributeRead = True
+
+        if elemId is not None and eid != elemId.id:
+            from ghidra.core.error import DecoderError
+            raise DecoderError(f"Expecting <{elemId.name}> but id did not match")
+        return eid
+
+    def closeElement(self, id_: int) -> None:
+        if self._pos >= len(self._buf):
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting element close but reached end of stream")
+        header = self._buf[self._pos]
+        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_END:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting element close")
+        closeId, newPos = self._readHeaderId(self._pos)
+        if closeId != id_:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Did not see expected closing element")
+        self._pos = newPos
+
+    def closeElementSkipping(self, id_: int) -> None:
+        stack = [id_]
+        while stack:
+            if self._pos >= len(self._buf):
+                from ghidra.core.error import DecoderError
+                raise DecoderError("Unexpected end of stream during skip")
+            header = self._buf[self._pos] & _PF.HEADER_MASK
+            if header == _PF.ELEMENT_END:
+                self.closeElement(stack.pop())
+            elif header == _PF.ELEMENT_START:
+                stack.append(self.openElement())
+            else:
+                from ghidra.core.error import DecoderError
+                raise DecoderError("Corrupt packed stream")
+
+    def getNextAttributeId(self) -> int:
+        if not self._attributeRead:
+            self._skipAttribute()
+        if self._curPos >= len(self._buf):
+            return 0
+        header = self._buf[self._curPos]
+        if (header & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
+            return 0
+        eid = header & _PF.ELEMENTID_MASK
+        if header & _PF.HEADEREXTEND_MASK:
+            eid <<= _PF.RAWDATA_BITSPERBYTE
+            eid |= (self._buf[self._curPos + 1] & _PF.RAWDATA_MASK)
+        self._attributeRead = False
+        return eid
+
+    def getIndexedAttributeId(self, attribId: AttributeId) -> int:
+        return 0
+
+    def rewindAttributes(self) -> None:
+        self._curPos = self._startPos
+        self._attributeRead = True
+
+    def readBool(self, attribId: Optional[AttributeId] = None) -> bool:
+        if attribId is not None:
+            self._findMatchingAttribute(attribId)
+        typeByte = self._readTypeByte()
+        self._attributeRead = True
+        if (typeByte >> _PF.TYPECODE_SHIFT) != _PF.TYPECODE_BOOLEAN:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting boolean attribute")
+        result = (typeByte & _PF.LENGTHCODE_MASK) != 0
+        if attribId is not None:
+            self._curPos = self._startPos
+        return result
+
+    def readSignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
+        if attribId is not None:
+            self._findMatchingAttribute(attribId)
+        typeByte = self._readTypeByte()
+        typeCode = typeByte >> _PF.TYPECODE_SHIFT
+        if typeCode == _PF.TYPECODE_SIGNEDINT_POSITIVE:
+            res = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+        elif typeCode == _PF.TYPECODE_SIGNEDINT_NEGATIVE:
+            res = -self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+        else:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting signed integer attribute")
+        self._attributeRead = True
+        if attribId is not None:
+            self._curPos = self._startPos
+        return res
+
+    def readSignedIntegerExpectString(self, expect_or_attribId,
+                                       expect_str: Optional[str] = None,
+                                       expectval: int = 0) -> int:
+        if isinstance(expect_or_attribId, AttributeId):
+            self._findMatchingAttribute(expect_or_attribId)
+            # Peek type
+            savedPos = self._curPos
+            _h = self._buf[self._curPos]
+            skip = 2 if (_h & _PF.HEADEREXTEND_MASK) else 1
+            typeByte = self._buf[self._curPos + skip]
+            typeCode = typeByte >> _PF.TYPECODE_SHIFT
+            if typeCode == _PF.TYPECODE_STRING:
+                val = self.readString()
+                self._curPos = self._startPos
+                if val != expect_str:
+                    from ghidra.core.error import DecoderError
+                    raise DecoderError(f'Expecting string "{expect_str}" but read "{val}"')
+                return expectval
+            else:
+                self._curPos = savedPos
+                res = self.readSignedInteger()
+                self._curPos = self._startPos
+                return res
+        else:
+            # expect_or_attribId is the expected string
+            savedPos = self._curPos
+            _h = self._buf[self._curPos]
+            skip = 2 if (_h & _PF.HEADEREXTEND_MASK) else 1
+            typeByte = self._buf[self._curPos + skip]
+            typeCode = typeByte >> _PF.TYPECODE_SHIFT
+            if typeCode == _PF.TYPECODE_STRING:
+                val = self.readString()
+                if val != expect_or_attribId:
+                    from ghidra.core.error import DecoderError
+                    raise DecoderError(f'Expecting string "{expect_or_attribId}" but read "{val}"')
+                return expect_str if expect_str is not None else expectval
+            else:
+                self._curPos = savedPos
+                return self.readSignedInteger()
+
+    def readUnsignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
+        if attribId is not None:
+            self._findMatchingAttribute(attribId)
+        typeByte = self._readTypeByte()
+        typeCode = typeByte >> _PF.TYPECODE_SHIFT
+        if typeCode != _PF.TYPECODE_UNSIGNEDINT:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting unsigned integer attribute")
+        res = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+        self._attributeRead = True
+        if attribId is not None:
+            self._curPos = self._startPos
+        return res
+
+    def readString(self, attribId: Optional[AttributeId] = None) -> str:
+        if attribId is not None:
+            self._findMatchingAttribute(attribId)
+        typeByte = self._readTypeByte()
+        typeCode = typeByte >> _PF.TYPECODE_SHIFT
+        if typeCode != _PF.TYPECODE_STRING:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Expecting string attribute")
+        strLen = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+        result = self._buf[self._curPos:self._curPos + strLen].decode("utf-8", errors="replace")
+        self._curPos += strLen
+        self._attributeRead = True
+        if attribId is not None:
+            self._curPos = self._startPos
+        return result
+
+    def readSpace(self, attribId: Optional[AttributeId] = None) -> AddrSpace:
+        if attribId is not None:
+            self._findMatchingAttribute(attribId)
+        typeByte = self._readTypeByte()
+        typeCode = typeByte >> _PF.TYPECODE_SHIFT
+        spc = None
+        if typeCode == _PF.TYPECODE_ADDRESSSPACE:
+            idx = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+            if self.spcManager is not None:
+                spc = self.spcManager.getSpace(idx)
+        elif typeCode == _PF.TYPECODE_SPECIALSPACE:
+            code = typeByte & _PF.LENGTHCODE_MASK
+            if self.spcManager is not None:
+                if code == _PF.SPECIALSPACE_STACK:
+                    spc = self.spcManager.getStackSpace()
+                elif code == _PF.SPECIALSPACE_JOIN:
+                    spc = self.spcManager.getJoinSpace()
+        if spc is None:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Cannot resolve address space")
+        self._attributeRead = True
+        if attribId is not None:
+            self._curPos = self._startPos
+        return spc
+
+    def readOpcode(self, attribId: Optional[AttributeId] = None) -> OpCode:
+        val = self.readSignedInteger(attribId)
+        if val < 0 or val >= OpCode.CPUI_MAX.value:
+            from ghidra.core.error import DecoderError
+            raise DecoderError("Bad encoded OpCode")
+        return OpCode(val)
+
+
+# =========================================================================
+# PackedEncode – binary packed format encoder
+# =========================================================================
+
+class PackedEncode(Encoder):
+    """A byte-based encoder for Ghidra's packed binary format.
+
+    C++ ref: ``PackedEncode`` in marshal.hh / marshal.cc
+    """
+
+    def __init__(self, stream: Optional[io.BytesIO] = None) -> None:
+        self._stream: io.BytesIO = stream if stream is not None else io.BytesIO()
+
+    def getBytes(self) -> bytes:
+        return self._stream.getvalue()
+
+    def _writeHeader(self, header: int, eid: int) -> None:
+        if eid > 0x1F:
+            header |= _PF.HEADEREXTEND_MASK
+            header |= (eid >> _PF.RAWDATA_BITSPERBYTE)
+            extByte = (eid & _PF.RAWDATA_MASK) | _PF.RAWDATA_MARKER
+            self._stream.write(bytes([header, extByte]))
+        else:
+            self._stream.write(bytes([header | eid]))
+
+    def _writeInteger(self, typeByte: int, val: int) -> None:
+        if val == 0:
+            self._stream.write(bytes([typeByte]))
+            return
+        # Determine length code
+        if val < 0x80:
+            lenCode, sa = 1, 0
+        elif val < 0x4000:
+            lenCode, sa = 2, 7
+        elif val < 0x200000:
+            lenCode, sa = 3, 14
+        elif val < 0x10000000:
+            lenCode, sa = 4, 21
+        elif val < 0x800000000:
+            lenCode, sa = 5, 28
+        elif val < 0x40000000000:
+            lenCode, sa = 6, 35
+        elif val < 0x2000000000000:
+            lenCode, sa = 7, 42
+        elif val < 0x100000000000000:
+            lenCode, sa = 8, 49
+        elif val < 0x8000000000000000:
+            lenCode, sa = 9, 56
+        else:
+            lenCode, sa = 10, 63
+        self._stream.write(bytes([typeByte | lenCode]))
+        while sa >= 0:
+            piece = ((val >> sa) & _PF.RAWDATA_MASK) | _PF.RAWDATA_MARKER
+            self._stream.write(bytes([piece]))
+            sa -= _PF.RAWDATA_BITSPERBYTE
+
+    def openElement(self, elemId: ElementId) -> None:
+        self._writeHeader(_PF.ELEMENT_START, elemId.id)
+
+    def closeElement(self, elemId: ElementId) -> None:
+        self._writeHeader(_PF.ELEMENT_END, elemId.id)
+
+    def writeBool(self, attribId: AttributeId, val: bool) -> None:
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        tb = (_PF.TYPECODE_BOOLEAN << _PF.TYPECODE_SHIFT) | (1 if val else 0)
+        self._stream.write(bytes([tb]))
+
+    def writeSignedInteger(self, attribId: AttributeId, val: int) -> None:
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        if val < 0:
+            tb = _PF.TYPECODE_SIGNEDINT_NEGATIVE << _PF.TYPECODE_SHIFT
+            num = -val
+        else:
+            tb = _PF.TYPECODE_SIGNEDINT_POSITIVE << _PF.TYPECODE_SHIFT
+            num = val
+        self._writeInteger(tb, num)
+
+    def writeUnsignedInteger(self, attribId: AttributeId, val: int) -> None:
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        self._writeInteger(_PF.TYPECODE_UNSIGNEDINT << _PF.TYPECODE_SHIFT, val)
+
+    def writeString(self, attribId: AttributeId, val: str) -> None:
+        data = val.encode("utf-8")
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        self._writeInteger(_PF.TYPECODE_STRING << _PF.TYPECODE_SHIFT, len(data))
+        self._stream.write(data)
+
+    def writeStringIndexed(self, attribId: AttributeId, index: int, val: str) -> None:
+        data = val.encode("utf-8")
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id + index)
+        self._writeInteger(_PF.TYPECODE_STRING << _PF.TYPECODE_SHIFT, len(data))
+        self._stream.write(data)
+
+    def writeSpace(self, attribId: AttributeId, spc: AddrSpace) -> None:
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        spc_type = spc.getType() if hasattr(spc, 'getType') else -1
+        from ghidra.core.space import IPTR_SPACEBASE, IPTR_JOIN, IPTR_IOP, IPTR_FSPEC
+        if spc_type == IPTR_FSPEC:
+            self._stream.write(bytes([(_PF.TYPECODE_SPECIALSPACE << _PF.TYPECODE_SHIFT) | _PF.SPECIALSPACE_FSPEC]))
+        elif spc_type == IPTR_IOP:
+            self._stream.write(bytes([(_PF.TYPECODE_SPECIALSPACE << _PF.TYPECODE_SHIFT) | _PF.SPECIALSPACE_IOP]))
+        elif spc_type == IPTR_JOIN:
+            self._stream.write(bytes([(_PF.TYPECODE_SPECIALSPACE << _PF.TYPECODE_SHIFT) | _PF.SPECIALSPACE_JOIN]))
+        elif spc_type == IPTR_SPACEBASE:
+            if hasattr(spc, 'isFormalStackSpace') and spc.isFormalStackSpace():
+                self._stream.write(bytes([(_PF.TYPECODE_SPECIALSPACE << _PF.TYPECODE_SHIFT) | _PF.SPECIALSPACE_STACK]))
+            else:
+                self._stream.write(bytes([(_PF.TYPECODE_SPECIALSPACE << _PF.TYPECODE_SHIFT) | _PF.SPECIALSPACE_SPACEBASE]))
+        else:
+            idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
+            self._writeInteger(_PF.TYPECODE_ADDRESSSPACE << _PF.TYPECODE_SHIFT, idx)
+
+    def writeOpcode(self, attribId: AttributeId, opc: OpCode) -> None:
+        self._writeHeader(_PF.ATTRIBUTE, attribId.id)
+        self._writeInteger(_PF.TYPECODE_SIGNEDINT_POSITIVE << _PF.TYPECODE_SHIFT, int(opc))

@@ -3,7 +3,7 @@ Non-zero mask calculation. Corresponds to PcodeOp::getNZMaskLocal() in op.cc.
 """
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import (
-    calc_mask, pcode_left, pcode_right, sign_extend,
+    calc_mask, pcode_left, pcode_right, sign_extend_sized,
     coveringmask, leastsigbit_set, mostsigbit_set, popcount,
 )
 
@@ -28,7 +28,7 @@ def getNZMaskLocal(op, cliploop=True):
     if opc in (OpCode.CPUI_COPY, OpCode.CPUI_INT_ZEXT):
         return op.getIn(0).getNZMask()
     if opc == OpCode.CPUI_INT_SEXT:
-        return sign_extend(op.getIn(0).getNZMask(), op.getIn(0).getSize(), size) & fm
+        return sign_extend_sized(op.getIn(0).getNZMask(), op.getIn(0).getSize(), size) & fm
     if opc in (OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_OR):
         r = op.getIn(0).getNZMask()
         return r | op.getIn(1).getNZMask() if r != fm else fm
@@ -50,6 +50,17 @@ def getNZMaskLocal(op, cliploop=True):
         if (r & (fm ^ (fm >> 1))) == 0:
             return pcode_right(r, sa)
         return pcode_right(r, sa) | ((fm >> sa) ^ fm)
+    if opc == OpCode.CPUI_INT_DIV:
+        val = op.getIn(0).getNZMask()
+        r = coveringmask(val)
+        if op.getIn(1).isConstant():
+            sa = mostsigbit_set(op.getIn(1).getNZMask())
+            if sa != -1:
+                r >>= sa
+        return r & fm
+    if opc == OpCode.CPUI_INT_REM:
+        val = op.getIn(1).getNZMask() - 1
+        return coveringmask(val) & fm
     if opc == OpCode.CPUI_SUBPIECE:
         r = op.getIn(0).getNZMask()
         s = int(op.getIn(1).getOffset())
@@ -86,10 +97,16 @@ def getNZMaskLocal(op, cliploop=True):
         if op.numInput() == 0: return fm
         r = 0
         for i in range(op.numInput()):
+            if cliploop:
+                parent = op.getParent()
+                if parent is not None and hasattr(parent, 'isLoopIn') and parent.isLoopIn(i):
+                    continue
             r |= op.getIn(i).getNZMask()
         return r
     if opc == OpCode.CPUI_INDIRECT:
         return fm
+    if opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CPOOLREF):
+        return 1 if hasattr(op, 'isCalculatedBool') and op.isCalculatedBool() else fm
     if opc == OpCode.CPUI_POPCOUNT:
         s = popcount(op.getIn(0).getNZMask())
         return coveringmask(s) & fm

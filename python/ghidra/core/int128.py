@@ -43,6 +43,62 @@ def div128by64(dividend: int, divisor: int) -> tuple:
     return (q & ((1 << 128) - 1), r & 0xFFFFFFFFFFFFFFFF)
 
 
+MASK128 = (1 << 128) - 1
+MASK64 = (1 << 64) - 1
+
+
+def subtract128(a: int, b: int) -> int:
+    """Subtract two 128-bit unsigned values (a - b) mod 2^128."""
+    return (a - b) & MASK128
+
+
+def uless128(a: int, b: int) -> bool:
+    """128-bit unsigned less-than comparison."""
+    return (a & MASK128) < (b & MASK128)
+
+
+def ulessequal128(a: int, b: int) -> bool:
+    """128-bit unsigned less-than-or-equal comparison."""
+    return (a & MASK128) <= (b & MASK128)
+
+
+def udiv128(numer: int, denom: int) -> tuple:
+    """Divide 128-bit by 128-bit unsigned, returning (quotient, remainder).
+
+    Both values are treated as unsigned 128-bit integers.
+    Raises LowlevelError on divide by zero.
+    """
+    numer = numer & MASK128
+    denom = denom & MASK128
+    if denom == 0:
+        from ghidra.core.error import LowlevelError
+        raise LowlevelError("divide by 0")
+    q = numer // denom
+    r = numer % denom
+    return (q & MASK128, r & MASK128)
+
+
+def count_leading_zeros(val: int) -> int:
+    """Return the number of leading zero bits in a 64-bit value."""
+    val = val & MASK64
+    if val == 0:
+        return 64
+    n = 0
+    if val <= 0x00000000FFFFFFFF:
+        n += 32; val <<= 32
+    if val <= 0x0000FFFFFFFFFFFF:
+        n += 16; val <<= 16
+    if val <= 0x00FFFFFFFFFFFFFF:
+        n += 8; val <<= 8
+    if val <= 0x0FFFFFFFFFFFFFFF:
+        n += 4; val <<= 4
+    if val <= 0x3FFFFFFFFFFFFFFF:
+        n += 2; val <<= 2
+    if val <= 0x7FFFFFFFFFFFFFFF:
+        n += 1
+    return n
+
+
 def calcDivisor(n: int, y: int, xsize: int) -> int:
     """Calculate the actual divisor from multiply-high constant and shift.
     

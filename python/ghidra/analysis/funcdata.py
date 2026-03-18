@@ -231,8 +231,12 @@ class Funcdata:
     def setTypeRecovery(self, val: bool) -> None:
         if val:
             self._flags |= Funcdata.typerecovery_on
+            self._flags &= ~Funcdata.typerecovery_start
+            self._flags &= ~Funcdata.typerecovery_exceeded
         else:
             self._flags &= ~Funcdata.typerecovery_on
+            self._flags &= ~Funcdata.typerecovery_start
+            self._flags &= ~Funcdata.typerecovery_exceeded
 
     def hasNoStructBlocks(self) -> bool:
         return self._sblocks.getSize() == 0
@@ -247,6 +251,8 @@ class Funcdata:
 
     def startTypeRecovery(self) -> bool:
         if (self._flags & Funcdata.typerecovery_on) == 0:
+            return False
+        if (self._flags & Funcdata.typerecovery_start) != 0:
             return False
         self._flags |= Funcdata.typerecovery_start
         return True
@@ -766,10 +772,22 @@ class Funcdata:
         vn.setDef(op)
 
     def opSetInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
-        """Set an input of a PcodeOp."""
+        """Set an input of a PcodeOp.
+
+        If *vn* is a free varnode that already has a descendant, clone it
+        first so the "free varnode has one descendant" invariant is preserved.
+        This matches C++ Ghidra behaviour (op.cc: PcodeOp::setInput).
+        """
         old = op.getIn(slot)
         if old is not None:
             old.eraseDescend(op)
+        # Clone free varnodes that already have a descendant
+        if vn.isFree() and not vn.isSpacebase() and len(vn._descend) > 0:
+            from ghidra.core.address import Address
+            addr = vn.getAddr()
+            clone = self.newVarnode(vn.getSize(), addr)
+            clone._flags = vn._flags  # Preserve flags (input, constant, etc.)
+            vn = clone
         op.setInput(vn, slot)
         vn.addDescend(op)
 
@@ -1912,29 +1930,127 @@ class Funcdata:
 
     # --- Encode / decode ---
 
-    def encodeVarnode(self, encoder, vn) -> None:
-        """Encode a specific Varnode to stream."""
-        pass
+    def encodeVarnode(self, encoder, iter_vns) -> None:
+        """Encode a set of Varnodes to stream.
 
-    def encode(self, encoder, uid=0, savetree: bool = True) -> None:
-        """Encode a description of this function to stream."""
-        pass
+        C++ ref: ``Funcdata::encodeVarnode``
+        """
+        for vn in iter_vns:
+            vn.encode(encoder)
+
+    def encode(self, encoder, uid: int = 0, savetree: bool = True) -> None:
+        """Encode a description of this function to stream.
+
+        C++ ref: ``Funcdata::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_FUNCTION, ATTRIB_ID, ATTRIB_NAME, ATTRIB_SIZE, ATTRIB_NOCODE,
+        )
+        encoder.openElement(ELEM_FUNCTION)
+        if uid != 0:
+            encoder.writeUnsignedInteger(ATTRIB_ID, uid)
+        encoder.writeString(ATTRIB_NAME, self.name)
+        encoder.writeSignedInteger(ATTRIB_SIZE, self.size)
+        if self.hasNoCode():
+            encoder.writeBool(ATTRIB_NOCODE, True)
+        self.baseaddr.encode(encoder)
+
+        if not self.hasNoCode():
+            if self._localmap is not None and hasattr(self._localmap, 'encodeRecursive'):
+                self._localmap.encodeRecursive(encoder, False)
+
+        if savetree:
+            self.encodeTree(encoder)
+            self.encodeHigh(encoder)
+        self.encodeJumpTable(encoder)
+        self.funcp.encode(encoder)
+        if hasattr(self, '_localoverride') and self._localoverride is not None:
+            self._localoverride.encode(encoder, self._glb)
+        encoder.closeElement(ELEM_FUNCTION)
 
     def decode(self, decoder) -> int:
         """Restore the state of this function from a stream."""
         return 0
 
     def encodeTree(self, encoder) -> None:
-        """Encode a description of the p-code tree to stream."""
-        pass
+        """Encode the p-code tree (varnodes, ops, blocks, edges) to stream.
+
+        C++ ref: ``Funcdata::encodeTree``
+        """
+        from ghidra.core.marshal import (
+            ELEM_AST, ELEM_VARNODES, ELEM_BLOCK, ELEM_BLOCKEDGE,
+            ATTRIB_INDEX,
+        )
+        from ghidra.core.space import IPTR_IOP
+        encoder.openElement(ELEM_AST)
+
+        # Encode all varnodes grouped by address space
+        encoder.openElement(ELEM_VARNODES)
+        for i in range(self._glb.numSpaces()):
+            base = self._glb.getSpace(i)
+            if base is None or base.getType() == IPTR_IOP:
+                continue
+            vns = self._vbank.beginLocSpace(base)
+            self.encodeVarnode(encoder, vns)
+        encoder.closeElement(ELEM_VARNODES)
+
+        # Encode each basic block with its ops
+        for i in range(self._bblocks.getSize()):
+            bs = self._bblocks.getBlock(i)
+            encoder.openElement(ELEM_BLOCK)
+            encoder.writeSignedInteger(ATTRIB_INDEX, bs.getIndex())
+            bs.encodeBody(encoder)
+            for op in bs.getOpList():
+                op.encode(encoder)
+            encoder.closeElement(ELEM_BLOCK)
+
+        # Encode edges for blocks that have incoming edges
+        for i in range(self._bblocks.getSize()):
+            bs = self._bblocks.getBlock(i)
+            if bs.sizeIn() == 0:
+                continue
+            encoder.openElement(ELEM_BLOCKEDGE)
+            encoder.writeSignedInteger(ATTRIB_INDEX, bs.getIndex())
+            bs.encodeEdges(encoder)
+            encoder.closeElement(ELEM_BLOCKEDGE)
+
+        encoder.closeElement(ELEM_AST)
 
     def encodeHigh(self, encoder) -> None:
-        """Encode a description of all HighVariables to stream."""
-        pass
+        """Encode all HighVariables to stream.
+
+        C++ ref: ``Funcdata::encodeHigh``
+        """
+        from ghidra.core.marshal import ELEM_HIGHLIST
+        if not self.isHighOn():
+            return
+        encoder.openElement(ELEM_HIGHLIST)
+        seen = set()
+        for vn in self._vbank.allVarnodes():
+            if vn.isAnnotation():
+                continue
+            high = vn.getHigh()
+            if high is None:
+                continue
+            hid = id(high)
+            if hid in seen:
+                continue
+            seen.add(hid)
+            high.encode(encoder)
+        encoder.closeElement(ELEM_HIGHLIST)
 
     def encodeJumpTable(self, encoder) -> None:
-        """Encode a description of jump-tables to stream."""
-        pass
+        """Encode jump-tables to stream.
+
+        C++ ref: ``Funcdata::encodeJumpTable``
+        """
+        from ghidra.core.marshal import ELEM_JUMPTABLELIST
+        if not hasattr(self, '_jumpvec') or not self._jumpvec:
+            return
+        encoder.openElement(ELEM_JUMPTABLELIST)
+        for jt in self._jumpvec:
+            jt.encode(encoder)
+        encoder.closeElement(ELEM_JUMPTABLELIST)
 
     def decodeJumpTable(self, decoder) -> None:
         """Decode jump-tables from a stream."""

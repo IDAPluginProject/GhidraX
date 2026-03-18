@@ -12,7 +12,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, List
 
 from ghidra.core.error import LowlevelError
-from ghidra.output.prettyprint import Emit, EmitMarkup, SyntaxHighlight
+from ghidra.output.prettyprint import Emit, EmitMarkup, EmitPrettyPrint, SyntaxHighlight
 
 if TYPE_CHECKING:
     from ghidra.analysis.funcdata import Funcdata
@@ -105,6 +105,42 @@ class Atom:
         self.offset: int = offset
 
 
+class PrintLanguageCapability(ABC):
+    """Base class for high-level language capabilities."""
+
+    _thelist: list[PrintLanguageCapability] = []
+
+    def __init__(self, name: str = "", isdefault: bool = False) -> None:
+        self.name: str = name
+        self.isdefault: bool = isdefault
+
+    def getName(self) -> str:
+        return self.name
+
+    def initialize(self) -> None:
+        if self.isdefault:
+            PrintLanguageCapability._thelist.insert(0, self)
+        else:
+            PrintLanguageCapability._thelist.append(self)
+
+    @abstractmethod
+    def buildLanguage(self, glb):
+        ...
+
+    @staticmethod
+    def getDefault() -> PrintLanguageCapability:
+        if len(PrintLanguageCapability._thelist) == 0:
+            raise LowlevelError("No print languages registered")
+        return PrintLanguageCapability._thelist[0]
+
+    @staticmethod
+    def findCapability(name: str) -> Optional[PrintLanguageCapability]:
+        for capability in PrintLanguageCapability._thelist:
+            if capability.getName() == name:
+                return capability
+        return None
+
+
 # tagtype constants
 syntax = 0
 vartoken = 1
@@ -167,7 +203,7 @@ class PrintLanguage(ABC):
     def __init__(self, glb=None, nm: str = "") -> None:
         self._glb = glb  # Architecture
         self._name: str = nm
-        self._emit: Optional[Emit] = None
+        self._emit: Optional[Emit] = EmitPrettyPrint()
         self._castStrategy: Optional[CastStrategy] = None
         self._modstack: List[int] = []
         self._scopestack: list = []
@@ -184,6 +220,7 @@ class PrintLanguage(ABC):
         self._revpol: List[ReversePolish] = []
         self._nodepend: List[NodePending] = []
         self._pending: int = 0
+        self.resetDefaultsInternal()
 
     # --- Basic accessors ---
 
@@ -229,8 +266,6 @@ class PrintLanguage(ABC):
         self._curscope = sc
 
     def popScope(self) -> None:
-        if not self._scopestack:
-            return
         self._scopestack.pop()
         if self._scopestack:
             self._curscope = self._scopestack[-1]
@@ -242,8 +277,17 @@ class PrintLanguage(ABC):
     def setCommentDelimeter(self, start: str, stop: str, usecommentfill: bool) -> None:
         self._commentstart = start
         self._commentend = stop
+        if self._emit is None or not hasattr(self._emit, 'setCommentFill'):
+            return
+        if usecommentfill:
+            self._emit.setCommentFill(start)
+        else:
+            self._emit.setCommentFill(" " * len(start))
 
     def setLineCommentIndent(self, val: int) -> None:
+        max_line_size = self._emit.getMaxLineSize() if self._emit is not None else -1
+        if val < 0 or (max_line_size >= 0 and val >= max_line_size):
+            raise LowlevelError("Bad comment indent value")
         self._line_commentindent = val
 
     def setInstructionComment(self, val: int) -> None:
@@ -364,8 +408,11 @@ class PrintLanguage(ABC):
         else:
             symboloff = high.getSymbolOffset() if hasattr(high, 'getSymbolOffset') else -1
             if symboloff == -1:
-                self.pushSymbol(sym, vn, op)
-                return
+                tp = sym.getType() if hasattr(sym, 'getType') else None
+                if tp is not None and hasattr(tp, 'needsResolution') and not tp.needsResolution():
+                    self.pushSymbol(sym, vn, op)
+                    return
+                symboloff = 0
             tp = sym.getType() if hasattr(sym, 'getType') else None
             if tp is not None and symboloff + vn.getSize() <= tp.getSize():
                 inslot = op.getSlot(vn) if (isRead and hasattr(op, 'getSlot')) else -1
@@ -489,7 +536,7 @@ class PrintLanguage(ABC):
         elif atom.type == fieldtoken:
             self._emit.tagField(atom.name, atom.highlight, atom.ptr_second, atom.offset, atom.op)
         elif atom.type == casetoken:
-            pass
+            self._emit.tagCaseLabel(atom.name, atom.highlight, atom.op, atom.ptr_second)
         elif atom.type == blanktoken:
             pass
 
@@ -673,8 +720,7 @@ class PrintLanguage(ABC):
     def clear(self) -> None:
         """Clear the RPN stack and the low-level emitter."""
         if self._emit is not None:
-            self._emit.parenlevel = 0
-            self._emit.indentlevel = 0
+            self._emit.clear()
         if self._modstack:
             self._mods = self._modstack[0]
             self._modstack.clear()
@@ -685,9 +731,12 @@ class PrintLanguage(ABC):
         self._nodepend.clear()
 
     def resetDefaultsInternal(self) -> None:
+        from ghidra.database.comment import Comment
         self._mods = 0
+        self._head_comment_type = int(Comment.CommentType.header | Comment.CommentType.warningheader)
         self._line_commentindent = 20
         self._namespc_strategy = PrintLanguage.MINIMAL_NAMESPACES
+        self._instr_comment_type = int(Comment.CommentType.user2 | Comment.CommentType.warning)
 
     def getPending(self) -> int:
         return self._pending
@@ -844,10 +893,62 @@ class PrintLanguage(ABC):
 
     def emitLineComment(self, indent: int, comm) -> None:
         """Emit a comment line."""
-        if self._emit is not None:
-            self._emit.tagLine(indent)
-            txt = comm.getText() if hasattr(comm, 'getText') else str(comm)
-            self._emit.tagComment(txt, SyntaxHighlight.comment_color, 0)
+        if self._emit is None:
+            return
+        text = comm.getText() if hasattr(comm, 'getText') else str(comm)
+        addr = comm.getAddr() if hasattr(comm, 'getAddr') else None
+        spc = addr.getSpace() if addr is not None and hasattr(addr, 'getSpace') else None
+        off = addr.getOffset() if addr is not None and hasattr(addr, 'getOffset') else 0
+
+        if indent < 0:
+            indent = self._line_commentindent
+        self._emit.tagLine(indent)
+        id_ = self._emit.startComment()
+        self._emit.tagComment(self._commentstart, SyntaxHighlight.comment_color, spc, off)
+
+        pos = 0
+        while pos < len(text):
+            tok = text[pos]
+            pos += 1
+            if tok == ' ' or tok == '\t':
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    if tok != ' ' and tok != '\t':
+                        break
+                    count += 1
+                    pos += 1
+                self._emit.spaces(count)
+            elif tok == '\n':
+                self._emit.tagLine()
+            elif tok == '\r':
+                continue
+            elif tok == '{' and pos < len(text) and text[pos] == '@':
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    count += 1
+                    pos += 1
+                    if tok == '}':
+                        break
+                annote = text[pos - count:pos]
+                self._emit.tagComment(annote, SyntaxHighlight.comment_color, spc, off)
+            else:
+                count = 1
+                while pos < len(text):
+                    tok = text[pos]
+                    if tok.isspace():
+                        break
+                    count += 1
+                    pos += 1
+                sub = text[pos - count:pos]
+                self._emit.tagComment(sub, SyntaxHighlight.comment_color, spc, off)
+
+        if self._commentend:
+            self._emit.tagComment(self._commentend, SyntaxHighlight.comment_color, spc, off)
+        self._emit.stopComment(id_)
+        if hasattr(comm, 'setEmitted'):
+            comm.setEmitted(True)
 
     @abstractmethod
     def checkPrintNegation(self, vn) -> bool:

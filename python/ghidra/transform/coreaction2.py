@@ -704,7 +704,7 @@ class ActionBlockStructure(Action):
         if graph.getSize() != 0:
             return 0
         graph.buildCopy(data.getBasicBlocks())
-        from ghidra.block.collapse import CollapseStructure
+        from ghidra.block.blockaction import CollapseStructure
         collapse = CollapseStructure(graph)
         collapse.collapseAll()
         self._count += collapse.getChangeCount()

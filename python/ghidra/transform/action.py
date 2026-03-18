@@ -948,11 +948,13 @@ class ActionDatabase:
 
     def universalAction(self, glb: Architecture) -> None:
         """Build the universal action. Override to populate."""
-        pass
+        from ghidra.transform.universal import universalAction as _universalAction
+        _universalAction(self, glb)
 
     def buildDefaultGroups(self) -> None:
         """Set up descriptions of preconfigured root Actions. Override to populate."""
-        pass
+        from ghidra.transform.universal import buildDefaultGroups as _buildDefaultGroups
+        _buildDefaultGroups(self)
 
     def resetDefaults(self) -> None:
         """(Re)set the default configuration."""

@@ -103,9 +103,26 @@ class SymbolEntry:
             return tp
         return None  # Simplified - full impl would do sub-type lookup
 
+    def decode(self, decoder) -> None:
+        """Decode a SymbolEntry from a stream.
+
+        C++ ref: ``SymbolEntry::decode``
+        """
+        from ghidra.core.marshal import ELEM_HASH, ATTRIB_VAL
+        elemId = decoder.peekElement()
+        if elemId == ELEM_HASH.id:
+            decoder.openElement()
+            self.hash = decoder.readUnsignedInteger(ATTRIB_VAL)
+            self.addr = Address()
+            decoder.closeElement(elemId)
+        else:
+            self.addr = Address.decode(decoder)
+            self.hash = 0
+        self.uselimit.decode(decoder)
+
     def __repr__(self) -> str:
-        sname = self.symbol.getName() if self.symbol else "?"
-        return f"SymbolEntry({sname} @ {self.addr}, size={self.size})"
+        return (f"SymbolEntry(sym={self.symbol.name!r}, "
+                f"addr={self.addr}, size={self.size})")
 
 
 # =========================================================================
@@ -315,8 +332,76 @@ class Symbol:
     def encode(self, encoder) -> None:
         pass
 
+    def decodeHeader(self, decoder) -> None:
+        """Decode symbol header attributes from a stream.
+
+        C++ ref: ``Symbol::decodeHeader``
+        """
+        from ghidra.core.marshal import (
+            ATTRIB_CAT, ATTRIB_ID, ATTRIB_NAME, ATTRIB_READONLY,
+            ATTRIB_VOLATILE, ATTRIB_MERGE,
+        )
+        self.name = ""
+        self.displayName = ""
+        self.category = Symbol.no_category
+        self.symbolId = 0
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_CAT.id:
+                self.category = decoder.readSignedInteger()
+            elif attribId == ATTRIB_ID.id:
+                self.symbolId = decoder.readUnsignedInteger()
+                if (self.symbolId >> 56) == (Symbol.ID_BASE >> 56):
+                    self.symbolId = 0
+            elif attribId == ATTRIB_NAME.id:
+                self.name = decoder.readString()
+            elif attribId == ATTRIB_READONLY.id:
+                if decoder.readBool():
+                    self.flags |= Varnode.readonly
+            elif attribId == ATTRIB_VOLATILE.id:
+                if decoder.readBool():
+                    self.flags |= Varnode.volatil
+            elif attribId == ATTRIB_MERGE.id:
+                if not decoder.readBool():
+                    self.dispflags |= Symbol.isolate
+                    self.flags |= Varnode.typelock
+            # Other attributes consumed by iteration
+        if self.category == Symbol.function_parameter:
+            from ghidra.core.marshal import ATTRIB_INDEX
+            try:
+                self.catindex = decoder.readUnsignedInteger(ATTRIB_INDEX)
+            except Exception:
+                self.catindex = 0
+        else:
+            self.catindex = 0
+        if not self.displayName:
+            self.displayName = self.name
+
+    def decodeBody(self, decoder) -> None:
+        """Decode the data-type of this Symbol.
+
+        C++ ref: ``Symbol::decodeBody``
+        """
+        if self.scope is not None and hasattr(self.scope, 'glb') and self.scope.glb is not None:
+            arch = self.scope.glb
+            if hasattr(arch, 'types') and arch.types is not None:
+                try:
+                    self.type = arch.types.decodeType(decoder)
+                except Exception:
+                    pass
+
     def decode(self, decoder) -> None:
-        pass
+        """Decode this Symbol from a stream.
+
+        C++ ref: ``Symbol::decode``
+        """
+        from ghidra.core.marshal import ELEM_SYMBOL
+        elemId = decoder.openElement(ELEM_SYMBOL)
+        self.decodeHeader(decoder)
+        self.decodeBody(decoder)
+        decoder.closeElement(elemId)
 
     def __repr__(self) -> str:
         tname = self.type.getName() if self.type else "?"
@@ -335,6 +420,18 @@ class FunctionSymbol(Symbol):
         super().__init__(scope, name)
         self.fd = None  # Funcdata (set later)
         self.consumeSize: int = size
+        self._buildType()
+
+    def _buildType(self) -> None:
+        """Set default code type and lock flags."""
+        if self.scope is not None and hasattr(self.scope, 'glb') and self.scope.glb is not None:
+            arch = self.scope.glb
+            if hasattr(arch, 'types') and arch.types is not None:
+                try:
+                    self.type = arch.types.getTypeCode()
+                except Exception:
+                    pass
+        self.flags |= Varnode.namelock | Varnode.typelock
 
     def getFunction(self):
         return self.fd
@@ -347,6 +444,51 @@ class FunctionSymbol(Symbol):
 
     def setBytesConsumed(self, sz: int) -> None:
         self.consumeSize = sz
+
+    def decode(self, decoder) -> None:
+        """Decode a FunctionSymbol from a stream.
+
+        C++ ref: ``FunctionSymbol::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_FUNCTION, ELEM_FUNCTIONSHELL,
+            ATTRIB_NAME, ATTRIB_ID, ATTRIB_LABEL,
+        )
+        elemId = decoder.peekElement()
+        if elemId == ELEM_FUNCTION.id:
+            # Full function definition — decode the funcdata
+            # For now, just read the shell-like attributes
+            decoder.openElement()
+            self.symbolId = 0
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME.id:
+                    self.name = decoder.readString()
+                elif attribId == ATTRIB_ID.id:
+                    self.symbolId = decoder.readUnsignedInteger()
+                elif attribId == ATTRIB_LABEL.id:
+                    self.displayName = decoder.readString()
+            # Skip any child elements
+            decoder.closeElementSkipping(elemId)
+        else:
+            # functionshell
+            decoder.openElement()
+            self.symbolId = 0
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME.id:
+                    self.name = decoder.readString()
+                elif attribId == ATTRIB_ID.id:
+                    self.symbolId = decoder.readUnsignedInteger()
+                elif attribId == ATTRIB_LABEL.id:
+                    self.displayName = decoder.readString()
+            decoder.closeElement(elemId)
+        if not self.displayName:
+            self.displayName = self.name
 
 
 # =========================================================================
@@ -384,6 +526,16 @@ class LabSymbol(Symbol):
     def getType(self) -> int:
         return 4  # label type
 
+    def decode(self, decoder) -> None:
+        """Decode a LabSymbol from a stream.
+
+        C++ ref: ``LabSymbol::decode``
+        """
+        from ghidra.core.marshal import ELEM_LABELSYM
+        elemId = decoder.openElement(ELEM_LABELSYM)
+        self.decodeHeader(decoder)
+        decoder.closeElement(elemId)
+
 
 # =========================================================================
 # ExternRefSymbol
@@ -402,6 +554,26 @@ class ExternRefSymbol(Symbol):
 
     def setRefAddr(self, addr: Address) -> None:
         self.refaddr = addr
+
+    def decode(self, decoder) -> None:
+        """Decode an ExternRefSymbol from a stream.
+
+        C++ ref: ``ExternRefSymbol::decode``
+        """
+        from ghidra.core.marshal import ELEM_EXTERNREFSYMBOL, ATTRIB_NAME
+        elemId = decoder.openElement(ELEM_EXTERNREFSYMBOL)
+        self.name = ""
+        self.displayName = ""
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_NAME.id:
+                self.name = decoder.readString()
+        self.refaddr = Address.decode(decoder)
+        if not self.displayName:
+            self.displayName = self.name
+        decoder.closeElement(elemId)
 
 
 # =========================================================================
@@ -870,6 +1042,17 @@ class ScopeInternal(Scope):
         entry = SymbolEntry(sym, addr, size)
         return self.addMapEntry(sym, entry)
 
+    def begin(self):
+        for entries in self._entriesByAddr.values():
+            for entry in entries:
+                yield entry
+
+    def beginDynamic(self):
+        for sym in self._symbolsById.values():
+            for entry in sym.mapentry:
+                if entry.isDynamic():
+                    yield entry
+
     def getCategorySize(self, cat: int) -> int:
         lst = self._categoryMap.get(cat)
         return len(lst) if lst else 0
@@ -902,6 +1085,22 @@ class ScopeInternal(Scope):
         self.addSymbol(fsym)
         self.addMapEntry(fsym, entry)
         return fsym
+
+    def addCodeLabel(self, addr: Address, name: str) -> LabSymbol:
+        """Create and add a code label symbol."""
+        lsym = LabSymbol(self, name)
+        entry = SymbolEntry(lsym, addr, 1)
+        self.addSymbol(lsym)
+        self.addMapEntry(lsym, entry)
+        return lsym
+
+    def queryCodeLabel(self, addr: Address) -> Optional[LabSymbol]:
+        """Find a code label symbol by exact address."""
+        entry = self.findAddr(addr, Address())
+        if entry is None:
+            return None
+        sym = entry.getSymbol()
+        return sym if isinstance(sym, LabSymbol) else None
 
     def queryByAddr(self, addr: Address, sz: int) -> Optional[Symbol]:
         """Find a symbol that covers the given address range."""

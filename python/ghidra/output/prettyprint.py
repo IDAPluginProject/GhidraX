@@ -36,6 +36,11 @@ class SyntaxHighlight(IntEnum):
     special_color = 10
 
 
+class PendPrint:
+    def callback(self, emit: "Emit") -> None:
+        raise NotImplementedError()
+
+
 class Emit(ABC):
     """Interface for emitting the Decompiler's formal output: source code.
 
@@ -46,6 +51,7 @@ class Emit(ABC):
         self.indentlevel: int = 0
         self.parenlevel: int = 0
         self.indentincrement: int = 2
+        self._pendPrint: Optional[PendPrint] = None
 
     def resetDefaults(self) -> None:
         self.indentincrement = 2
@@ -170,6 +176,13 @@ class Emit(ABC):
     def clear(self) -> None:
         self.parenlevel = 0
         self.indentlevel = 0
+        self._pendPrint = None
+
+    def getOutputStream(self):
+        return None
+
+    def setOutputStream(self, stream) -> None:
+        pass
 
     def setMaxLineSize(self, mls: int) -> None:
         pass
@@ -179,6 +192,24 @@ class Emit(ABC):
 
     def setCommentFill(self, fill: str) -> None:
         pass
+
+    def setMarkup(self, val: bool) -> None:
+        pass
+
+    def emitPending(self) -> None:
+        if self._pendPrint is not None:
+            pend = self._pendPrint
+            self._pendPrint = None
+            pend.callback(self)
+
+    def setPendingPrint(self, pend: PendPrint) -> None:
+        self._pendPrint = pend
+
+    def cancelPendingPrint(self) -> None:
+        self._pendPrint = None
+
+    def hasPendingPrint(self, pend: PendPrint) -> bool:
+        return self._pendPrint is pend
 
     def openBraceIndent(self, brace: str, style: int = 0) -> int:
         """Emit an opening brace and add an indent level."""
@@ -230,6 +261,12 @@ class EmitMarkup(Emit):
     def getOutput(self) -> str:
         return self._stream.getvalue()
 
+    def getOutputStream(self):
+        return self._stream
+
+    def setOutputStream(self, stream) -> None:
+        self._stream = stream if stream is not None else io.StringIO()
+
     def beginDocument(self) -> int:
         return self._nextId()
 
@@ -264,7 +301,7 @@ class EmitMarkup(Emit):
         return self._nextId()
 
     def endStatement(self, id_) -> None:
-        self._stream.write("\n")
+        pass
 
     def beginFuncProto(self) -> int:
         return self._nextId()
@@ -319,6 +356,7 @@ class EmitMarkup(Emit):
         return num
 
     def tagLine(self, indent=-1) -> int:
+        self.emitPending()
         self._stream.write("\n")
         if indent >= 0:
             self._stream.write(" " * indent)
@@ -328,6 +366,9 @@ class EmitMarkup(Emit):
 
     def emitsMarkup(self) -> bool:
         return False
+
+    def setMarkup(self, val: bool) -> None:
+        pass
 
 
 class EmitPrettyPrint(Emit):
@@ -546,6 +587,7 @@ class EmitPrettyPrint(Emit):
         return num
 
     def tagLine(self, indent=-1) -> int:
+        self.emitPending()
         self._low.tagLine(indent)
         if indent >= 0:
             self._spaceremain = self._maxlinesize - indent
@@ -586,3 +628,16 @@ class EmitPrettyPrint(Emit):
         if hasattr(self._low, 'getOutput'):
             return self._low.getOutput()
         return ""
+
+    def getOutputStream(self):
+        if hasattr(self._low, 'getOutputStream'):
+            return self._low.getOutputStream()
+        return None
+
+    def setOutputStream(self, stream) -> None:
+        if hasattr(self._low, 'setOutputStream'):
+            self._low.setOutputStream(stream)
+
+    def setMarkup(self, val: bool) -> None:
+        if hasattr(self._low, 'setMarkup'):
+            self._low.setMarkup(val)

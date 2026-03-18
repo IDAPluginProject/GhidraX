@@ -108,24 +108,83 @@ class Lifter:
     def lift_function(self, name: str, entry: int, size: int) -> Funcdata:
         """Lift a function starting at entry for size bytes into a Funcdata.
 
+        Uses control-flow-following (worklist) to only lift reachable code,
+        matching the C++ FlowInfo behaviour.
+
         This:
-        1. Translates each instruction to P-code via native SLEIGH
-        2. Creates Python Varnode/PcodeOp objects
-        3. Groups ops into basic blocks
-        4. Returns a populated Funcdata
+        1. Starts at the entry point and follows branches/fallthroughs
+        2. Translates each instruction to P-code via native SLEIGH
+        3. Creates Python Varnode/PcodeOp objects
+        4. Groups ops into a single basic block (later split by _split_basic_blocks)
+        5. Returns a populated Funcdata
         """
         code_spc = self._get_space(self._native.get_default_code_space())
         fd = Funcdata(name, name, None, Address(code_spc, entry), None, size)
 
-        # Lift all instructions in range
-        native_results = self._native.pcode_range(entry, entry + size)
-        if not native_results:
+        # --- Control-flow-following instruction collection ---
+        end_addr = entry + size if size > 0 else entry + 0x10000
+        worklist: List[int] = [entry]
+        visited: set = set()
+        insn_list: List = []  # (addr, native_result) in address order
+
+        while worklist:
+            addr = worklist.pop(0)
+            if addr in visited:
+                continue
+            if addr < entry or addr >= end_addr:
+                continue
+            visited.add(addr)
+
+            try:
+                insn = self._native.pcode(addr)
+            except Exception:
+                continue
+            if insn.length <= 0:
+                continue
+
+            insn_list.append(insn)
+            next_addr = addr + insn.length
+
+            # Determine control flow from the last pcode op
+            has_branch = False
+            has_return = False
+            for native_op in insn.ops:
+                opc_val = native_op.opcode
+                if opc_val == OpCode.CPUI_BRANCH.value:
+                    has_branch = True
+                    # Target is input[0]
+                    if native_op.inputs:
+                        tgt = native_op.inputs[0]
+                        if tgt.space != "const":
+                            worklist.append(tgt.offset)
+                elif opc_val == OpCode.CPUI_CBRANCH.value:
+                    # Conditional: both target and fallthrough
+                    if native_op.inputs:
+                        tgt = native_op.inputs[0]
+                        if tgt.space != "const":
+                            worklist.append(tgt.offset)
+                    worklist.append(next_addr)
+                elif opc_val == OpCode.CPUI_BRANCHIND.value:
+                    has_branch = True
+                elif opc_val == OpCode.CPUI_RETURN.value:
+                    has_return = True
+
+            # If no explicit branch/return, fall through to next instruction
+            if not has_branch and not has_return:
+                worklist.append(next_addr)
+
+        if not insn_list:
             return fd
 
-        # Create one basic block for now (simplified - no branch analysis)
+        # Sort by address to maintain sequential order
+        insn_list.sort(key=lambda r: r.addr)
+
+        # Create one basic block for now (later split by _split_basic_blocks)
         bb = fd.getBasicBlocks().newBlockBasic(fd)
-        bb.setInitialRange(Address(code_spc, entry),
-                           Address(code_spc, entry + size - 1))
+        first_addr = insn_list[0].addr
+        last_addr = insn_list[-1].addr
+        bb.setInitialRange(Address(code_spc, first_addr),
+                           Address(code_spc, last_addr))
 
         # Cache for defined (output) varnodes: (space_name, offset, size) -> Varnode
         # Only outputs are cached; inputs always get a fresh varnode because
@@ -144,7 +203,7 @@ class Lifter:
             return make_vn(space_name, offset, sz)
 
         # Convert each native PcodeResult -> Python PcodeOps
-        for insn in native_results:
+        for insn in insn_list:
             for native_op in insn.ops:
                 opc = OpCode(native_op.opcode)
                 num_in = len(native_op.inputs)

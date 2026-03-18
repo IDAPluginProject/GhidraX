@@ -17,19 +17,22 @@ if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
 
 # ---- Marshaling attribute / element IDs (mirrors C++ globals) ----
-ATTRIB_ALTINDEX = 75
-ATTRIB_DEPTH = 76
-ATTRIB_END = 77
-ATTRIB_INDEX = 78
-ATTRIB_OPCODE = 79
-ATTRIB_REV = 80
-ATTRIB_TYPE = 81
+# IDs must match C++ exactly for packed binary protocol interop.
+from ghidra.core.marshal import AttributeId, ElementId
 
-ELEM_BHEAD = 102
-ELEM_BLOCK = 103
-ELEM_BLOCKEDGE = 104
-ELEM_EDGE = 105
-ELEM_TARGET = 106
+ATTRIB_ALTINDEX = AttributeId("altindex", 75)   # block.cc
+ATTRIB_DEPTH = AttributeId("depth", 76)         # block.cc
+ATTRIB_END = AttributeId("end", 77)             # block.cc
+ATTRIB_OPCODE = AttributeId("opcode", 78)       # block.cc
+ATTRIB_REV = AttributeId("rev", 79)             # block.cc
+ATTRIB_INDEX = AttributeId("index", 10)         # marshal.cc (common)
+ATTRIB_TYPE = AttributeId("type", 22)           # marshal.cc (common)
+
+ELEM_BHEAD = ElementId("bhead", 102)            # block.cc
+ELEM_BLOCK = ElementId("block", 103)            # block.cc
+ELEM_BLOCKEDGE = ElementId("blockedge", 104)    # block.cc
+ELEM_EDGE = ElementId("edge", 105)              # block.cc
+ELEM_TARGET = ElementId("target", 7)            # marshal.cc (common)
 
 # =========================================================================
 # BlockEdge
@@ -137,6 +140,7 @@ class FlowBlock:
     def getIndex(self) -> int: return self._index
     def getParent(self) -> Optional[FlowBlock]: return self._parent
     def getImmedDom(self) -> Optional[FlowBlock]: return self._immed_dom
+    def setImmedDom(self, bl: Optional[FlowBlock]) -> None: self._immed_dom = bl
     def getCopyMap(self) -> Optional[FlowBlock]: return self._copymap
     def getFlags(self) -> int: return self._flags
     def setFlag(self, fl: int) -> None: self._flags |= fl
@@ -713,6 +717,10 @@ class BlockGraph(FlowBlock):
     def getType(self) -> int: return FlowBlock.t_graph
     def subBlock(self, i: int): return self._list[i] if 0 <= i < len(self._list) else None
 
+    def getEntryBlock(self) -> Optional[FlowBlock]:
+        """Return the entry (first) block, or None if empty."""
+        return self._list[0] if self._list else None
+
     def addBlock(self, bl: FlowBlock) -> None:
         m = bl._index
         if not self._list:
@@ -930,14 +938,17 @@ class BlockGraph(FlowBlock):
 
     def newBlockCopy(self, bl):
         ret = BlockCopy(bl)
-        ret._intothis = list(bl._intothis); ret._outofthis = list(bl._outofthis)
+        ret._intothis = [BlockEdge(edge.point, edge.label, edge.reverse_index) for edge in bl._intothis]
+        ret._outofthis = [BlockEdge(edge.point, edge.label, edge.reverse_index) for edge in bl._outofthis]
         ret._immed_dom = bl._immed_dom; ret._index = bl._index; ret._numdesc = bl._numdesc
         ret._flags |= bl._flags
         if len(ret._outofthis) > 2: ret._flags |= FlowBlock.f_switch_out
         self.addBlock(ret); return ret
 
-    def newBlockGoto(self, bl):
-        ret = BlockGoto(bl.getOut(0))
+    def newBlockGoto(self, bl, target=None):
+        if target is None:
+            target = bl.getOut(0)
+        ret = BlockGoto(target)
         self.identifyInternal(ret, [bl]); self.addBlock(ret)
         ret.forceOutputNum(1); self.removeEdge(ret, ret.getOut(0)); return ret
 
@@ -981,15 +992,17 @@ class BlockGraph(FlowBlock):
         ret.forceOutputNum(2); ret.forceFalseEdge(out0)
         self.removeEdge(ret, ret.getTrueOut()); return ret
 
-    def newBlockIf(self, cond, tc):
-        ret = BlockIf(); self.identifyInternal(ret, [cond, tc]); self.addBlock(ret)
+    def newBlockIf(self, cond, tc, fc=None):
+        nodes = [cond, tc] if fc is None else [cond, tc, fc]
+        ret = BlockIf(); self.identifyInternal(ret, nodes); self.addBlock(ret)
         ret.forceOutputNum(1); return ret
 
     def newBlockIfElse(self, cond, tc, fc):
-        ret = BlockIf(); self.identifyInternal(ret, [cond, tc, fc]); self.addBlock(ret)
-        ret.forceOutputNum(1); return ret
+        return self.newBlockIf(cond, tc, fc)
 
-    def newBlockWhileDo(self, cond, cl):
+    def newBlockWhileDo(self, cond, cl=None):
+        if cl is None:
+            cl = cond
         ret = BlockWhileDo(); self.identifyInternal(ret, [cond, cl]); self.addBlock(ret)
         ret.forceOutputNum(1); return ret
 
@@ -2017,6 +2030,7 @@ class BlockSwitch(BlockGraph):
     def getCaseBlock(self, i: int): return self._caseblocks[i].block
     def isDefaultCase(self, i: int) -> bool: return self._caseblocks[i].isdefault
     def getGotoCaseType(self, i: int) -> int: return self._caseblocks[i].gototype
+    def getGotoType(self, i: int) -> int: return self._caseblocks[i].gototype
     def isExit(self, i: int) -> bool: return self._caseblocks[i].isexit
     def getType(self) -> int: return FlowBlock.t_switch
     def emit(self, lng) -> None: lng.emitBlockSwitch(self)
