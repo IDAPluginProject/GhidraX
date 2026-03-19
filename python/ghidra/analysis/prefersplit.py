@@ -68,10 +68,20 @@ class PreferSplitRecord:
         return self.totalSize // self.splitSize
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode this record's storage as a VarnodeData element.
+
+        C++ ref: Architecture stores PreferSplitRecords via VarnodeData encoding.
+        """
+        self.storage.encode(encoder)
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode this record's storage from a VarnodeData element.
+
+        C++ ref: ``Architecture::decodePreferSplit`` — decodes storage then
+        sets splitoffset = storage.size / 2.
+        """
+        self.storage = Address.decode(decoder)
+        self.splitSize = self.totalSize // 2 if self.totalSize > 0 else 0
 
     def __lt__(self, other) -> bool:
         if not isinstance(other, PreferSplitRecord):
@@ -135,13 +145,45 @@ class PreferSplitManager:
         return self._records
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode a <prefersplit> element containing multiple records.
+
+        C++ ref: ``Architecture::decodePreferSplit``
+        """
+        from ghidra.core.marshal import ELEM_PREFERSPLIT, ATTRIB_STYLE
+        elemId = decoder.openElement(ELEM_PREFERSPLIT)
+        style = decoder.readString(ATTRIB_STYLE)
+        if style != "inhalf":
+            raise Exception("Unknown prefersplit style: " + style)
+        while decoder.peekElement() != 0:
+            rec = PreferSplitRecord()
+            rec.storage = Address.decode(decoder)
+            rec.totalSize = rec.storage.getAddrSize() if hasattr(rec.storage, 'getAddrSize') else 0
+            rec.splitSize = rec.totalSize // 2 if rec.totalSize > 0 else 0
+            self._records.append(rec)
+        decoder.closeElement(elemId)
+        self._records.sort()
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode all records as a <prefersplit> element.
+
+        C++ ref: mirrors ``Architecture::decodePreferSplit`` in reverse.
+        """
+        from ghidra.core.marshal import ELEM_PREFERSPLIT, ATTRIB_STYLE
+        if not self._records:
+            return
+        encoder.openElement(ELEM_PREFERSPLIT)
+        encoder.writeString(ATTRIB_STYLE, "inhalf")
+        for rec in self._records:
+            rec.encode(encoder)
+        encoder.closeElement(ELEM_PREFERSPLIT)
 
     def fillinAddress(self, fd) -> None:
-        pass
+        """Fill in register addresses from the translate object.
+
+        For records that reference register names, resolve them to actual
+        addresses using the function's architecture translate object.
+        """
+        pass  # Requires full translate infrastructure
 
     def clear(self) -> None:
         self._records.clear()

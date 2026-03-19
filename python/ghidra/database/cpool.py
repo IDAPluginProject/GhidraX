@@ -65,7 +65,47 @@ class CPoolRecord:
         return self.flags
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode this CPoolRecord as a <cpoolrec> element.
+
+        C++ ref: ``CPoolRecord::encode``
+        """
+        from ghidra.core.marshal import (
+            ATTRIB_TAG, ATTRIB_CONSTRUCTOR, ATTRIB_DESTRUCTOR,
+            ATTRIB_CONTENT, ATTRIB_LENGTH,
+            ELEM_CPOOLREC, ELEM_TOKEN, ELEM_VALUE, ELEM_DATA,
+        )
+        tag_map = {
+            CPoolRecord.pointer_method: "method",
+            CPoolRecord.pointer_field: "field",
+            CPoolRecord.instance_of: "instanceof",
+            CPoolRecord.array_length: "arraylength",
+            CPoolRecord.check_cast: "checkcast",
+            CPoolRecord.string_literal: "string",
+            CPoolRecord.class_reference: "classref",
+        }
+        encoder.openElement(ELEM_CPOOLREC)
+        encoder.writeString(ATTRIB_TAG, tag_map.get(self.tag, "primitive"))
+        if self.isConstructor():
+            encoder.writeBool(ATTRIB_CONSTRUCTOR, True)
+        if self.isDestructor():
+            encoder.writeBool(ATTRIB_DESTRUCTOR, True)
+        if self.tag == CPoolRecord.primitive:
+            encoder.openElement(ELEM_VALUE)
+            encoder.writeUnsignedInteger(ATTRIB_CONTENT, self.value)
+            encoder.closeElement(ELEM_VALUE)
+        if self.byteData is not None:
+            encoder.openElement(ELEM_DATA)
+            encoder.writeSignedInteger(ATTRIB_LENGTH, len(self.byteData))
+            hex_str = ' '.join(f'{b:02x}' for b in self.byteData)
+            encoder.writeString(ATTRIB_CONTENT, hex_str)
+            encoder.closeElement(ELEM_DATA)
+        else:
+            encoder.openElement(ELEM_TOKEN)
+            encoder.writeString(ATTRIB_CONTENT, self.token)
+            encoder.closeElement(ELEM_TOKEN)
+        if self.type is not None and hasattr(self.type, 'encodeRef'):
+            self.type.encodeRef(encoder)
+        encoder.closeElement(ELEM_CPOOLREC)
 
     def decode(self, decoder, typegrp=None) -> None:
         """Decode a CPoolRecord from a <cpoolrec> element.
@@ -204,10 +244,40 @@ class ConstantPoolInternal(ConstantPool):
         self._pool[tuple(refs)] = rec
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode the entire constant pool.
 
-    def decode(self, decoder) -> None:
-        pass
+        C++ ref: ``ConstantPoolInternal::encode``
+        """
+        from ghidra.core.marshal import ELEM_CONSTANTPOOL, ELEM_REF, ATTRIB_A, ATTRIB_B
+        encoder.openElement(ELEM_CONSTANTPOOL)
+        for key, rec in self._pool.items():
+            # Encode reference key as <ref> element
+            a = key[0] if len(key) > 0 else 0
+            b = key[1] if len(key) > 1 else 0
+            encoder.openElement(ELEM_REF)
+            encoder.writeUnsignedInteger(ATTRIB_A, a)
+            encoder.writeUnsignedInteger(ATTRIB_B, b)
+            encoder.closeElement(ELEM_REF)
+            rec.encode(encoder)
+        encoder.closeElement(ELEM_CONSTANTPOOL)
+
+    def decode(self, decoder, typegrp=None) -> None:
+        """Decode the entire constant pool.
+
+        C++ ref: ``ConstantPoolInternal::decode``
+        """
+        from ghidra.core.marshal import ELEM_CONSTANTPOOL, ELEM_REF, ATTRIB_A, ATTRIB_B
+        elemId = decoder.openElement(ELEM_CONSTANTPOOL)
+        while decoder.peekElement() != 0:
+            refId = decoder.openElement(ELEM_REF)
+            a = decoder.readUnsignedInteger(ATTRIB_A)
+            b = decoder.readUnsignedInteger(ATTRIB_B)
+            decoder.closeElement(refId)
+            refs = [a, b]
+            rec = self._createRecord(refs)
+            if rec is not None:
+                rec.decode(decoder, typegrp)
+        decoder.closeElement(elemId)
 
     def size(self) -> int:
         return len(self._pool)

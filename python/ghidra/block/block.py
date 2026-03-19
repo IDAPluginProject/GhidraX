@@ -404,7 +404,7 @@ class FlowBlock:
         s.write(str(self._index))
         start = self.getStart()
         stop = self.getStop()
-        if start.isValid() and stop.isValid():
+        if not start.isInvalid() and not stop.isInvalid():
             s.write(f' {start}-{stop}')
 
     def printTree(self, s, level: int) -> None:
@@ -415,7 +415,7 @@ class FlowBlock:
     def printShortHeader(self, s) -> None:
         s.write(f'Block_{self._index}')
         start = self.getStart()
-        if start.isValid():
+        if not start.isInvalid():
             s.write(f':{start}')
 
     def setGotoBranch(self, i: int) -> None:
@@ -1260,6 +1260,8 @@ class BlockBasic(FlowBlock):
     def addOp(self, op) -> None:
         """Append a PcodeOp to this basic block."""
         self._op.append(op)
+        if hasattr(op, 'setParent'):
+            op.setParent(self)
 
     def removeOp(self, op) -> None:
         """Remove a PcodeOp from this basic block."""
@@ -1271,6 +1273,8 @@ class BlockBasic(FlowBlock):
     def insertOp(self, op, pos: int = 0) -> None:
         """Insert a PcodeOp at a specific position."""
         self._op.insert(pos, op)
+        if hasattr(op, 'setParent'):
+            op.setParent(self)
 
     def getOpList(self):
         """Return the list of PcodeOps."""

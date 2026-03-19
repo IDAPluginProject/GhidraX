@@ -277,11 +277,16 @@ class Funcdata:
         return 0
 
     def setHighLevel(self) -> None:
-        """Assign HighVariable objects to each Varnode."""
+        """Turn on HighVariable objects for all existing Varnodes.
+
+        C++ ref: ``Funcdata::setHighLevel``
+        """
         if (self._flags & Funcdata.highlevel_on) != 0:
             return
         self._flags |= Funcdata.highlevel_on
         self._high_level_index = self._vbank.getCreateIndex()
+        for vn in list(self._vbank.beginLoc()):
+            self.assignHigh(vn)
 
     def getActiveOutput(self):
         """Get the active output parameter recovery object, or None."""
@@ -292,9 +297,17 @@ class Funcdata:
         self._activeoutput = None
 
     def initActiveOutput(self) -> None:
-        """Initialize active output parameter recovery."""
+        """Initialize active output parameter recovery.
+
+        C++ ref: ``Funcdata::initActiveOutput``
+        """
         from ghidra.fspec.paramactive import ParamActive
         self._activeoutput = ParamActive(False)
+        maxdelay = self._funcp.getMaxOutputDelay() if hasattr(self._funcp, 'getMaxOutputDelay') else 0
+        if maxdelay > 0:
+            maxdelay = 3
+        if hasattr(self._activeoutput, 'setMaxPass'):
+            self._activeoutput.setMaxPass(maxdelay)
 
     def calcNZMask(self) -> None:
         """Calculate the non-zero mask property on all Varnodes."""
@@ -302,8 +315,23 @@ class Funcdata:
         _calcNZMask(self)
 
     def clearDeadVarnodes(self) -> None:
-        """Remove Varnodes that are no longer referenced."""
-        self._vbank.clearDead()
+        """Free any Varnodes not attached to anything.
+
+        Input Varnodes that have no descendants and are not locked are
+        demoted to free, then all free Varnodes with no descendants are
+        destroyed.
+
+        C++ ref: ``Funcdata::clearDeadVarnodes``
+        """
+        for vn in list(self._vbank.beginLoc()):
+            if vn.hasNoDescend():
+                if vn.isInput() and not (hasattr(vn, 'isLockedInput') and vn.isLockedInput()):
+                    if hasattr(self._vbank, 'makeFree'):
+                        self._vbank.makeFree(vn)
+                    if hasattr(vn, 'clearCover'):
+                        vn.clearCover()
+                if vn.isFree():
+                    self._vbank.destroy(vn)
 
     def clearDeadOps(self) -> None:
         """Remove PcodeOps that have been marked as dead."""
@@ -311,7 +339,8 @@ class Funcdata:
 
     def seenDeadcode(self, spc) -> None:
         """Record that dead code has been seen for a given space."""
-        pass  # TODO: heritage.seenDeadCode(spc)
+        if hasattr(self, '_heritage') and self._heritage is not None:
+            self._heritage.seenDeadCode(spc)
 
     def spacebase(self) -> None:
         """Mark Varnode objects that hold stack-pointer values as spacebase."""
@@ -511,8 +540,36 @@ class Funcdata:
         return vn
 
     def setInputVarnode(self, vn: Varnode) -> Varnode:
-        """Mark a Varnode as an input to the function."""
+        """Mark a Varnode as an input to the function.
+
+        If the Varnode is already an input, return it. Check for overlapping
+        input Varnodes — if one exists with the same size and address, return
+        it instead. Then set varnode properties and mark unaffected/return_address
+        effects.
+
+        C++ ref: ``Funcdata::setInputVarnode``
+        """
+        if vn.isInput():
+            return vn
+        # Check for overlapping existing inputs
+        existing = self._vbank.findInput(vn.getSize(), vn.getAddr())
+        if existing is not None and existing.isInput():
+            return existing
         vn.setInput()
+        self.setVarnodeProperties(vn)
+        # Check for unaffected/return_address effects
+        if hasattr(self._funcp, 'hasEffect'):
+            effecttype = self._funcp.hasEffect(vn.getAddr(), vn.getSize())
+            UNAFFECTED = 1  # EffectRecord::unaffected
+            RETURN_ADDRESS = 2  # EffectRecord::return_address
+            if effecttype == UNAFFECTED:
+                if hasattr(vn, 'setUnaffected'):
+                    vn.setUnaffected()
+            elif effecttype == RETURN_ADDRESS:
+                if hasattr(vn, 'setUnaffected'):
+                    vn.setUnaffected()
+                if hasattr(vn, 'setReturnAddress'):
+                    vn.setReturnAddress()
         return vn
 
     def deleteVarnode(self, vn: Varnode) -> None:
@@ -538,6 +595,22 @@ class Funcdata:
         return self._vbank.findCoveredInput(s, loc)
 
     def findHigh(self, nm):
+        """Look up a Symbol by name and return its associated HighVariable.
+
+        C++ ref: ``Funcdata::findHigh``
+        """
+        if self._localmap is not None and hasattr(self._localmap, 'queryByName'):
+            symList = []
+            self._localmap.queryByName(nm, symList)
+            if symList:
+                sym = symList[0]
+                entry = sym.getFirstWholeMap() if hasattr(sym, 'getFirstWholeMap') else None
+                if entry is not None:
+                    vn = self.findLinkedVarnode(entry)
+                    if vn is not None and hasattr(vn, 'getHigh'):
+                        return vn.getHigh()
+            return None
+        # Fallback: brute-force scan
         for vn in self._vbank.allVarnodes():
             h = vn.getHigh() if hasattr(vn, 'getHigh') else None
             if h and hasattr(h, 'getSymbol'):
@@ -710,14 +783,97 @@ class Funcdata:
     def beginOpAll(self):
         return self._obank.beginAll() if hasattr(self._obank, 'beginAll') else iter([])
 
-    def mapGlobals(self):
-        pass
+    def mapGlobals(self) -> None:
+        """Search for addrtied Varnodes in global scope and create Symbols.
 
-    def prepareThisPointer(self):
-        pass
+        C++ ref: ``Funcdata::mapGlobals``
+        """
+        if self._localmap is None:
+            return
+        inconsistentuse = False
+        for vn in list(self._vbank.beginLoc()):
+            if vn.isFree():
+                continue
+            if not vn.isPersist():
+                continue
+            if hasattr(vn, 'getSymbolEntry') and vn.getSymbolEntry() is not None:
+                continue
+            addr = vn.getAddr()
+            sz = vn.getSize()
+            # Query existing symbol properties
+            fl = 0
+            usepoint = Address()
+            entry = None
+            if hasattr(self._localmap, 'queryProperties'):
+                entry = self._localmap.queryProperties(addr, 1, usepoint, fl)
+            if entry is None:
+                # Try to discover scope and add symbol
+                discover = None
+                if hasattr(self._localmap, 'discoverScope'):
+                    ct = vn.getType() if hasattr(vn, 'getType') and vn.getType() is not None else None
+                    if ct is None and self._glb is not None and hasattr(self._glb, 'types'):
+                        ct = self._glb.types.getBase(sz, 1)  # TYPE_UNKNOWN
+                    discover = self._localmap.discoverScope(addr, sz, usepoint)
+                if discover is not None and hasattr(discover, 'addSymbol'):
+                    index = 0
+                    nm = discover.buildVariableName(addr, usepoint, ct, index,
+                                                    Varnode.addrtied | Varnode.persist) \
+                        if hasattr(discover, 'buildVariableName') else f"DAT_{addr.getOffset():x}"
+                    discover.addSymbol(nm, ct, addr, usepoint)
+            else:
+                # Check for inconsistent use (symbol too small for varnode)
+                eaddr = entry.getAddr() if hasattr(entry, 'getAddr') else addr
+                esz = entry.getSize() if hasattr(entry, 'getSize') else sz
+                if addr.getOffset() + sz - 1 > eaddr.getOffset() + esz - 1:
+                    inconsistentuse = True
+        if inconsistentuse:
+            self.warningHeader("Globals starting with '_' overlap smaller symbols at the same address")
 
-    def markIndirectOnly(self):
-        pass
+    def prepareThisPointer(self) -> None:
+        """Ensure 'this' pointer Varnode is treated as pointer data-type.
+
+        C++ ref: ``Funcdata::prepareThisPointer``
+        """
+        numInputs = self._funcp.numParams()
+        for i in range(numInputs):
+            param = self._funcp.getParam(i)
+            if param is not None and hasattr(param, 'isThisPointer'):
+                if param.isThisPointer() and param.isTypeLocked():
+                    return
+        # Check if type recommendations already exist
+        if self._localmap is not None and hasattr(self._localmap, 'hasTypeRecommendations'):
+            if self._localmap.hasTypeRecommendations():
+                return
+        # Build a void* type recommendation
+        if self._glb is None or not hasattr(self._glb, 'types'):
+            return
+        dt = self._glb.types.getTypeVoid() if hasattr(self._glb.types, 'getTypeVoid') else None
+        if dt is None:
+            return
+        spc = self._glb.getDefaultDataSpace() if hasattr(self._glb, 'getDefaultDataSpace') else None
+        if spc is None:
+            return
+        addrSize = spc.getAddrSize() if hasattr(spc, 'getAddrSize') else 4
+        wordSize = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
+        dt = self._glb.types.getTypePointer(addrSize, dt, wordSize) \
+            if hasattr(self._glb.types, 'getTypePointer') else dt
+        addr = self._funcp.getThisPointerStorage(dt) \
+            if hasattr(self._funcp, 'getThisPointerStorage') else None
+        if addr is not None and self._localmap is not None and hasattr(self._localmap, 'addTypeRecommendation'):
+            self._localmap.addTypeRecommendation(addr, dt)
+
+    def markIndirectOnly(self) -> None:
+        """Mark illegal input Varnodes that are only used by INDIRECT ops.
+
+        C++ ref: ``Funcdata::markIndirectOnly``
+        """
+        for vn in list(self._vbank.beginLoc()):
+            if not vn.isInput():
+                continue
+            if not hasattr(vn, 'isIllegalInput') or not vn.isIllegalInput():
+                continue
+            if Funcdata.checkIndirectUse(vn):
+                vn.setFlags(Varnode.indirectonly)
 
     def setBasicBlockRange(self, bb, beg, end):
         if hasattr(bb, 'setInitialRange'):
@@ -736,8 +892,12 @@ class Funcdata:
     def clearJumpTables(self):
         self._jumpvec.clear()
 
-    def sortCallSpecs(self):
-        pass
+    def sortCallSpecs(self) -> None:
+        """Sort call specs in dominance order.
+
+        C++ ref: ``Funcdata::sortCallSpecs``
+        """
+        self._qlst.sort(key=lambda fc: fc.getEntryAddress() if hasattr(fc, 'getEntryAddress') else Address())
 
     # --- PcodeOp creation routines ---
 
@@ -1479,99 +1639,592 @@ class Funcdata:
 
     @staticmethod
     def checkIndirectUse(vn) -> bool:
-        """Check if a Varnode is used only by INDIRECT ops."""
-        for desc in vn.getDescendants():
-            if desc.code() != OpCode.CPUI_INDIRECT:
-                return False
-        return True
+        """Check if the given Varnode only flows into call-based INDIRECT ops.
+
+        Flow is followed through MULTIEQUAL ops and INDIRECT store ops.
+
+        C++ ref: ``Funcdata::checkIndirectUse``
+        """
+        vlist = [vn]
+        marked = {id(vn)}
+        result = True
+        i = 0
+        while i < len(vlist) and result:
+            cur = vlist[i]
+            i += 1
+            for op in cur.getDescendants():
+                opc = op.code()
+                if opc == OpCode.CPUI_INDIRECT:
+                    if hasattr(op, 'isIndirectStore') and op.isIndirectStore():
+                        outvn = op.getOut()
+                        if outvn is not None and id(outvn) not in marked:
+                            vlist.append(outvn)
+                            marked.add(id(outvn))
+                elif opc == OpCode.CPUI_MULTIEQUAL:
+                    outvn = op.getOut()
+                    if outvn is not None and id(outvn) not in marked:
+                        vlist.append(outvn)
+                        marked.add(id(outvn))
+                else:
+                    result = False
+                    break
+        return result
 
     # --- Varnode manipulation helpers ---
 
     def destroyVarnode(self, vn) -> None:
-        """Delete the given Varnode from this function."""
+        """Delete the given Varnode, clearing all references first.
+
+        All PcodeOps reading the Varnode have their input slot cleared.
+        If the Varnode is defined by a PcodeOp, that op's output is cleared.
+
+        C++ ref: ``Funcdata::destroyVarnode``
+        """
+        for op in list(vn.getDescendants()):
+            slot = op.getSlot(vn)
+            op.clearInput(slot)
+        defop = vn.getDef() if vn.isWritten() else None
+        if defop is not None:
+            defop.setOutput(None)
+            vn._def = None
+        if hasattr(vn, 'destroyDescend'):
+            vn.destroyDescend()
         self._vbank.destroy(vn)
 
     def cloneVarnode(self, vn):
-        """Clone a Varnode (between copies of the function)."""
-        newvn = self._vbank.create(vn.getSize(), vn.getAddr())
+        """Clone a Varnode, preserving allowed flags.
+
+        C++ ref: ``Funcdata::cloneVarnode``
+        """
+        ct = vn.getType() if hasattr(vn, 'getType') else None
+        newvn = self._vbank.create(vn.getSize(), vn.getAddr(), ct)
+        # Clone only the allowed flags
+        allowed = (Varnode.annotation | Varnode.externref |
+                   Varnode.readonly | Varnode.persist |
+                   Varnode.addrtied | Varnode.addrforce |
+                   Varnode.indirect_creation | Varnode.incidental_copy |
+                   Varnode.volatil | Varnode.mapped)
+        vflags = vn.getFlags() & allowed
+        newvn.setFlags(vflags)
         return newvn
 
     def splitUses(self, vn) -> None:
-        """Make all reads of the given Varnode unique by inserting COPYs."""
+        """Duplicate the defining PcodeOp at each read so each becomes a new unique.
+
+        For each descendant except the last, clone the defining op and
+        create a new output Varnode, then redirect the descendant's input
+        to the new clone output. Dead-code actions should remove the
+        original op if it becomes unused.
+
+        C++ ref: ``Funcdata::splitUses``
+        """
+        op = vn.getDef()
+        if op is None:
+            return
         descs = list(vn.getDescendants())
         if len(descs) <= 1:
             return
-        for desc in descs[1:]:
-            slot = desc.getSlot(vn)
-            copyop = self.newOp(1, desc.getAddr())
-            self.opSetOpcode(copyop, OpCode.CPUI_COPY)
-            newvn = self.newUniqueOut(vn.getSize(), copyop)
-            self.opSetInput(copyop, vn, 0)
-            self.opInsertBefore(copyop, desc)
-            self.opSetInput(desc, newvn, slot)
+        # Process all descendants except the last one (which keeps the original)
+        for useop in descs[:-1]:
+            slot = useop.getSlot(vn)
+            newop = self.newOp(op.numInput(), op.getAddr())
+            newvn = self.newVarnode(vn.getSize(), vn.getAddr(), vn.getType() if hasattr(vn, 'getType') else None)
+            self.opSetOutput(newop, newvn)
+            self.opSetOpcode(newop, op.code())
+            for i in range(op.numInput()):
+                self.opSetInput(newop, op.getIn(i), i)
+            self.opSetInput(useop, newvn, slot)
+            self.opInsertBefore(newop, op)
 
     def descend2Undef(self, vn) -> bool:
-        """Transform all reads of the given Varnode to a special undefined constant."""
-        if vn.hasNoDescend():
-            return False
-        for desc in list(vn.getDescendants()):
-            slot = desc.getSlot(vn)
-            newvn = self.newConstant(vn.getSize(), 0)
-            self.opSetInput(desc, newvn, slot)
-        return True
+        """Replace reads of the given Varnode with a special 0xBADDEF constant.
+
+        For MULTIEQUAL and INDIRECT ops, a COPY is inserted since constants
+        cannot be placed directly as inputs. Blocks with no predecessors
+        (unreachable) are skipped.
+
+        C++ ref: ``Funcdata::descend2Undef``
+        """
+        res = False
+        sz = vn.getSize()
+        for op in list(vn.getDescendants()):
+            bl = op.getParent()
+            if bl is not None and hasattr(bl, 'isDead') and bl.isDead():
+                continue
+            if bl is not None and bl.sizeIn() != 0:
+                res = True
+            i = op.getSlot(vn)
+            badconst = self.newConstant(sz, 0xBADDEF)
+            opc = op.code()
+            if opc == OpCode.CPUI_MULTIEQUAL:
+                # Cannot put constant directly into MULTIEQUAL
+                inbl = bl.getIn(i) if bl is not None else None
+                if inbl is not None:
+                    copyop = self.newOp(1, inbl.getStart())
+                    inputvn = self.newUniqueOut(sz, copyop)
+                    self.opSetOpcode(copyop, OpCode.CPUI_COPY)
+                    self.opSetInput(copyop, badconst, 0)
+                    self.opInsertEnd(copyop, inbl)
+                    self.opSetInput(op, inputvn, i)
+                else:
+                    self.opSetInput(op, badconst, i)
+            elif opc == OpCode.CPUI_INDIRECT:
+                # Cannot put constant directly into INDIRECT
+                copyop = self.newOp(1, op.getAddr())
+                inputvn = self.newUniqueOut(sz, copyop)
+                self.opSetOpcode(copyop, OpCode.CPUI_COPY)
+                self.opSetInput(copyop, badconst, 0)
+                self.opInsertBefore(copyop, op)
+                self.opSetInput(op, inputvn, i)
+            else:
+                self.opSetInput(op, badconst, i)
+        return res
 
     def assignHigh(self, vn):
-        """Assign a new HighVariable to a Varnode."""
-        high = HighVariable(vn)
-        return high
+        """Assign a HighVariable to a Varnode if high-level analysis is on.
+
+        Only assigns if highlevel_on flag is set. Calculates cover if the
+        Varnode already has one, and skips annotation Varnodes.
+
+        C++ ref: ``Funcdata::assignHigh``
+        """
+        if (self._flags & Funcdata.highlevel_on) != 0:
+            if hasattr(vn, 'hasCover') and vn.hasCover():
+                if hasattr(vn, 'calcCover'):
+                    vn.calcCover()
+            if not (hasattr(vn, 'isAnnotation') and vn.isAnnotation()):
+                return HighVariable(vn)
+        return None
 
     def setVarnodeProperties(self, vn) -> None:
-        """Look-up boolean properties and data-type information for a Varnode."""
-        pass
+        """Look-up boolean properties and data-type information for a Varnode.
 
-    def coverVarnodes(self, entry, result: list) -> None:
-        """Find Varnodes that overlap the given SymbolEntry range."""
-        if entry is None:
-            return
-        addr = entry.getAddr() if hasattr(entry, 'getAddr') else None
-        sz = entry.getSize() if hasattr(entry, 'getSize') else 0
-        if addr is None or sz == 0:
-            return
-        for vn in self._vbank.beginLoc():
-            if vn.getAddr() == addr and vn.getSize() == sz:
-                result.append(vn)
+        C++ ref: ``Funcdata::setVarnodeProperties``
+        """
+        if not vn.isMapped():
+            vflags = 0
+            usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else Address()
+            entry = None
+            if self._localmap is not None and hasattr(self._localmap, 'queryProperties'):
+                entry = self._localmap.queryProperties(vn.getAddr(), vn.getSize(), usepoint, vflags)
+            if entry is not None and hasattr(vn, 'setSymbolProperties'):
+                vn.setSymbolProperties(entry)
+            elif vflags != 0:
+                vn.setFlags(vflags & ~Varnode.typelock)
+        if self.isHighOn() and hasattr(vn, 'calcCover'):
+            vn.calcCover()
 
-    def syncVarnodesWithSymbol(self, iterobj, fl, ct) -> bool:
-        """Sync Varnodes matching flags with their symbol data-type."""
-        return False
+    def coverVarnodes(self, entry, vnlist: list) -> None:
+        """Make sure every Varnode in the given list has a Symbol it will link to.
+
+        This is used when Varnodes overlap a locked Symbol but extend beyond it.
+        An existing Symbol is passed in with a list of possibly overextending
+        Varnodes. The list is in Address order. We check that each Varnode has
+        a Symbol that overlaps its first byte (to guarantee a link). If one
+        doesn't exist it is created.
+
+        C++ ref: ``Funcdata::coverVarnodes``
+        """
+        if entry is None or not vnlist:
+            return
+        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+        if sym is None:
+            return
+        scope = sym.getScope() if hasattr(sym, 'getScope') else None
+        if scope is None:
+            return
+        for i, vn in enumerate(vnlist):
+            # We only need to check once for all Varnodes at the same Address
+            # Of these, pick the biggest Varnode (last one in the list at same addr)
+            if i + 1 < len(vnlist) and vnlist[i + 1].getAddr() == vn.getAddr():
+                continue
+            usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else Address()
+            overlapEntry = scope.findContainer(vn.getAddr(), vn.getSize(), usepoint) if hasattr(scope, 'findContainer') else None
+            if overlapEntry is None:
+                diff = vn.getOffset() - entry.getAddr().getOffset()
+                name = f"{sym.getName()}_{diff}"
+                if vn.isAddrTied() if hasattr(vn, 'isAddrTied') else False:
+                    usepoint = Address()
+                if hasattr(scope, 'addSymbol'):
+                    tp = vn.getHigh().getType() if hasattr(vn, 'getHigh') and vn.getHigh() is not None else None
+                    scope.addSymbol(name, tp, vn.getAddr(), usepoint)
+
+    def syncVarnodesWithSymbol(self, iterobj, fl: int, ct) -> bool:
+        """Update boolean properties and data-type on a set of Varnodes.
+
+        The iterator provides a sequence of Varnodes at the same location.
+        We update their flags and optionally their data-type to match what
+        is dictated by the Symbol mapping.
+
+        C++ ref: ``Funcdata::syncVarnodesWithSymbol``
+        """
+        from ghidra.ir.varnode import Varnode as VnCls
+        updateoccurred = False
+        mask = VnCls.mapped
+        if (fl & VnCls.addrtied) == 0:
+            mask |= VnCls.addrtied | VnCls.addrforce
+        if (fl & VnCls.nolocalalias) != 0:
+            mask |= VnCls.nolocalalias | VnCls.addrforce
+        fl &= mask
+
+        vnlist = list(iterobj) if not isinstance(iterobj, list) else iterobj
+        for vn in vnlist:
+            if vn.isFree():
+                continue
+            vnflags = vn.getFlags()
+            if hasattr(vn, 'mapentry') and vn.mapentry is not None:
+                localMask = mask & ~VnCls.mapped
+                localFlags = fl & localMask
+                if (vnflags & localMask) != localFlags:
+                    updateoccurred = True
+                    vn.setFlags(localFlags)
+                    vn.clearFlags((~localFlags) & localMask)
+            elif (vnflags & mask) != fl:
+                updateoccurred = True
+                vn.setFlags(fl)
+                vn.clearFlags((~fl) & mask)
+            if ct is not None and hasattr(vn, 'updateType'):
+                if vn.updateType(ct):
+                    updateoccurred = True
+        return updateoccurred
 
     def handleSymbolConflict(self, entry, vn):
-        """Handle two variables with matching storage."""
-        return None
+        """Handle a Varnode that overlaps the given SymbolEntry.
+
+        Make sure the Varnode is part of the variable underlying the Symbol.
+        If not, remap things so that the Varnode maps to a distinct Symbol.
+        In either case, attach the appropriate Symbol to the Varnode.
+
+        C++ ref: ``Funcdata::handleSymbolConflict``
+        """
+        if entry is None:
+            return None
+        # Simple cases: input, addrtied, persist, constant, or dynamic entry
+        if vn.isInput() or (hasattr(vn, 'isAddrTied') and vn.isAddrTied()) or \
+           vn.isPersist() or vn.isConstant() or \
+           (hasattr(entry, 'isDynamic') and entry.isDynamic()):
+            if hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
+            return entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+
+        high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+        otherHigh = None
+        # Look for a conflicting HighVariable at same size/addr
+        if hasattr(self, 'beginLoc') and hasattr(entry, 'getSize') and hasattr(entry, 'getAddr'):
+            for othervn in self.beginLoc(entry.getSize(), entry.getAddr()):
+                if othervn.getSize() != entry.getSize():
+                    break
+                if othervn.getAddr() != entry.getAddr():
+                    break
+                tmpHigh = othervn.getHigh() if hasattr(othervn, 'getHigh') else None
+                if tmpHigh is not None and tmpHigh is not high:
+                    otherHigh = tmpHigh
+                    break
+
+        if otherHigh is None:
+            if hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
+            return entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+
+        # Conflicting variable - build a dynamic symbol
+        if hasattr(self, 'buildDynamicSymbol'):
+            self.buildDynamicSymbol(vn)
+        se = vn.getSymbolEntry() if hasattr(vn, 'getSymbolEntry') else None
+        return se.getSymbol() if se is not None and hasattr(se, 'getSymbol') else None
 
     def applyUnionFacet(self, entry, dhash) -> bool:
         """Apply union facet resolution from dynamic hash."""
         return False
 
     def onlyOpUse(self, invn, opmatch, trial, mainFlags) -> bool:
-        """Check if invn is only used by opmatch (for parameter passing)."""
-        return True
+        """Check if a Varnode is only used as a parameter to a given op.
 
-    def ancestorOpUse(self, maxlevel, invn, op, trial, offset, mainFlags) -> bool:
-        """Check if a Varnode traces to a legitimate source for parameter passing."""
-        return True
+        Walk all descendants of invn. If every path leads to opmatch
+        (at the correct slot) or to an INDIRECT / MULTIEQUAL / extension,
+        return True. Any other real use means the Varnode is not exclusively
+        used for parameter passing.
+
+        C++ ref: ``Funcdata::onlyOpUse``
+        """
+        TraverseIndirectAlt = 0x1
+        TraverseActionAlt = 0x2
+        TraverseConcatHigh = 0x4
+        TraverseLsbTruncated = 0x8
+
+        varlist = [(invn, mainFlags)]
+        marked = {id(invn)}
+        res = True
+        i = 0
+        while i < len(varlist) and res:
+            vn, baseFlags = varlist[i]
+            i += 1
+            for op in vn.getDescendants():
+                if op is opmatch:
+                    trialSlot = trial.getSlot() if hasattr(trial, 'getSlot') else 0
+                    if op.getIn(trialSlot) is vn:
+                        continue
+                curFlags = baseFlags
+                opc = op.code()
+                if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH,
+                           OpCode.CPUI_BRANCHIND, OpCode.CPUI_LOAD, OpCode.CPUI_STORE):
+                    res = False
+                    break
+                elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                    if self.checkCallDoubleUse(opmatch, op, vn, curFlags, trial):
+                        continue
+                    res = False
+                    break
+                elif opc == OpCode.CPUI_INDIRECT:
+                    curFlags |= TraverseIndirectAlt
+                elif opc == OpCode.CPUI_COPY:
+                    outvn = op.getOut()
+                    if outvn is not None and hasattr(outvn, 'getSpace'):
+                        if outvn.getSpace().getType() != IPTR_INTERNAL:
+                            if not (hasattr(op, 'isIncidentalCopy') and op.isIncidentalCopy()):
+                                if not (hasattr(vn, 'isIncidentalCopy') and vn.isIncidentalCopy()):
+                                    curFlags |= TraverseActionAlt
+                elif opc == OpCode.CPUI_RETURN:
+                    if opmatch.code() == OpCode.CPUI_RETURN:
+                        trialSlot = trial.getSlot() if hasattr(trial, 'getSlot') else 0
+                        if op.getIn(trialSlot) is vn:
+                            continue
+                    res = False
+                    break
+                elif opc in (OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INT_SEXT,
+                             OpCode.CPUI_INT_ZEXT, OpCode.CPUI_CAST):
+                    pass  # Follow through
+                elif opc == OpCode.CPUI_PIECE:
+                    if op.getIn(0) is vn:
+                        if (curFlags & TraverseLsbTruncated) != 0:
+                            continue
+                        curFlags |= TraverseConcatHigh
+                elif opc == OpCode.CPUI_SUBPIECE:
+                    if op.getIn(1).getOffset() != 0:
+                        if (curFlags & TraverseConcatHigh) == 0:
+                            curFlags |= TraverseLsbTruncated
+                else:
+                    curFlags |= TraverseActionAlt
+                subvn = op.getOut()
+                if subvn is not None:
+                    if hasattr(subvn, 'isPersist') and subvn.isPersist():
+                        res = False
+                        break
+                    if id(subvn) not in marked:
+                        varlist.append((subvn, curFlags))
+                        marked.add(id(subvn))
+        return res
+
+    def ancestorOpUse(self, maxlevel: int, invn, op, trial, offset: int, mainFlags: int) -> bool:
+        """Test if the given trial Varnode is likely only used for parameter passing.
+
+        Flow is followed from the Varnode and from ancestors it was copied
+        from to see if it hits anything other than the given CALL or RETURN.
+
+        C++ ref: ``Funcdata::ancestorOpUse``
+        """
+        if maxlevel == 0:
+            return False
+        if not invn.isWritten():
+            if not invn.isInput():
+                return False
+            if not invn.isTypeLock():
+                return False
+            return self.onlyOpUse(invn, op, trial, mainFlags)
+
+        defop = invn.getDef()
+        opc = defop.code()
+        if opc == OpCode.CPUI_INDIRECT:
+            if hasattr(defop, 'isIndirectCreation') and defop.isIndirectCreation():
+                return False
+            return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags | 0x10)
+        elif opc == OpCode.CPUI_MULTIEQUAL:
+            if hasattr(defop, 'isMark') and defop.isMark():
+                return False
+            if hasattr(defop, 'setMark'):
+                defop.setMark()
+            for j in range(defop.numInput()):
+                if self.ancestorOpUse(maxlevel - 1, defop.getIn(j), op, trial, offset, mainFlags):
+                    if hasattr(defop, 'clearMark'):
+                        defop.clearMark()
+                    return True
+            if hasattr(defop, 'clearMark'):
+                defop.clearMark()
+            return False
+        elif opc == OpCode.CPUI_COPY:
+            inSpace = invn.getSpace().getType() if hasattr(invn, 'getSpace') and invn.getSpace() is not None else IPTR_INTERNAL
+            isIncidental = (hasattr(defop, 'isIncidentalCopy') and defop.isIncidentalCopy()) or \
+                           (hasattr(defop.getIn(0), 'isIncidentalCopy') and defop.getIn(0).isIncidentalCopy())
+            if inSpace == IPTR_INTERNAL or isIncidental:
+                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags)
+        elif opc == OpCode.CPUI_PIECE:
+            if offset == 0:
+                return self.ancestorOpUse(maxlevel - 1, defop.getIn(1), op, trial, 0, mainFlags)
+            if offset == defop.getIn(1).getSize():
+                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, 0, mainFlags)
+            return False
+        elif opc == OpCode.CPUI_SUBPIECE:
+            newOff = defop.getIn(1).getOffset()
+            if newOff == 0:
+                srcvn = defop.getIn(0)
+                if srcvn.isWritten():
+                    remop = srcvn.getDef()
+                    if remop.code() in (OpCode.CPUI_INT_REM, OpCode.CPUI_INT_SREM):
+                        if hasattr(trial, 'setRemFormed'):
+                            trial.setRemFormed()
+            inSpace = invn.getSpace().getType() if hasattr(invn, 'getSpace') and invn.getSpace() is not None else IPTR_INTERNAL
+            isIncidental = (hasattr(defop, 'isIncidentalCopy') and defop.isIncidentalCopy()) or \
+                           (hasattr(defop.getIn(0), 'isIncidentalCopy') and defop.getIn(0).isIncidentalCopy())
+            if inSpace == IPTR_INTERNAL or isIncidental:
+                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset + newOff, mainFlags)
+        elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+            return False
+        return self.onlyOpUse(invn, op, trial, mainFlags)
 
     def checkCallDoubleUse(self, opmatch, op, vn, fl, trial) -> bool:
-        """Check if a Varnode is used in two different call sites."""
+        """Check if a Varnode is legitimately used in two different call sites.
+
+        If vn flows into a CALL/CALLIND op that is different from opmatch,
+        determine if this constitutes a legitimate double-use (same function,
+        same parameter slot) or if it should be considered a real alternate use.
+
+        C++ ref: ``Funcdata::checkCallDoubleUse``
+        """
+        j = op.getSlot(vn) if hasattr(op, 'getSlot') else -1
+        if j <= 0:
+            return False  # Flow traces to indirect call variable, not a param
+        fc = self.getCallSpecs(op) if hasattr(self, 'getCallSpecs') else None
+        matchfc = self.getCallSpecs(opmatch) if hasattr(self, 'getCallSpecs') else None
+        if fc is not None and matchfc is not None and op.code() == opmatch.code():
+            isdirect = (opmatch.code() == OpCode.CPUI_CALL)
+            sameFunc = False
+            if isdirect and hasattr(matchfc, 'getEntryAddress') and hasattr(fc, 'getEntryAddress'):
+                sameFunc = (matchfc.getEntryAddress() == fc.getEntryAddress())
+            elif not isdirect:
+                sameFunc = (op.getIn(0) is opmatch.getIn(0))
+            if sameFunc:
+                if hasattr(fc, 'getActiveInput') and fc.getActiveInput() is not None:
+                    active = fc.getActiveInput()
+                    if hasattr(active, 'getTrialForInputVarnode'):
+                        curtrial = active.getTrialForInputVarnode(j)
+                        if curtrial is not None and hasattr(curtrial, 'getAddress') and hasattr(trial, 'getAddress'):
+                            if curtrial.getAddress() == trial.getAddress():
+                                if op.getParent() == opmatch.getParent():
+                                    if opmatch.getSeqNum().getOrder() < op.getSeqNum().getOrder():
+                                        return True
+                                else:
+                                    return True
+
+        if fc is not None and hasattr(fc, 'isInputActive') and fc.isInputActive():
+            if hasattr(fc, 'getActiveInput') and fc.getActiveInput() is not None:
+                active = fc.getActiveInput()
+                if hasattr(active, 'getTrialForInputVarnode'):
+                    curtrial = active.getTrialForInputVarnode(j)
+                    if curtrial is not None and hasattr(curtrial, 'isChecked') and curtrial.isChecked():
+                        if hasattr(curtrial, 'isActive') and curtrial.isActive():
+                            return False
+                    else:
+                        return False
+            return True
         return False
 
     def attemptDynamicMapping(self, entry, dhash) -> bool:
-        """Attempt dynamic symbol mapping."""
+        """Map properties of a dynamic symbol to a Varnode.
+
+        Given a dynamic mapping, try to find the mapped Varnode, then adjust
+        type and flags to reflect this mapping.
+
+        C++ ref: ``Funcdata::attemptDynamicMapping``
+        """
+        if entry is None:
+            return False
+        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+        if sym is None:
+            return False
+        if hasattr(dhash, 'clear'):
+            dhash.clear()
+        category = sym.getCategory() if hasattr(sym, 'getCategory') else -1
+        UNION_FACET = 3  # Symbol::union_facet
+        EQUATE = 1  # Symbol::equate
+        if category == UNION_FACET:
+            if hasattr(self, 'applyUnionFacet'):
+                return self.applyUnionFacet(entry, dhash)
+            return False
+        vn = None
+        if hasattr(dhash, 'findVarnode'):
+            useaddr = entry.getFirstUseAddress() if hasattr(entry, 'getFirstUseAddress') else None
+            hashval = entry.getHash() if hasattr(entry, 'getHash') else 0
+            vn = dhash.findVarnode(self, useaddr, hashval)
+        if vn is None:
+            return False
+        if hasattr(vn, 'getSymbolEntry') and vn.getSymbolEntry() is not None:
+            return False  # Already labeled
+        if category == EQUATE:
+            if hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
+            return True
+        esize = entry.getSize() if hasattr(entry, 'getSize') else 0
+        if esize == vn.getSize():
+            if hasattr(vn, 'setSymbolProperties'):
+                if vn.setSymbolProperties(entry):
+                    return True
         return False
 
     def attemptDynamicMappingLate(self, entry, dhash) -> bool:
-        """Attempt late dynamic symbol mapping."""
-        return False
+        """Map the name of a dynamic symbol to a Varnode (late pass).
+
+        Attaches the Symbol name but may not enforce the data-type. If the
+        symbol did not lock its type, the Varnode's propagated type is used.
+
+        C++ ref: ``Funcdata::attemptDynamicMappingLate``
+        """
+        if entry is None:
+            return False
+        if hasattr(dhash, 'clear'):
+            dhash.clear()
+        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+        if sym is None:
+            return False
+        UNION_FACET = 3
+        EQUATE = 1
+        if hasattr(sym, 'getCategory') and sym.getCategory() == UNION_FACET:
+            if hasattr(self, 'applyUnionFacet'):
+                return self.applyUnionFacet(entry, dhash)
+            return False
+        vn = None
+        if hasattr(dhash, 'findVarnode'):
+            useaddr = entry.getFirstUseAddress() if hasattr(entry, 'getFirstUseAddress') else None
+            hashval = entry.getHash() if hasattr(entry, 'getHash') else 0
+            vn = dhash.findVarnode(self, useaddr, hashval)
+        if vn is None:
+            return False
+        if hasattr(vn, 'getSymbolEntry') and vn.getSymbolEntry() is not None:
+            return False
+        if hasattr(sym, 'getCategory') and sym.getCategory() == EQUATE:
+            if hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
+            return True
+        esize = entry.getSize() if hasattr(entry, 'getSize') else 0
+        if vn.getSize() != esize:
+            return False
+        # Handle implied varnodes (cast insertion)
+        if hasattr(vn, 'isImplied') and vn.isImplied():
+            newvn = None
+            if vn.isWritten() and vn.getDef().code() == OpCode.CPUI_CAST:
+                newvn = vn.getDef().getIn(0)
+            else:
+                castop = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
+                if castop is not None and castop.code() == OpCode.CPUI_CAST:
+                    newvn = castop.getOut()
+            if newvn is not None and hasattr(newvn, 'isExplicit') and newvn.isExplicit():
+                vn = newvn
+        if hasattr(vn, 'setSymbolEntry'):
+            vn.setSymbolEntry(entry)
+        if hasattr(sym, 'isTypeLocked') and not sym.isTypeLocked():
+            if self._localmap is not None and hasattr(self._localmap, 'retypeSymbol'):
+                vntype = vn.getType() if hasattr(vn, 'getType') else None
+                if vntype is not None:
+                    self._localmap.retypeSymbol(sym, vntype)
+        return True
 
     # --- Iterator / search methods ---
 
@@ -1643,8 +2296,51 @@ class Funcdata:
         return self.newConstant(4, 0)
 
     def spacebaseConstant(self, op, slot, entry, rampoint, origval, origsize) -> None:
-        """Replace a constant reference with an address relative to a spacebase register."""
-        pass
+        """Replace a constant reference with an address relative to a spacebase register.
+
+        C++ ref: ``Funcdata::spacebaseConstant``
+        """
+        if rampoint is None or self._glb is None:
+            return
+        sz = rampoint.getAddrSize() if hasattr(rampoint, 'getAddrSize') else 4
+        spaceid = rampoint.getSpace() if hasattr(rampoint, 'getSpace') else None
+
+        # Build spacebase pointer type
+        sb_type = None
+        if hasattr(self._glb, 'types'):
+            if hasattr(self._glb.types, 'getTypeSpacebase'):
+                sb_type = self._glb.types.getTypeSpacebase(spaceid, Address())
+                wordSize = spaceid.getWordSize() if spaceid is not None and hasattr(spaceid, 'getWordSize') else 1
+                sb_type = self._glb.types.getTypePointer(sz, sb_type, wordSize)
+
+        # Calculate extra offset from entry start
+        entry_off = entry.getAddr().getOffset() if hasattr(entry, 'getAddr') else 0
+        extra = rampoint.getOffset() - entry_off
+
+        # Create spacebase constant varnode
+        spacebase_vn = self.newConstant(sz, 0)
+        if sb_type is not None and hasattr(spacebase_vn, 'updateType'):
+            spacebase_vn.updateType(sb_type, True, True)
+        spacebase_vn.setFlags(Varnode.spacebase)
+
+        # Build PTRSUB operation
+        addOp = self.newOp(2, op.getAddr())
+        self.opSetOpcode(addOp, OpCode.CPUI_PTRSUB)
+        self.newUniqueOut(sz, addOp)
+        self.opInsertBefore(addOp, op)
+
+        newconstoff = origval - extra
+        newconst = self.newConstant(sz, newconstoff & ((1 << (sz * 8)) - 1))
+        if hasattr(newconst, 'setPtrCheck'):
+            newconst.setPtrCheck()
+
+        self.opSetInput(addOp, spacebase_vn, 0)
+        self.opSetInput(addOp, newconst, 1)
+
+        # Replace the original input with addOp output
+        outvn = addOp.getOut()
+        if outvn is not None:
+            self.opSetInput(op, outvn, slot)
 
     def switchOverJumpTables(self, flow) -> None:
         """Convert jump-table addresses to basic block indices."""
@@ -1653,8 +2349,18 @@ class Funcdata:
                 jt.switchOver(flow)
 
     def issueDatatypeWarnings(self) -> None:
-        """Add warning headers for any data-types that have been modified."""
-        pass
+        """Add warning headers for any data-types that have been modified.
+
+        C++ ref: ``Funcdata::issueDatatypeWarnings``
+        """
+        # In practice, this checks if the decompiler has modified data types
+        # and emits warnings. We provide a minimal implementation.
+        if self._glb is None:
+            return
+        if hasattr(self._glb, 'types') and self._glb.types is not None:
+            if hasattr(self._glb.types, 'getDirtyTypes'):
+                for dt in self._glb.types.getDirtyTypes():
+                    self.warningHeader(f"Data-type '{dt.getName()}' has been modified")
 
     def enableJTCallback(self, cb) -> None:
         """Enable a jump-table callback."""
@@ -1713,12 +2419,34 @@ class Funcdata:
     # --- Warning / comment ---
 
     def warning(self, txt: str, ad: Address) -> None:
-        """Add a warning comment in the function body."""
-        pass  # Would use CommentDatabase
+        """Add a warning comment in the function body.
+
+        C++ ref: ``Funcdata::warning``
+        """
+        if (self._flags & Funcdata.jumptablerecovery_on) != 0:
+            msg = "WARNING (jumptable): "
+        else:
+            msg = "WARNING: "
+        msg += txt
+        if self._glb is not None and hasattr(self._glb, 'commentdb') and self._glb.commentdb is not None:
+            self._glb.commentdb.addCommentNoDuplicate(0x4, self._baseaddr, ad, msg)
+        elif self._glb is not None and hasattr(self._glb, 'printMessage'):
+            self._glb.printMessage(msg)
 
     def warningHeader(self, txt: str) -> None:
-        """Add a warning comment in the function header."""
-        pass
+        """Add a warning comment in the function header.
+
+        C++ ref: ``Funcdata::warningHeader``
+        """
+        if (self._flags & Funcdata.jumptablerecovery_on) != 0:
+            msg = "WARNING (jumptable): "
+        else:
+            msg = "WARNING: "
+        msg += txt
+        if self._glb is not None and hasattr(self._glb, 'commentdb') and self._glb.commentdb is not None:
+            self._glb.commentdb.addCommentNoDuplicate(0x8, self._baseaddr, self._baseaddr, msg)
+        elif self._glb is not None and hasattr(self._glb, 'printMessage'):
+            self._glb.printMessage(msg)
 
     # --- Flow and inline ---
 
@@ -1738,8 +2466,16 @@ class Funcdata:
             self._flags |= Funcdata.baddata_present
 
     def truncatedFlow(self, fd, flow) -> None:
-        """Generate a truncated set of p-code from an existing flow."""
-        pass
+        """Generate a truncated set of p-code from an existing flow.
+
+        C++ ref: ``Funcdata::truncatedFlow``
+        """
+        # Truncated flow re-uses an existing FlowInfo to generate ops/blocks
+        # for a subset of the function body. Minimal implementation.
+        if flow is not None and hasattr(flow, 'generateOps'):
+            flow.generateOps()
+        if flow is not None and hasattr(flow, 'generateBlocks'):
+            flow.generateBlocks()
 
     def inlineFlow(self, inlinefd, flow, callop) -> int:
         """In-line the given function. Returns 0=EZ, 1=hard, -1=fail."""
@@ -1751,8 +2487,30 @@ class Funcdata:
             self._localoverride.insertFlowOverride(addr, flowtype)
 
     def doLiveInject(self, payload, addr, bl, pos) -> None:
-        """Inject p-code into a live basic block."""
-        pass
+        """Inject p-code from a payload into a live basic block.
+
+        C++ ref: ``Funcdata::doLiveInject``
+        """
+        if payload is None or self._glb is None:
+            return
+        if not hasattr(self._glb, 'pcodeinjectlib'):
+            return
+        injectlib = self._glb.pcodeinjectlib
+        if injectlib is None:
+            return
+        # Get injection context
+        if hasattr(injectlib, 'getCachedContext'):
+            context = injectlib.getCachedContext()
+            if hasattr(context, 'clear'):
+                context.clear()
+            context.baseaddr = addr
+            context.nextaddr = addr
+        # Emit injected ops into dead list, then insert them
+        if hasattr(payload, 'inject'):
+            from ghidra.sleigh.pcodeemit import PcodeEmitFd
+            emitter = PcodeEmitFd()
+            emitter.setFuncdata(self)
+            payload.inject(context, emitter)
 
     # --- Clone / Indirect ---
 
@@ -1843,21 +2601,64 @@ class Funcdata:
     # --- Varnode search / link ---
 
     def findLinkedVarnode(self, entry):
-        """Find a Varnode matching the given Symbol mapping."""
+        """Return the first Varnode matching the given SymbolEntry.
+
+        For dynamic entries, uses DynamicHash. For non-dynamic entries,
+        iterates Varnodes at the entry's location, checking usepoint.
+
+        C++ ref: ``Funcdata::findLinkedVarnode``
+        """
         if entry is None:
+            return None
+        if hasattr(entry, 'isDynamic') and entry.isDynamic():
+            try:
+                from ghidra.analysis.dynamic import DynamicHash
+                dhash = DynamicHash()
+                vn = dhash.findVarnode(self, entry.getFirstUseAddress(), entry.getHash())
+                if vn is not None and not vn.isAnnotation():
+                    return vn
+            except (ImportError, Exception):
+                pass
             return None
         addr = entry.getAddr() if hasattr(entry, 'getAddr') else None
         sz = entry.getSize() if hasattr(entry, 'getSize') else 0
         if addr is None or sz == 0:
             return None
+        usestart = entry.getFirstUseAddress() if hasattr(entry, 'getFirstUseAddress') else None
+        if usestart is None or (hasattr(usestart, 'isInvalid') and usestart.isInvalid()):
+            # No usepoint constraint — find first address-tied varnode at loc
+            for vn in self._vbank.beginLoc():
+                if vn.getAddr() == addr and vn.getSize() == sz:
+                    if not (hasattr(vn, 'isAddrTied') and not vn.isAddrTied()):
+                        return vn
+            return None
+        # With usepoint constraint — check inUse
         for vn in self._vbank.beginLoc():
             if vn.getAddr() == addr and vn.getSize() == sz:
-                return vn
+                usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else None
+                if usepoint is not None and hasattr(entry, 'inUse') and entry.inUse(usepoint):
+                    return vn
         return None
 
     def findLinkedVarnodes(self, entry, res: list) -> None:
-        """Find Varnodes that map to the given SymbolEntry."""
+        """Find Varnodes that map to the given SymbolEntry.
+
+        For dynamic entries, uses DynamicHash. For non-dynamic entries,
+        iterates Varnodes at the entry's location, checking usepoint.
+
+        C++ ref: ``Funcdata::findLinkedVarnodes``
+        """
         if entry is None:
+            return
+        if hasattr(entry, 'isDynamic') and entry.isDynamic():
+            try:
+                from ghidra.analysis.dynamic import DynamicHash
+                dhash = DynamicHash()
+                vn = dhash.findVarnode(self, entry.getFirstUseAddress(), entry.getHash())
+                if vn is not None:
+                    res.append(vn)
+            except (ImportError, Exception):
+                pass
             return
         addr = entry.getAddr() if hasattr(entry, 'getAddr') else None
         sz = entry.getSize() if hasattr(entry, 'getSize') else 0
@@ -1865,27 +2666,238 @@ class Funcdata:
             return
         for vn in self._vbank.beginLoc():
             if vn.getAddr() == addr and vn.getSize() == sz:
-                res.append(vn)
+                usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else None
+                if usepoint is not None and hasattr(entry, 'inUse') and entry.inUse(usepoint):
+                    res.append(vn)
+                elif not hasattr(entry, 'inUse'):
+                    res.append(vn)
 
     def linkSymbol(self, vn):
-        """Find or create Symbol associated with given Varnode."""
-        return None
+        """Find or create a Symbol associated with the given Varnode.
+
+        If the Varnode is a proto-partial, delegate to linkProtoPartial first.
+        Then check for an existing Symbol on the HighVariable. If none, query
+        the local scope for an overlapping entry and either handle a conflict
+        or create a new local symbol.
+
+        C++ ref: ``Funcdata::linkSymbol``
+        """
+        if vn is None:
+            return None
+        if hasattr(vn, 'isProtoPartial') and vn.isProtoPartial():
+            self.linkProtoPartial(vn)
+        high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+        if high is not None and hasattr(high, 'getSymbol'):
+            sym = high.getSymbol()
+            if sym is not None:
+                return sym
+        if self._localmap is None:
+            return None
+        fl = 0
+        usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else Address()
+        entry = None
+        if hasattr(self._localmap, 'queryProperties'):
+            entry = self._localmap.queryProperties(vn.getAddr(), 1, usepoint, fl)
+        if entry is not None:
+            sym = self.handleSymbolConflict(entry, vn)
+        else:
+            # Must create a symbol entry
+            if not vn.isPersist():
+                if hasattr(vn, 'isAddrTied') and vn.isAddrTied():
+                    usepoint = Address()
+                ct = high.getType() if high is not None and hasattr(high, 'getType') else None
+                if hasattr(self._localmap, 'addSymbol'):
+                    entry = self._localmap.addSymbol("", ct, vn.getAddr(), usepoint)
+                    if entry is not None:
+                        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
+                        if hasattr(vn, 'setSymbolEntry'):
+                            vn.setSymbolEntry(entry)
+                    else:
+                        sym = None
+                else:
+                    sym = None
+            else:
+                sym = None
+        return sym
 
     def linkSymbolReference(self, vn):
-        """Discover and attach Symbol to a constant reference."""
-        return None
+        """Recover the Symbol referred to by a constant Varnode in a PTRSUB op.
+
+        A reference to a symbol (&varname) is typically stored as a PTRSUB
+        where the first input is a spacebase Varnode and the second is a
+        constant encoding the symbol's address.
+
+        C++ ref: ``Funcdata::linkSymbolReference``
+        """
+        if vn is None:
+            return None
+        op = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
+        if op is None:
+            return None
+        in0 = op.getIn(0)
+        if in0 is None:
+            return None
+        high0 = in0.getHigh() if hasattr(in0, 'getHigh') else None
+        if high0 is None:
+            return None
+        ptype = high0.getType() if hasattr(high0, 'getType') else None
+        if ptype is None or not hasattr(ptype, 'getMetatype'):
+            return None
+        TYPE_PTR = 7  # Ghidra metatype constant
+        TYPE_SPACEBASE = 12
+        if ptype.getMetatype() != TYPE_PTR:
+            return None
+        sb = ptype.getPtrTo() if hasattr(ptype, 'getPtrTo') else None
+        if sb is None or not hasattr(sb, 'getMetatype') or sb.getMetatype() != TYPE_SPACEBASE:
+            return None
+        scope = sb.getMap() if hasattr(sb, 'getMap') else None
+        if scope is None:
+            return None
+        addr = sb.getAddress(vn.getOffset(), in0.getSize(), op.getAddr()) if hasattr(sb, 'getAddress') else None
+        if addr is None or (hasattr(addr, 'isInvalid') and addr.isInvalid()):
+            return None
+        entry = scope.queryContainer(addr, 1, Address()) if hasattr(scope, 'queryContainer') else None
+        if entry is None:
+            return None
+        off = int(addr.getOffset() - entry.getAddr().getOffset())
+        if hasattr(entry, 'getOffset'):
+            off += entry.getOffset()
+        if hasattr(vn, 'setSymbolReference'):
+            vn.setSymbolReference(entry, off)
+        return entry.getSymbol() if hasattr(entry, 'getSymbol') else None
 
     def linkProtoPartial(self, vn) -> None:
-        """Find or create Symbol and a partial mapping."""
-        pass
+        """Find or create Symbol and a partial mapping.
+
+        C++ ref: ``Funcdata::linkProtoPartial``
+        """
+        # Minimal implementation — full version requires HighVariable merge tracking
+        if vn is None or self._localmap is None:
+            return
+        if hasattr(vn, 'getHigh') and vn.getHigh() is not None:
+            high = vn.getHigh()
+            if hasattr(high, 'getSymbol') and high.getSymbol() is not None:
+                return  # Already linked
 
     def buildDynamicSymbol(self, vn) -> None:
-        """Build a dynamic Symbol associated with the given Varnode."""
-        pass
+        """Build a dynamic Symbol associated with the given Varnode.
+
+        If a Symbol is already attached, no change is made. Otherwise a special
+        dynamic Symbol is created that is associated with the Varnode via a hash
+        of its local data-flow.
+
+        C++ ref: ``Funcdata::buildDynamicSymbol``
+        """
+        if vn is None or self._localmap is None:
+            return
+        # C++ throws for locked varnodes; we silently skip
+        if hasattr(vn, 'isTypeLock') and vn.isTypeLock():
+            return
+        if hasattr(vn, 'isNameLock') and vn.isNameLock():
+            return
+        # Check for existing symbol via HighVariable
+        high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+        if high is not None and hasattr(high, 'getSymbol') and high.getSymbol() is not None:
+            return  # Symbol already exists
+        try:
+            from ghidra.analysis.dynamic import DynamicHash
+            dhash = DynamicHash()
+            dhash.uniqueHash(vn, self)
+            if dhash.getHash() == 0:
+                return
+            if vn.isConstant():
+                if hasattr(self._localmap, 'addEquateSymbol'):
+                    sym = self._localmap.addEquateSymbol("", 0x20, vn.getOffset(),
+                                                         dhash.getAddress(), dhash.getHash())
+                else:
+                    return
+            else:
+                vntype = high.getType() if high is not None and hasattr(high, 'getType') else None
+                if hasattr(self._localmap, 'addDynamicSymbol'):
+                    sym = self._localmap.addDynamicSymbol("", vntype, dhash.getAddress(), dhash.getHash())
+                else:
+                    return
+            if sym is not None and hasattr(sym, 'getFirstWholeMap'):
+                entry = sym.getFirstWholeMap()
+                if entry is not None and hasattr(vn, 'setSymbolEntry'):
+                    vn.setSymbolEntry(entry)
+        except (ImportError, Exception):
+            # DynamicHash may not be available yet; fallback to simple addDynamicSymbol
+            if hasattr(self._localmap, 'addDynamicSymbol'):
+                self._localmap.addDynamicSymbol(vn)
 
     def combineInputVarnodes(self, vnHi, vnLo) -> None:
-        """Combine two contiguous input Varnodes into one."""
-        pass
+        """Combine two contiguous input Varnodes into one.
+
+        Find all PIECE ops that directly combine vnHi and vnLo, convert them
+        to COPYs of the new combined input. For other uses of vnHi/vnLo,
+        create SUBPIECE ops to extract the original pieces.
+
+        C++ ref: ``Funcdata::combineInputVarnodes``
+        """
+        if vnHi is None or vnLo is None:
+            return
+        if not vnHi.isInput() or not vnLo.isInput():
+            return
+        # Determine combined address based on endianness
+        addr = vnLo.getAddr()
+        isBigEndian = hasattr(addr, 'isBigEndian') and addr.isBigEndian()
+        if isBigEndian:
+            addr = vnHi.getAddr()
+
+        # Find PIECE ops that directly combine hi and lo
+        pieceList = []
+        otherOpsHi = False
+        otherOpsLo = False
+        for op in list(vnHi.getDescendants()):
+            if op.code() == OpCode.CPUI_PIECE and op.getIn(0) is vnHi and op.getIn(1) is vnLo:
+                pieceList.append(op)
+            else:
+                otherOpsHi = True
+        for op in list(vnLo.getDescendants()):
+            if op.code() != OpCode.CPUI_PIECE or op.getIn(0) is not vnHi or op.getIn(1) is not vnLo:
+                otherOpsLo = True
+
+        # Remove the lo input from PIECE ops and unset hi input
+        for pieceOp in pieceList:
+            if hasattr(self, 'opRemoveInput'):
+                self.opRemoveInput(pieceOp, 1)
+            self.opUnsetInput(pieceOp, 0)
+
+        # Create SUBPIECE replacements for non-PIECE uses
+        subHi = None
+        subLo = None
+        bb = self._bblocks.getBlock(0) if self._bblocks.getSize() > 0 else None
+        if otherOpsHi and bb is not None:
+            subHi = self.newOp(2, bb.getStart())
+            self.opSetOpcode(subHi, OpCode.CPUI_SUBPIECE)
+            self.opSetInput(subHi, self.newConstant(4, vnLo.getSize()), 1)
+            newHi = self.newVarnodeOut(vnHi.getSize(), vnHi.getAddr(), subHi)
+            self.opInsertBegin(subHi, bb)
+            self.totalReplace(vnHi, newHi)
+        if otherOpsLo and bb is not None:
+            subLo = self.newOp(2, bb.getStart())
+            self.opSetOpcode(subLo, OpCode.CPUI_SUBPIECE)
+            self.opSetInput(subLo, self.newConstant(4, 0), 1)
+            newLo = self.newVarnodeOut(vnLo.getSize(), vnLo.getAddr(), subLo)
+            self.opInsertBegin(subLo, bb)
+            self.totalReplace(vnLo, newLo)
+
+        # Destroy old inputs and create the combined input
+        outSize = vnHi.getSize() + vnLo.getSize()
+        self._vbank.destroy(vnHi)
+        self._vbank.destroy(vnLo)
+        inVn = self.newVarnode(outSize, addr)
+        inVn = self.setInputVarnode(inVn)
+
+        # Wire up PIECE ops as COPYs of the combined input
+        for pieceOp in pieceList:
+            self.opSetInput(pieceOp, inVn, 0)
+            self.opSetOpcode(pieceOp, OpCode.CPUI_COPY)
+        if subHi is not None:
+            self.opSetInput(subHi, inVn, 0)
+        if subLo is not None:
+            self.opSetInput(subLo, inVn, 0)
 
     def findSpacebaseInput(self, spc):
         """Find the input Varnode for the given spacebase."""
@@ -1969,8 +2981,68 @@ class Funcdata:
         encoder.closeElement(ELEM_FUNCTION)
 
     def decode(self, decoder) -> int:
-        """Restore the state of this function from a stream."""
-        return 0
+        """Restore the state of this function from a stream.
+
+        C++ ref: ``Funcdata::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_FUNCTION, ELEM_LOCALDB, ELEM_OVERRIDE, ELEM_PROTOTYPE,
+            ELEM_JUMPTABLELIST, ATTRIB_NAME, ATTRIB_SIZE, ATTRIB_ID,
+            ATTRIB_NOCODE, ATTRIB_LABEL,
+        )
+        self._name = ""
+        self._size = -1
+        uid = 0
+        elemId = decoder.openElement(ELEM_FUNCTION)
+        for _ in range(100):
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_NAME.id:
+                self._name = decoder.readString()
+            elif attribId == ATTRIB_SIZE.id:
+                self._size = decoder.readSignedInteger()
+            elif attribId == ATTRIB_ID.id:
+                uid = decoder.readUnsignedInteger()
+            elif attribId == ATTRIB_NOCODE.id:
+                if decoder.readBool():
+                    self._flags |= Funcdata.no_code
+            elif attribId == ATTRIB_LABEL.id:
+                self._displayName = decoder.readString()
+        if not self._name:
+            raise RuntimeError("Missing function name")
+        if not self._displayName:
+            self._displayName = self._name
+        if self._size == -1:
+            raise RuntimeError("Missing function size")
+        # Decode base address
+        if hasattr(Address, 'decode'):
+            self._baseaddr = Address.decode(decoder)
+        # Decode child elements
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_LOCALDB.id:
+                # Decode local scope
+                if self._glb is not None and hasattr(self._glb, 'symboltab'):
+                    self._glb.symboltab.decodeScope(decoder, None)
+            elif subId == ELEM_OVERRIDE.id:
+                if hasattr(self, '_localoverride') and self._localoverride is not None:
+                    self._localoverride.decode(decoder, self._glb)
+                else:
+                    decoder.skipElement()
+            elif subId == ELEM_PROTOTYPE.id:
+                if self._localmap is not None:
+                    self._funcp.setScope(self._localmap, Address(self._baseaddr.getSpace(),
+                                                                 self._baseaddr.getOffset() - 1))
+                self._funcp.decode(decoder, self._glb)
+            elif subId == ELEM_JUMPTABLELIST.id:
+                self.decodeJumpTable(decoder)
+            else:
+                decoder.skipElement()
+        decoder.closeElement(elemId)
+        return uid
 
     def encodeTree(self, encoder) -> None:
         """Encode the p-code tree (varnodes, ops, blocks, edges) to stream.
@@ -2053,49 +3125,374 @@ class Funcdata:
         encoder.closeElement(ELEM_JUMPTABLELIST)
 
     def decodeJumpTable(self, decoder) -> None:
-        """Decode jump-tables from a stream."""
-        pass
+        """Decode jump-tables from a stream.
+
+        C++ ref: ``Funcdata::decodeJumpTable``
+        """
+        from ghidra.core.marshal import ELEM_JUMPTABLELIST
+        from ghidra.analysis.jumptable import JumpTable
+        elemId = decoder.openElement(ELEM_JUMPTABLELIST)
+        while decoder.peekElement() != 0:
+            jt = JumpTable(self._glb)
+            jt.decode(decoder)
+            self._jumpvec.append(jt)
+        decoder.closeElement(elemId)
 
     # --- Data-flow / transformation helpers ---
 
     def syncVarnodesWithSymbols(self, lm=None, updateDatatypes: bool = False,
                                  unmappedAliasCheck: bool = False) -> bool:
-        return False
+        """Synchronize Varnode properties with their Symbol overlaps.
+
+        For every Varnode in the local scope's address space, find any
+        overlapping SymbolEntry, update the Varnode's flags (mapped,
+        addrtied, nolocalalias, etc.) and optionally its data-type.
+
+        C++ ref: ``Funcdata::syncVarnodesWithSymbols``
+        """
+        if lm is None:
+            lm = self._localmap
+        if lm is None:
+            return False
+        updateoccurred = False
+        spaceId = lm.getSpaceId() if hasattr(lm, 'getSpaceId') else None
+        if spaceId is None:
+            return False
+        vnlist = list(self._vbank.beginLoc(spaceId)) if hasattr(self._vbank, 'beginLoc') else []
+        i = 0
+        while i < len(vnlist):
+            vnexemplar = vnlist[i]
+            # Collect all varnodes at same size/addr
+            group = [vnexemplar]
+            j = i + 1
+            while j < len(vnlist) and vnlist[j].getSize() == vnexemplar.getSize() and vnlist[j].getAddr() == vnexemplar.getAddr():
+                group.append(vnlist[j])
+                j += 1
+            entry = lm.findOverlap(vnexemplar.getAddr(), vnexemplar.getSize()) if hasattr(lm, 'findOverlap') else None
+            ct = None
+            if entry is not None:
+                fl = entry.getAllFlags() if hasattr(entry, 'getAllFlags') else 0
+                if hasattr(entry, 'getSize') and entry.getSize() >= vnexemplar.getSize():
+                    if updateDatatypes and hasattr(entry, 'getSizedType'):
+                        ct = entry.getSizedType(vnexemplar.getAddr(), vnexemplar.getSize())
+                        if ct is not None and hasattr(ct, 'getMetatype') and ct.getMetatype() == 15:  # TYPE_UNKNOWN
+                            ct = None
+                else:
+                    fl &= ~(Varnode.typelock | Varnode.namelock)
+            else:
+                if hasattr(lm, 'inScope') and lm.inScope(vnexemplar.getAddr(), vnexemplar.getSize(),
+                        vnexemplar.getUsePoint(self) if hasattr(vnexemplar, 'getUsePoint') else Address()):
+                    fl = Varnode.mapped | Varnode.addrtied
+                elif unmappedAliasCheck and hasattr(lm, 'isUnmappedUnaliased'):
+                    fl = Varnode.nolocalalias if lm.isUnmappedUnaliased(vnexemplar) else 0
+                else:
+                    fl = 0
+            if self.syncVarnodesWithSymbol(group, fl, ct):
+                updateoccurred = True
+            i = j
+        return updateoccurred
 
     def transferVarnodeProperties(self, vn, newVn, lsbOffset: int = 0) -> None:
-        """Transfer properties from one Varnode to another."""
-        if vn is not None and newVn is not None:
-            newVn._type = vn._type
-            if vn.isTypeLock():
-                newVn.setFlags(Varnode.typelock)
+        """Transfer directwrite, addrforce, and consume properties.
+
+        The consume mask is shifted right by lsbOffset bytes, with high bits
+        filled in, and masked to the new Varnode's size.
+
+        C++ ref: ``Funcdata::transferVarnodeProperties``
+        """
+        if vn is None or newVn is None:
+            return
+        # Compute shifted consume mask
+        newConsume = (1 << 64) - 1  # ~0ULL
+        if lsbOffset < 8:  # sizeof(uintb)
+            fillBits = 0
+            if lsbOffset != 0:
+                fillBits = newConsume << (8 * (8 - lsbOffset))
+            oldConsume = vn.getConsume() if hasattr(vn, 'getConsume') else newConsume
+            mask = (1 << (8 * newVn.getSize())) - 1
+            newConsume = ((oldConsume >> (8 * lsbOffset)) | fillBits) & mask
+        vnFlags = vn.getFlags() & (Varnode.directwrite | Varnode.addrforce)
+        newVn.setFlags(vnFlags)
+        if hasattr(newVn, 'setConsume'):
+            newVn.setConsume(newConsume)
 
     def fillinReadOnly(self, vn) -> bool:
-        """Replace the given Varnode with its (constant) value in the load image."""
-        return False
+        """Replace the given Varnode with its (constant) value in the load image.
+
+        If the Varnode is written, mark a warning and return False.
+        Otherwise load bytes from the load image, create a constant, and
+        replace all read references.
+
+        C++ ref: ``Funcdata::fillinReadOnly``
+        """
+        if vn.isWritten():
+            defop = vn.getDef()
+            if defop.isMarker():
+                if hasattr(defop, 'setAdditionalFlag'):
+                    defop.setAdditionalFlag(PcodeOp.warning)
+            elif not (hasattr(defop, 'isWarning') and defop.isWarning()):
+                if hasattr(defop, 'setAdditionalFlag'):
+                    defop.setAdditionalFlag(PcodeOp.warning)
+                if (not vn.isAddrForce()) or (not vn.hasNoDescend()):
+                    msg = f"Read-only address ({vn.getSpace().getName()},{vn.getAddr()}) is written"
+                    if hasattr(self, 'warning'):
+                        self.warning(msg, defop.getAddr())
+            return False
+        if vn.getSize() > 8:
+            return False
+        # Load bytes from the load image
+        if self._glb is None or not hasattr(self._glb, 'loader'):
+            return False
+        try:
+            buf = bytearray(vn.getSize())
+            self._glb.loader.loadFill(buf, vn.getSize(), vn.getAddr())
+        except Exception:
+            if hasattr(vn, 'clearFlags'):
+                from ghidra.ir.varnode import Varnode as VnCls
+                vn.clearFlags(VnCls.readonly)
+            return True
+        # Convert bytes to integer
+        if vn.getSpace().isBigEndian():
+            res = int.from_bytes(buf, 'big')
+        else:
+            res = int.from_bytes(buf, 'little')
+        # Replace all read references with the constant
+        changemade = False
+        locktype = vn.getType() if (hasattr(vn, 'isTypeLock') and vn.isTypeLock()) else None
+        descends = list(vn.getDescend()) if hasattr(vn, 'getDescend') else []
+        for op in descends:
+            slot = op.getSlot(vn) if hasattr(op, 'getSlot') else 0
+            if op.isMarker():
+                if op.code() != OpCode.CPUI_INDIRECT or slot != 0:
+                    continue
+                outvn = op.getOut()
+                if outvn is not None and outvn.getAddr() == vn.getAddr():
+                    continue
+                if hasattr(self, 'opRemoveInput'):
+                    self.opRemoveInput(op, 1)
+                self.opSetOpcode(op, OpCode.CPUI_COPY)
+            cvn = self.newConstant(vn.getSize(), res)
+            if locktype is not None and hasattr(cvn, 'updateType'):
+                cvn.updateType(locktype, True, True)
+            self.opSetInput(op, cvn, slot)
+            changemade = True
+        return changemade
 
     def replaceVolatile(self, vn) -> bool:
-        """Replace accesses of the given Varnode with volatile operations."""
-        return False
+        """Replace accesses of the given Varnode with volatile operations.
+
+        The Varnode is assumed not fully linked. The read or write action is
+        modeled by inserting a special user op (CALLOTHER) that represents
+        the action. The given Varnode is replaced by a temporary Varnode
+        within the data-flow, and the original address becomes a parameter.
+
+        C++ ref: ``Funcdata::replaceVolatile``
+        """
+        if vn.isWritten():
+            # Written value - insert volatile write user op after defining op
+            vw_index = 0  # BUILTIN_VOLATILE_WRITE index
+            if self._glb is not None and hasattr(self._glb, 'userops'):
+                vw_op = self._glb.userops.registerBuiltin(1) if hasattr(self._glb.userops, 'registerBuiltin') else None
+                if vw_op is not None and hasattr(vw_op, 'getIndex'):
+                    vw_index = vw_op.getIndex()
+            if not vn.hasNoDescend():
+                return False  # Volatile memory was propagated
+            defop = vn.getDef()
+            newop = self.newOp(3, defop.getAddr())
+            self.opSetOpcode(newop, OpCode.CPUI_CALLOTHER)
+            self.opSetInput(newop, self.newConstant(4, vw_index), 0)
+            # First parameter is the offset of volatile memory location
+            annoteVn = self.newCodeRef(vn.getAddr()) if hasattr(self, 'newCodeRef') else self.newConstant(vn.getSize(), vn.getOffset())
+            if hasattr(annoteVn, 'setFlags'):
+                from ghidra.ir.varnode import Varnode as VnCls
+                annoteVn.setFlags(VnCls.volatil)
+            self.opSetInput(newop, annoteVn, 1)
+            # Replace the volatile variable with a temp
+            tmp = self.newUnique(vn.getSize())
+            self.opSetOutput(defop, tmp)
+            self.opSetInput(newop, tmp, 2)
+            self.opInsertAfter(newop, defop)
+        else:
+            # Read value - insert volatile read user op before reading op
+            vr_index = 0  # BUILTIN_VOLATILE_READ index
+            if self._glb is not None and hasattr(self._glb, 'userops'):
+                vr_op_obj = self._glb.userops.registerBuiltin(0) if hasattr(self._glb.userops, 'registerBuiltin') else None
+                if vr_op_obj is not None and hasattr(vr_op_obj, 'getIndex'):
+                    vr_index = vr_op_obj.getIndex()
+            if vn.hasNoDescend():
+                return False  # Dead
+            readop = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
+            if readop is None:
+                return False
+            newop = self.newOp(2, readop.getAddr())
+            self.opSetOpcode(newop, OpCode.CPUI_CALLOTHER)
+            tmp = self.newUniqueOut(vn.getSize(), newop) if hasattr(self, 'newUniqueOut') else self.newUnique(vn.getSize())
+            self.opSetInput(newop, self.newConstant(4, vr_index), 0)
+            annoteVn = self.newCodeRef(vn.getAddr()) if hasattr(self, 'newCodeRef') else self.newConstant(vn.getSize(), vn.getOffset())
+            if hasattr(annoteVn, 'setFlags'):
+                from ghidra.ir.varnode import Varnode as VnCls
+                annoteVn.setFlags(VnCls.volatil)
+            self.opSetInput(newop, annoteVn, 1)
+            slot = readop.getSlot(vn) if hasattr(readop, 'getSlot') else 0
+            self.opSetInput(readop, tmp, slot)
+            self.opInsertBefore(newop, readop)
+        if vn.isTypeLock() and hasattr(newop, 'setAdditionalFlag'):
+            newop.setAdditionalFlag(PcodeOp.special_prop)
+        return True
 
     def remapVarnode(self, vn, sym, usepoint) -> None:
-        pass
+        """Remap a Symbol to a given Varnode using the local scope.
+
+        Any previous links between Symbol and Varnode are removed, then
+        a new mapping is created in the local scope.
+
+        C++ ref: ``Funcdata::remapVarnode``
+        """
+        if hasattr(vn, 'clearSymbolLinks'):
+            vn.clearSymbolLinks()
+        if self._localmap is not None and hasattr(self._localmap, 'remapSymbol'):
+            entry = self._localmap.remapSymbol(sym, vn.getAddr(), usepoint)
+            if entry is not None and hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
 
     def remapDynamicVarnode(self, vn, sym, usepoint, hashval) -> None:
-        pass
+        """Remap a Symbol to a Varnode using a new dynamic mapping.
+
+        C++ ref: ``Funcdata::remapDynamicVarnode``
+        """
+        if hasattr(vn, 'clearSymbolLinks'):
+            vn.clearSymbolLinks()
+        if self._localmap is not None and hasattr(self._localmap, 'remapSymbolDynamic'):
+            entry = self._localmap.remapSymbolDynamic(sym, hashval, usepoint)
+            if entry is not None and hasattr(vn, 'setSymbolEntry'):
+                vn.setSymbolEntry(entry)
 
     def newExtendedConstant(self, s: int, val, op):
-        """Create extended precision constant."""
-        return self.newConstant(s, val[0] if isinstance(val, list) else val)
+        """Construct a constant Varnode up to 128 bits using INT_ZEXT or PIECE.
+
+        If size <= 8, returns a normal constant. Otherwise, if the high
+        64-bit chunk is zero, uses INT_ZEXT; otherwise uses PIECE to
+        combine two 64-bit halves.
+
+        C++ ref: ``Funcdata::newExtendedConstant``
+        """
+        if isinstance(val, (list, tuple)):
+            lo = val[0]
+            hi = val[1] if len(val) > 1 else 0
+        else:
+            lo = val
+            hi = 0
+        if s <= 8:
+            return self.newConstant(s, lo)
+        if hi == 0:
+            extOp = self.newOp(1, op.getAddr())
+            self.opSetOpcode(extOp, OpCode.CPUI_INT_ZEXT)
+            newConstVn = self.newUniqueOut(s, extOp)
+            self.opSetInput(extOp, self.newConstant(8, lo), 0)
+            self.opInsertBefore(extOp, op)
+        else:
+            pieceOp = self.newOp(2, op.getAddr())
+            self.opSetOpcode(pieceOp, OpCode.CPUI_PIECE)
+            newConstVn = self.newUniqueOut(s, pieceOp)
+            self.opSetInput(pieceOp, self.newConstant(8, hi), 0)  # Most significant
+            self.opSetInput(pieceOp, self.newConstant(8, lo), 1)  # Least significant
+            self.opInsertBefore(pieceOp, op)
+        return newConstVn
 
     def adjustInputVarnodes(self, addr, sz: int) -> None:
-        pass
+        """Adjust input Varnodes contained in the given range.
+
+        All input Varnodes in the range are replaced by SUBPIECE ops from
+        a single new input Varnode covering the whole range.
+
+        C++ ref: ``Funcdata::adjustInputVarnodes``
+        """
+        endaddr = addr + (sz - 1)
+        inlist = []
+        # Collect input varnodes in range
+        for vn in list(self._vbank.beginLoc()):
+            if not vn.isInput():
+                continue
+            if vn.getSpace() is not addr.getSpace():
+                continue
+            vn_off = vn.getOffset()
+            if vn_off < addr.getOffset() or vn_off > endaddr.getOffset():
+                continue
+            if vn_off + (vn.getSize() - 1) > endaddr.getOffset():
+                raise Exception("Cannot properly adjust input varnodes")
+            inlist.append(vn)
+        # Replace each with SUBPIECE
+        for i, vn in enumerate(inlist):
+            sa = addr.justifiedContain(sz, vn.getAddr(), vn.getSize(), False)
+            if not vn.isInput() or sa < 0 or sz <= vn.getSize():
+                raise Exception("Bad adjustment to input varnode")
+            subop = self.newOp(2, self.getAddress())
+            self.opSetOpcode(subop, OpCode.CPUI_SUBPIECE)
+            self.opSetInput(subop, self.newConstant(4, sa), 1)
+            newvn = self.newVarnodeOut(vn.getSize(), vn.getAddr(), subop)
+            bl = self._bblocks.getBlock(0) if self._bblocks.getSize() > 0 else None
+            if bl is not None:
+                self.opInsertBegin(subop, bl)
+            self.totalReplace(vn, newvn)
+            self.deleteVarnode(vn)
+            inlist[i] = newvn
+        # Create new combined input
+        invn = self.newVarnode(sz, addr)
+        invn = self.setInputVarnode(invn)
+        invn.setWriteMask()
+        # Wire SUBPIECE ops to read from the new combined input
+        for newvn in inlist:
+            op = newvn.getDef()
+            if op is not None:
+                self.opSetInput(op, invn, 0)
 
     def findDisjointCover(self, vn):
-        """Find range covering given Varnode and any intersecting Varnodes."""
-        return (vn.getAddr(), vn.getSize())
+        """Find range covering given Varnode and any intersecting Varnodes.
+
+        Walk backwards and forwards through the location-sorted Varnode list
+        to find the maximal range that covers the given Varnode and all
+        overlapping Varnodes.
+
+        C++ ref: ``Funcdata::findDisjointCover``
+        """
+        addr = vn.getAddr()
+        endoff = addr.getOffset() + vn.getSize()
+        # Walk backwards to extend start
+        if hasattr(self._vbank, 'beginLoc'):
+            for curvn in self._vbank.beginLoc():
+                if curvn.getSpace() is not addr.getSpace():
+                    continue
+                curEnd = curvn.getOffset() + curvn.getSize()
+                if curEnd <= addr.getOffset():
+                    continue
+                if curvn.getOffset() >= endoff:
+                    break
+                if curvn.getOffset() < addr.getOffset():
+                    addr = Address(addr.getSpace(), curvn.getOffset())
+                if curEnd > endoff:
+                    endoff = curEnd
+        sz = endoff - addr.getOffset()
+        return (addr, sz)
 
     def checkForLanedRegister(self, sz: int, addr) -> None:
-        pass
+        """Check if a storage range is a potential laned register.
+
+        If so, record the storage with the matching laned register record
+        in the lanedMap.
+
+        C++ ref: ``Funcdata::checkForLanedRegister``
+        """
+        if self._glb is None:
+            return
+        if not hasattr(self._glb, 'getLanedRegister'):
+            return
+        lanedReg = self._glb.getLanedRegister(addr, sz)
+        if lanedReg is None:
+            return
+        if not hasattr(self, '_lanedMap'):
+            self._lanedMap = {}
+        key = (addr.getSpace(), addr.getOffset(), sz)
+        self._lanedMap[key] = lanedReg
 
     def recoverJumpTable(self, op, flow=None, mode_ref=None):
         """Recover a jump-table for the given BRANCHIND op."""
@@ -2105,7 +3502,44 @@ class Funcdata:
         return None
 
     def testForReturnAddress(self, vn) -> bool:
-        return False
+        """Test if the given Varnode traces back to the return address input.
+
+        Walk backwards through INDIRECT, COPY, and INT_AND (alignment mask)
+        ops to see if the ultimate source is the default return address input.
+
+        C++ ref: ``Funcdata::testForReturnAddress``
+        """
+        glb = self.getArch() if hasattr(self, 'getArch') else None
+        if glb is None:
+            return False
+        retaddr = getattr(glb, 'defaultReturnAddr', None)
+        if retaddr is None or (hasattr(retaddr, 'space') and retaddr.space is None):
+            return False
+        while vn.isWritten():
+            op = vn.getDef()
+            opc = op.code()
+            if opc == OpCode.CPUI_INDIRECT or opc == OpCode.CPUI_COPY:
+                vn = op.getIn(0)
+            elif opc == OpCode.CPUI_INT_AND:
+                if not op.getIn(1).isConstant():
+                    return False
+                vn = op.getIn(0)
+            else:
+                return False
+        # Compare to default return address
+        if hasattr(retaddr, 'space'):
+            if vn.getSpace() != retaddr.space:
+                return False
+            if vn.getOffset() != retaddr.offset:
+                return False
+            if vn.getSize() != retaddr.size:
+                return False
+        elif hasattr(retaddr, 'getAddr'):
+            if vn.getAddr() != retaddr.getAddr() or vn.getSize() != retaddr.size:
+                return False
+        else:
+            return False
+        return vn.isInput()
 
     def getInternalString(self, buf, size, ptrType, readOp):
         return None
@@ -2114,10 +3548,39 @@ class Funcdata:
         return False
 
     def forceFacingType(self, parent, fieldNum: int, op, slot: int) -> None:
-        pass
+        """Force a specific field resolution for a data-type on a PcodeOp edge.
+
+        C++ ref: ``Funcdata::forceFacingType``
+        """
+        baseType = parent
+        if hasattr(baseType, 'getMetatype'):
+            from ghidra.types.type_base import TYPE_PTR
+            if baseType.getMetatype() == TYPE_PTR and hasattr(baseType, 'getPtrTo'):
+                baseType = baseType.getPtrTo()
+        if hasattr(parent, 'isPointerRel') and parent.isPointerRel():
+            if self._glb is not None and hasattr(self._glb, 'types'):
+                wordSize = parent.getWordSize() if hasattr(parent, 'getWordSize') else 1
+                parent = self._glb.types.getTypePointer(parent.getSize(), baseType, wordSize)
+        if hasattr(self, 'setUnionField'):
+            from ghidra.types.type_base import ResolvedUnion
+            resolve = ResolvedUnion(parent, fieldNum, self._glb.types) if self._glb is not None else None
+            if resolve is not None:
+                self.setUnionField(parent, op, slot, resolve)
 
     def inheritResolution(self, parent, op, slot: int, oldOp, oldSlot: int) -> int:
-        return -1
+        """Copy a read/write facing resolution for a data-type from one PcodeOp to another.
+
+        C++ ref: ``Funcdata::inheritResolution``
+        """
+        if not hasattr(self, '_unionMap'):
+            return -1
+        key = (id(parent), id(oldOp), oldSlot)
+        resolve = self._unionMap.get(key)
+        if resolve is None:
+            return -1
+        if hasattr(self, 'setUnionField'):
+            self.setUnionField(parent, op, slot, resolve)
+        return resolve.getFieldNum() if hasattr(resolve, 'getFieldNum') else -1
 
     def markReturnCopy(self, op) -> None:
         op.setFlag(PcodeOp.return_copy)

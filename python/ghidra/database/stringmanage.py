@@ -97,12 +97,67 @@ class StringManager:
         return self.maximumChars
 
     def encode(self, encoder) -> None:
-        """Encode all cached strings to a stream."""
-        pass
+        """Encode all cached strings as a <stringmanage> element.
+
+        C++ ref: ``StringManager::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_STRINGMANAGE, ELEM_STRING, ELEM_BYTES,
+            ATTRIB_TRUNC, ATTRIB_CONTENT,
+        )
+        encoder.openElement(ELEM_STRINGMANAGE)
+        for addr_hash, sdata in self._stringMap.items():
+            encoder.openElement(ELEM_STRING)
+            # addr_hash is stored as key; in full impl, encode Address
+            encoder.openElement(ELEM_BYTES)
+            encoder.writeBool(ATTRIB_TRUNC, sdata.isTruncated)
+            hex_str = ''.join(f'{b:02x}' for b in sdata.byteData)
+            encoder.writeString(ATTRIB_CONTENT, hex_str)
+            encoder.closeElement(ELEM_BYTES)
+            encoder.closeElement(ELEM_STRING)
+        encoder.closeElement(ELEM_STRINGMANAGE)
 
     def decode(self, decoder) -> None:
-        """Decode cached strings from a stream."""
-        pass
+        """Decode cached strings from a <stringmanage> element.
+
+        C++ ref: ``StringManager::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_STRINGMANAGE, ELEM_STRING, ELEM_BYTES,
+            ATTRIB_TRUNC, ATTRIB_CONTENT,
+        )
+        elemId = decoder.openElement(ELEM_STRINGMANAGE)
+        while True:
+            subId = decoder.peekElement()
+            if subId != ELEM_STRING.id:
+                break
+            decoder.openElement()
+            # In the full C++ impl, Address::decode is called here
+            # Skip address decoding for now; use a counter key
+            addr_key = len(self._stringMap)
+            sdata = StringData()
+            subId2 = decoder.openElement(ELEM_BYTES)
+            sdata.isTruncated = decoder.readBool(ATTRIB_TRUNC)
+            hex_content = decoder.readString(ATTRIB_CONTENT)
+            # Parse hex pairs
+            hex_content = hex_content.strip()
+            byte_list = []
+            i = 0
+            while i < len(hex_content):
+                c = hex_content[i]
+                if c in ' \t\n\r':
+                    i += 1
+                    continue
+                if i + 1 < len(hex_content):
+                    byte_list.append(int(hex_content[i:i+2], 16))
+                    i += 2
+                else:
+                    i += 1
+            sdata.byteData = bytes(byte_list)
+            decoder.closeElement(subId2)
+            self._stringMap[addr_key] = sdata
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     def testForString(self, addr: Address, charType: Datatype, buf: bytes, sz: int) -> bool:
         """Quick test if the given data could be a string."""

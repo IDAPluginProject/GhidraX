@@ -103,6 +103,22 @@ class SymbolEntry:
             return tp
         return None  # Simplified - full impl would do sub-type lookup
 
+    def encode(self, encoder) -> None:
+        """Encode this SymbolEntry to a stream.
+
+        C++ ref: ``SymbolEntry::encode``
+        """
+        if self.isPiece():
+            return
+        if self.addr.isInvalid():
+            from ghidra.core.marshal import ELEM_HASH, ATTRIB_VAL
+            encoder.openElement(ELEM_HASH)
+            encoder.writeUnsignedInteger(ATTRIB_VAL, self.hash)
+            encoder.closeElement(ELEM_HASH)
+        else:
+            self.addr.encode(encoder)
+        self.uselimit.encode(encoder)
+
     def decode(self, decoder) -> None:
         """Decode a SymbolEntry from a stream.
 
@@ -329,8 +345,64 @@ class Symbol:
     def setScope(self, sc) -> None:
         self.scope = sc
 
+    def encodeHeader(self, encoder) -> None:
+        """Encode the header attributes of this Symbol.
+
+        C++ ref: ``Symbol::encodeHeader``
+        """
+        from ghidra.core.marshal import (
+            ATTRIB_NAME, ATTRIB_ID, ATTRIB_NAMELOCK, ATTRIB_TYPELOCK,
+            ATTRIB_READONLY, ATTRIB_VOLATILE, ATTRIB_CAT, ATTRIB_INDEX,
+            ATTRIB_INDIRECTSTORAGE, ATTRIB_HIDDENRETPARM, ATTRIB_THISPTR,
+            ATTRIB_FORMAT,
+        )
+        from ghidra.core.marshal import AttributeId
+        ATTRIB_MERGE = AttributeId("merge", 200)
+
+        encoder.writeString(ATTRIB_NAME, self.name)
+        encoder.writeUnsignedInteger(ATTRIB_ID, self.getId())
+        if (self.flags & Varnode.namelock) != 0:
+            encoder.writeBool(ATTRIB_NAMELOCK, True)
+        if (self.flags & Varnode.typelock) != 0:
+            encoder.writeBool(ATTRIB_TYPELOCK, True)
+        if (self.flags & Varnode.readonly) != 0:
+            encoder.writeBool(ATTRIB_READONLY, True)
+        if (self.flags & Varnode.volatil) != 0:
+            encoder.writeBool(ATTRIB_VOLATILE, True)
+        if (self.flags & Varnode.indirectstorage) != 0:
+            encoder.writeBool(ATTRIB_INDIRECTSTORAGE, True)
+        if (self.flags & Varnode.hiddenretparm) != 0:
+            encoder.writeBool(ATTRIB_HIDDENRETPARM, True)
+        if (self.dispflags & Symbol.isolate) != 0:
+            encoder.writeBool(ATTRIB_MERGE, False)
+        if (self.dispflags & Symbol.is_this_ptr) != 0:
+            encoder.writeBool(ATTRIB_THISPTR, True)
+        fmt = self.getDisplayFormat()
+        if fmt != 0:
+            fmt_names = {1: "hex", 2: "dec", 3: "oct", 4: "bin", 5: "char"}
+            encoder.writeString(ATTRIB_FORMAT, fmt_names.get(fmt, "hex"))
+        encoder.writeSignedInteger(ATTRIB_CAT, self.category)
+        if self.category >= 0:
+            encoder.writeUnsignedInteger(ATTRIB_INDEX, self.catindex)
+
+    def encodeBody(self, encoder) -> None:
+        """Encode the data-type for this Symbol.
+
+        C++ ref: ``Symbol::encodeBody``
+        """
+        if self.type is not None and hasattr(self.type, 'encodeRef'):
+            self.type.encodeRef(encoder)
+
     def encode(self, encoder) -> None:
-        pass
+        """Encode this Symbol to a stream.
+
+        C++ ref: ``Symbol::encode``
+        """
+        from ghidra.core.marshal import ELEM_SYMBOL
+        encoder.openElement(ELEM_SYMBOL)
+        self.encodeHeader(encoder)
+        self.encodeBody(encoder)
+        encoder.closeElement(ELEM_SYMBOL)
 
     def decodeHeader(self, decoder) -> None:
         """Decode symbol header attributes from a stream.
@@ -737,8 +809,47 @@ class Scope(ABC):
     def addMapPoint(self, sym: Symbol, addr: Address, usepoint: Address) -> Optional[SymbolEntry]:
         return None
 
-    def addMapSym(self, decoder) -> Optional[SymbolEntry]:
-        return None
+    def addMapSym(self, decoder) -> Optional[Symbol]:
+        """Decode a ``<mapsym>`` element, create the Symbol and its SymbolEntry mappings.
+
+        C++ ref: ``Scope::addMapSym``
+        """
+        from ghidra.core.marshal import (
+            ELEM_MAPSYM, ELEM_SYMBOL, ELEM_EQUATESYMBOL, ELEM_FUNCTION,
+            ELEM_FUNCTIONSHELL, ELEM_LABELSYM, ELEM_EXTERNREFSYMBOL,
+            ELEM_FACETSYMBOL,
+        )
+        elemId = decoder.openElement(ELEM_MAPSYM)
+        subId = decoder.peekElement()
+        owner = self.owner if self.owner is not None else self
+        if subId == ELEM_SYMBOL.id:
+            sym = Symbol(owner)
+        elif subId == ELEM_EQUATESYMBOL.id:
+            sym = EquateSymbol(owner)
+        elif subId in (ELEM_FUNCTION.id, ELEM_FUNCTIONSHELL.id):
+            sym = FunctionSymbol(owner)
+        elif subId == ELEM_LABELSYM.id:
+            sym = LabSymbol(owner)
+        elif subId == ELEM_EXTERNREFSYMBOL.id:
+            sym = ExternRefSymbol(owner)
+        else:
+            sym = Symbol(owner)
+        try:
+            sym.decode(decoder)
+        except (RecovError, Exception):
+            decoder.closeElement(elemId)
+            return None
+        self.addSymbol(sym)
+        while decoder.peekElement() != 0:
+            entry = SymbolEntry(sym)
+            entry.decode(decoder)
+            if entry.isInvalid():
+                self.removeSymbol(sym)
+                decoder.closeElement(elemId)
+                return None
+            self.addMapEntry(sym, entry)
+        decoder.closeElement(elemId)
+        return sym
 
     # --- Symbol modification ---
 
@@ -764,10 +875,37 @@ class Scope(ABC):
         sym.setThisPointer(val)
 
     def overrideSizeLockType(self, sym: Symbol, ct) -> None:
-        pass
+        """Change the data-type of a size-locked Symbol.
+
+        An exception is thrown if the new data-type doesn't fit the size.
+
+        C++ ref: ``Scope::overrideSizeLockType``
+        """
+        if sym.type is not None and ct is not None:
+            if sym.type.getSize() == ct.getSize():
+                if not sym.isSizeTypeLocked():
+                    raise LowlevelError("Overriding symbol that is not size locked")
+                sym.type = ct
+                return
+        raise LowlevelError("Overriding symbol with different type size")
 
     def resetSizeLockType(self, sym: Symbol) -> None:
-        pass
+        """Reset a size-locked Symbol's data-type back to UNKNOWN.
+
+        The lock is preserved but the data-type is cleared.
+
+        C++ ref: ``Scope::resetSizeLockType``
+        """
+        if sym.type is None:
+            return
+        from ghidra.types.datatype import MetaType
+        if sym.type.getMetatype() == MetaType.TYPE_UNKNOWN:
+            return
+        size = sym.type.getSize()
+        if self.glb is not None and hasattr(self.glb, 'types') and self.glb.types is not None:
+            sym.type = self.glb.types.getBase(size, MetaType.TYPE_UNKNOWN)
+        else:
+            sym.type = None
 
     def removeSymbolMappings(self, sym: Symbol) -> None:
         sym.mapentry.clear()
@@ -789,7 +927,29 @@ class Scope(ABC):
     def findCodeLabel(self, addr: Address) -> Optional[LabSymbol]:
         return None
 
-    def findDistinguishingScope(self, sym: Symbol) -> Optional['Scope']:
+    def findDistinguishingScope(self, op2: 'Scope') -> Optional['Scope']:
+        """Find the first ancestor Scope not in common with *op2*.
+
+        C++ ref: ``Scope::findDistinguishingScope``
+        """
+        if self is op2:
+            return None
+        if self.parent is op2:
+            return self
+        if op2.parent is self:
+            return None
+        if self.parent is op2.parent:
+            return self
+        thisPath = self.getScopePath()
+        op2Path = op2.getScopePath()
+        minLen = min(len(thisPath), len(op2Path))
+        for i in range(minLen):
+            if thisPath[i] != op2Path[i]:
+                return thisPath[i] if isinstance(thisPath[i], Scope) else self
+        if minLen < len(thisPath):
+            return self
+        if minLen < len(op2Path):
+            return None
         return self
 
     # --- Scope hierarchy ---
@@ -805,17 +965,19 @@ class Scope(ABC):
     def discoverScope(self, addr: Address, sz: int, usepoint: Address) -> Optional['Scope']:
         return self
 
-    def resolveScope(self, addr: Address) -> Optional['Scope']:
-        return self
-
     def getFullName(self) -> str:
-        parts = []
-        cur = self
-        while cur is not None:
-            parts.append(cur.name)
-            cur = cur.parent
-        parts.reverse()
-        return "::".join(parts)
+        """Get the full path name of this Scope.
+
+        C++ ref: ``Scope::getFullName``
+        """
+        if self.parent is None:
+            return ""
+        fname = self.name
+        scope = self.parent
+        while scope is not None and scope.parent is not None:
+            fname = scope.name + "::" + fname
+            scope = scope.parent
+        return fname
 
     def getScopePath(self) -> List[str]:
         parts = []
@@ -891,7 +1053,8 @@ class Scope(ABC):
         return self.findContainer(addr, size, usepoint) is not None
 
     def inRange(self, addr: Address, size: int) -> bool:
-        return False
+        """Check if the given address range is owned by this Scope."""
+        return self.rangetree.inRange(addr, size)
 
     def isNameUsed(self, name: str, scope: Optional['Scope'] = None) -> bool:
         return self.findByName(name) is not None
@@ -1164,36 +1327,190 @@ class ScopeInternal(Scope):
         return self.findContainer(addr, size, usepoint)
 
     def setProperties(self, addr: Address, size: int, flags: int) -> None:
+        """Set boolean properties on an address range."""
+        # Simplified: no-op for in-memory scope
         pass
 
     def adjustCaches(self) -> None:
+        """Adjust internal caches after configuration changes.
+
+        C++ ref: ``ScopeInternal::adjustCaches``
+        """
+        # In-memory scope doesn't need per-space maptable resizing
         pass
+
+    def clear(self) -> None:
+        """Remove all symbols from this scope.
+
+        C++ ref: ``ScopeInternal::clear``
+        """
+        for sym in list(self._symbolsById.values()):
+            self.removeSymbol(sym)
+        self._nextSymId = Symbol.ID_BASE
+
+    def clearCategory(self, cat: int) -> None:
+        """Remove all symbols in the given category.
+
+        If *cat* < 0, remove all uncategorized symbols.
+
+        C++ ref: ``ScopeInternal::clearCategory``
+        """
+        if cat >= 0:
+            lst = self._categoryMap.get(cat, [])
+            for sym in list(lst):
+                self.removeSymbol(sym)
+        else:
+            for sym in list(self._symbolsById.values()):
+                if sym.getCategory() >= 0:
+                    continue
+                self.removeSymbol(sym)
 
     def clearUnlocked(self) -> None:
-        """Remove all symbols that aren't type-locked or name-locked."""
-        to_remove = [s for s in self._symbolsById.values()
-                     if not s.isTypeLocked() and not s.isNameLocked()]
-        for sym in to_remove:
-            self.removeSymbol(sym)
+        """Remove unlocked symbols; clear unlocked names on locked ones.
+
+        Type-locked symbols are kept but their names are cleared if not
+        name-locked. Size-type-locked symbols get their type reset.
+        Equate symbols are always preserved.
+
+        C++ ref: ``ScopeInternal::clearUnlocked``
+        """
+        for sym in list(self._symbolsById.values()):
+            if sym.isTypeLocked():
+                if not sym.isNameLocked():
+                    if not sym.isNameUndefined():
+                        self.renameSymbol(sym, self.buildUndefinedName())
+                self.clearAttribute(sym, Varnode.nolocalalias if hasattr(Varnode, 'nolocalalias') else 0)
+                if sym.isSizeTypeLocked():
+                    self.resetSizeLockType(sym)
+            elif sym.getCategory() == Symbol.equate:
+                continue
+            else:
+                self.removeSymbol(sym)
 
     def clearUnlockedCategory(self, cat: int) -> None:
-        """Remove unlocked symbols in the given category."""
-        lst = self._categoryMap.get(cat, [])
-        to_remove = [s for s in lst if not s.isTypeLocked() and not s.isNameLocked()]
-        for sym in to_remove:
-            self.removeSymbol(sym)
+        """Remove unlocked symbols in the given category.
+
+        C++ ref: ``ScopeInternal::clearUnlockedCategory``
+        """
+        if cat >= 0:
+            lst = self._categoryMap.get(cat, [])
+            for sym in list(lst):
+                if sym.isTypeLocked():
+                    if not sym.isNameLocked():
+                        if not sym.isNameUndefined():
+                            self.renameSymbol(sym, self.buildUndefinedName())
+                    if sym.isSizeTypeLocked():
+                        self.resetSizeLockType(sym)
+                else:
+                    self.removeSymbol(sym)
+        else:
+            for sym in list(self._symbolsById.values()):
+                if sym.getCategory() >= 0:
+                    continue
+                if sym.isTypeLocked():
+                    if not sym.isNameLocked():
+                        if not sym.isNameUndefined():
+                            self.renameSymbol(sym, self.buildUndefinedName())
+                else:
+                    self.removeSymbol(sym)
 
     def removeRange(self, spc, first: int, last: int) -> None:
-        pass
+        """Remove an address range from this scope's ownership.
+
+        C++ ref: ``Scope::removeRange``
+        """
+        self.rangetree.removeRange(spc, first, last)
 
     def addRange(self, spc, first: int, last: int) -> None:
-        pass
+        """Add an address range to this scope's ownership.
+
+        C++ ref: ``Scope::addRange``
+        """
+        self.rangetree.insertRange(spc, first, last)
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode this scope and all its symbols to a stream.
+
+        C++ ref: ``ScopeInternal::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_SCOPE, ELEM_PARENT, ELEM_SYMBOLLIST, ELEM_MAPSYM,
+            ATTRIB_NAME, ATTRIB_ID, ATTRIB_TYPE,
+        )
+        encoder.openElement(ELEM_SCOPE)
+        encoder.writeString(ATTRIB_NAME, self.name)
+        encoder.writeUnsignedInteger(ATTRIB_ID, self.uniqueId)
+        if self.parent is not None:
+            encoder.openElement(ELEM_PARENT)
+            encoder.writeUnsignedInteger(ATTRIB_ID, self.parent.getId())
+            encoder.closeElement(ELEM_PARENT)
+        self.rangetree.encode(encoder)
+        if self._symbolsById:
+            encoder.openElement(ELEM_SYMBOLLIST)
+            for sym in self._symbolsById.values():
+                symbolType = 0
+                if sym.mapentry:
+                    e0 = sym.mapentry[0]
+                    if e0.isDynamic():
+                        if sym.getCategory() == Symbol.union_facet:
+                            continue
+                        symbolType = 2 if sym.getCategory() == Symbol.equate else 1
+                encoder.openElement(ELEM_MAPSYM)
+                if symbolType == 1:
+                    encoder.writeString(ATTRIB_TYPE, "dynamic")
+                elif symbolType == 2:
+                    encoder.writeString(ATTRIB_TYPE, "equate")
+                sym.encode(encoder)
+                for ent in sym.mapentry:
+                    if hasattr(ent, 'encode'):
+                        ent.encode(encoder)
+                encoder.closeElement(ELEM_MAPSYM)
+            encoder.closeElement(ELEM_SYMBOLLIST)
+        encoder.closeElement(ELEM_SCOPE)
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode this scope's symbols from a stream.
+
+        C++ ref: ``ScopeInternal::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_PARENT, ELEM_RANGELIST, ELEM_RANGEEQUALSSYMBOLS,
+            ELEM_SYMBOLLIST, ELEM_MAPSYM, ELEM_HOLE, ELEM_COLLISION,
+        )
+        subId = decoder.peekElement()
+        if subId == ELEM_PARENT.id:
+            decoder.skipElement()
+            subId = decoder.peekElement()
+        if subId == ELEM_RANGELIST.id:
+            newrangetree = RangeList()
+            newrangetree.decode(decoder)
+            self.rangetree = newrangetree
+        elif subId == ELEM_RANGEEQUALSSYMBOLS.id:
+            decoder.openElement()
+            decoder.closeElement(subId)
+        subId = decoder.openElement(ELEM_SYMBOLLIST)
+        if subId != 0:
+            while True:
+                symId = decoder.peekElement()
+                if symId == 0:
+                    break
+                if symId == ELEM_MAPSYM.id:
+                    self.addMapSym(decoder)
+                elif symId == ELEM_HOLE.id:
+                    decoder.skipElement()
+                elif symId == ELEM_COLLISION.id:
+                    decoder.skipElement()
+                else:
+                    decoder.skipElement()
+            decoder.closeElement(subId)
+
+    def printEntries(self, s) -> None:
+        """Print all symbol entries to the given stream."""
+        s.write(f"Scope {self.name}\n")
+        for entries in self._entriesByAddr.values():
+            for entry in entries:
+                sym = entry.getSymbol()
+                s.write(f"  {sym.name}: {entry.addr} size={entry.size}\n")
 
     def getNumSymbols(self) -> int:
         return len(self._symbolsById)
@@ -1242,9 +1559,25 @@ class Database:
     def findScope(self, id_: int) -> Optional[Scope]:
         return self._scopeMap.get(id_)
 
-    def resolveScope(self, addr: Address) -> Optional[Scope]:
-        """Find the most specific scope owning the given address."""
-        # Simplified: just return global scope
+    def resolveScope(self, id_or_addr) -> Optional[Scope]:
+        """Find a Scope by id or address.
+
+        If *id_or_addr* is an int, look up by scope id.
+        If it is an Address, find the owning scope (falls back to global).
+
+        C++ ref: ``Database::resolveScope``
+        """
+        if isinstance(id_or_addr, int):
+            return self._scopeMap.get(id_or_addr)
+        # Address-based: check if any non-global scope owns the address
+        if self._globalScope is not None:
+            for sc in self._scopeMap.values():
+                if sc is self._globalScope:
+                    continue
+                if sc.fd is not None:
+                    continue  # Skip function scopes
+                if sc.rangetree.inRange(id_or_addr, 1):
+                    return sc
         return self._globalScope
 
     def removeScope(self, scope: Scope) -> None:
@@ -1260,15 +1593,79 @@ class Database:
         scope.name = newname
         scope.displayName = newname
 
-    def mapScope(self, scope: Scope, spc, first: int, last: int) -> None:
-        """Associate an address range with a scope."""
-        pass
+    def mapScope(self, scope_or_qpoint, addr_or_spc=None, first_or_usepoint=None, last: int = 0):
+        """Associate an address range with a scope, or map an address to a scope.
+
+        Two signatures:
+        - mapScope(scope, spc, first, last) — add address range to scope
+        - mapScope(qpoint, addr, usepoint) — find scope owning addr
+
+        C++ ref: ``Database::addRange`` / ``Database::mapScope``
+        """
+        if isinstance(addr_or_spc, Address):
+            # mapScope(qpoint, addr, usepoint) — resolve
+            return scope_or_qpoint
+        # mapScope(scope, spc, first, last) — add range
+        scope_or_qpoint.addRange(addr_or_spc, first_or_usepoint, last)
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode the entire Database to a stream.
+
+        C++ ref: ``Database::encode``
+        """
+        from ghidra.core.marshal import ELEM_DB
+        encoder.openElement(ELEM_DB)
+        if self._globalScope is not None:
+            self._globalScope.encodeRecursive(encoder)
+        encoder.closeElement(ELEM_DB)
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode the Database from a stream.
+
+        C++ ref: ``Database::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_DB, ELEM_SCOPE, ELEM_PARENT, ELEM_PROPERTY_CHANGEPOINT,
+            ATTRIB_NAME, ATTRIB_ID, ATTRIB_LABEL,
+        )
+        elemId = decoder.openElement(ELEM_DB)
+        # Skip property changepoints
+        while True:
+            subId = decoder.peekElement()
+            if subId != ELEM_PROPERTY_CHANGEPOINT.id:
+                break
+            decoder.skipElement()
+        # Read scopes
+        while True:
+            subId = decoder.openElement()
+            if subId != ELEM_SCOPE.id:
+                break
+            name = ""
+            scopeId = 0
+            displayName = ""
+            for _ in range(100):
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME.id:
+                    name = decoder.readString()
+                elif attribId == ATTRIB_ID.id:
+                    scopeId = decoder.readUnsignedInteger()
+                elif attribId == ATTRIB_LABEL.id:
+                    displayName = decoder.readString()
+            parentScope = None
+            parentId = decoder.peekElement()
+            if parentId == ELEM_PARENT.id:
+                pElem = decoder.openElement(ELEM_PARENT)
+                pid = decoder.readUnsignedInteger(ATTRIB_ID)
+                parentScope = self._scopeMap.get(pid)
+                decoder.closeElement(pElem)
+            newScope = self.findCreateScope(scopeId, name, parentScope)
+            if displayName:
+                newScope.displayName = displayName
+            newScope.decode(decoder)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     def clear(self) -> None:
         self._scopeMap.clear()
@@ -1293,7 +1690,67 @@ class Database:
         self._readonly = val
 
     def deleteSubScopes(self, scope) -> None:
-        pass
+        """Delete all child scopes of the given scope.
+
+        C++ ref: ``Database::deleteSubScopes``
+        """
+        for child_id in list(scope.children.keys()):
+            child = scope.children[child_id]
+            self._clearReferences(child)
+        scope.children.clear()
+
+    def _clearReferences(self, scope) -> None:
+        """Recursively clear scope references from the id map."""
+        for child in scope.children.values():
+            self._clearReferences(child)
+        self._scopeMap.pop(scope.uniqueId, None)
+
+    def findCreateScope(self, id_: int, name: str, parent=None) -> Scope:
+        """Find a Scope by id; create it if it doesn't exist.
+
+        C++ ref: ``Database::findCreateScope``
+        """
+        res = self._scopeMap.get(id_)
+        if res is not None:
+            return res
+        newscope = ScopeInternal(id_, name, self.glb)
+        self._scopeMap[newscope.uniqueId] = newscope
+        if parent is not None:
+            parent.attachScope(newscope)
+        elif self._globalScope is None:
+            self._globalScope = newscope
+        return newscope
+
+    def addRange(self, scope, spc, first: int, last: int) -> None:
+        """Add an address range to a scope's ownership.
+
+        C++ ref: ``Database::addRange``
+        """
+        scope.addRange(spc, first, last)
+
+    def removeRange(self, scope, spc, first: int, last: int) -> None:
+        """Remove an address range from a scope's ownership.
+
+        C++ ref: ``Database::removeRange``
+        """
+        scope.removeRange(spc, first, last)
+
+    def clearUnlocked(self, scope) -> None:
+        """Recursively clear unlocked symbols in a scope and its children.
+
+        C++ ref: ``Database::clearUnlocked``
+        """
+        for child in scope.children.values():
+            self.clearUnlocked(child)
+        scope.clearUnlocked()
+
+    def adjustCaches(self) -> None:
+        """Inform all scopes of configuration changes.
+
+        C++ ref: ``Database::adjustCaches``
+        """
+        for sc in self._scopeMap.values():
+            sc.adjustCaches()
 
     def findByName(self, nm: str):
         for s in self._scopeMap.values():

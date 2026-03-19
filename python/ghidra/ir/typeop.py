@@ -117,25 +117,99 @@ class TypeOp:
         """Check if this op stops type propagation."""
         return False
 
+    def setMetatypeIn(self, mt) -> None:
+        """Override input metatype (used by selectJavaOperators)."""
+        pass  # Only meaningful on TypeOpBinary/TypeOpUnary/TypeOpFunc
+
+    def setMetatypeOut(self, mt) -> None:
+        """Override output metatype (used by selectJavaOperators)."""
+        pass  # Only meaningful on TypeOpBinary/TypeOpUnary/TypeOpFunc
+
+    def setSymbol(self, nm: str) -> None:
+        """Override display symbol name."""
+        self.name = nm
+
     @staticmethod
     def floatSignManipulation(op) -> OpCode:
         """Return the floating-point op associated with sign bit manipulation."""
+        opc = op.code() if hasattr(op, 'code') else op.getOpcode()
+        if opc == OpCode.CPUI_INT_AND:
+            cvn = op.getIn(1)
+            if cvn is not None and hasattr(cvn, 'isConstant') and cvn.isConstant():
+                sz = cvn.getSize()
+                mask = (1 << (8 * sz)) - 1
+                val = mask >> 1
+                if val == cvn.getOffset():
+                    return OpCode.CPUI_FLOAT_ABS
+        elif opc == OpCode.CPUI_INT_XOR:
+            cvn = op.getIn(1)
+            if cvn is not None and hasattr(cvn, 'isConstant') and cvn.isConstant():
+                sz = cvn.getSize()
+                mask = (1 << (8 * sz)) - 1
+                val = mask ^ (mask >> 1)
+                if val == cvn.getOffset():
+                    return OpCode.CPUI_FLOAT_NEG
         return OpCode.CPUI_MAX
 
     @staticmethod
     def propagateToPointer(t, dt, sz: int, wordsz: int):
-        """Propagate data-type to a pointer."""
+        """Propagate a dereferenced data-type up to its pointer through LOAD/STORE.
+
+        Don't create more than a depth of 1 (i.e. ptr->ptr).
+        """
+        meta = dt.getMetatype() if hasattr(dt, 'getMetatype') else TYPE_UNKNOWN
+        if meta == TYPE_PTR:
+            dt = t.getBase(dt.getSize(), TYPE_UNKNOWN)
+        if hasattr(t, 'getTypePointer'):
+            return t.getTypePointer(sz, dt, wordsz)
         return None
 
     @staticmethod
     def propagateFromPointer(t, dt, sz: int):
-        """Propagate data-type from a pointer."""
+        """Propagate a pointer data-type down to its element through LOAD/STORE."""
+        if not hasattr(dt, 'getMetatype'):
+            return None
+        if dt.getMetatype() != TYPE_PTR:
+            return None
+        if hasattr(dt, 'getPtrTo'):
+            ptrto = dt.getPtrTo()
+            if hasattr(ptrto, 'isVariableLength') and ptrto.isVariableLength():
+                return None
+            if ptrto.getSize() == sz:
+                return ptrto
         return None
 
     @staticmethod
     def selectJavaOperators(inst: list, val: bool) -> None:
         """Toggle Java specific aspects of the op-code information."""
-        pass
+        if val:
+            inst[int(OpCode.CPUI_INT_ZEXT)].setMetatypeIn(TYPE_UNKNOWN)
+            inst[int(OpCode.CPUI_INT_ZEXT)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_NEGATE)].setMetatypeIn(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_NEGATE)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_XOR)].setMetatypeIn(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_XOR)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_OR)].setMetatypeIn(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_OR)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_AND)].setMetatypeIn(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_AND)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setMetatypeIn(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setMetatypeOut(TYPE_INT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setSymbol('>>>')
+        else:
+            inst[int(OpCode.CPUI_INT_ZEXT)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_ZEXT)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_NEGATE)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_NEGATE)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_XOR)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_XOR)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_OR)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_OR)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_AND)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_AND)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setMetatypeIn(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setMetatypeOut(TYPE_UINT)
+            inst[int(OpCode.CPUI_INT_RIGHT)].setSymbol('>>')
 
     def getOutputLocal(self, op) -> Optional[Datatype]:
         outvn = op.getOut()
@@ -270,6 +344,12 @@ class TypeOpBinary(TypeOp):
         self.metaout: MetaType = metaout
         self.metain: MetaType = metain
 
+    def setMetatypeIn(self, mt) -> None:
+        self.metain = mt
+
+    def setMetatypeOut(self, mt) -> None:
+        self.metaout = mt
+
     def getOutputLocal(self, op):
         outvn = op.getOut()
         if outvn is None:
@@ -291,6 +371,12 @@ class TypeOpUnary(TypeOp):
         self.metaout: MetaType = metaout
         self.metain: MetaType = metain
 
+    def setMetatypeIn(self, mt) -> None:
+        self.metain = mt
+
+    def setMetatypeOut(self, mt) -> None:
+        self.metaout = mt
+
     def getOutputLocal(self, op):
         outvn = op.getOut()
         if outvn is None:
@@ -311,6 +397,12 @@ class TypeOpFunc(TypeOp):
         super().__init__(tlst, opc, name)
         self.metaout: MetaType = metaout
         self.metain: MetaType = metain
+
+    def setMetatypeIn(self, mt) -> None:
+        self.metain = mt
+
+    def setMetatypeOut(self, mt) -> None:
+        self.metaout = mt
 
     def getOutputLocal(self, op):
         outvn = op.getOut()
@@ -345,24 +437,59 @@ class TypeOpCopy(TypeOp):
         invn = op.getIn(0)
         return invn.getHighTypeReadFacing(op) if invn is not None and hasattr(invn,'getHighTypeReadFacing') else None
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return alttype  # COPY propagates type directly
+        if inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            if hasattr(self.tlst, 'getArch'):
+                spc = self.tlst.getArch().getDefaultDataSpace()
+                wordsz = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
+                return self.tlst.getTypePointer(alttype.getSize(), self.tlst.getBase(1, TYPE_UNKNOWN), wordsz)
+            return alttype
+        return alttype
 
 class TypeOpLoad(TypeOp):
     """CPUI_LOAD — dereference pointer to produce value."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_LOAD, "LOAD")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.special | getattr(PcOp, 'nocollapse', 0)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        if outslot == -1 and inslot == 1:  # from pointer input to output
-            if hasattr(alttype, 'getPtrTo'):
-                return alttype.getPtrTo()
-        return None
+        if inslot == 0 or outslot == 0:
+            return None  # Don't propagate along space edge
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            return None
+        if inslot == -1:  # Propagating output to input (value to ptr)
+            spc_vn = op.getIn(0)
+            wordsz = 1
+            if hasattr(spc_vn, 'getSpaceFromConst'):
+                spc = spc_vn.getSpaceFromConst()
+                if spc is not None and hasattr(spc, 'getWordSize'):
+                    wordsz = spc.getWordSize()
+            return TypeOp.propagateToPointer(self.tlst, alttype, outvn.getSize(), wordsz)
+        else:
+            return TypeOp.propagateFromPointer(self.tlst, alttype, outvn.getSize())
 
 class TypeOpStore(TypeOp):
     """CPUI_STORE — store value through pointer."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_STORE, "STORE")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.special | getattr(PcOp, 'nocollapse', 0)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        if inslot == 0 or outslot == 0:
+            return None
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            return None
+        if inslot == 2:  # Propagating value to ptr
+            spc_vn = op.getIn(0)
+            wordsz = 1
+            if hasattr(spc_vn, 'getSpaceFromConst'):
+                spc = spc_vn.getSpaceFromConst()
+                if spc is not None and hasattr(spc, 'getWordSize'):
+                    wordsz = spc.getWordSize()
+            return TypeOp.propagateToPointer(self.tlst, alttype, outvn.getSize(), wordsz)
+        else:
+            return TypeOp.propagateFromPointer(self.tlst, alttype, outvn.getSize())
 
 class TypeOpBranch(TypeOp):
     """CPUI_BRANCH."""
@@ -433,48 +560,89 @@ class TypeOpIntEqual(TypeOpBinary):
     """CPUI_INT_EQUAL."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_EQUAL, "==", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput | PcOp.commutative
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        return TypeOpIntEqual.propagateAcrossCompare(alttype, self.tlst, invn, outvn, inslot, outslot)
+    @staticmethod
+    def propagateAcrossCompare(alttype, typegrp, invn, outvn, inslot, outslot):
+        """Propagate a data-type across a comparison PcodeOp."""
+        if inslot == -1 or outslot == -1:
+            return None
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            if hasattr(typegrp, 'getArch'):
+                spc = typegrp.getArch().getDefaultDataSpace()
+                wordsz = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
+                return typegrp.getTypePointer(alttype.getSize(), typegrp.getBase(1, TYPE_UNKNOWN), wordsz)
+        return alttype
 
 class TypeOpIntNotEqual(TypeOpBinary):
     """CPUI_INT_NOTEQUAL."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_NOTEQUAL, "!=", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput | PcOp.commutative
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        return TypeOpIntEqual.propagateAcrossCompare(alttype, self.tlst, invn, outvn, inslot, outslot)
 
 class TypeOpIntSless(TypeOpBinary):
     """CPUI_INT_SLESS."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SLESS, "s<", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        if inslot == -1 or outslot == -1:
+            return None  # Must propagate input <-> input
+        if hasattr(alttype, 'getMetatype') and alttype.getMetatype() != TYPE_INT:
+            return None  # Only propagate signed things
+        return alttype
 
 class TypeOpIntSlessEqual(TypeOpBinary):
     """CPUI_INT_SLESSEQUAL."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SLESSEQUAL, "s<=", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        if inslot == -1 or outslot == -1:
+            return None
+        if hasattr(alttype, 'getMetatype') and alttype.getMetatype() != TYPE_INT:
+            return None
+        return alttype
 
 class TypeOpIntLess(TypeOpBinary):
     """CPUI_INT_LESS."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_LESS, "<", TYPE_BOOL, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        return TypeOpIntEqual.propagateAcrossCompare(alttype, self.tlst, invn, outvn, inslot, outslot)
 
 class TypeOpIntLessEqual(TypeOpBinary):
     """CPUI_INT_LESSEQUAL."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_LESSEQUAL, "<=", TYPE_BOOL, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput
+        self.addlflags = TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        return TypeOpIntEqual.propagateAcrossCompare(alttype, self.tlst, invn, outvn, inslot, outslot)
 
-class TypeOpIntZext(TypeOpUnary):
+class TypeOpIntZext(TypeOpFunc):
     """CPUI_INT_ZEXT — zero extension."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_ZEXT, "ZEXT", TYPE_UINT, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.unary
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}{op.getOut().getSize()}"
     def getOutputToken(self, op, castStrategy=None):
         return self.tlst.getBase(op.getOut().getSize(), TYPE_UINT) if op.getOut() else None
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
@@ -482,10 +650,14 @@ class TypeOpIntZext(TypeOpUnary):
             return alttype
         return None
 
-class TypeOpIntSext(TypeOpUnary):
+class TypeOpIntSext(TypeOpFunc):
     """CPUI_INT_SEXT — sign extension."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SEXT, "SEXT", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.unary
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}{op.getOut().getSize()}"
     def getOutputToken(self, op, castStrategy=None):
         return self.tlst.getBase(op.getOut().getSize(), TYPE_INT) if op.getOut() else None
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
@@ -497,39 +669,125 @@ class TypeOpIntAdd(TypeOpBinary):
     """CPUI_INT_ADD — addition, pointer arithmetic."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_ADD, "+", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative
+        self.addlflags = TypeOp.arithmetic_op | TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        if hasattr(alttype, 'getMetatype') and alttype.getMetatype() == TYPE_PTR:
+        meta = alttype.getMetatype() if hasattr(alttype, 'getMetatype') else TYPE_UNKNOWN
+        if meta != TYPE_PTR:
+            if meta != TYPE_INT and meta != TYPE_UINT:
+                return None
+            if outslot != 1 or not (hasattr(op.getIn(1), 'isConstant') and op.getIn(1).isConstant()):
+                return None
+        elif inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output for pointers
+        if hasattr(outvn, 'isConstant') and outvn.isConstant() and meta != TYPE_PTR:
             return alttype
-        return None
+        elif inslot == -1:
+            return None  # Don't propagate pointer types output->input
+        else:
+            return TypeOpIntAdd.propagateAddIn2Out(alttype, self.tlst, op, inslot)
+    @staticmethod
+    def propagateAddIn2Out(alttype, typegrp, op, inslot):
+        """Propagate a pointer data-type through an ADD from input to output."""
+        if not hasattr(alttype, 'getMetatype') or alttype.getMetatype() != TYPE_PTR:
+            return None
+        if hasattr(alttype, 'getPtrTo'):
+            ptrto = alttype.getPtrTo()
+            align = ptrto.getAlignSize() if hasattr(ptrto, 'getAlignSize') else ptrto.getSize()
+        else:
+            align = 1
+        cmd = TypeOpIntAdd.propagateAddPointer(op, inslot, align)
+        if cmd == 2:
+            return None  # Doesn't look like a good pointer add
+        if cmd == 3 or cmd == 0:
+            return alttype  # Propagate unchanged
+        return alttype  # cmd == 1: propagate with offset
+    @staticmethod
+    def propagateAddPointer(op, slot: int, sz: int) -> int:
+        """Determine how a pointer propagates through ADD/PTRADD/PTRSUB.
+
+        Returns:
+          0 = adding zero constant
+          1 = adding non-zero constant
+          2 = don't propagate
+          3 = propagate unchanged (variable index)
+        """
+        opc = op.code() if hasattr(op, 'code') else op.getOpcode()
+        if opc == OpCode.CPUI_PTRADD:
+            if slot != 0:
+                return 2
+            constvn = op.getIn(1)
+            if hasattr(constvn, 'isConstant') and constvn.isConstant():
+                mult = op.getIn(2).getOffset()
+                off = (constvn.getOffset() * mult) & ((1 << (8 * constvn.getSize())) - 1)
+                return 0 if off == 0 else 1
+            if sz != 0:
+                mult = op.getIn(2).getOffset()
+                if mult % sz != 0:
+                    return 2
+            return 3
+        if opc == OpCode.CPUI_PTRSUB:
+            if slot != 0:
+                return 2
+            off = op.getIn(1).getOffset()
+            return 0 if off == 0 else 1
+        if opc == OpCode.CPUI_INT_ADD:
+            othervn = op.getIn(1 - slot)
+            if not (hasattr(othervn, 'isConstant') and othervn.isConstant()):
+                if sz == 1:
+                    return 3
+                return 2
+            off = othervn.getOffset()
+            return 0 if off == 0 else 1
+        return 2
 
 class TypeOpIntSub(TypeOpBinary):
     """CPUI_INT_SUB — subtraction."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SUB, "-", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+        self.addlflags = TypeOp.arithmetic_op | TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if hasattr(alttype, 'getMetatype') and alttype.getMetatype() == TYPE_PTR:
             if inslot == 0 and outslot == -1:
                 return alttype
         return None
 
-class TypeOpIntCarry(TypeOpBinary):
+class TypeOpIntCarry(TypeOpFunc):
     """CPUI_INT_CARRY."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_CARRY, "CARRY", TYPE_BOOL, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative | PcOp.booloutput
+        self.addlflags = TypeOp.arithmetic_op
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}"
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
-class TypeOpIntScarry(TypeOpBinary):
+class TypeOpIntScarry(TypeOpFunc):
     """CPUI_INT_SCARRY."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SCARRY, "SCARRY", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative | PcOp.booloutput
+        self.addlflags = TypeOp.arithmetic_op
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}"
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
-class TypeOpIntSborrow(TypeOpBinary):
+class TypeOpIntSborrow(TypeOpFunc):
     """CPUI_INT_SBORROW."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SBORROW, "SBORROW", TYPE_BOOL, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.booloutput
+        self.addlflags = TypeOp.arithmetic_op
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}"
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
@@ -551,27 +809,55 @@ class TypeOpIntXor(TypeOpBinary):
     """CPUI_INT_XOR."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_XOR, "^", TYPE_UINT, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative
+        self.addlflags = TypeOp.logical_op | TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return alttype if outslot == -1 else None
+        is_enum = hasattr(alttype, 'isEnumType') and alttype.isEnumType()
+        if not is_enum:
+            meta = alttype.getMetatype() if hasattr(alttype, 'getMetatype') else TYPE_UNKNOWN
+            if meta != TYPE_FLOAT:
+                return None
+            if TypeOp.floatSignManipulation(op) == OpCode.CPUI_MAX:
+                return None
+        return alttype
 
 class TypeOpIntAnd(TypeOpBinary):
     """CPUI_INT_AND."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_AND, "&", TYPE_UINT, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative
+        self.addlflags = TypeOp.logical_op | TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return alttype if outslot == -1 else None
+        is_enum = hasattr(alttype, 'isEnumType') and alttype.isEnumType()
+        if not is_enum:
+            meta = alttype.getMetatype() if hasattr(alttype, 'getMetatype') else TYPE_UNKNOWN
+            if meta != TYPE_FLOAT:
+                return None
+            if TypeOp.floatSignManipulation(op) == OpCode.CPUI_MAX:
+                return None
+        return alttype
 
 class TypeOpIntOr(TypeOpBinary):
     """CPUI_INT_OR."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_OR, "|", TYPE_UINT, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | PcOp.commutative
+        self.addlflags = TypeOp.logical_op | TypeOp.inherits_sign
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return alttype if outslot == -1 else None
+        if not (hasattr(alttype, 'isEnumType') and alttype.isEnumType()):
+            return None  # Only propagate enums for OR
+        return alttype
 
 class TypeOpIntLeft(TypeOpBinary):
     """CPUI_INT_LEFT — left shift."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_LEFT, "<<", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+        self.addlflags = TypeOp.inherits_sign | TypeOp.inherits_sign_zero | TypeOp.shift_op
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if inslot == 0 and outslot == -1:
             return alttype
@@ -581,6 +867,9 @@ class TypeOpIntRight(TypeOpBinary):
     """CPUI_INT_RIGHT — logical right shift."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_RIGHT, ">>", TYPE_UINT, TYPE_UINT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+        self.addlflags = TypeOp.inherits_sign | TypeOp.inherits_sign_zero | TypeOp.shift_op
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if inslot == 0 and outslot == -1:
             return alttype
@@ -590,6 +879,9 @@ class TypeOpIntSright(TypeOpBinary):
     """CPUI_INT_SRIGHT — arithmetic right shift."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_INT_SRIGHT, "s>>", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+        self.addlflags = TypeOp.inherits_sign | TypeOp.inherits_sign_zero | TypeOp.shift_op
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if inslot == 0 and outslot == -1:
             return alttype
@@ -787,16 +1079,37 @@ class TypeOpFloatRound(TypeOpUnary):
 class TypeOpPiece(TypeOpFunc):
     """CPUI_PIECE — concatenation of two values."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_PIECE, "PIECE", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_PIECE, "CONCAT", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}{op.getIn(1).getSize()}"
+    def getInputCast(self, op, slot, castStrategy=None):
+        return None  # Never need a cast into a PIECE
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        if inslot != -1:
+            return None
+        return alttype  # Simplified: propagate output type to input
 
 class TypeOpSubpiece(TypeOpFunc):
     """CPUI_SUBPIECE — extraction of sub-value."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_SUBPIECE, "SUBPIECE", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_SUBPIECE, "SUB", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary
+    def getOperatorName(self, op) -> str:
+        return f"{self.name}{op.getIn(0).getSize()}{op.getOut().getSize()}"
+    def getInputCast(self, op, slot, castStrategy=None):
+        return None  # Never need a cast into a SUBPIECE
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        return None
+        if inslot != 0 or outslot != -1:
+            return None  # Propagation must be from in0 to out
+        while alttype is not None and alttype.getSize() != outvn.getSize():
+            if hasattr(alttype, 'getSubType'):
+                alttype = alttype.getSubType(0, None)
+            else:
+                break
+        return alttype
 
 class TypeOpCast(TypeOp):
     """CPUI_CAST — explicit type cast."""
@@ -810,46 +1123,84 @@ class TypeOpCast(TypeOp):
 class TypeOpPtradd(TypeOp):
     """CPUI_PTRADD — pointer + index*size."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_PTRADD, "PTRADD")
+        super().__init__(tlst, OpCode.CPUI_PTRADD, "+")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.ternary | getattr(PcOp, 'nocollapse', 0)
+        self.addlflags = TypeOp.arithmetic_op
     def getInputLocal(self, op, slot):
-        if slot == 0:
-            invn = op.getIn(0)
-            if invn is not None:
-                return self.tlst.getBase(invn.getSize(), TYPE_PTR)
-        return self.tlst.getTypeVoid()
+        return self.tlst.getBase(op.getIn(slot).getSize(), TYPE_INT)
+    def getOutputLocal(self, op):
+        return self.tlst.getBase(op.getOut().getSize(), TYPE_INT)
+    def getOutputToken(self, op, castStrategy=None):
+        return op.getIn(0).getHighTypeReadFacing(op) if hasattr(op.getIn(0), 'getHighTypeReadFacing') else None
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        if inslot == 0:
-            return alttype
-        return None
+        if inslot == 2 or outslot == 2:
+            return None
+        if inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output
+        meta = alttype.getMetatype() if hasattr(alttype, 'getMetatype') else TYPE_UNKNOWN
+        if meta != TYPE_PTR:
+            return None
+        if inslot == -1:
+            return None  # Don't propagate pointer output->input
+        return TypeOpIntAdd.propagateAddIn2Out(alttype, self.tlst, op, inslot)
 
-class TypeOpPtrsub(TypeOpBinary):
+class TypeOpPtrsub(TypeOp):
     """CPUI_PTRSUB — pointer + constant offset."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_PTRSUB, "PTRSUB", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_PTRSUB, "->")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.binary | getattr(PcOp, 'nocollapse', 0)
+        self.addlflags = TypeOp.arithmetic_op
+    def getOutputLocal(self, op):
+        return self.tlst.getBase(op.getOut().getSize(), TYPE_INT)
+    def getInputLocal(self, op, slot):
+        return self.tlst.getBase(op.getIn(slot).getSize(), TYPE_INT)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        if inslot == 0:
-            return alttype
-        return None
+        if inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output
+        meta = alttype.getMetatype() if hasattr(alttype, 'getMetatype') else TYPE_UNKNOWN
+        if meta != TYPE_PTR:
+            return None
+        if inslot == -1:
+            return None  # Don't propagate pointer output->input
+        return TypeOpIntAdd.propagateAddIn2Out(alttype, self.tlst, op, inslot)
 
 class TypeOpMultiequal(TypeOp):
     """CPUI_MULTIEQUAL — SSA phi-node."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_MULTIEQUAL, "MULTIEQUAL")
-    def getOutputLocal(self, op):
-        return self.tlst.getTypeVoid()
+        super().__init__(tlst, OpCode.CPUI_MULTIEQUAL, "?")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.special | PcOp.marker | getattr(PcOp, 'nocollapse', 0)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
+        if inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            if hasattr(self.tlst, 'getArch'):
+                spc = self.tlst.getArch().getDefaultDataSpace()
+                wordsz = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
+                return self.tlst.getTypePointer(alttype.getSize(), self.tlst.getBase(1, TYPE_UNKNOWN), wordsz)
         return alttype
 
 class TypeOpIndirect(TypeOp):
     """CPUI_INDIRECT — indirect effect."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_INDIRECT, "INDIRECT")
-    def getOutputLocal(self, op):
-        return self.tlst.getTypeVoid()
+        super().__init__(tlst, OpCode.CPUI_INDIRECT, "[]")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.special | PcOp.marker | getattr(PcOp, 'nocollapse', 0)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
-        if inslot == 0:
-            return alttype
-        return None
+        if hasattr(op, 'isIndirectCreation') and op.isIndirectCreation():
+            return None
+        if inslot == 1 or outslot == 1:
+            return None
+        if inslot != -1 and outslot != -1:
+            return None  # Must propagate input <-> output
+        if hasattr(invn, 'isSpacebase') and invn.isSpacebase():
+            if hasattr(self.tlst, 'getArch'):
+                spc = self.tlst.getArch().getDefaultDataSpace()
+                wordsz = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
+                return self.tlst.getTypePointer(alttype.getSize(), self.tlst.getBase(1, TYPE_UNKNOWN), wordsz)
+        return alttype
 
 class TypeOpSegmentOp(TypeOp):
     """CPUI_SEGMENTOP."""
@@ -875,28 +1226,44 @@ class TypeOpNew(TypeOp):
 class TypeOpInsert(TypeOpFunc):
     """CPUI_INSERT."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_INSERT, "INSERT", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_INSERT, "INSERT", TYPE_UNKNOWN, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.ternary
+    def getInputLocal(self, op, slot):
+        if slot == 0:
+            return self.tlst.getBase(op.getIn(slot).getSize(), TYPE_UNKNOWN)
+        return super().getInputLocal(op, slot)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
 class TypeOpExtract(TypeOpFunc):
     """CPUI_EXTRACT."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_EXTRACT, "EXTRACT", TYPE_UNKNOWN, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_EXTRACT, "EXTRACT", TYPE_INT, TYPE_INT)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.ternary
+    def getInputLocal(self, op, slot):
+        if slot == 0:
+            return self.tlst.getBase(op.getIn(slot).getSize(), TYPE_UNKNOWN)
+        return super().getInputLocal(op, slot)
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
-class TypeOpPopcount(TypeOpUnary):
+class TypeOpPopcount(TypeOpFunc):
     """CPUI_POPCOUNT."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_POPCOUNT, "POPCOUNT", TYPE_UINT, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_POPCOUNT, "POPCOUNT", TYPE_INT, TYPE_UNKNOWN)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.unary
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
-class TypeOpLzcount(TypeOpUnary):
+class TypeOpLzcount(TypeOpFunc):
     """CPUI_LZCOUNT."""
     def __init__(self, tlst):
-        super().__init__(tlst, OpCode.CPUI_LZCOUNT, "LZCOUNT", TYPE_UINT, TYPE_UNKNOWN)
+        super().__init__(tlst, OpCode.CPUI_LZCOUNT, "LZCOUNT", TYPE_INT, TYPE_UNKNOWN)
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.unary
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         return None
 
@@ -905,117 +1272,96 @@ def registerTypeOps(tlst: TypeFactory, trans=None) -> List[Optional[TypeOp]]:
     """Build all TypeOp objects indexed by OpCode value.
 
     Corresponds to TypeOp::registerInstructions in typeop.cc.
+    Uses specialized subclasses for each opcode.
     """
-    from ghidra.ir.op import PcodeOp as PcOp
-
     inst: List[Optional[TypeOp]] = [None] * int(OpCode.CPUI_MAX)
     behaviors = OpBehavior.registerInstructions(trans)
 
-    def _b(opc, nm, mo, mi, fl=0, al=0):
-        t = TypeOpBinary(tlst, opc, nm, mo, mi)
-        t.opflags = fl; t.addlflags = al
-        if opc < len(behaviors) and behaviors[opc]:
-            t.behave = behaviors[opc]
-        inst[int(opc)] = t
+    def _reg(t: TypeOp) -> None:
+        opc_val = int(t.opcode)
+        if opc_val < len(behaviors) and behaviors[opc_val]:
+            t.behave = behaviors[opc_val]
+        inst[opc_val] = t
 
-    def _u(opc, nm, mo, mi, fl=0, al=0):
-        t = TypeOpUnary(tlst, opc, nm, mo, mi)
-        t.opflags = fl; t.addlflags = al
-        if opc < len(behaviors) and behaviors[opc]:
-            t.behave = behaviors[opc]
-        inst[int(opc)] = t
+    _reg(TypeOpCopy(tlst))
+    _reg(TypeOpLoad(tlst))
+    _reg(TypeOpStore(tlst))
+    _reg(TypeOpBranch(tlst))
+    _reg(TypeOpCbranch(tlst))
+    _reg(TypeOpBranchind(tlst))
+    _reg(TypeOpCall(tlst))
+    _reg(TypeOpCallind(tlst))
+    _reg(TypeOpCallother(tlst))
+    _reg(TypeOpReturn(tlst))
 
-    def _s(opc, nm, fl=0):
-        t = TypeOp(tlst, opc, nm)
-        t.opflags = fl | PcOp.special
-        if opc < len(behaviors) and behaviors[opc]:
-            t.behave = behaviors[opc]
-        inst[int(opc)] = t
+    _reg(TypeOpIntEqual(tlst))
+    _reg(TypeOpIntNotEqual(tlst))
+    _reg(TypeOpIntSless(tlst))
+    _reg(TypeOpIntSlessEqual(tlst))
+    _reg(TypeOpIntLess(tlst))
+    _reg(TypeOpIntLessEqual(tlst))
 
-    U = TYPE_UNKNOWN; I = TYPE_INT; UI = TYPE_UINT; B = TYPE_BOOL; F = TYPE_FLOAT
-    bi = PcOp.binary; un = PcOp.unary; bo = PcOp.booloutput; cm = PcOp.commutative
-    br = PcOp.branch; ca = PcOp.call; cr = PcOp.coderef; rt = PcOp.returns
-    hc = PcOp.has_callspec; mk = PcOp.marker
+    _reg(TypeOpIntZext(tlst))
+    _reg(TypeOpIntSext(tlst))
 
-    _u(OpCode.CPUI_COPY, "COPY", U, U, un)
-    _s(OpCode.CPUI_LOAD, "LOAD")
-    _s(OpCode.CPUI_STORE, "STORE")
-    _s(OpCode.CPUI_BRANCH, "BRANCH", br | cr)
-    _s(OpCode.CPUI_CBRANCH, "CBRANCH", br | cr)
-    _s(OpCode.CPUI_BRANCHIND, "BRANCHIND", br)
-    _s(OpCode.CPUI_CALL, "CALL", ca | cr | hc)
-    _s(OpCode.CPUI_CALLIND, "CALLIND", ca | hc)
-    _s(OpCode.CPUI_CALLOTHER, "CALLOTHER")
-    _s(OpCode.CPUI_RETURN, "RETURN", br | rt)
+    _reg(TypeOpIntAdd(tlst))
+    _reg(TypeOpIntSub(tlst))
+    _reg(TypeOpIntCarry(tlst))
+    _reg(TypeOpIntScarry(tlst))
+    _reg(TypeOpIntSborrow(tlst))
 
-    _b(OpCode.CPUI_INT_EQUAL, "==", B, I, bi | bo | cm)
-    _b(OpCode.CPUI_INT_NOTEQUAL, "!=", B, I, bi | bo | cm)
-    _b(OpCode.CPUI_INT_SLESS, "s<", B, I, bi | bo)
-    _b(OpCode.CPUI_INT_SLESSEQUAL, "s<=", B, I, bi | bo)
-    _b(OpCode.CPUI_INT_LESS, "<", B, UI, bi | bo)
-    _b(OpCode.CPUI_INT_LESSEQUAL, "<=", B, UI, bi | bo)
+    _reg(TypeOpInt2Comp(tlst))
+    _reg(TypeOpIntNegate(tlst))
 
-    _u(OpCode.CPUI_INT_ZEXT, "ZEXT", UI, UI, un)
-    _u(OpCode.CPUI_INT_SEXT, "SEXT", I, I, un)
+    _reg(TypeOpIntXor(tlst))
+    _reg(TypeOpIntAnd(tlst))
+    _reg(TypeOpIntOr(tlst))
+    _reg(TypeOpIntLeft(tlst))
+    _reg(TypeOpIntRight(tlst))
+    _reg(TypeOpIntSright(tlst))
+    _reg(TypeOpIntMult(tlst))
+    _reg(TypeOpIntDiv(tlst))
+    _reg(TypeOpIntSdiv(tlst))
+    _reg(TypeOpIntRem(tlst))
+    _reg(TypeOpIntSrem(tlst))
 
-    _b(OpCode.CPUI_INT_ADD, "+", I, I, bi | cm, TypeOp.arithmetic_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_SUB, "-", I, I, bi, TypeOp.arithmetic_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_CARRY, "CARRY", B, UI, bi | bo)
-    _b(OpCode.CPUI_INT_SCARRY, "SCARRY", B, I, bi | bo)
-    _b(OpCode.CPUI_INT_SBORROW, "SBORROW", B, I, bi | bo)
+    _reg(TypeOpBoolNegate(tlst))
+    _reg(TypeOpBoolXor(tlst))
+    _reg(TypeOpBoolAnd(tlst))
+    _reg(TypeOpBoolOr(tlst))
 
-    _u(OpCode.CPUI_INT_2COMP, "-", I, I, un)
-    _u(OpCode.CPUI_INT_NEGATE, "~", UI, UI, un, TypeOp.logical_op)
+    _reg(TypeOpFloatEqual(tlst))
+    _reg(TypeOpFloatNotEqual(tlst))
+    _reg(TypeOpFloatLess(tlst))
+    _reg(TypeOpFloatLessEqual(tlst))
+    _reg(TypeOpFloatNan(tlst))
+    _reg(TypeOpFloatAdd(tlst))
+    _reg(TypeOpFloatDiv(tlst))
+    _reg(TypeOpFloatMult(tlst))
+    _reg(TypeOpFloatSub(tlst))
+    _reg(TypeOpFloatNeg(tlst))
+    _reg(TypeOpFloatAbs(tlst))
+    _reg(TypeOpFloatSqrt(tlst))
+    _reg(TypeOpFloatInt2Float(tlst))
+    _reg(TypeOpFloatFloat2Float(tlst))
+    _reg(TypeOpFloatTrunc(tlst))
+    _reg(TypeOpFloatCeil(tlst))
+    _reg(TypeOpFloatFloor(tlst))
+    _reg(TypeOpFloatRound(tlst))
 
-    _b(OpCode.CPUI_INT_XOR, "^", UI, UI, bi | cm, TypeOp.logical_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_AND, "&", UI, UI, bi | cm, TypeOp.logical_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_OR, "|", UI, UI, bi | cm, TypeOp.logical_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_LEFT, "<<", I, I, bi, TypeOp.shift_op | TypeOp.inherits_sign_zero)
-    _b(OpCode.CPUI_INT_RIGHT, ">>", UI, UI, bi, TypeOp.shift_op)
-    _b(OpCode.CPUI_INT_SRIGHT, "s>>", I, I, bi, TypeOp.shift_op)
-    _b(OpCode.CPUI_INT_MULT, "*", I, I, bi | cm, TypeOp.arithmetic_op | TypeOp.inherits_sign)
-    _b(OpCode.CPUI_INT_DIV, "/", UI, UI, bi, TypeOp.arithmetic_op)
-    _b(OpCode.CPUI_INT_SDIV, "s/", I, I, bi, TypeOp.arithmetic_op)
-    _b(OpCode.CPUI_INT_REM, "%", UI, UI, bi, TypeOp.arithmetic_op)
-    _b(OpCode.CPUI_INT_SREM, "s%", I, I, bi, TypeOp.arithmetic_op)
-
-    _u(OpCode.CPUI_BOOL_NEGATE, "!", B, B, un | bo)
-    _b(OpCode.CPUI_BOOL_XOR, "^^", B, B, bi | bo | cm)
-    _b(OpCode.CPUI_BOOL_AND, "&&", B, B, bi | bo | cm)
-    _b(OpCode.CPUI_BOOL_OR, "||", B, B, bi | bo | cm)
-
-    _b(OpCode.CPUI_FLOAT_EQUAL, "f==", B, F, bi | bo | cm, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_NOTEQUAL, "f!=", B, F, bi | bo | cm, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_LESS, "f<", B, F, bi | bo, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_LESSEQUAL, "f<=", B, F, bi | bo, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_NAN, "NAN", B, F, un | bo, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_ADD, "f+", F, F, bi | cm, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_DIV, "f/", F, F, bi, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_MULT, "f*", F, F, bi | cm, TypeOp.floatingpoint_op)
-    _b(OpCode.CPUI_FLOAT_SUB, "f-", F, F, bi, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_NEG, "f-", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_ABS, "ABS", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_SQRT, "SQRT", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_INT2FLOAT, "INT2FLOAT", F, I, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_FLOAT2FLOAT, "FLOAT2FLOAT", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_TRUNC, "TRUNC", I, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_CEIL, "CEIL", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_FLOOR, "FLOOR", F, F, un, TypeOp.floatingpoint_op)
-    _u(OpCode.CPUI_FLOAT_ROUND, "ROUND", F, F, un, TypeOp.floatingpoint_op)
-
-    _s(OpCode.CPUI_MULTIEQUAL, "MULTIEQUAL", mk)
-    _s(OpCode.CPUI_INDIRECT, "INDIRECT", mk)
-    _b(OpCode.CPUI_PIECE, "PIECE", U, U, bi)
-    _b(OpCode.CPUI_SUBPIECE, "SUBPIECE", U, U, bi)
-    _s(OpCode.CPUI_CAST, "CAST", un)
-    _b(OpCode.CPUI_PTRADD, "PTRADD", U, U, PcOp.ternary)
-    _b(OpCode.CPUI_PTRSUB, "PTRSUB", U, U, bi)
-    _s(OpCode.CPUI_SEGMENTOP, "SEGMENTOP")
-    _s(OpCode.CPUI_CPOOLREF, "CPOOLREF")
-    _s(OpCode.CPUI_NEW, "NEW")
-    _s(OpCode.CPUI_INSERT, "INSERT")
-    _s(OpCode.CPUI_EXTRACT, "EXTRACT")
-    _u(OpCode.CPUI_POPCOUNT, "POPCOUNT", UI, U, un)
-    _u(OpCode.CPUI_LZCOUNT, "LZCOUNT", UI, U, un)
+    _reg(TypeOpMultiequal(tlst))
+    _reg(TypeOpIndirect(tlst))
+    _reg(TypeOpPiece(tlst))
+    _reg(TypeOpSubpiece(tlst))
+    _reg(TypeOpCast(tlst))
+    _reg(TypeOpPtradd(tlst))
+    _reg(TypeOpPtrsub(tlst))
+    _reg(TypeOpSegmentOp(tlst))
+    _reg(TypeOpCpoolRef(tlst))
+    _reg(TypeOpNew(tlst))
+    _reg(TypeOpInsert(tlst))
+    _reg(TypeOpExtract(tlst))
+    _reg(TypeOpPopcount(tlst))
+    _reg(TypeOpLzcount(tlst))
 
     return inst

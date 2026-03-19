@@ -119,9 +119,27 @@ class HighIntersectTest:
         self._stackOps = stackOps
         self._cache: dict = {}
 
-    def updateHigh(self, high: HighVariable) -> None:
-        """Update cache information for a HighVariable."""
-        pass
+    def updateHigh(self, high: HighVariable) -> bool:
+        """Update cache information for a HighVariable.
+
+        Checks if the HighVariable's cover is dirty, and if so,
+        updates it and purges stale cache entries.
+
+        C++ ref: ``HighIntersectTest::updateHigh``
+        """
+        if hasattr(high, 'isCoverDirty') and not high.isCoverDirty():
+            return True
+        if hasattr(high, 'updateCover'):
+            high.updateCover()
+        self._purgeHigh(high)
+        return False
+
+    def _purgeHigh(self, high: HighVariable) -> None:
+        """Remove all cached intersection results involving a given HighVariable."""
+        hid = id(high)
+        to_remove = [k for k in self._cache if k[0] == hid or k[1] == hid]
+        for k in to_remove:
+            del self._cache[k]
 
     def intersection(self, a: HighVariable, b: HighVariable) -> bool:
         """Test if two HighVariables have intersecting covers.
@@ -1075,8 +1093,27 @@ class Merge:
         return self._numHighMerges if hasattr(self, '_numHighMerges') else 0
 
     def verifyHighCovers(self) -> None:
-        """Verify that all HighVariable covers are consistent (debug method)."""
-        pass
+        """Verify that all HighVariable covers are consistent (debug method).
+
+        For each HighVariable, make sure there are no internal intersections
+        between its instance Varnodes (unless one is a COPY shadow of the other).
+
+        C++ ref: ``Merge::verifyHighCovers``
+        """
+        if self._data is None:
+            return
+        if not hasattr(self._data, 'beginLoc'):
+            return
+        for vn in self._data.beginLoc():
+            if hasattr(vn, 'hasCover') and vn.hasCover():
+                high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+                if high is None:
+                    continue
+                if hasattr(high, 'hasCopyIn1') and not high.hasCopyIn1():
+                    if hasattr(high, 'setCopyIn1'):
+                        high.setCopyIn1()
+                    if hasattr(high, 'verifyCover'):
+                        high.verifyCover()
 
     def collectInputs(self, high: HighVariable, oplist: list, op: PcodeOp) -> None:
         """Collect Varnode instances from a HighVariable that are inputs to a given PcodeOp."""

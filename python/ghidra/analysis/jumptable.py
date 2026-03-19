@@ -21,6 +21,30 @@ class LoadTable:
     def __lt__(self, other):
         return self.addr < other.addr
 
+    def encode(self, encoder) -> None:
+        """Encode this LoadTable as a <loadtable> element.
+
+        C++ ref: ``LoadTable::encode``
+        """
+        from ghidra.core.marshal import ELEM_LOADTABLE, ATTRIB_SIZE, ATTRIB_NUM
+        encoder.openElement(ELEM_LOADTABLE)
+        encoder.writeSignedInteger(ATTRIB_SIZE, self.size)
+        encoder.writeSignedInteger(ATTRIB_NUM, self.num)
+        self.addr.encode(encoder)
+        encoder.closeElement(ELEM_LOADTABLE)
+
+    def decode(self, decoder) -> None:
+        """Decode this LoadTable from a <loadtable> element.
+
+        C++ ref: ``LoadTable::decode``
+        """
+        from ghidra.core.marshal import ELEM_LOADTABLE, ATTRIB_SIZE, ATTRIB_NUM
+        elemId = decoder.openElement(ELEM_LOADTABLE)
+        self.size = decoder.readSignedInteger(ATTRIB_SIZE)
+        self.num = decoder.readSignedInteger(ATTRIB_NUM)
+        self.addr = Address.decode(decoder)
+        decoder.closeElement(elemId)
+
     @staticmethod
     def collapseTable(table: list) -> None:
         """Collapse adjacent table entries."""
@@ -385,12 +409,83 @@ class JumpTable:
         return False
 
     def encode(self, encoder) -> None:
-        """Encode this jump-table to a stream."""
-        pass
+        """Encode this jump-table as a <jumptable> element.
+
+        C++ ref: ``JumpTable::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_JUMPTABLE, ELEM_DEST, ATTRIB_LABEL,
+        )
+        if not self.isRecovered():
+            return
+        encoder.openElement(ELEM_JUMPTABLE)
+        self.opaddress.encode(encoder)
+        for i, addr in enumerate(self.addresstable):
+            encoder.openElement(ELEM_DEST)
+            if not addr.isInvalid():
+                spc = addr.getSpace()
+                if spc is not None and hasattr(spc, 'encodeAttributes'):
+                    spc.encodeAttributes(encoder, addr.getOffset())
+            if i < len(self.label):
+                if self.label[i] != JumpValues.NO_LABEL:
+                    encoder.writeUnsignedInteger(ATTRIB_LABEL, self.label[i])
+            encoder.closeElement(ELEM_DEST)
+        for lp in self.loadpoints:
+            if hasattr(lp, 'encode'):
+                lp.encode(encoder)
+        if self.jmodel is not None and self.jmodel.isOverride():
+            if hasattr(self.jmodel, 'encode'):
+                self.jmodel.encode(encoder)
+        encoder.closeElement(ELEM_JUMPTABLE)
 
     def decode(self, decoder) -> None:
-        """Decode this jump-table from a stream."""
-        pass
+        """Decode this jump-table from a <jumptable> element.
+
+        C++ ref: ``JumpTable::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_JUMPTABLE, ELEM_DEST, ELEM_LOADTABLE,
+            ELEM_BASICOVERRIDE, ATTRIB_LABEL,
+        )
+        elemId = decoder.openElement(ELEM_JUMPTABLE)
+        self.opaddress = Address.decode(decoder)
+        missedlabel = False
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_DEST.id:
+                decoder.openElement()
+                foundlabel = False
+                while True:
+                    attribId = decoder.getNextAttributeId()
+                    if attribId == 0:
+                        break
+                    if attribId == ATTRIB_LABEL.id:
+                        if missedlabel:
+                            raise Exception("Jumptable entries are missing labels")
+                        lab = decoder.readUnsignedInteger()
+                        self.label.append(lab)
+                        foundlabel = True
+                        break
+                if not foundlabel:
+                    missedlabel = True
+                addr = Address.decode(decoder)
+                self.addresstable.append(addr)
+            elif subId == ELEM_LOADTABLE.id:
+                lp = LoadTable()
+                lp.decode(decoder)
+                self.loadpoints.append(lp)
+            elif subId == ELEM_BASICOVERRIDE.id:
+                self.jmodel = JumpBasicOverride(self)
+                self.jmodel.decode(decoder)
+            else:
+                decoder.openElement()
+                decoder.closeElement(subId)
+        decoder.closeElement(elemId)
+        if self.label:
+            while len(self.label) < len(self.addresstable):
+                self.label.append(JumpValues.NO_LABEL)
 
     def setOverride(self, addrtable: list, naddr, h: int, sv: int) -> None:
         """Force a manual override of the jump-table addresses."""
@@ -728,4 +823,41 @@ class JumpBasicOverride(JumpModel):
         return self._addrOverride[i]
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode this override as a <basicoverride> element.
+
+        C++ ref: ``JumpBasicOverride::encode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_BASICOVERRIDE, ELEM_DEST,
+            ELEM_NORMADDR, ELEM_NORMHASH, ELEM_STARTVAL,
+            ATTRIB_CONTENT,
+        )
+        encoder.openElement(ELEM_BASICOVERRIDE)
+        for addr in self._addrOverride:
+            encoder.openElement(ELEM_DEST)
+            spc = addr.getSpace()
+            if spc is not None and hasattr(spc, 'encodeAttributes'):
+                spc.encodeAttributes(encoder, addr.getOffset())
+            encoder.closeElement(ELEM_DEST)
+        encoder.closeElement(ELEM_BASICOVERRIDE)
+
+    def decode(self, decoder) -> None:
+        """Decode this override from a <basicoverride> element.
+
+        C++ ref: ``JumpBasicOverride::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_BASICOVERRIDE, ELEM_DEST,
+            ELEM_NORMADDR, ELEM_NORMHASH, ELEM_STARTVAL,
+            ATTRIB_CONTENT,
+        )
+        elemId = decoder.openElement(ELEM_BASICOVERRIDE)
+        while True:
+            subId = decoder.openElement()
+            if subId == 0:
+                break
+            if subId == ELEM_DEST.id:
+                addr = Address.decode(decoder)
+                self._addrOverride.append(addr)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)

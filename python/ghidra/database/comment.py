@@ -58,7 +58,39 @@ class Comment:
         self.text = txt
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode this comment as a <comment> element.
+
+        C++ ref: ``Comment::encode``
+        """
+        from ghidra.core.marshal import ELEM_COMMENT, ELEM_TEXT, ATTRIB_TYPE, ATTRIB_CONTENT
+        tpname = Comment.decodeCommentType(self.type)
+        encoder.openElement(ELEM_COMMENT)
+        encoder.writeString(ATTRIB_TYPE, tpname)
+        self.funcaddr.encode(encoder)
+        self.addr.encode(encoder)
+        encoder.openElement(ELEM_TEXT)
+        encoder.writeString(ATTRIB_CONTENT, self.text)
+        encoder.closeElement(ELEM_TEXT)
+        encoder.closeElement(ELEM_COMMENT)
+
+    def decode(self, decoder) -> None:
+        """Decode this comment from a <comment> element.
+
+        C++ ref: ``Comment::decode``
+        """
+        from ghidra.core.marshal import ELEM_COMMENT, ATTRIB_TYPE, ATTRIB_CONTENT
+        self.emitted = False
+        self.type = 0
+        elemId = decoder.openElement(ELEM_COMMENT)
+        self.type = Comment.encodeCommentType(decoder.readString(ATTRIB_TYPE))
+        self.funcaddr = Address.decode(decoder)
+        self.addr = Address.decode(decoder)
+        subId = decoder.peekElement()
+        if subId != 0:
+            decoder.openElement()
+            self.text = decoder.readString(ATTRIB_CONTENT)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     @staticmethod
     def encodeCommentType(name: str) -> int:
@@ -138,10 +170,29 @@ class CommentDatabaseInternal(CommentDatabase):
         return self._comments.get(self._key(fad), [])
 
     def encode(self, encoder) -> None:
-        pass
+        """Encode the entire comment database.
+
+        C++ ref: ``CommentDatabaseInternal::encode``
+        """
+        from ghidra.core.marshal import ELEM_COMMENTDB
+        encoder.openElement(ELEM_COMMENTDB)
+        for comment_list in self._comments.values():
+            for comm in comment_list:
+                comm.encode(encoder)
+        encoder.closeElement(ELEM_COMMENTDB)
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode the entire comment database.
+
+        C++ ref: ``CommentDatabaseInternal::decode``
+        """
+        from ghidra.core.marshal import ELEM_COMMENTDB
+        elemId = decoder.openElement(ELEM_COMMENTDB)
+        while decoder.peekElement() != 0:
+            comm = Comment()
+            comm.decode(decoder)
+            self.addComment(comm.getType(), comm.getFuncAddr(), comm.getAddr(), comm.getText())
+        decoder.closeElement(elemId)
 
     def beginComment(self, fad: Address):
         return iter(self.getComments(fad))

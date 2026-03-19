@@ -72,6 +72,7 @@ class UserOpManage:
         self.glb = None
         self._useroplist: List[Optional[UserPcodeOp]] = []
         self._useropmap: Dict[str, UserPcodeOp] = {}
+        self._builtinmap: Dict[int, UserPcodeOp] = {}
 
     def initialize(self, glb) -> None:
         self.glb = glb
@@ -111,21 +112,51 @@ class UserOpManage:
         return len(self._useroplist)
 
     def decodeSegmentOp(self, decoder, glb) -> None:
-        """Decode a segment op from a stream."""
-        pass
+        """Decode a <segmentop> element and register it.
+
+        C++ ref: ``UserOpManage::decodeSegmentOp``
+        """
+        s_op = SegmentOp("", glb, len(self._useroplist))
+        s_op.decode(decoder)
+        self.registerOp(s_op)
 
     def decodeJumpAssist(self, decoder, glb) -> None:
-        """Decode a jump assist op from a stream."""
-        pass
+        """Decode a <jumpassist> element and register it.
+
+        C++ ref: ``UserOpManage::decodeJumpAssist``
+        """
+        op = JumpAssistOp("", glb)
+        op.decode(decoder)
+        self.registerOp(op)
 
     def decodeCallOtherFixup(self, decoder, glb) -> None:
-        """Decode a CALLOTHER fixup from a stream."""
-        pass
+        """Decode a <callotherfixup> element and register it.
+
+        C++ ref: ``UserOpManage::decodeCallOtherFixup``
+        """
+        op = InjectedUserOp("", glb, 0, 0)
+        op.decode(decoder)
+        self.registerOp(op)
 
     def manualCallOtherFixup(self, useropname: str, outname: str,
                               inname: list, snippet: str, glb=None) -> None:
-        """Manually define a CALLOTHER fixup."""
-        pass
+        """Manually define a CALLOTHER fixup.
+
+        C++ ref: ``UserOpManage::manualCallOtherFixup``
+        """
+        userop = self.getOp(useropname)
+        if userop is None:
+            raise Exception("Unknown userop: " + useropname)
+        if not isinstance(userop, UnspecializedPcodeOp):
+            raise Exception("Cannot fixup userop: " + useropname)
+        if glb is None:
+            glb = self.glb
+        injectid = -1
+        if glb is not None and hasattr(glb, 'pcodeinjectlib'):
+            injectid = glb.pcodeinjectlib.manualCallOtherFixup(
+                useropname, outname, inname, snippet)
+        op = InjectedUserOp(useropname, glb, userop.getIndex(), injectid)
+        self.registerOp(op)
 
     def getSegmentOp(self, i: int = 0):
         """Get the i-th SegmentOp (if any)."""
@@ -140,13 +171,55 @@ class UserOpManage:
         """Return the number of SegmentOps registered."""
         return sum(1 for op in self._useroplist if op is not None and isinstance(op, SegmentOp))
 
-    def registerBuiltin(self, glb) -> None:
-        """Register built-in user ops (volatile read/write, etc.)."""
-        pass
+    def registerBuiltin(self, i: int) -> Optional[UserPcodeOp]:
+        """Register a built-in user-op by id.
+
+        C++ ref: ``UserOpManage::registerBuiltin``
+        """
+        # Check if already registered
+        if not hasattr(self, '_builtinmap'):
+            self._builtinmap: Dict[int, UserPcodeOp] = {}
+        if i in self._builtinmap:
+            return self._builtinmap[i]
+        glb = self.glb
+        if i == UserPcodeOp.BUILTIN_VOLATILE_READ:
+            res = VolatileReadOp("read_volatile", glb)
+        elif i == UserPcodeOp.BUILTIN_VOLATILE_WRITE:
+            res = VolatileWriteOp("write_volatile", glb)
+        else:
+            res = UnspecializedPcodeOp(f"builtin_{i}", glb, i)
+        self._builtinmap[i] = res
+        return res
 
     def decodeVolatile(self, decoder, glb) -> None:
-        """Decode volatile read/write ops from a stream."""
-        pass
+        """Decode volatile read/write ops from a <volatile> element.
+
+        C++ ref: ``UserOpManage::decodeVolatile``
+        """
+        from ghidra.core.marshal import ATTRIB_INPUTOP, ATTRIB_OUTPUTOP, ATTRIB_FORMAT
+        if not hasattr(self, '_builtinmap'):
+            self._builtinmap: Dict[int, UserPcodeOp] = {}
+        readOpName = ""
+        writeOpName = ""
+        functionalDisplay = False
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_INPUTOP.id:
+                readOpName = decoder.readString()
+            elif attribId == ATTRIB_OUTPUTOP.id:
+                writeOpName = decoder.readString()
+            elif attribId == ATTRIB_FORMAT.id:
+                fmt = decoder.readString()
+                if fmt == "functional":
+                    functionalDisplay = True
+        if not readOpName or not writeOpName:
+            raise Exception("Missing inputop/outputop attributes in <volatile> element")
+        vr_op = VolatileReadOp(readOpName, glb)
+        self._builtinmap[UserPcodeOp.BUILTIN_VOLATILE_READ] = vr_op
+        vw_op = VolatileWriteOp(writeOpName, glb)
+        self._builtinmap[UserPcodeOp.BUILTIN_VOLATILE_WRITE] = vw_op
 
 
 class SegmentOp(UserPcodeOp):
@@ -174,7 +247,60 @@ class SegmentOp(UserPcodeOp):
         return self.injectId
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode a <segmentop> element.
+
+        C++ ref: ``SegmentOp::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_SEGMENTOP, ELEM_CONSTRESOLVE, ELEM_PCODE,
+            ATTRIB_SPACE, ATTRIB_FARPOINTER, ATTRIB_USEROP,
+        )
+        elemId = decoder.openElement(ELEM_SEGMENTOP)
+        self.spc = None
+        self.injectId = -1
+        self.baseinsize = 0
+        self.innerinsize = 0
+        self.supportsfarpointer = False
+        self.name = "segment"
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_SPACE.id:
+                self.spc = decoder.readSpace()
+            elif attribId == ATTRIB_FARPOINTER.id:
+                self.supportsfarpointer = True
+            elif attribId == ATTRIB_USEROP.id:
+                self.name = decoder.readString()
+        if self.spc is None:
+            raise Exception("<segmentop> expecting space attribute")
+        if self.glb is not None and hasattr(self.glb, 'userops'):
+            otherop = self.glb.userops.getOp(self.name)
+            if otherop is not None:
+                self.useropindex = otherop.getIndex()
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_CONSTRESOLVE.id:
+                decoder.openElement()
+                if decoder.peekElement() != 0:
+                    from ghidra.core.address import Address
+                    addr = Address.decode(decoder)
+                    self.constresolve = addr
+                decoder.closeElement(subId)
+            elif subId == ELEM_PCODE.id:
+                if self.glb is not None and hasattr(self.glb, 'pcodeinjectlib'):
+                    nm = self.name + "_pcode"
+                    self.injectId = self.glb.pcodeinjectlib.decodeInject(
+                        "cspec", nm, 2, decoder)  # EXECUTABLEPCODE_TYPE=2
+                else:
+                    decoder.openElement()
+                    decoder.closeElement(subId)
+            else:
+                decoder.openElement()
+                decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     def getNumVariableTerms(self) -> int:
         return 0
@@ -211,7 +337,60 @@ class JumpAssistOp(UserPcodeOp):
         self.index2case = val
 
     def decode(self, decoder) -> None:
-        pass
+        """Decode a <jumpassist> element.
+
+        C++ ref: ``JumpAssistOp::decode``
+        """
+        from ghidra.core.marshal import (
+            ELEM_JUMPASSIST, ELEM_CASE_PCODE, ELEM_ADDR_PCODE,
+            ELEM_DEFAULT_PCODE, ELEM_SIZE_PCODE, ATTRIB_NAME,
+        )
+        elemId = decoder.openElement(ELEM_JUMPASSIST)
+        self.name = decoder.readString(ATTRIB_NAME)
+        self.index2case = -1
+        self.index2addr = -1
+        self.defaultaddr = -1
+        self.calcsize = -1
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_CASE_PCODE.id:
+                if self.glb is not None and hasattr(self.glb, 'pcodeinjectlib'):
+                    self.index2case = self.glb.pcodeinjectlib.decodeInject(
+                        "jumpassistop", self.name + "_index2case", 2, decoder)
+                else:
+                    decoder.openElement()
+                    decoder.closeElement(subId)
+            elif subId == ELEM_ADDR_PCODE.id:
+                if self.glb is not None and hasattr(self.glb, 'pcodeinjectlib'):
+                    self.index2addr = self.glb.pcodeinjectlib.decodeInject(
+                        "jumpassistop", self.name + "_index2addr", 2, decoder)
+                else:
+                    decoder.openElement()
+                    decoder.closeElement(subId)
+            elif subId == ELEM_DEFAULT_PCODE.id:
+                if self.glb is not None and hasattr(self.glb, 'pcodeinjectlib'):
+                    self.defaultaddr = self.glb.pcodeinjectlib.decodeInject(
+                        "jumpassistop", self.name + "_defaultaddr", 2, decoder)
+                else:
+                    decoder.openElement()
+                    decoder.closeElement(subId)
+            elif subId == ELEM_SIZE_PCODE.id:
+                if self.glb is not None and hasattr(self.glb, 'pcodeinjectlib'):
+                    self.calcsize = self.glb.pcodeinjectlib.decodeInject(
+                        "jumpassistop", self.name + "_calcsize", 2, decoder)
+                else:
+                    decoder.openElement()
+                    decoder.closeElement(subId)
+            else:
+                decoder.openElement()
+                decoder.closeElement(subId)
+        decoder.closeElement(elemId)
+        if self.glb is not None and hasattr(self.glb, 'userops'):
+            base = self.glb.userops.getOp(self.name)
+            if base is not None:
+                self.useropindex = base.getIndex()
 
 
 class InternalStringOp(UserPcodeOp):
