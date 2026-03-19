@@ -125,19 +125,42 @@ class TestSortCallSpecs:
         fd.sortCallSpecs()
         assert fd._qlst == []
 
-    def test_sort_orders_by_address(self):
+    def test_sort_orders_by_block_and_order(self):
         fd = _make_fd()
 
-        class FakeCS:
-            def __init__(self, off):
-                self._off = off
+        class FakeSeq:
+            def __init__(self, order):
+                self._order = order
+            def getOrder(self):
+                return self._order
 
+        class FakeBlock:
+            def __init__(self, idx):
+                self._idx = idx
+            def getIndex(self):
+                return self._idx
+
+        class FakeOp:
+            def __init__(self, blk_idx, order):
+                self._blk = FakeBlock(blk_idx)
+                self._seq = FakeSeq(order)
+            def getParent(self):
+                return self._blk
+            def getSeqNum(self):
+                return self._seq
+
+        class FakeCS:
+            def __init__(self, off, blk_idx, order):
+                self._off = off
+                self._op = FakeOp(blk_idx, order)
             def getEntryAddress(self):
                 return Address(fd._glb.getDefaultCodeSpace(), self._off)
+            def getOp(self):
+                return self._op
 
-        cs1 = FakeCS(0x3000)
-        cs2 = FakeCS(0x1000)
-        cs3 = FakeCS(0x2000)
+        cs1 = FakeCS(0x3000, 2, 0)
+        cs2 = FakeCS(0x1000, 0, 0)
+        cs3 = FakeCS(0x2000, 1, 0)
         fd._qlst = [cs1, cs2, cs3]
         fd.sortCallSpecs()
         offsets = [cs.getEntryAddress().getOffset() for cs in fd._qlst]
@@ -570,15 +593,38 @@ class TestCompareCallspecs:
     def test_compare(self):
         spc = _MinimalSpace()
 
-        class FakeCS:
-            def __init__(self, off):
-                self._addr = Address(spc, off)
+        class FakeSeq:
+            def __init__(self, order):
+                self._order = order
+            def getOrder(self):
+                return self._order
 
+        class FakeBlock:
+            def __init__(self, idx):
+                self._idx = idx
+            def getIndex(self):
+                return self._idx
+
+        class FakeOp:
+            def __init__(self, blk_idx, order):
+                self._blk = FakeBlock(blk_idx)
+                self._seq = FakeSeq(order)
+            def getParent(self):
+                return self._blk
+            def getSeqNum(self):
+                return self._seq
+
+        class FakeCS:
+            def __init__(self, off, blk_idx, order=0):
+                self._addr = Address(spc, off)
+                self._op = FakeOp(blk_idx, order)
             def getEntryAddress(self):
                 return self._addr
+            def getOp(self):
+                return self._op
 
-        a = FakeCS(0x1000)
-        b = FakeCS(0x2000)
+        a = FakeCS(0x1000, 0)
+        b = FakeCS(0x2000, 1)
         assert Funcdata.compareCallspecs(a, b) is True
         assert Funcdata.compareCallspecs(b, a) is False
 

@@ -120,6 +120,8 @@ def calcNZMask(data):
     for op in list(data._obank.beginAlive()):
         for i in range(op.numInput()):
             vn = op.getIn(i)
+            if vn is None:
+                continue
             if not vn.isWritten():
                 if vn.isConstant():
                     vn._nzm = vn.getOffset()
