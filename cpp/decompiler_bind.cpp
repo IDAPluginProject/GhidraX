@@ -375,7 +375,23 @@ public:
 
             } else if (stop_after == "heritage") {
                 // Stage 2: flow + heritage (SSA)
-                fd->startProcessing();
+                // Must run prerequisite actions before opHeritage to avoid
+                // segfault — heritage needs function prototypes, call specs,
+                // varnode properties, etc. to be set up first.
+                // This mirrors the universalAction order in coreaction.cc.
+                AddrSpace *stackspace = arch.getStackSpace();
+
+                ActionStart           a1("base");        a1.reset(*fd); a1.perform(*fd);
+                ActionConstbase       a2("base");        a2.reset(*fd); a2.perform(*fd);
+                ActionNormalizeSetup  a3("normalanalysis"); a3.reset(*fd); a3.perform(*fd);
+                ActionDefaultParams   a4("base");        a4.reset(*fd); a4.perform(*fd);
+                ActionExtraPopSetup   a5("base", stackspace); a5.reset(*fd); a5.perform(*fd);
+                ActionPrototypeTypes  a6("protorecovery"); a6.reset(*fd); a6.perform(*fd);
+                ActionFuncLink        a7("protorecovery"); a7.reset(*fd); a7.perform(*fd);
+                ActionFuncLinkOutOnly a8("noproto");      a8.reset(*fd); a8.perform(*fd);
+                ActionUnreachable     a9("base");        a9.reset(*fd); a9.perform(*fd);
+                ActionVarnodeProps    a10("base");       a10.reset(*fd); a10.perform(*fd);
+
                 fd->opHeritage();
                 result["ir"] = dumpIr(fd);
 

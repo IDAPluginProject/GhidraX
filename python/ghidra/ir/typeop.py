@@ -1089,7 +1089,22 @@ class TypeOpPiece(TypeOpFunc):
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if inslot != -1:
             return None
-        return alttype  # Simplified: propagate output type to input
+        # Compute byte offset for the output slot within the composite
+        inVn0 = op.getIn(0)
+        spc = inVn0.getSpace() if hasattr(inVn0, 'getSpace') else None
+        if spc is not None and hasattr(spc, 'isBigEndian') and spc.isBigEndian():
+            byteOff = 0 if outslot == 0 else inVn0.getSize()
+        else:
+            byteOff = op.getIn(1).getSize() if outslot == 0 else 0
+        while alttype is not None and (byteOff != 0 or alttype.getSize() != outvn.getSize()):
+            if hasattr(alttype, 'getSubType'):
+                alttype = alttype.getSubType(byteOff, None)
+            else:
+                break
+            if alttype is None:
+                break
+            byteOff = 0
+        return alttype
 
 class TypeOpSubpiece(TypeOpFunc):
     """CPUI_SUBPIECE — extraction of sub-value."""
@@ -1104,11 +1119,23 @@ class TypeOpSubpiece(TypeOpFunc):
     def propagateType(self, alttype, op, invn, outvn, inslot, outslot):
         if inslot != 0 or outslot != -1:
             return None  # Propagation must be from in0 to out
-        while alttype is not None and alttype.getSize() != outvn.getSize():
+        # Compute byte offset based on endianness (C++ computeByteOffsetForComposite)
+        outSize = outvn.getSize()
+        lsb = op.getIn(1).getOffset() if op.numInput() > 1 else 0
+        vn = op.getIn(0)
+        spc = vn.getSpace() if hasattr(vn, 'getSpace') else None
+        if spc is not None and hasattr(spc, 'isBigEndian') and spc.isBigEndian():
+            byteOff = vn.getSize() - outSize - lsb
+        else:
+            byteOff = lsb
+        while alttype is not None and (byteOff != 0 or alttype.getSize() != outvn.getSize()):
             if hasattr(alttype, 'getSubType'):
-                alttype = alttype.getSubType(0, None)
+                alttype = alttype.getSubType(byteOff, None)
             else:
                 break
+            if alttype is None:
+                break
+            byteOff = 0
         return alttype
 
 class TypeOpCast(TypeOp):

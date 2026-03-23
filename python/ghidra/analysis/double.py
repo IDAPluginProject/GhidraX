@@ -9,6 +9,7 @@ them into single logical operations.
 
 from __future__ import annotations
 from typing import Optional, List
+from ghidra.core.address import calc_mask
 from ghidra.core.opcodes import OpCode
 
 
@@ -1488,21 +1489,194 @@ class ShiftForm:
 
     def __init__(self) -> None:
         self.inv = SplitVarnode()
-        self.outdoub = SplitVarnode()
-        self.sa = None
+        self.out = SplitVarnode()
+        self.lo = None
+        self.hi = None
+        self.reslo = None
+        self.reshi = None
+        self.midlo = None
+        self.midhi = None
+        self.salo = None
+        self.sahi = None
+        self.samid = None
+        self.loshift = None
+        self.midshift = None
+        self.hishift = None
+        self.orop = None
+        self.opc = None
         self.existop = None
+
+    def mapLeft(self) -> bool:
+        """Assume reshi, reslo are filled in, fill in other ops and varnodes for left shift."""
+        if not self.reslo.isWritten():
+            return False
+        if not self.reshi.isWritten():
+            return False
+        self.loshift = self.reslo.getDef()
+        self.opc = self.loshift.code()
+        if self.opc != OpCode.CPUI_INT_LEFT:
+            return False
+        self.orop = self.reshi.getDef()
+        if self.orop.code() not in (OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_ADD):
+            return False
+        self.midlo = self.orop.getIn(0)
+        self.midhi = self.orop.getIn(1)
+        if not self.midlo.isWritten():
+            return False
+        if not self.midhi.isWritten():
+            return False
+        if self.midhi.getDef().code() != OpCode.CPUI_INT_LEFT:
+            self.midhi, self.midlo = self.midlo, self.midhi
+        self.midshift = self.midlo.getDef()
+        if self.midshift.code() != OpCode.CPUI_INT_RIGHT:
+            return False
+        self.hishift = self.midhi.getDef()
+        if self.hishift.code() != OpCode.CPUI_INT_LEFT:
+            return False
+        if self.lo is not self.loshift.getIn(0):
+            return False
+        if self.hi is not self.hishift.getIn(0):
+            return False
+        if self.lo is not self.midshift.getIn(0):
+            return False
+        self.salo = self.loshift.getIn(1)
+        self.sahi = self.hishift.getIn(1)
+        self.samid = self.midshift.getIn(1)
+        return True
+
+    def mapRight(self) -> bool:
+        """Assume reshi, reslo are filled in, fill in other ops and varnodes for right shift."""
+        if not self.reslo.isWritten():
+            return False
+        if not self.reshi.isWritten():
+            return False
+        self.hishift = self.reshi.getDef()
+        self.opc = self.hishift.code()
+        if self.opc not in (OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT):
+            return False
+        self.orop = self.reslo.getDef()
+        if self.orop.code() not in (OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_ADD):
+            return False
+        self.midlo = self.orop.getIn(0)
+        self.midhi = self.orop.getIn(1)
+        if not self.midlo.isWritten():
+            return False
+        if not self.midhi.isWritten():
+            return False
+        if self.midlo.getDef().code() != OpCode.CPUI_INT_RIGHT:
+            self.midhi, self.midlo = self.midlo, self.midhi
+        self.midshift = self.midhi.getDef()
+        if self.midshift.code() != OpCode.CPUI_INT_LEFT:
+            return False
+        self.loshift = self.midlo.getDef()
+        if self.loshift.code() != OpCode.CPUI_INT_RIGHT:
+            return False
+        if self.lo is not self.loshift.getIn(0):
+            return False
+        if self.hi is not self.hishift.getIn(0):
+            return False
+        if self.hi is not self.midshift.getIn(0):
+            return False
+        self.salo = self.loshift.getIn(1)
+        self.sahi = self.hishift.getIn(1)
+        self.samid = self.midshift.getIn(1)
+        return True
+
+    def verifyShiftAmount(self) -> bool:
+        """Make sure all the shift amount varnodes are consistent."""
+        if not self.salo.isConstant():
+            return False
+        if not self.samid.isConstant():
+            return False
+        if not self.sahi.isConstant():
+            return False
+        val = self.salo.getOffset()
+        if val != self.sahi.getOffset():
+            return False
+        if val >= 8 * self.lo.getSize():
+            return False
+        complement = 8 * self.lo.getSize() - val
+        if self.samid.getOffset() != complement:
+            return False
+        return True
+
+    def verifyLeft(self, h, l, loop) -> bool:
+        """Verify the left shift pattern starting from the lo shift op."""
+        self.hi = h
+        self.lo = l
+        self.loshift = loop
+        self.reslo = self.loshift.getOut()
+        for hishift in list(h.getDescendants()):
+            if hishift.code() != OpCode.CPUI_INT_LEFT:
+                continue
+            outvn = hishift.getOut()
+            for midshift in list(outvn.getDescendants()):
+                tmpvn = midshift.getOut()
+                if tmpvn is None:
+                    continue
+                self.reshi = tmpvn
+                if not self.mapLeft():
+                    continue
+                if not self.verifyShiftAmount():
+                    continue
+                return True
+        return False
+
+    def verifyRight(self, h, l, hiop) -> bool:
+        """Verify the right shift pattern starting from the hi shift op."""
+        self.hi = h
+        self.lo = l
+        self.hishift = hiop
+        self.reshi = hiop.getOut()
+        for loshift in list(l.getDescendants()):
+            if loshift.code() != OpCode.CPUI_INT_RIGHT:
+                continue
+            outvn = loshift.getOut()
+            for midshift in list(outvn.getDescendants()):
+                tmpvn = midshift.getOut()
+                if tmpvn is None:
+                    continue
+                self.reslo = tmpvn
+                if not self.mapRight():
+                    continue
+                if not self.verifyShiftAmount():
+                    continue
+                return True
+        return False
 
     def applyRuleLeft(self, i, op, workishi: bool, data) -> bool:
         """Apply the left shift form rule.
         Corresponds to ShiftForm::applyRuleLeft in double.cc."""
-        # Stub: requires complex shift pattern matching
-        return False
+        if workishi:
+            return False
+        if not i.hasBothPieces():
+            return False
+        self.inv = i
+        if not self.verifyLeft(self.inv.getHi(), self.inv.getLo(), op):
+            return False
+        self.out.initPartial(self.inv.getSize(), self.reslo, self.reshi)
+        self.existop = SplitVarnode.prepareShiftOp(self.out, self.inv)
+        if self.existop is None:
+            return False
+        SplitVarnode.createShiftOp(data, self.out, self.inv, self.salo, self.existop, self.opc)
+        return True
 
     def applyRuleRight(self, i, op, workishi: bool, data) -> bool:
         """Apply the right shift form rule.
         Corresponds to ShiftForm::applyRuleRight in double.cc."""
-        # Stub: requires complex shift pattern matching
-        return False
+        if not workishi:
+            return False
+        if not i.hasBothPieces():
+            return False
+        self.inv = i
+        if not self.verifyRight(self.inv.getHi(), self.inv.getLo(), op):
+            return False
+        self.out.initPartial(self.inv.getSize(), self.reslo, self.reshi)
+        self.existop = SplitVarnode.prepareShiftOp(self.out, self.inv)
+        if self.existop is None:
+            return False
+        SplitVarnode.createShiftOp(data, self.out, self.inv, self.salo, self.existop, self.opc)
+        return True
 
 
 class MultForm:
@@ -1511,14 +1685,293 @@ class MultForm:
 
     def __init__(self) -> None:
         self.inv = SplitVarnode()
-        self.indoub = SplitVarnode()
+        self.in2 = SplitVarnode()
         self.outdoub = SplitVarnode()
+        self.lo1 = None
+        self.hi1 = None
+        self.lo2 = None
+        self.hi2 = None
+        self.reslo = None
+        self.reshi = None
+        self.midtmp = None
+        self.lo1zext = None
+        self.lo2zext = None
+        self.add1 = None
+        self.add2 = None
+        self.subhi = None
+        self.multhi1 = None
+        self.multhi2 = None
+        self.multlo = None
+        self.existop = None
+
+    @staticmethod
+    def zextOf(big, small) -> bool:
+        """Verify that big is (some form of) a zero extension of small."""
+        if small.isConstant():
+            if not big.isConstant():
+                return False
+            return big.getOffset() == small.getOffset()
+        if not big.isWritten():
+            return False
+        op = big.getDef()
+        if op.code() == OpCode.CPUI_INT_ZEXT:
+            return op.getIn(0) is small
+        if op.code() == OpCode.CPUI_INT_AND:
+            if not op.getIn(1).isConstant():
+                return False
+            if op.getIn(1).getOffset() != calc_mask(small.getSize()):
+                return False
+            whole = op.getIn(0)
+            if not small.isWritten():
+                return False
+            sub = small.getDef()
+            if sub.code() != OpCode.CPUI_SUBPIECE:
+                return False
+            return sub.getIn(0) is whole
+        return False
+
+    def mapResHiSmallConst(self, rhi) -> bool:
+        """Find reshi = hi1*lo2 + (tmp>>32) for small constant case."""
+        self.reshi = rhi
+        if not self.reshi.isWritten():
+            return False
+        self.add1 = self.reshi.getDef()
+        if self.add1.code() != OpCode.CPUI_INT_ADD:
+            return False
+        ad1 = self.add1.getIn(0)
+        ad2 = self.add1.getIn(1)
+        if not ad1.isWritten():
+            return False
+        if not ad2.isWritten():
+            return False
+        self.multhi1 = ad1.getDef()
+        if self.multhi1.code() != OpCode.CPUI_INT_MULT:
+            self.subhi = self.multhi1
+            self.multhi1 = ad2.getDef()
+        else:
+            self.subhi = ad2.getDef()
+        if self.multhi1.code() != OpCode.CPUI_INT_MULT:
+            return False
+        if self.subhi.code() != OpCode.CPUI_SUBPIECE:
+            return False
+        self.midtmp = self.subhi.getIn(0)
+        if not self.midtmp.isWritten():
+            return False
+        self.multlo = self.midtmp.getDef()
+        if self.multlo.code() != OpCode.CPUI_INT_MULT:
+            return False
+        self.lo1zext = self.multlo.getIn(0)
+        self.lo2zext = self.multlo.getIn(1)
+        return True
+
+    def mapResHi(self, rhi) -> bool:
+        """Find reshi = hi1*lo2 + hi2*lo1 + (tmp>>32)."""
+        self.reshi = rhi
+        if not self.reshi.isWritten():
+            return False
+        self.add1 = self.reshi.getDef()
+        if self.add1.code() != OpCode.CPUI_INT_ADD:
+            return False
+        ad1 = self.add1.getIn(0)
+        ad2 = self.add1.getIn(1)
+        if not ad1.isWritten():
+            return False
+        if not ad2.isWritten():
+            return False
+        self.add2 = ad1.getDef()
+        if self.add2.code() == OpCode.CPUI_INT_ADD:
+            ad1 = self.add2.getIn(0)
+            ad3 = self.add2.getIn(1)
+        else:
+            self.add2 = ad2.getDef()
+            if self.add2.code() != OpCode.CPUI_INT_ADD:
+                return False
+            ad2 = self.add2.getIn(0)
+            ad3 = self.add2.getIn(1)
+        if not ad1.isWritten():
+            return False
+        if not ad2.isWritten():
+            return False
+        if not ad3.isWritten():
+            return False
+        self.subhi = ad1.getDef()
+        if self.subhi.code() == OpCode.CPUI_SUBPIECE:
+            self.multhi1 = ad2.getDef()
+            self.multhi2 = ad3.getDef()
+        else:
+            self.subhi = ad2.getDef()
+            if self.subhi.code() == OpCode.CPUI_SUBPIECE:
+                self.multhi1 = ad1.getDef()
+                self.multhi2 = ad3.getDef()
+            else:
+                self.subhi = ad3.getDef()
+                if self.subhi.code() == OpCode.CPUI_SUBPIECE:
+                    self.multhi1 = ad1.getDef()
+                    self.multhi2 = ad2.getDef()
+                else:
+                    return False
+        if self.multhi1.code() != OpCode.CPUI_INT_MULT:
+            return False
+        if self.multhi2.code() != OpCode.CPUI_INT_MULT:
+            return False
+        self.midtmp = self.subhi.getIn(0)
+        if not self.midtmp.isWritten():
+            return False
+        self.multlo = self.midtmp.getDef()
+        if self.multlo.code() != OpCode.CPUI_INT_MULT:
+            return False
+        self.lo1zext = self.multlo.getIn(0)
+        self.lo2zext = self.multlo.getIn(1)
+        return True
+
+    def findLoFromInSmallConst(self) -> bool:
+        """Label lo2 from multhi1, assuming small constant model."""
+        vn1 = self.multhi1.getIn(0)
+        vn2 = self.multhi1.getIn(1)
+        if vn1 is self.hi1:
+            self.lo2 = vn2
+        elif vn2 is self.hi1:
+            self.lo2 = vn1
+        else:
+            return False
+        if not self.lo2.isConstant():
+            return False
+        self.hi2 = None
+        return True
+
+    def findLoFromIn(self) -> bool:
+        """Label lo2/hi2 pair from multhi1 and multhi2."""
+        vn1 = self.multhi1.getIn(0)
+        vn2 = self.multhi1.getIn(1)
+        if vn1 is not self.lo1 and vn2 is not self.lo1:
+            self.multhi1, self.multhi2 = self.multhi2, self.multhi1
+            vn1 = self.multhi1.getIn(0)
+            vn2 = self.multhi1.getIn(1)
+        if vn1 is self.lo1:
+            self.hi2 = vn2
+        elif vn2 is self.lo1:
+            self.hi2 = vn1
+        else:
+            return False
+        vn1 = self.multhi2.getIn(0)
+        vn2 = self.multhi2.getIn(1)
+        if vn1 is self.hi1:
+            self.lo2 = vn2
+        elif vn2 is self.hi1:
+            self.lo2 = vn1
+        else:
+            return False
+        return True
+
+    def verifyLo(self) -> bool:
+        """Verify midtmp is formed properly from lo1 and lo2."""
+        if int(self.subhi.getIn(1).getOffset()) != self.lo1.getSize():
+            return False
+        if MultForm.zextOf(self.lo1zext, self.lo1):
+            if MultForm.zextOf(self.lo2zext, self.lo2):
+                return True
+        elif MultForm.zextOf(self.lo1zext, self.lo2):
+            if MultForm.zextOf(self.lo2zext, self.lo1):
+                return True
+        return False
+
+    def findResLo(self) -> bool:
+        """Find potential reslo from midtmp descendants."""
+        for op in list(self.midtmp.getDescendants()):
+            if op.code() != OpCode.CPUI_SUBPIECE:
+                continue
+            if int(op.getIn(1).getOffset()) != 0:
+                continue
+            self.reslo = op.getOut()
+            if self.reslo.getSize() != self.lo1.getSize():
+                continue
+            return True
+        for op in list(self.lo1.getDescendants()):
+            if op.code() != OpCode.CPUI_INT_MULT:
+                continue
+            vn1 = op.getIn(0)
+            vn2 = op.getIn(1)
+            if self.lo2.isConstant():
+                if (not vn1.isConstant() or vn1.getOffset() != self.lo2.getOffset()) and \
+                   (not vn2.isConstant() or vn2.getOffset() != self.lo2.getOffset()):
+                    continue
+            else:
+                if op.getIn(0) is not self.lo2 and op.getIn(1) is not self.lo2:
+                    continue
+            self.reslo = op.getOut()
+            return True
+        return False
+
+    def mapFromInSmallConst(self, rhi) -> bool:
+        if not self.mapResHiSmallConst(rhi):
+            return False
+        if not self.findLoFromInSmallConst():
+            return False
+        if not self.verifyLo():
+            return False
+        if not self.findResLo():
+            return False
+        return True
+
+    def mapFromIn(self, rhi) -> bool:
+        if not self.mapResHi(rhi):
+            return False
+        if not self.findLoFromIn():
+            return False
+        if not self.verifyLo():
+            return False
+        if not self.findResLo():
+            return False
+        return True
+
+    def replace(self, data) -> bool:
+        """Transform matched multiply to logical variables."""
+        self.outdoub.initPartial(self.inv.getSize(), self.reslo, self.reshi)
+        if self.hi2 is None:
+            losize = self.lo1.getSize()
+            val = self.lo2.getOffset() & calc_mask(losize)
+            self.in2.initPartialConst(self.inv.getSize(), val)
+        else:
+            self.in2.initPartial(self.inv.getSize(), self.lo2, self.hi2)
+        if self.in2.exceedsConstPrecision():
+            return False
+        self.existop = SplitVarnode.prepareBinaryOp(self.outdoub, self.inv, self.in2)
+        if self.existop is None:
+            return False
+        SplitVarnode.createBinaryOp(data, self.outdoub, self.inv, self.in2, self.existop, OpCode.CPUI_INT_MULT)
+        return True
+
+    def verify(self, h, l, hop) -> bool:
+        """Verify the full multiply pattern."""
+        self.hi1 = h
+        self.lo1 = l
+        for add1 in list(hop.getOut().getDescendants()):
+            if add1.code() != OpCode.CPUI_INT_ADD:
+                continue
+            self.add1 = add1
+            for add2 in list(add1.getOut().getDescendants()):
+                if add2.code() != OpCode.CPUI_INT_ADD:
+                    continue
+                self.add2 = add2
+                if self.mapFromIn(add2.getOut()):
+                    return True
+            if self.mapFromIn(add1.getOut()):
+                return True
+            if self.mapFromInSmallConst(add1.getOut()):
+                return True
+        return False
 
     def applyRule(self, i, op, workishi: bool, data) -> bool:
         """Apply the mult form rule.
         Corresponds to MultForm::applyRule in double.cc."""
-        # Stub: requires complex multiply pattern matching
-        return False
+        if not workishi:
+            return False
+        if not i.hasBothPieces():
+            return False
+        self.inv = i
+        if not self.verify(self.inv.getHi(), self.inv.getLo(), op):
+            return False
+        return self.replace(data)
 
 
 class Equal2Form:
@@ -1677,30 +2130,36 @@ class PhiForm:
         if hphi.code() != OpCode.CPUI_MULTIEQUAL:
             return False
         self.inv = i
-        hi = self.inv.getHi()
-        lo = self.inv.getLo()
-        if hphi.getOut() is not hi:
+        hibase = self.inv.getHi()
+        lobase = self.inv.getLo()
+        hiphi = hphi
+        inslot = hiphi.getSlot(hibase)
+        outvn = hiphi.getOut()
+        if outvn is None or outvn.hasNoDescend():
             return False
-        # Find the matching lo MULTIEQUAL
+        blbase = hiphi.getParent()
         lophi = None
-        if lo.isWritten():
-            lodef = lo.getDef()
-            if lodef.code() == OpCode.CPUI_MULTIEQUAL:
-                lophi = lodef
+        for desc in list(lobase.getDescendants()):
+            if desc.code() != OpCode.CPUI_MULTIEQUAL:
+                continue
+            if desc.getParent() is not blbase:
+                continue
+            if desc.getIn(inslot) is not lobase:
+                continue
+            lophi = desc
+            break
         if lophi is None:
             return False
-        if hphi.numInput() != lophi.numInput():
-            return False
-        numin = hphi.numInput()
+        numin = hiphi.numInput()
         self.inlist = []
-        for idx in range(numin):
+        for j in range(numin):
             sv = SplitVarnode()
-            hi_in = hphi.getIn(idx)
-            lo_in = lophi.getIn(idx)
-            sv.initPartial(self.inv.getSize(), lo_in, hi_in)
+            vhi = hiphi.getIn(j)
+            vlo = lophi.getIn(j)
+            sv.initPartial(self.inv.getSize(), vlo, vhi)
             self.inlist.append(sv)
         self.outvn = SplitVarnode()
-        self.outvn.initPartial(self.inv.getSize(), lo, hi)
+        self.outvn.initPartial(self.inv.getSize(), lophi.getOut(), hiphi.getOut())
         existop = SplitVarnode.preparePhiOp(self.outvn, self.inlist)
         if existop is None:
             return False
@@ -1861,7 +2320,9 @@ class RuleDoubleIn:
         return SplitVarnode.applyRuleIn(inv, data)
 
     def reset(self, data) -> None:
-        pass
+        """C++ ref: ``RuleDoubleIn::reset``"""
+        if hasattr(data, 'setDoublePrecisRecovery'):
+            data.setDoublePrecisRecovery(True)
 
 
 class RuleDoubleOut:
@@ -1918,11 +2379,108 @@ class RuleDoubleLoad:
         return [int(OpCode.CPUI_PIECE)]
 
     def applyOp(self, op, data) -> int:
-        return 0
+        piece0 = op.getIn(0)
+        piece1 = op.getIn(1)
+        if not piece0.isWritten():
+            return 0
+        if not piece1.isWritten():
+            return 0
+        load1 = piece1.getDef()
+        if load1.code() != OpCode.CPUI_LOAD:
+            return 0
+        load0 = piece0.getDef()
+        opc = load0.code()
+        offset = 0
+        if opc == OpCode.CPUI_SUBPIECE:
+            if load0.getIn(1).getOffset() != 0:
+                return 0
+            vn0 = load0.getIn(0)
+            if not vn0.isWritten():
+                return 0
+            offset = vn0.getSize() - piece0.getSize()
+            load0 = vn0.getDef()
+            opc = load0.code()
+        if opc != OpCode.CPUI_LOAD:
+            return 0
+        ok, loadlo, loadhi, spc = SplitVarnode.testContiguousPointers(load0, load1)
+        if not ok:
+            return 0
+        size = piece0.getSize() + piece1.getSize()
+        latest = RuleDoubleLoad.noWriteConflict(loadlo, loadhi, spc)
+        if latest is None:
+            return 0
+        newload = data.newOp(2, latest.getAddr())
+        vnout = data.newUniqueOut(size, newload)
+        spcvn = data.newVarnodeSpace(spc) if hasattr(data, 'newVarnodeSpace') else data.newConstant(loadlo.getIn(0).getSize(), loadlo.getIn(0).getOffset())
+        data.opSetOpcode(newload, OpCode.CPUI_LOAD)
+        data.opSetInput(newload, spcvn, 0)
+        addrvn = loadlo.getIn(1)
+        if hasattr(spc, 'isBigEndian') and spc.isBigEndian() and offset != 0:
+            newadd = data.newOp(2, latest.getAddr())
+            addout = data.newUniqueOut(addrvn.getSize(), newadd)
+            data.opSetOpcode(newadd, OpCode.CPUI_INT_ADD)
+            data.opSetInput(newadd, addrvn, 0)
+            data.opSetInput(newadd, data.newConstant(addrvn.getSize(), offset), 1)
+            data.opInsertAfter(newadd, latest)
+            addrvn = addout
+            latest = newadd
+        data.opSetInput(newload, addrvn, 1)
+        data.opInsertAfter(newload, latest)
+        data.opRemoveInput(op, 1)
+        data.opSetOpcode(op, OpCode.CPUI_COPY)
+        data.opSetInput(op, vnout, 0)
+        return 1
 
     @staticmethod
     def noWriteConflict(op1, op2, spc, indirects=None):
-        return None
+        """Check that there is no write conflict between two LOADs or STOREs in the same block."""
+        bb = op1.getParent()
+        if bb is not op2.getParent():
+            return None
+        if hasattr(op2, 'getSeqNum') and hasattr(op1, 'getSeqNum'):
+            if op2.getSeqNum().getOrder() < op1.getSeqNum().getOrder():
+                op1, op2 = op2, op1
+        else:
+            return op2
+        startop = op1
+        if op1.code() == OpCode.CPUI_STORE:
+            tmpOp = startop.previousOp() if hasattr(startop, 'previousOp') else None
+            while tmpOp is not None and tmpOp.code() == OpCode.CPUI_INDIRECT:
+                startop = tmpOp
+                tmpOp = tmpOp.previousOp() if hasattr(tmpOp, 'previousOp') else None
+        if hasattr(startop, 'getBasicIter') and hasattr(op2, 'getBasicIter'):
+            it = startop.getBasicIter()
+            endit = op2.getBasicIter()
+            curop = next(it, None)
+            while curop is not None and curop is not op2:
+                if curop is op1:
+                    curop = next(it, None)
+                    continue
+                opc = curop.code()
+                if opc == OpCode.CPUI_STORE:
+                    cspc = curop.getIn(0).getSpaceFromConst() if hasattr(curop.getIn(0), 'getSpaceFromConst') else None
+                    if cspc is spc:
+                        return None
+                elif opc == OpCode.CPUI_INDIRECT:
+                    from ghidra.ir.op import PcodeOp
+                    affector = PcodeOp.getOpFromConst(curop.getIn(1).getAddr()) if hasattr(PcodeOp, 'getOpFromConst') else None
+                    if affector is op1 or affector is op2:
+                        if indirects is not None:
+                            indirects.append(curop)
+                    else:
+                        outvn = curop.getOut()
+                        if outvn is not None and outvn.getSpace() is spc:
+                            return None
+                elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CALLOTHER,
+                             OpCode.CPUI_RETURN, OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH,
+                             OpCode.CPUI_BRANCHIND):
+                    return None
+                else:
+                    outvn = curop.getOut()
+                    if outvn is not None and outvn.getSpace() is spc:
+                        return None
+                curop = next(it, None)
+        return op2
 
 
 class RuleDoubleStore:
@@ -1944,12 +2502,119 @@ class RuleDoubleStore:
         return [int(OpCode.CPUI_STORE)]
 
     def applyOp(self, op, data) -> int:
+        vnlo = op.getIn(2)
+        if not hasattr(vnlo, 'isPrecisLo') or not vnlo.isPrecisLo():
+            return 0
+        if not vnlo.isWritten():
+            return 0
+        subpieceOpLo = vnlo.getDef()
+        if subpieceOpLo.code() != OpCode.CPUI_SUBPIECE:
+            return 0
+        if subpieceOpLo.getIn(1).getOffset() != 0:
+            return 0
+        whole = subpieceOpLo.getIn(0)
+        if whole.isFree():
+            return 0
+        for subpieceOpHi in list(whole.beginDescend()):
+            if subpieceOpHi.code() != OpCode.CPUI_SUBPIECE:
+                continue
+            if subpieceOpHi is subpieceOpLo:
+                continue
+            hi_offset = int(subpieceOpHi.getIn(1).getOffset())
+            if hi_offset != vnlo.getSize():
+                continue
+            vnhi = subpieceOpHi.getOut()
+            if not hasattr(vnhi, 'isPrecisHi') or not vnhi.isPrecisHi():
+                continue
+            if vnhi.getSize() != whole.getSize() - hi_offset:
+                continue
+            for storeOp2 in list(vnhi.beginDescend()):
+                if storeOp2.code() != OpCode.CPUI_STORE:
+                    continue
+                if storeOp2.getIn(2) is not vnhi:
+                    continue
+                ok, storelo, storehi, spc = SplitVarnode.testContiguousPointers(storeOp2, op)
+                if not ok:
+                    continue
+                indirects = []
+                latest = RuleDoubleLoad.noWriteConflict(storelo, storehi, spc, indirects)
+                if latest is None:
+                    continue
+                if not RuleDoubleStore.testIndirectUse(storelo, storehi, indirects):
+                    continue
+                newstore = data.newOp(3, latest.getAddr())
+                spcvn = data.newVarnodeSpace(spc) if hasattr(data, 'newVarnodeSpace') else data.newConstant(storelo.getIn(0).getSize(), storelo.getIn(0).getOffset())
+                data.opSetOpcode(newstore, OpCode.CPUI_STORE)
+                data.opSetInput(newstore, spcvn, 0)
+                addrvn = storelo.getIn(1)
+                if addrvn.isConstant():
+                    addrvn = data.newConstant(addrvn.getSize(), addrvn.getOffset())
+                data.opSetInput(newstore, addrvn, 1)
+                data.opSetInput(newstore, whole, 2)
+                data.opInsertAfter(newstore, latest)
+                data.opDestroy(op)
+                data.opDestroy(storeOp2)
+                RuleDoubleStore.reassignIndirects(data, newstore, indirects)
+                return 1
         return 0
 
     @staticmethod
     def testIndirectUse(op1, op2, indirects) -> bool:
-        return False
+        """Test if output Varnodes from INDIRECTs are used within the range of op1..op2."""
+        if hasattr(op2, 'getSeqNum') and hasattr(op1, 'getSeqNum'):
+            if op2.getSeqNum().getOrder() < op1.getSeqNum().getOrder():
+                op1, op2 = op2, op1
+        for ind in indirects:
+            outvn = ind.getOut()
+            usecount = 0
+            usebyop2 = 0
+            for useop in outvn.beginDescend():
+                usecount += 1
+                if useop.getParent() is not op1.getParent():
+                    continue
+                if hasattr(useop, 'getSeqNum'):
+                    order = useop.getSeqNum().getOrder()
+                    if order < op1.getSeqNum().getOrder():
+                        continue
+                    if order > op2.getSeqNum().getOrder():
+                        continue
+                if useop.code() == OpCode.CPUI_INDIRECT:
+                    from ghidra.ir.op import PcodeOp
+                    affector = PcodeOp.getOpFromConst(useop.getIn(1).getAddr()) if hasattr(PcodeOp, 'getOpFromConst') else None
+                    if affector is op2:
+                        usebyop2 += 1
+                        continue
+                return False
+            if usebyop2 > 0 and usecount != usebyop2:
+                return False
+            if usebyop2 > 1:
+                return False
+        return True
 
     @staticmethod
     def reassignIndirects(data, newStore, indirects) -> None:
-        pass
+        """Reassign INDIRECT ops to point at a new combined STORE.
+
+        Search for INDIRECT pairs.  The earlier is deleted.  The later gains the
+        earlier's input.  Then move all surviving INDIRECTs before the new STORE.
+
+        C++ ref: ``RuleDoubleStore::reassignIndirects``
+        """
+        # Phase 1: mark and merge pairs
+        for op in indirects:
+            op.setMark()
+            vn = op.getIn(0)
+            if vn is None or not vn.isWritten():
+                continue
+            earlyop = vn.getDef()
+            if earlyop is not None and earlyop.isMark():
+                data.opSetInput(op, earlyop.getIn(0), 0)
+                data.opDestroy(earlyop)
+        # Phase 2: clear marks and move before newStore
+        for op in indirects:
+            op.clearMark()
+            if op.isDead():
+                continue
+            data.opUninsert(op)
+            data.opInsertBefore(op, newStore)
+            data.opSetInput(op, data.newVarnodeIop(newStore), 1)

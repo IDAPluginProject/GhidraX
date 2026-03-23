@@ -423,6 +423,10 @@ class UnifyState:
     def initializeOp(self, idx: int, op) -> None:
         self._storemap[idx].setOp(op)
 
+    def initialize(self, idx: int, op) -> None:
+        """Set up the initial op at the given index for rule matching."""
+        self._storemap[idx].setOp(op)
+
     # Legacy API aliases
     def getData(self, index: int) -> UnifyDatatype:
         return self.data(index)

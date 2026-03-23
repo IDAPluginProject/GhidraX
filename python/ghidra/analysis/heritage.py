@@ -164,14 +164,30 @@ class TaskList:
         self._list: List[MemRange] = []
 
     def add(self, addr: Address, size: int, fl: int) -> None:
-        """Add a range to the list (merging with last if overlapping)."""
-        if self._list:
-            entry = self._list[-1]
-            over = addr.overlap(0, entry.addr, entry.size)
-            if over >= 0:
-                relsize = size + over
-                if relsize > entry.size:
-                    entry.size = relsize
+        """Add a range to the list (merging if overlapping with any existing entry).
+
+        C++ LocationMap is a sorted map that naturally deduplicates.
+        We search the entire list to find an existing entry that overlaps
+        the new range and merge into it rather than creating a duplicate.
+        """
+        spc = addr.getSpace()
+        off = addr.getOffset()
+        for entry in self._list:
+            if entry.addr.getSpace() is not spc:
+                continue
+            e_off = entry.addr.getOffset()
+            e_end = e_off + entry.size
+            # Check overlap: [off, off+size) intersects [e_off, e_end)
+            if off < e_end and (off + size) > e_off:
+                # Merge: extend entry to cover both ranges
+                new_off = min(off, e_off)
+                new_end = max(off + size, e_end)
+                entry.addr = Address(spc, new_off)
+                entry.size = new_end - new_off
+                entry.flags |= fl
+                return
+            # Also merge if ranges are identical
+            if off == e_off and size == entry.size:
                 entry.flags |= fl
                 return
         self._list.append(MemRange(addr, size, fl))
@@ -193,6 +209,10 @@ class TaskList:
 
     def clear(self) -> None:
         self._list.clear()
+
+    def sort(self) -> None:
+        """Sort ranges by address to match C++ sorted map iteration order."""
+        self._list.sort(key=lambda m: (id(m.addr.getSpace()), m.addr.getOffset()))
 
     def __iter__(self):
         return iter(self._list)
@@ -430,7 +450,10 @@ class Heritage:
         num = arch.numSpaces() if hasattr(arch, 'numSpaces') else 0
         for i in range(num):
             spc = arch.getSpace(i)
-            self._infolist.append(HeritageInfo(spc))
+            if spc is None:
+                self._infolist.append(HeritageInfo(None))
+            else:
+                self._infolist.append(HeritageInfo(spc))
 
     def forceRestructure(self) -> None:
         """Force regeneration of basic block structures."""
@@ -576,184 +599,6 @@ class Heritage:
             idom = bl.getImmedDom()
             if idom is not None:
                 self._domchildren.setdefault(id(idom), []).append(bl)
-
-    def _computeDominanceFrontier(self) -> Dict:
-        """Compute dominance frontier for each block."""
-        graph = self._fd.getBasicBlocks()
-        df = {}  # block_id -> set of block_ids in dominance frontier
-        for i in range(graph.getSize()):
-            bl = graph.getBlock(i)
-            df[id(bl)] = set()
-        for i in range(graph.getSize()):
-            bl = graph.getBlock(i)
-            if bl.sizeIn() < 2:
-                continue
-            for j in range(bl.sizeIn()):
-                runner = bl.getIn(j)
-                while runner is not None and runner is not bl.getImmedDom():
-                    df.setdefault(id(runner), set()).add(id(bl))
-                    runner = runner.getImmedDom()
-        return df
-
-    def _collectVarnodes(self):
-        """Collect all varnodes grouped by their address for heritage."""
-        addr_groups = {}  # (spc_idx, offset, size) -> list of (varnode, is_write)
-        for vn in list(self._fd._vbank.beginLoc()):
-            if vn.isConstant() or vn.isAnnotation():
-                continue
-            spc = vn.getSpace()
-            if spc is None:
-                continue
-            key = (spc.getIndex(), vn.getAddr().getOffset(), vn.getSize())
-            if key not in addr_groups:
-                addr_groups[key] = []
-            addr_groups[key].append(vn)
-        return addr_groups
-
-    def _placePhiNodes(self, writes, df, graph):
-        """Place MULTIEQUAL (phi) nodes at dominance frontiers of write locations."""
-        from ghidra.core.opcodes import OpCode
-        block_id_map = {}
-        for i in range(graph.getSize()):
-            block_id_map[id(graph.getBlock(i))] = graph.getBlock(i)
-        write_blocks = set()
-        for vn in writes:
-            if vn.isWritten():
-                parent = vn.getDef().getParent()
-                if parent is not None:
-                    write_blocks.add(id(parent))
-            elif vn.isInput():
-                entry = graph.getEntryBlock()
-                if entry is not None:
-                    write_blocks.add(id(entry))
-        # Iterated dominance frontier
-        worklist = list(write_blocks)
-        phi_blocks = set()
-        while worklist:
-            blid = worklist.pop()
-            for frontier_blid in df.get(blid, set()):
-                if frontier_blid not in phi_blocks:
-                    phi_blocks.add(frontier_blid)
-                    worklist.append(frontier_blid)
-        # Insert MULTIEQUAL at each phi block
-        for phi_blid in phi_blocks:
-            bl = block_id_map.get(phi_blid)
-            if bl is None:
-                continue
-            numinputs = bl.sizeIn()
-            if numinputs < 2:
-                continue
-            # Get representative varnode for size/address
-            rep = writes[0]
-            op = self._fd.newOp(numinputs, bl.getStart())
-            self._fd.opSetOpcode(op, OpCode.CPUI_MULTIEQUAL)
-            outvn = self._fd.newVarnodeOut(rep.getSize(), rep.getAddr(), op)
-            for i in range(numinputs):
-                invn = self._fd.newVarnode(rep.getSize(), rep.getAddr())
-                self._fd.opSetInput(op, invn, i)
-            self._fd.opInsertBegin(op, bl)
-
-    def heritage(self) -> None:
-        """Perform one pass of heritage (SSA construction).
-
-        Algorithm (Cytron et al. 1991):
-        1. Build dominator tree
-        2. Compute dominance frontiers
-        3. Collect address ranges that need heritage
-        4. Place phi nodes (MULTIEQUAL) at iterated dominance frontiers
-        5. Rename variables (SSA renaming)
-        """
-        self._pass += 1
-        if self._fd is None:
-            return
-        graph = self._fd.getBasicBlocks()
-        if graph.getSize() == 0:
-            return
-        # Step 1: Build dominator tree
-        self._buildDominatorTree()
-        # Step 2: Compute dominance frontiers
-        df = self._computeDominanceFrontier()
-        # Step 3: Collect varnodes by address
-        addr_groups = self._collectVarnodes()
-        # Step 4: Place phi nodes for each address group
-        for key, vnlist in addr_groups.items():
-            if len(vnlist) > 1:
-                self._placePhiNodes(vnlist, df, graph)
-        # Step 5: SSA variable renaming
-        self._rename(graph)
-
-    def _rename(self, graph) -> None:
-        """Perform SSA variable renaming by walking dominator tree."""
-        from ghidra.core.opcodes import OpCode
-        from collections import defaultdict
-        if graph.getSize() == 0:
-            return
-        entry = graph.getEntryBlock()
-        if entry is None:
-            return
-        varstack = defaultdict(list)  # Address key -> stack of defining Varnodes
-        self._renameRecurse(entry, varstack)
-
-    def _renameRecurse(self, bl, varstack) -> None:
-        """Recursive SSA rename walk down the dominator tree."""
-        from ghidra.core.opcodes import OpCode
-        writelist = []
-        if not hasattr(bl, 'getOpList'):
-            return
-        # Process each op in the block
-        for op in list(bl.getOpList()):
-            if op.code() != OpCode.CPUI_MULTIEQUAL:
-                # Replace reads of free varnodes with top of stack
-                for slot in range(op.numInput()):
-                    vnin = op.getIn(slot)
-                    if vnin.isHeritageKnown():
-                        continue
-                    if vnin.isFree() and not vnin.isConstant():
-                        key = (vnin.getAddr().getOffset(), vnin.getSize())
-                        stack = varstack[key]
-                        if not stack:
-                            # Create input varnode
-                            vnnew = self._fd.newVarnode(vnin.getSize(), vnin.getAddr())
-                            vnnew = self._fd.setInputVarnode(vnnew)
-                            stack.append(vnnew)
-                        else:
-                            vnnew = stack[-1]
-                        self._fd.opSetInput(op, vnnew, slot)
-            # Push writes onto stack
-            vnout = op.getOut()
-            if vnout is not None and not vnout.isHeritageKnown():
-                key = (vnout.getAddr().getOffset(), vnout.getSize())
-                varstack[key].append(vnout)
-                writelist.append(vnout)
-        # Process MULTIEQUAL inputs in successor blocks
-        for i in range(bl.sizeOut()):
-            subbl = bl.getOut(i)
-            slot = bl.getOutRevIndex(i)
-            if not hasattr(subbl, 'getOpList'):
-                continue
-            for op in subbl.getOpList():
-                if op.code() != OpCode.CPUI_MULTIEQUAL:
-                    break
-                if slot < op.numInput():
-                    vnin = op.getIn(slot)
-                    if not vnin.isHeritageKnown() and vnin.isFree() and not vnin.isConstant():
-                        key = (vnin.getAddr().getOffset(), vnin.getSize())
-                        stack = varstack[key]
-                        if not stack:
-                            vnnew = self._fd.newVarnode(vnin.getSize(), vnin.getAddr())
-                            vnnew = self._fd.setInputVarnode(vnnew)
-                            stack.append(vnnew)
-                        else:
-                            vnnew = stack[-1]
-                        self._fd.opSetInput(op, vnnew, slot)
-        # Recurse to dominator tree children
-        for child in self._domchildren.get(id(bl), []):
-            self._renameRecurse(child, varstack)
-        # Pop this block's writes off the stack
-        for vnout in writelist:
-            key = (vnout.getAddr().getOffset(), vnout.getSize())
-            if varstack[key]:
-                varstack[key].pop()
 
     # ----------------------------------------------------------------
     # Guard methods (data-flow across calls/stores/loads/returns)
@@ -940,10 +785,15 @@ class Heritage:
         if not hasattr(self._fd, 'beginOp'):
             return
         spc = addr.getSpace()
-        for op in self._fd.beginOp(OpCode.CPUI_STORE):
+        for op in list(self._fd.beginOp(OpCode.CPUI_STORE)):
             if hasattr(op, 'isDead') and op.isDead():
                 continue
-            storeSpc = op.getIn(0).getSpaceFromConst() if hasattr(op.getIn(0), 'getSpaceFromConst') else None
+            in0 = op.getIn(0)
+            # In C++, STORE input[0] is always a constant encoding the target space ID.
+            # Skip if input[0] is not a constant — raw p-code hasn't resolved the space yet.
+            if not in0.isConstant():
+                continue
+            storeSpc = in0.getSpaceFromConst() if hasattr(in0, 'getSpaceFromConst') else None
             if storeSpc is spc or (hasattr(spc, 'getContain') and spc.getContain() is storeSpc):
                 if hasattr(self._fd, 'newIndirectOp'):
                     indop = self._fd.newIndirectOp(op, addr, size, 0)
@@ -1322,7 +1172,8 @@ class Heritage:
         self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
         vn1 = self._fd.newVarnode(size, addr)
         overlap = vn.overlap(addr, size)
-        vn2 = self._fd.newConstant(4, overlap if overlap >= 0 else 0)
+        addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
+        vn2 = self._fd.newConstant(addrSize, overlap if overlap >= 0 else 0)
         self._fd.opSetInput(newop, vn1, 0)
         self._fd.opSetInput(newop, vn2, 1)
         self._fd.opSetOutput(newop, vn)
@@ -1372,7 +1223,8 @@ class Heritage:
                 big.setActiveHeritage()
                 self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetInput(newop, big, 0)
-                self._fd.opSetInput(newop, self._fd.newConstant(4, overlap + vn.getSize()), 1)
+                addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
+                self._fd.opSetInput(newop, self._fd.newConstant(addrSize, overlap + vn.getSize()), 1)
                 self._fd.opInsertBefore(newop, op)
 
         # Create least significant piece if needed
@@ -1393,7 +1245,8 @@ class Heritage:
                 big.setActiveHeritage()
                 self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetInput(newop, big, 0)
-                self._fd.opSetInput(newop, self._fd.newConstant(4, 0), 1)
+                addrSize2 = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
+                self._fd.opSetInput(newop, self._fd.newConstant(addrSize2, 0), 1)
                 self._fd.opInsertBefore(newop, op)
 
         # Concatenate least significant piece with vn
@@ -1611,14 +1464,21 @@ class Heritage:
         self.splitPieces(newvn, None, vn.getAddr(), vn.getSize(), vn)
         vn.setWriteMask()
 
-    def refinement(self, memrange, readvars: list, writevars: list, inputvars: list) -> bool:
+    def refinement(self, idx: int, readvars: list, writevars: list, inputvars: list) -> int:
         """Find the common refinement of all reads and writes and split them.
+
+        Matching C++, this modifies the disjoint task list: erases the original
+        MemRange at *idx* and inserts refined sub-ranges in its place.
+
+        Returns the index of the first sub-range (so the caller can re-collect),
+        or -1 if no non-trivial refinement was found.
 
         C++ ref: ``Heritage::refinement``
         """
+        memrange = self._disjoint[idx]
         size = memrange.size
         if size > 1024:
-            return False
+            return -1
         addr = memrange.addr
         refine = [0] * (size + 1)  # Fencepost
         self.buildRefinement(refine, addr, readvars)
@@ -1632,7 +1492,7 @@ class Heritage:
                 refine[lastpos] = curpos - lastpos
                 lastpos = curpos
         if lastpos == 0:
-            return False  # No non-trivial refinements
+            return -1  # No non-trivial refinements
         refine[lastpos] = size - lastpos
         self.remove13Refinement(refine)
         for vn in readvars:
@@ -1641,7 +1501,35 @@ class Heritage:
             self.refineWrite(vn, addr, refine)
         for vn in inputvars:
             self.refineInput(vn, addr, refine)
-        return True
+
+        # Alter the disjoint cover to reflect our refinement (C++ heritage.cc:1920-1938)
+        flags = memrange.flags
+        self._disjoint.erase(idx)
+        # Also update globaldisjoint
+        giter = self._globaldisjoint.find(addr) if hasattr(self._globaldisjoint, 'find') else None
+        curPass = 0
+        if giter is not None:
+            curPass = giter.get('pass', 0) if isinstance(giter, dict) else 0
+            if hasattr(self._globaldisjoint, 'erase'):
+                self._globaldisjoint.erase(giter)
+        cut = 0
+        sz = refine[cut]
+        curaddr = addr
+        res_idx = self._disjoint.insert(idx, curaddr, sz, flags)
+        if hasattr(self._globaldisjoint, 'add'):
+            self._globaldisjoint.add(curaddr, sz, curPass, [0])
+        cut += sz
+        curaddr = Address(addr.getSpace(), addr.getOffset() + cut)
+        insert_pos = idx + 1
+        while cut < size:
+            sz = refine[cut]
+            self._disjoint.insert(insert_pos, curaddr, sz, flags)
+            if hasattr(self._globaldisjoint, 'add'):
+                self._globaldisjoint.add(curaddr, sz, curPass, [0])
+            cut += sz
+            curaddr = Address(addr.getSpace(), addr.getOffset() + cut)
+            insert_pos += 1
+        return res_idx
 
     def callOpIndirectEffect(self, addr: Address, size: int, op) -> bool:
         """Determine if the address range is affected by the given call p-code op."""
@@ -1678,6 +1566,8 @@ class Heritage:
         letting the data-flow for the new larger range determine the data-flow for the
         old Varnode. The original Varnode is redefined as the output of a SUBPIECE
         of a larger free Varnode.
+
+        C++ ref: ``Heritage::removeRevisitedMarkers``
         """
         info = self.getInfo(addr.getSpace())
         if info is not None and info.deadremoved > 0:
@@ -1694,12 +1584,34 @@ class Heritage:
             bl = op.getParent()
             opc = op.code()
 
+            # Determine insertion position (the op AFTER which we insert the SUBPIECE)
+            insertAfterOp = None
             if opc == OpCode.CPUI_INDIRECT:
                 # Insert SUBPIECE after target of INDIRECT
+                iopVn = op.getIn(1)
+                from ghidra.ir.op import PcodeOp as PcodeOpCls
+                targetOp = None
+                if hasattr(PcodeOpCls, 'getOpFromConst'):
+                    targetOp = PcodeOpCls.getOpFromConst(iopVn.getAddr())
+                if targetOp is not None and not (hasattr(targetOp, 'isDead') and targetOp.isDead()):
+                    insertAfterOp = targetOp
+                else:
+                    insertAfterOp = op  # Fallback: after the INDIRECT itself
                 if hasattr(vn, 'clearAddrForce'):
                     vn.clearAddrForce()
             elif opc == OpCode.CPUI_MULTIEQUAL:
-                pass  # Insert SUBPIECE after all MULTIEQUALs in block
+                # Insert SUBPIECE after all MULTIEQUALs in block
+                insertAfterOp = op
+                if bl is not None and hasattr(bl, 'getOpList'):
+                    found = False
+                    for blop in bl.getOpList():
+                        if found:
+                            if blop.code() == OpCode.CPUI_MULTIEQUAL:
+                                insertAfterOp = blop
+                            else:
+                                break
+                        elif blop is op:
+                            found = True
             else:
                 # Remove return form COPY
                 if hasattr(self._fd, 'opUnlink'):
@@ -1728,7 +1640,10 @@ class Heritage:
                 self._fd.opSetInput(op, newInputs[0], 0)
                 self._fd.opSetInput(op, newInputs[1], 1)
 
-            if bl is not None and hasattr(self._fd, 'opInsertBegin'):
+            # Insert at the correct position
+            if bl is not None and insertAfterOp is not None:
+                self._fd.opInsertAfter(op, insertAfterOp)
+            elif bl is not None:
                 self._fd.opInsertBegin(op, bl)
 
             vn.setWriteMask()
@@ -1861,7 +1776,7 @@ class Heritage:
         lastcombo = [vn]
         while len(lastcombo) < joinrec.numPieces():
             nextlev = []
-            self.splitJoinLevel(lastcombo, nextlev, joinrec)
+            self._splitJoinLevel(lastcombo, nextlev, joinrec)
             for i in range(len(lastcombo)):
                 curvn = lastcombo[i]
                 mosthalf = nextlev[2 * i]
@@ -1906,7 +1821,7 @@ class Heritage:
         lastcombo = [vn]
         while len(lastcombo) < joinrec.numPieces():
             nextlev = []
-            self.splitJoinLevel(lastcombo, nextlev, joinrec)
+            self._splitJoinLevel(lastcombo, nextlev, joinrec)
             for i in range(len(lastcombo)):
                 curvn = lastcombo[i]
                 mosthalf = nextlev[2 * i]
@@ -2436,6 +2351,16 @@ class Heritage:
                 self._augment[k].append(v)
                 k = z[k]
 
+        # Sort each augment list by idom index ascending.
+        # C++ visitIncr uses `break` when idom(v).index >= j, which assumes
+        # augment entries are sorted by idom index.  In C++ this is guaranteed
+        # by DFS block ordering; Python block indices may differ, so we must
+        # sort explicitly.
+        for lst in self._augment:
+            if len(lst) > 1:
+                lst.sort(key=lambda v: v.getImmedDom().getIndex()
+                         if v.getImmedDom() is not None else 0)
+
     def visitIncr(self, qnode, vnode) -> None:
         """The heart of the phi-node placement algorithm."""
         i = vnode.getIndex()
@@ -2455,7 +2380,7 @@ class Heritage:
             else:
                 break
         if i < len(self._flags) and (self._flags[i] & Heritage.boundary_node) == 0:
-            children = self._domchildren.get(id(vnode), [])
+            children = self._domchild[i] if i < len(self._domchild) else []
             for child in children:
                 cidx = child.getIndex()
                 if cidx < len(self._flags) and (self._flags[cidx] & Heritage.mark_node) == 0:
@@ -2490,17 +2415,33 @@ class Heritage:
 
     def placeMultiequals(self) -> None:
         """Perform phi-node placement for the current set of address ranges."""
+        # Sort ranges by address to match C++ sorted-map iteration order.
+        # This ensures INDIRECTs at call sites are created in address order.
+        self._disjoint.sort()
         readvars: list = []
         writevars: list = []
         inputvars: list = []
         removevars: list = []
-        for memrange in self._disjoint:
-            self.collect(memrange, readvars, writevars, inputvars, removevars)
+        # Use index-based iteration because refinement can modify the list
+        idx = 0
+        while idx < len(self._disjoint):
+            memrange = self._disjoint[idx]
+            maxsize = self.collect(memrange, readvars, writevars, inputvars, removevars)
             size = memrange.size
+            # C++ refinement: split large ranges into sub-ranges (heritage.cc placeMultiequals)
+            if size > 4 and maxsize < size:
+                ref_idx = self.refinement(idx, readvars, writevars, inputvars)
+                if ref_idx >= 0:
+                    idx = ref_idx
+                    memrange = self._disjoint[idx]
+                    self.collect(memrange, readvars, writevars, inputvars, removevars)
+                    size = memrange.size
             if not readvars:
                 if not writevars and not inputvars:
+                    idx += 1
                     continue
                 if memrange.addr.getSpace().getType() == IPTR_INTERNAL or memrange.oldAddresses():
+                    idx += 1
                     continue
             if removevars:
                 self.removeRevisitedMarkers(removevars, memrange.addr, size)
@@ -2517,6 +2458,7 @@ class Heritage:
                     vnin = self._fd.newVarnode(size, memrange.addr)
                     self._fd.opSetInput(multiop, vnin, j)
                 self._fd.opInsertBegin(multiop, bl)
+            idx += 1
         self._merge.clear()
 
     def rename(self) -> None:
@@ -2610,7 +2552,9 @@ class Heritage:
                     self._fd.deleteVarnode(vnin)
 
         # Recurse to dominator tree children
-        for child in self._domchildren.get(id(bl), []):
+        bl_idx = bl.getIndex()
+        children = self._domchild[bl_idx] if bl_idx < len(self._domchild) else []
+        for child in children:
             self.renameRecurse(child, varstack)
 
         # Pop this block's writes off the stack

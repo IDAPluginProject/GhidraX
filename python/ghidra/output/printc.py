@@ -2788,31 +2788,82 @@ class PrintC(PrintLanguage):
         return len(self._nodepend) > 0 if hasattr(self, '_nodepend') else False
 
     def emitGlobalVarDeclsAsComments(self, fd) -> None:
-        pass
+        """Emit global variable declarations as comments in the function body.
+
+        C++ ref: ``PrintC::emitGlobalVarDeclsRecursive`` (used in docAllGlobals)
+        """
+        if self._emit is None or self._glb is None:
+            return
+        if hasattr(self._glb, 'symboltab') and self._glb.symboltab is not None:
+            scope = self._glb.symboltab.getGlobalScope()
+            if scope is not None:
+                self._emitGlobalVarDeclsRecursive(scope)
 
     def emitTypedefDefinition(self, ct) -> None:
-        pass
+        """Emit a typedef definition for a given data-type.
+
+        C++ ref: ``PrintC::emitTypeDefinition``
+        """
+        if self._emit is None or ct is None:
+            return
+        nm = ct.getName() if hasattr(ct, 'getName') else ""
+        if not nm:
+            return
+        self._emit.tagLine()
+        self._emit.print("typedef ", SyntaxHighlight.keyword_color)
+        self.pushTypeStart(ct, False)
+        self._emit.tagType(nm, SyntaxHighlight.type_color, ct)
+        self.pushTypeEnd(ct)
+        self._emit.print(self.SEMICOLON)
 
     def pushPartialCopy(self, op) -> None:
-        pass
+        """Push a partial copy as a functional operator fallback.
+
+        C++ ref: related to ``PrintC::pushPartialSymbol``
+        """
+        self.opFunc(op)
 
     def pushMismatchCopy(self, op) -> None:
-        pass
+        """Push a type-mismatched copy as a functional operator fallback.
+
+        C++ ref: related to ``PrintC::pushMismatchSymbol``
+        """
+        self.opFunc(op)
 
     def emitInlineExpression(self, op) -> None:
-        pass
+        """Emit an inline expression for a given PcodeOp."""
+        if op is not None:
+            self.emitExpression(op)
 
     def emitLocalScopeDecls(self, scope, cat: int) -> None:
-        pass
+        """Emit variable declarations for the given scope and category.
+
+        C++ ref: ``PrintC::emitScopeVarDecls``
+        """
+        self.emitScopeVarDecls(scope, cat)
 
     def pushAnnotatedLocation(self, addr, vn, op) -> None:
-        pass
+        """Push an annotated address location as a hex string."""
+        if addr is not None:
+            s = addr.printRaw() if hasattr(addr, 'printRaw') else hex(addr.getOffset())
+            self.pushAtom(Atom(s, vartoken, SyntaxHighlight.const_color, op, vn))
 
     def pushCharLiteral(self, val: int, ct, vn=None, op=None) -> None:
-        pass
+        """Push a character literal constant.
+
+        Delegates to pushCharConstant.
+
+        C++ ref: ``PrintC::pushCharConstant``
+        """
+        self.pushCharConstant(val, ct, vartoken, vn, op)
 
     def adjustComparisonOperators(self, op, ct) -> None:
-        pass
+        """Adjust comparison operator tokens based on data-type.
+
+        Currently a no-op; comparison operators are already correct.
+        C++ ref: no direct equivalent needed.
+        """
+        return
 
     def emitEnumDefinition(self, ct):
         """Emit an enum type definition: typedef enum { ... } Name;"""

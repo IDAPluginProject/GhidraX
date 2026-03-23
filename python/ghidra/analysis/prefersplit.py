@@ -7,8 +7,19 @@ When a register can be logically split into smaller lanes (e.g. XMM into
 """
 
 from __future__ import annotations
-from typing import List
+from typing import List, Optional, TYPE_CHECKING
 from ghidra.core.address import Address
+from ghidra.core.opcodes import OpCode
+
+if TYPE_CHECKING:
+    from ghidra.analysis.funcdata import Funcdata
+
+
+def _calc_mask(size: int) -> int:
+    """Calculate bit mask for given byte size."""
+    if size >= 8:
+        return 0xFFFFFFFFFFFFFFFF
+    return (1 << (size * 8)) - 1
 
 
 class LanedRegister:
@@ -93,22 +104,25 @@ class PreferSplitManager:
     """Manages a collection of PreferSplitRecords for an architecture.
 
     Handles splitting Varnodes at preferred points during heritage.
+    C++ ref: PreferSplitManager in prefersplit.hh/cc
     """
+
+    IPTR_INTERNAL = 4  # AddrSpace type constant for unique/temp space
 
     class SplitInstance:
         """Tracks a Varnode being split into hi/lo pieces."""
         def __init__(self, vn=None, off: int = 0):
             self.splitoffset: int = off
             self.vn = vn
-            self.hi = None  # Most significant piece
-            self.lo = None  # Least significant piece
+            self.hi = None
+            self.lo = None
 
     def __init__(self) -> None:
         self._records: List[PreferSplitRecord] = []
-        self._data = None  # Funcdata
+        self._data: Optional[Funcdata] = None
         self._tempsplits: list = []
 
-    def init(self, fd, records) -> None:
+    def init(self, fd: Funcdata, records) -> None:
         """Initialize with a Funcdata and list of PreferSplitRecords."""
         self._data = fd
         if records is not None:
@@ -118,15 +132,16 @@ class PreferSplitManager:
         self._records.append(rec)
         self._records.sort()
 
-    def findRecord(self, addr_or_vn, sz: int = None) -> PreferSplitRecord:
-        """Find a record by address+size or by Varnode."""
+    def findRecord(self, addr_or_vn, sz: int = None) -> Optional[PreferSplitRecord]:
+        """Find a record by address+size or by Varnode.
+
+        C++ ref: PreferSplitManager::findRecord uses binary search (lower_bound).
+        """
         if sz is not None:
-            # findRecord(addr, sz)
             for rec in self._records:
                 if rec.storage == addr_or_vn and rec.totalSize == sz:
                     return rec
         else:
-            # findRecord(vn) - match by varnode's storage
             vn = addr_or_vn
             if vn is None:
                 return None
@@ -145,10 +160,7 @@ class PreferSplitManager:
         return self._records
 
     def decode(self, decoder) -> None:
-        """Decode a <prefersplit> element containing multiple records.
-
-        C++ ref: ``Architecture::decodePreferSplit``
-        """
+        """Decode a <prefersplit> element containing multiple records."""
         from ghidra.core.marshal import ELEM_PREFERSPLIT, ATTRIB_STYLE
         elemId = decoder.openElement(ELEM_PREFERSPLIT)
         style = decoder.readString(ATTRIB_STYLE)
@@ -164,10 +176,7 @@ class PreferSplitManager:
         self._records.sort()
 
     def encode(self, encoder) -> None:
-        """Encode all records as a <prefersplit> element.
-
-        C++ ref: mirrors ``Architecture::decodePreferSplit`` in reverse.
-        """
+        """Encode all records as a <prefersplit> element."""
         from ghidra.core.marshal import ELEM_PREFERSPLIT, ATTRIB_STYLE
         if not self._records:
             return
@@ -178,22 +187,485 @@ class PreferSplitManager:
         encoder.closeElement(ELEM_PREFERSPLIT)
 
     def fillinAddress(self, fd) -> None:
-        """Fill in register addresses from the translate object.
-
-        For records that reference register names, resolve them to actual
-        addresses using the function's architecture translate object.
-        """
+        """Fill in register addresses from the translate object."""
         pass  # Requires full translate infrastructure
 
     def clear(self) -> None:
         self._records.clear()
         self._tempsplits.clear()
 
+    # ------------------------------------------------------------------
+    # Core split logic matching C++ prefersplit.cc
+    # ------------------------------------------------------------------
+
+    def _fillinInstance(self, inst: 'PreferSplitManager.SplitInstance',
+                        bigendian: bool, sethi: bool, setlo: bool) -> None:
+        """Define the varnode pieces of *inst*.
+
+        C++ ref: PreferSplitManager::fillinInstance (lines 33-67)
+        """
+        vn = inst.vn
+        if bigendian:
+            losize = vn.getSize() - inst.splitoffset
+        else:
+            losize = inst.splitoffset
+        hisize = vn.getSize() - losize
+
+        if vn.isConstant():
+            origval = vn.getOffset()
+            loval = origval & _calc_mask(losize)
+            hival = (origval >> (8 * losize)) & _calc_mask(hisize)
+            if setlo and inst.lo is None:
+                inst.lo = self._data.newConstant(losize, loval)
+            if sethi and inst.hi is None:
+                inst.hi = self._data.newConstant(hisize, hival)
+        else:
+            if bigendian:
+                if setlo and inst.lo is None:
+                    inst.lo = self._data.newVarnode(losize, vn.getAddr() + inst.splitoffset)
+                if sethi and inst.hi is None:
+                    inst.hi = self._data.newVarnode(hisize, vn.getAddr())
+            else:
+                if setlo and inst.lo is None:
+                    inst.lo = self._data.newVarnode(losize, vn.getAddr())
+                if sethi and inst.hi is None:
+                    inst.hi = self._data.newVarnode(hisize, vn.getAddr() + inst.splitoffset)
+
+    def _createCopyOps(self, ininst: 'PreferSplitManager.SplitInstance',
+                        outinst: 'PreferSplitManager.SplitInstance',
+                        op, istemp: bool) -> None:
+        """Create COPY ops based on ininst and outinst to replace op.
+
+        C++ ref: PreferSplitManager::createCopyOps (lines 69-87)
+        """
+        hiop = self._data.newOp(1, op.getAddr())
+        loop = self._data.newOp(1, op.getAddr())
+        self._data.opSetOpcode(hiop, int(OpCode.CPUI_COPY))
+        self._data.opSetOpcode(loop, int(OpCode.CPUI_COPY))
+
+        self._data.opInsertAfter(loop, op)
+        self._data.opInsertAfter(hiop, op)
+        self._data.opUnsetInput(op, 0)
+
+        self._data.opSetOutput(hiop, outinst.hi)
+        self._data.opSetOutput(loop, outinst.lo)
+        self._data.opSetInput(hiop, ininst.hi, 0)
+        self._data.opSetInput(loop, ininst.lo, 0)
+        self._tempsplits.append(hiop)
+        self._tempsplits.append(loop)
+
+    def _testDefiningCopy(self, inst: 'PreferSplitManager.SplitInstance', defop) -> tuple:
+        """Check that inst defined by defop is really splittable.
+
+        C++ ref: PreferSplitManager::testDefiningCopy (lines 89-105)
+        Returns (ok, istemp).
+        """
+        invn = defop.getIn(0)
+        istemp = False
+        if not invn.isConstant():
+            spcType = invn.getSpace().getType() if hasattr(invn.getSpace(), 'getType') else -1
+            if spcType != self.IPTR_INTERNAL:
+                inrec = self.findRecord(invn)
+                if inrec is None:
+                    return (False, istemp)
+                if inrec.splitSize != inst.splitoffset:
+                    return (False, istemp)
+                if not invn.isFree():
+                    return (False, istemp)
+            else:
+                istemp = True
+        return (True, istemp)
+
+    def _splitDefiningCopy(self, inst: 'PreferSplitManager.SplitInstance', defop, istemp: bool) -> None:
+        """Do split of preferred split varnode defined by a COPY.
+
+        C++ ref: PreferSplitManager::splitDefiningCopy (lines 107-116)
+        """
+        invn = defop.getIn(0)
+        ininst = PreferSplitManager.SplitInstance(invn, inst.splitoffset)
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, True, True)
+        self._fillinInstance(ininst, bigendian, True, True)
+        self._createCopyOps(ininst, inst, defop, istemp)
+
+    def _testReadingCopy(self, inst: 'PreferSplitManager.SplitInstance', readop) -> tuple:
+        """Check that inst read by readop is really splittable.
+
+        C++ ref: PreferSplitManager::testReadingCopy (lines 118-131)
+        Returns (ok, istemp).
+        """
+        outvn = readop.getOut()
+        istemp = False
+        spcType = outvn.getSpace().getType() if hasattr(outvn.getSpace(), 'getType') else -1
+        if spcType != self.IPTR_INTERNAL:
+            outrec = self.findRecord(outvn)
+            if outrec is None:
+                return (False, istemp)
+            if outrec.splitSize != inst.splitoffset:
+                return (False, istemp)
+        else:
+            istemp = True
+        return (True, istemp)
+
+    def _splitReadingCopy(self, inst: 'PreferSplitManager.SplitInstance', readop, istemp: bool) -> None:
+        """Do split of varnode that is read by a COPY.
+
+        C++ ref: PreferSplitManager::splitReadingCopy (lines 133-142)
+        """
+        outvn = readop.getOut()
+        outinst = PreferSplitManager.SplitInstance(outvn, inst.splitoffset)
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, True, True)
+        self._fillinInstance(outinst, bigendian, True, True)
+        self._createCopyOps(inst, outinst, readop, istemp)
+
+    def _testZext(self, inst: 'PreferSplitManager.SplitInstance', op) -> bool:
+        """Check that inst defined by ZEXT is really splittable.
+
+        C++ ref: PreferSplitManager::testZext (lines 144-158)
+        """
+        invn = op.getIn(0)
+        if invn.isConstant():
+            return True
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        if bigendian:
+            losize = inst.vn.getSize() - inst.splitoffset
+        else:
+            losize = inst.splitoffset
+        if invn.getSize() != losize:
+            return False
+        return True
+
+    def _splitZext(self, inst: 'PreferSplitManager.SplitInstance', op) -> None:
+        """Split ZEXT-defined varnode.
+
+        C++ ref: PreferSplitManager::splitZext (lines 160-188)
+        """
+        ininst = PreferSplitManager.SplitInstance(op.getIn(0), inst.splitoffset)
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        if bigendian:
+            hisize = inst.splitoffset
+            losize = inst.vn.getSize() - inst.splitoffset
+        else:
+            losize = inst.splitoffset
+            hisize = inst.vn.getSize() - inst.splitoffset
+        if ininst.vn.isConstant():
+            origval = ininst.vn.getOffset()
+            loval = origval & _calc_mask(losize)
+            hival = (origval >> (8 * losize)) & _calc_mask(hisize)
+            ininst.lo = self._data.newConstant(losize, loval)
+            ininst.hi = self._data.newConstant(hisize, hival)
+        else:
+            ininst.lo = ininst.vn
+            ininst.hi = self._data.newConstant(hisize, 0)
+        self._fillinInstance(inst, bigendian, True, True)
+        self._createCopyOps(ininst, inst, op, False)
+
+    def _testPiece(self, inst: 'PreferSplitManager.SplitInstance', op) -> bool:
+        """Check that inst defined by PIECE is really splittable.
+
+        C++ ref: PreferSplitManager::testPiece (lines 190-200)
+        """
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        if bigendian:
+            if op.getIn(0).getSize() != inst.splitoffset:
+                return False
+        else:
+            if op.getIn(1).getSize() != inst.splitoffset:
+                return False
+        return True
+
+    def _splitPiece(self, inst: 'PreferSplitManager.SplitInstance', op) -> None:
+        """Split PIECE-defined varnode.
+
+        C++ ref: PreferSplitManager::splitPiece (lines 202-227)
+        """
+        loin = op.getIn(1)
+        hiin = op.getIn(0)
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, True, True)
+        hiop = self._data.newOp(1, op.getAddr())
+        loop = self._data.newOp(1, op.getAddr())
+        self._data.opSetOpcode(hiop, int(OpCode.CPUI_COPY))
+        self._data.opSetOpcode(loop, int(OpCode.CPUI_COPY))
+        self._data.opSetOutput(hiop, inst.hi)
+        self._data.opSetOutput(loop, inst.lo)
+        self._data.opInsertAfter(loop, op)
+        self._data.opInsertAfter(hiop, op)
+        self._data.opUnsetInput(op, 0)
+        self._data.opUnsetInput(op, 1)
+        if hiin.isConstant():
+            hiin = self._data.newConstant(hiin.getSize(), hiin.getOffset())
+        self._data.opSetInput(hiop, hiin, 0)
+        if loin.isConstant():
+            loin = self._data.newConstant(loin.getSize(), loin.getOffset())
+        self._data.opSetInput(loop, loin, 0)
+
+    def _testSubpiece(self, inst: 'PreferSplitManager.SplitInstance', op) -> bool:
+        """Check that inst read by SUBPIECE is really splittable.
+
+        C++ ref: PreferSplitManager::testSubpiece (lines 229-246)
+        """
+        vn = inst.vn
+        outvn = op.getOut()
+        suboff = int(op.getIn(1).getOffset())
+        if suboff == 0:
+            if vn.getSize() - inst.splitoffset != outvn.getSize():
+                return False
+        else:
+            if vn.getSize() - suboff != inst.splitoffset:
+                return False
+            if outvn.getSize() != inst.splitoffset:
+                return False
+        return True
+
+    def _splitSubpiece(self, inst: 'PreferSplitManager.SplitInstance', op) -> None:
+        """Rewrite SUBPIECE to a COPY extracting a logical piece.
+
+        C++ ref: PreferSplitManager::splitSubpiece (lines 248-263)
+        """
+        suboff = int(op.getIn(1).getOffset())
+        grabbinglo = (suboff == 0)
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, not grabbinglo, grabbinglo)
+        self._data.opSetOpcode(op, int(OpCode.CPUI_COPY))
+        self._data.opRemoveInput(op, 1)
+        invn = inst.lo if grabbinglo else inst.hi
+        self._data.opSetInput(op, invn, 0)
+
+    def _testLoad(self, inst: 'PreferSplitManager.SplitInstance', op) -> bool:
+        """C++ ref: PreferSplitManager::testLoad — always returns True."""
+        return True
+
+    def _splitLoad(self, inst: 'PreferSplitManager.SplitInstance', op) -> None:
+        """Split a LOAD that defines inst into two LOADs.
+
+        C++ ref: PreferSplitManager::splitLoad (lines 271-314)
+        """
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, True, True)
+        hiop = self._data.newOp(2, op.getAddr())
+        loop = self._data.newOp(2, op.getAddr())
+        addop = self._data.newOp(2, op.getAddr())
+        ptrvn = op.getIn(1)
+        self._data.opSetOpcode(hiop, int(OpCode.CPUI_LOAD))
+        self._data.opSetOpcode(loop, int(OpCode.CPUI_LOAD))
+        self._data.opSetOpcode(addop, int(OpCode.CPUI_INT_ADD))
+        self._data.opInsertAfter(loop, op)
+        self._data.opInsertAfter(hiop, op)
+        self._data.opInsertAfter(addop, op)
+        self._data.opUnsetInput(op, 1)
+        addvn = self._data.newUniqueOut(ptrvn.getSize(), addop)
+        self._data.opSetInput(addop, ptrvn, 0)
+        self._data.opSetInput(addop, self._data.newConstant(ptrvn.getSize(), inst.splitoffset), 1)
+        self._data.opSetOutput(hiop, inst.hi)
+        self._data.opSetOutput(loop, inst.lo)
+        spaceid = op.getIn(0)
+        spaceid2 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
+        self._data.opSetInput(hiop, spaceid2, 0)
+        spaceid3 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
+        self._data.opSetInput(loop, spaceid3, 0)
+        if ptrvn.isFree():
+            ptrvn = self._data.newVarnode(ptrvn.getSize(), ptrvn.getSpace(), ptrvn.getOffset())
+        if bigendian:
+            self._data.opSetInput(hiop, ptrvn, 1)
+            self._data.opSetInput(loop, addvn, 1)
+        else:
+            self._data.opSetInput(hiop, addvn, 1)
+            self._data.opSetInput(loop, ptrvn, 1)
+
+    def _testStore(self, inst: 'PreferSplitManager.SplitInstance', op) -> bool:
+        """C++ ref: PreferSplitManager::testStore — always returns True."""
+        return True
+
+    def _splitStore(self, inst: 'PreferSplitManager.SplitInstance', op) -> None:
+        """Split a STORE of inst into two STOREs.
+
+        C++ ref: PreferSplitManager::splitStore (lines 322-365)
+        """
+        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        self._fillinInstance(inst, bigendian, True, True)
+        hiop = self._data.newOp(3, op.getAddr())
+        loop = self._data.newOp(3, op.getAddr())
+        addop = self._data.newOp(2, op.getAddr())
+        ptrvn = op.getIn(1)
+        self._data.opSetOpcode(hiop, int(OpCode.CPUI_STORE))
+        self._data.opSetOpcode(loop, int(OpCode.CPUI_STORE))
+        self._data.opSetOpcode(addop, int(OpCode.CPUI_INT_ADD))
+        self._data.opInsertAfter(loop, op)
+        self._data.opInsertAfter(hiop, op)
+        self._data.opInsertAfter(addop, op)
+        self._data.opUnsetInput(op, 1)
+        self._data.opUnsetInput(op, 2)
+        addvn = self._data.newUniqueOut(ptrvn.getSize(), addop)
+        self._data.opSetInput(addop, ptrvn, 0)
+        self._data.opSetInput(addop, self._data.newConstant(ptrvn.getSize(), inst.splitoffset), 1)
+        self._data.opSetInput(hiop, inst.hi, 2)
+        self._data.opSetInput(loop, inst.lo, 2)
+        spaceid = op.getIn(0)
+        spaceid2 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
+        self._data.opSetInput(hiop, spaceid2, 0)
+        spaceid3 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
+        self._data.opSetInput(loop, spaceid3, 0)
+        if ptrvn.isFree():
+            ptrvn = self._data.newVarnode(ptrvn.getSize(), ptrvn.getSpace(), ptrvn.getOffset())
+        if bigendian:
+            self._data.opSetInput(hiop, ptrvn, 1)
+            self._data.opSetInput(loop, addvn, 1)
+        else:
+            self._data.opSetInput(hiop, addvn, 1)
+            self._data.opSetInput(loop, ptrvn, 1)
+
+    def _splitVarnode(self, inst: 'PreferSplitManager.SplitInstance') -> bool:
+        """Test if vn can be readily split, if so, do the split.
+
+        C++ ref: PreferSplitManager::splitVarnode (lines 367-428)
+        """
+        vn = inst.vn
+        if vn.isWritten():
+            if not vn.hasNoDescend():
+                return False
+            op = vn.getDef()
+            opc = op.code()
+            if opc == OpCode.CPUI_COPY:
+                ok, istemp = self._testDefiningCopy(inst, op)
+                if not ok:
+                    return False
+                self._splitDefiningCopy(inst, op, istemp)
+            elif opc == OpCode.CPUI_PIECE:
+                if not self._testPiece(inst, op):
+                    return False
+                self._splitPiece(inst, op)
+            elif opc == OpCode.CPUI_LOAD:
+                if not self._testLoad(inst, op):
+                    return False
+                self._splitLoad(inst, op)
+            elif opc == OpCode.CPUI_INT_ZEXT:
+                if not self._testZext(inst, op):
+                    return False
+                self._splitZext(inst, op)
+            else:
+                return False
+            self._data.opDestroy(op)
+        else:
+            if not vn.isFree():
+                return False
+            op = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
+            if op is None:
+                return False
+            opc = op.code()
+            if opc == OpCode.CPUI_COPY:
+                ok, istemp = self._testReadingCopy(inst, op)
+                if not ok:
+                    return False
+                self._splitReadingCopy(inst, op, istemp)
+            elif opc == OpCode.CPUI_SUBPIECE:
+                if not self._testSubpiece(inst, op):
+                    return False
+                self._splitSubpiece(inst, op)
+                return True  # Do not destroy op, it has been transformed
+            elif opc == OpCode.CPUI_STORE:
+                if not self._testStore(inst, op):
+                    return False
+                self._splitStore(inst, op)
+            else:
+                return False
+            self._data.opDestroy(op)
+        return True
+
+    def _splitRecord(self, rec: PreferSplitRecord) -> None:
+        """Split all Varnodes matching the given record.
+
+        C++ ref: PreferSplitManager::splitRecord (lines 430-449)
+        """
+        if self._data is None:
+            return
+        addr = rec.storage
+        inst = PreferSplitManager.SplitInstance(None, rec.splitSize)
+        if hasattr(self._data, 'beginLoc') and hasattr(self._data, 'endLoc'):
+            while True:
+                found = False
+                for vn in list(self._data.iterLoc(rec.totalSize, addr)):
+                    inst.vn = vn
+                    inst.lo = None
+                    inst.hi = None
+                    if self._splitVarnode(inst):
+                        found = True
+                        break
+                if not found:
+                    break
+        elif hasattr(self._data, '_vbank'):
+            for vn in list(self._data._vbank.beginLoc()):
+                if vn.getAddr() == rec.storage and vn.getSize() == rec.totalSize:
+                    inst.vn = vn
+                    inst.lo = None
+                    inst.hi = None
+                    self._splitVarnode(inst)
+
+    def _testTemporary(self, inst: 'PreferSplitManager.SplitInstance') -> bool:
+        """Test if a temporary can be split.
+
+        C++ ref: PreferSplitManager::testTemporary (lines 451-491)
+        """
+        op = inst.vn.getDef()
+        opc = op.code()
+        if opc == OpCode.CPUI_PIECE:
+            if not self._testPiece(inst, op):
+                return False
+        elif opc == OpCode.CPUI_LOAD:
+            if not self._testLoad(inst, op):
+                return False
+        elif opc == OpCode.CPUI_INT_ZEXT:
+            if not self._testZext(inst, op):
+                return False
+        else:
+            return False
+        for readop in (list(inst.vn.getDescend()) if hasattr(inst.vn, 'getDescend') else []):
+            ropc = readop.code()
+            if ropc == OpCode.CPUI_SUBPIECE:
+                if not self._testSubpiece(inst, readop):
+                    return False
+            elif ropc == OpCode.CPUI_STORE:
+                if not self._testStore(inst, readop):
+                    return False
+            else:
+                return False
+        return True
+
+    def _splitTemporary(self, inst: 'PreferSplitManager.SplitInstance') -> None:
+        """Split a temporary varnode.
+
+        C++ ref: PreferSplitManager::splitTemporary (lines 493-527)
+        """
+        vn = inst.vn
+        op = vn.getDef()
+        opc = op.code()
+        if opc == OpCode.CPUI_PIECE:
+            self._splitPiece(inst, op)
+        elif opc == OpCode.CPUI_LOAD:
+            self._splitLoad(inst, op)
+        elif opc == OpCode.CPUI_INT_ZEXT:
+            self._splitZext(inst, op)
+
+        while True:
+            descend = list(vn.getDescend()) if hasattr(vn, 'getDescend') else []
+            if not descend:
+                break
+            readop = descend[0]
+            ropc = readop.code()
+            if ropc == OpCode.CPUI_SUBPIECE:
+                self._splitSubpiece(inst, readop)
+            elif ropc == OpCode.CPUI_STORE:
+                self._splitStore(inst, readop)
+                self._data.opDestroy(readop)
+            else:
+                break
+        self._data.opDestroy(op)
+
     def split(self) -> None:
         """Perform initial splitting of Varnodes based on records.
 
-        For each PreferSplitRecord, find matching Varnodes in the function
-        and split them into hi/lo pieces.
+        C++ ref: PreferSplitManager::split (lines 558-563)
         """
         if self._data is None:
             return
@@ -201,63 +673,61 @@ class PreferSplitManager:
             self._splitRecord(rec)
 
     def splitAdditional(self) -> None:
-        """Split any additional temporaries that were discovered during initial split."""
-        for op in self._tempsplits:
-            pass  # Would split temporary copies
-        self._tempsplits.clear()
+        """Split any additional temporaries discovered during initial split.
 
-    def _splitRecord(self, rec: PreferSplitRecord) -> None:
-        """Split all Varnodes matching the given record."""
-        if self._data is None:
-            return
-        # Find all varnodes at the record's storage location
-        for vn in list(self._data._vbank.beginLoc()):
-            if vn.getAddr() == rec.storage and vn.getSize() == rec.totalSize:
-                inst = PreferSplitManager.SplitInstance(vn, rec.splitSize)
-                self._splitVarnode(inst)
-
-    def _splitVarnode(self, inst) -> bool:
-        """Split a single Varnode into hi/lo pieces."""
-        if inst.vn is None:
-            return False
-        vn = inst.vn
-        if vn.isWritten():
-            defop = vn.getDef()
+        C++ ref: PreferSplitManager::splitAdditional (lines 565-629)
+        """
+        defops: list = []
+        for tmpop in self._tempsplits:
+            if hasattr(tmpop, 'isDead') and tmpop.isDead():
+                continue
+            vn = tmpop.getIn(0)
+            if vn.isWritten():
+                defop = vn.getDef()
+                if defop.code() == OpCode.CPUI_SUBPIECE:
+                    invn = defop.getIn(0)
+                    spcType = invn.getSpace().getType() if hasattr(invn.getSpace(), 'getType') else -1
+                    if spcType == self.IPTR_INTERNAL:
+                        defops.append(defop)
+            outvn = tmpop.getOut()
+            if outvn is not None:
+                for descop in (list(outvn.getDescend()) if hasattr(outvn, 'getDescend') else []):
+                    if descop.code() == OpCode.CPUI_PIECE:
+                        poutvn = descop.getOut()
+                        pspcType = poutvn.getSpace().getType() if hasattr(poutvn.getSpace(), 'getType') else -1
+                        if pspcType == self.IPTR_INTERNAL:
+                            defops.append(descop)
+        for defop in defops:
+            if hasattr(defop, 'isDead') and defop.isDead():
+                continue
             opc = defop.code()
-            from ghidra.core.opcodes import OpCode
-            if opc == OpCode.CPUI_COPY:
-                return self._testDefiningCopy(inst, defop)
-            elif opc == OpCode.CPUI_PIECE:
-                return self._testPiece(inst, defop)
-            elif opc == OpCode.CPUI_INT_ZEXT:
-                return self._testZext(inst, defop)
-            elif opc == OpCode.CPUI_LOAD:
-                return self._testLoad(inst, defop)
-        return False
-
-    def _testDefiningCopy(self, inst, defop) -> bool:
-        return True
-
-    def _testReadingCopy(self, inst, readop) -> bool:
-        return True
-
-    def _testZext(self, inst, op) -> bool:
-        return True
-
-    def _testPiece(self, inst, op) -> bool:
-        return True
-
-    def _testSubpiece(self, inst, op) -> bool:
-        return True
-
-    def _testLoad(self, inst, op) -> bool:
-        return True
-
-    def _testStore(self, inst, op) -> bool:
-        return True
-
-    def _testTemporary(self, inst) -> bool:
-        return True
+            if opc == OpCode.CPUI_PIECE:
+                vn = defop.getOut()
+                bigendian = vn.getSpace().isBigEndian() if hasattr(vn.getSpace(), 'isBigEndian') else False
+                if bigendian:
+                    splitoff = defop.getIn(0).getSize()
+                else:
+                    splitoff = defop.getIn(1).getSize()
+                inst = PreferSplitManager.SplitInstance(vn, splitoff)
+                if self._testTemporary(inst):
+                    self._splitTemporary(inst)
+            elif opc == OpCode.CPUI_SUBPIECE:
+                vn = defop.getIn(0)
+                suboff = defop.getIn(1).getOffset()
+                bigendian = vn.getSpace().isBigEndian() if hasattr(vn.getSpace(), 'isBigEndian') else False
+                if bigendian:
+                    if suboff == 0:
+                        splitoff = vn.getSize() - defop.getOut().getSize()
+                    else:
+                        splitoff = vn.getSize() - int(suboff)
+                else:
+                    if suboff == 0:
+                        splitoff = defop.getOut().getSize()
+                    else:
+                        splitoff = int(suboff)
+                inst = PreferSplitManager.SplitInstance(vn, splitoff)
+                if self._testTemporary(inst):
+                    self._splitTemporary(inst)
 
     @staticmethod
     def initialize(records: list) -> None:

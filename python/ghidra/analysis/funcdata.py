@@ -7,7 +7,10 @@ Holds control-flow, data-flow, and prototype information.
 
 from __future__ import annotations
 
+import struct as _struct
 from typing import TYPE_CHECKING, Optional, List, Iterator
+
+_PTR_SIZE: int = _struct.calcsize('P')  # sizeof(void*): 8 on 64-bit, 4 on 32-bit
 
 from ghidra.core.address import Address, SeqNum
 from ghidra.core.opcodes import OpCode
@@ -128,8 +131,16 @@ class Funcdata:
         self._jumpvec.append(jt)
         return jt
 
-    def getCallSpecs(self, op):
-        """Look up FuncCallSpecs for a given CALL/CALLIND PcodeOp."""
+    def getCallSpecs(self, op_or_index):
+        """Look up FuncCallSpecs by PcodeOp or by integer index.
+
+        C++ has two overloads:
+          FuncCallSpecs *getCallSpecs(const PcodeOp *op)
+          FuncCallSpecs *getCallSpecs(int4 i)
+        """
+        if isinstance(op_or_index, int):
+            return self._qlst[op_or_index] if 0 <= op_or_index < len(self._qlst) else None
+        op = op_or_index
         opid = id(op)
         if opid in self._qlst_map:
             return self._qlst_map[opid]
@@ -330,6 +341,8 @@ class Funcdata:
         if not hasattr(self, '_heritage'):
             from ghidra.analysis.heritage import Heritage
             self._heritage = Heritage(self)
+        if not self._heritage._infolist:
+            self._heritage.buildInfoList()
         self._heritage.heritage()
 
     def getHeritagePass(self) -> int:
@@ -622,10 +635,15 @@ class Funcdata:
             if jumpop is not None and jumpop.isBranch():
                 self.opDestroy(jumpop)
         if hasattr(outbl, 'getOpList') and outbl.getOpList():
-            # Check for MULTIEQUALs
+            # Convert any leading MULTIEQUALs to COPYs (outbl has sizeIn==1)
+            for mop in list(outbl.getOpList()):
+                if mop.code() != OpCode.CPUI_MULTIEQUAL:
+                    break
+                # MULTIEQUAL with 1 input → COPY
+                while mop.numInput() > 1:
+                    self.opRemoveInput(mop, mop.numInput() - 1)
+                self.opSetOpcode(mop, OpCode.CPUI_COPY)
             firstop = outbl.getOpList()[0]
-            if firstop.code() == OpCode.CPUI_MULTIEQUAL:
-                raise Exception("Splicing block with MULTIEQUAL")
             firstop.clearFlag(PcodeOp.startbasic)
             # Reparent all ops from outbl to bl
             for op in list(outbl.getOpList()):
@@ -752,6 +770,8 @@ class Funcdata:
             uniq = None
             base = 0x10000000
         addr = Address(uniq, base)
+        if self._glb is not None and hasattr(self._glb, 'setUniqueBase'):
+            self._glb.setUniqueBase(base + s)
         vn = self._vbank.create(s, addr, ct)
         self.assignHigh(vn)
         if s >= self._minLanedSize:
@@ -782,9 +802,16 @@ class Funcdata:
 
         C++ ref: ``Funcdata::newUniqueOut``
         """
-        vn = self._vbank.createDefUnique(s, None, op) if hasattr(self._vbank, 'createDefUnique') else self.newUnique(s)
-        if not vn.isWritten():
-            vn.setDef(op)
+        if self._glb is not None:
+            uniq = self._glb.getUniqueSpace()
+            base = self._glb.getUniqueBase()
+        else:
+            uniq = None
+            base = 0x10000000
+        addr = Address(uniq, base)
+        if self._glb is not None and hasattr(self._glb, 'setUniqueBase'):
+            self._glb.setUniqueBase(base + s)
+        vn = self._vbank.createDef(s, addr, None, op)
         op.setOutput(vn)
         self.assignHigh(vn)
         if s >= self._minLanedSize:
@@ -887,18 +914,40 @@ class Funcdata:
             iopSpc = self._glb.getIopSpace()
         opaddr = op.getAddr() if hasattr(op, 'getAddr') else Address()
         addr = Address(iopSpc, id(op)) if iopSpc is not None else opaddr
-        vn = self._vbank.create(1, addr)
+        vn = self._vbank.create(_PTR_SIZE, addr)
         self.assignHigh(vn)
         return vn
 
     def newVarnodeSpace(self, spc):
+        """Create a constant varnode encoding an address space identifier.
+
+        C++ encodes the AddrSpace* pointer as a sizeof(void*)-byte constant.
+        We use 8 bytes to match the C++ 64-bit build output.
+
+        C++ ref: ``Funcdata::newVarnodeSpace``
+        """
         cs = self._glb.getConstantSpace() if self._glb else None
         idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
-        return self._vbank.create(4, Address(cs, idx) if cs else Address())
+        return self._vbank.create(8, Address(cs, idx) if cs else Address())
 
     def newVarnodeCallSpecs(self, fc):
-        addr = fc.getEntryAddress() if hasattr(fc, 'getEntryAddress') else Address()
-        return self._vbank.create(4, addr)
+        """Create an annotation Varnode encoding a reference to a FuncCallSpecs.
+
+        C++ ref: ``Funcdata::newVarnodeCallSpecs`` — uses FSPEC space with
+        the object id as the offset.
+        """
+        fspecSpc = None
+        if self._glb is not None and hasattr(self._glb, '_spc_mgr'):
+            fspecSpc = getattr(self._glb._spc_mgr, '_fspecSpace', None)
+        elif self._glb is not None and hasattr(self._glb, 'getFspecSpace'):
+            fspecSpc = self._glb.getFspecSpace()
+        if fspecSpc is not None:
+            addr = Address(fspecSpc, id(fc))
+        else:
+            addr = fc.getEntryAddress() if hasattr(fc, 'getEntryAddress') else Address()
+        vn = self._vbank.create(8 if fspecSpc is not None else 4, addr)
+        self.assignHigh(vn)
+        return vn
 
     def newCodeRef(self, m):
         """Create an annotation Varnode holding a code reference address.
@@ -1109,8 +1158,8 @@ class Funcdata:
         return self._obank.findOp(sq) if hasattr(self._obank, 'findOp') else None
 
     def beginOp(self, opc=None):
-        if opc is not None and hasattr(self._obank, 'begin'):
-            return self._obank.begin(opc)
+        if opc is not None and hasattr(self._obank, 'beginByOpcode'):
+            return iter(self._obank.beginByOpcode(opc))
         return self._obank.beginAll() if hasattr(self._obank, 'beginAll') else iter([])
 
     def beginOpAlive(self):
@@ -1887,22 +1936,54 @@ class Funcdata:
         if b.sizeIn() <= 1:
             raise RuntimeError("Cannot nodesplit block with only 1 in edge")
         bprime = self.nodeSplitBlockEdge(b, inedge)
-        # Clone ops from b into bprime (simplified: no CloneBlockOps helper)
+        # Clone ops from b into bprime (C++ ref: CloneBlockOps::cloneBlock + patchInputs)
+        origToClone = {}  # map original op -> cloned op
+        cloneList = []    # list of (cloneOp, origOp) pairs
         if hasattr(b, 'getOpList'):
+            # Phase 1: build skeleton clones with outputs
             for origop in list(b.getOpList()):
                 if origop.isBranch():
+                    if origop.code() != OpCode.CPUI_BRANCH:
+                        raise RuntimeError("Cannot duplicate 2-way or n-way branch in nodesplit")
                     continue
                 dup = self.newOp(origop.numInput(), origop.getAddr())
                 self.opSetOpcode(dup, origop.code())
+                # Clone output varnode
                 if origop.getOut() is not None:
-                    self.newVarnodeOut(origop.getOut().getSize(), origop.getOut().getAddr(), dup)
-                for i in range(origop.numInput()):
-                    inv = origop.getIn(i)
-                    if inv.isConstant():
-                        self.opSetInput(dup, self.newConstant(inv.getSize(), inv.getOffset()), i)
-                    else:
-                        self.opSetInput(dup, inv, i)
+                    opvn = origop.getOut()
+                    self.newVarnodeOut(opvn.getSize(), opvn.getAddr(), dup)
+                origToClone[id(origop)] = dup
+                cloneList.append((dup, origop))
                 self.opInsertEnd(dup, bprime)
+            # Phase 2: patch inputs (C++ ref: CloneBlockOps::patchInputs)
+            for dup, origop in cloneList:
+                if origop.code() == OpCode.CPUI_MULTIEQUAL:
+                    # Convert clone to COPY taking the inedge input
+                    self.opSetOpcode(dup, OpCode.CPUI_COPY)
+                    if hasattr(dup, 'setNumInputs'):
+                        dup.setNumInputs(1)
+                    self.opSetInput(dup, origop.getIn(inedge), 0)
+                    # Remove inedge from original MULTIEQUAL
+                    self.opRemoveInput(origop, inedge)
+                    if origop.numInput() == 1:
+                        self.opSetOpcode(origop, OpCode.CPUI_COPY)
+                else:
+                    for i in range(origop.numInput()):
+                        inv = origop.getIn(i)
+                        if inv.isConstant():
+                            cloneVn = inv  # Constants can be shared
+                        elif hasattr(inv, 'isAnnotation') and inv.isAnnotation():
+                            cloneVn = self.newCodeRef(inv.getAddr())
+                        elif inv.isWritten():
+                            defOp = inv.getDef()
+                            mapped = origToClone.get(id(defOp))
+                            if mapped is not None and mapped.getOut() is not None:
+                                cloneVn = mapped.getOut()
+                            else:
+                                cloneVn = inv
+                        else:
+                            cloneVn = inv
+                        self.opSetInput(dup, cloneVn, i)
         self.structureReset()
 
     def pushBranch(self, bb, slot: int, bbnew) -> None:
@@ -2894,8 +2975,80 @@ class Funcdata:
         self._jtcallback = None
 
     def stageJumpTable(self, partial, jt, op, flow):
-        """Stage analysis for a jump-table recovery."""
-        return None
+        """Stage jump-table analysis on a partial clone of the function.
+
+        If the partial Funcdata has not yet been analyzed for jump-table
+        recovery, a truncated flow is generated and the 'jumptable' action
+        group is run to simplify the partial function. Then the BRANCHIND
+        in the partial is located and the JumpTable is asked to recover
+        addresses from the simplified IR.
+
+        C++ ref: ``Funcdata::stageJumpTable``
+
+        Args:
+            partial: A Funcdata clone used for jump-table analysis.
+            jt: The JumpTable object to fill in.
+            op: The BRANCHIND PcodeOp in the original function.
+            flow: The FlowInfo for the original function (or None).
+
+        Returns:
+            A recovery mode string: 'success', 'fail_normal', 'fail_return',
+            'fail_thunk', or None on error.
+        """
+        if not partial.isJumptableRecoveryOn():
+            partial._flags |= Funcdata.jumptablerecovery_on
+            partial.truncatedFlow(self, flow)
+
+            if self._glb is not None and hasattr(self._glb, 'allacts'):
+                oldactname = self._glb.allacts.getCurrentName() if hasattr(self._glb.allacts, 'getCurrentName') else None
+                try:
+                    if hasattr(self._glb.allacts, 'setCurrent'):
+                        self._glb.allacts.setCurrent('jumptable')
+                    if hasattr(self, '_jtcallback') and self._jtcallback is not None:
+                        self._jtcallback(self, partial)
+                    else:
+                        cur = self._glb.allacts.getCurrent() if hasattr(self._glb.allacts, 'getCurrent') else None
+                        if cur is not None:
+                            cur.reset(partial)
+                            cur.perform(partial)
+                    if oldactname is not None and hasattr(self._glb.allacts, 'setCurrent'):
+                        self._glb.allacts.setCurrent(oldactname)
+                except Exception as err:
+                    if oldactname is not None and hasattr(self._glb.allacts, 'setCurrent'):
+                        self._glb.allacts.setCurrent(oldactname)
+                    self.warning(str(err), op.getAddr())
+                    return 'fail_normal'
+
+        partop = partial.findOp(op.getSeqNum()) if hasattr(partial, 'findOp') else None
+
+        if partop is None or partop.code() != OpCode.CPUI_BRANCHIND or partop.getAddr() != op.getAddr():
+            from ghidra.core.error import LowlevelError
+            raise LowlevelError("Error recovering jumptable: Bad partial clone")
+        if partop.isDead():
+            return 'success'
+
+        # Test if the branch target is copied from the return address
+        if self.testForReturnAddress(partop.getIn(0)):
+            return 'fail_return'
+
+        try:
+            if flow is not None and hasattr(jt, 'setLoadCollect'):
+                jt.setLoadCollect(flow.doesJumpRecord())
+            if hasattr(jt, 'setIndirectOp'):
+                jt.setIndirectOp(partop)
+            if hasattr(jt, 'isPartial') and jt.isPartial():
+                if hasattr(jt, 'recoverMultistage'):
+                    jt.recoverMultistage(partial)
+            else:
+                if hasattr(jt, 'recoverAddresses'):
+                    jt.recoverAddresses(partial)
+        except Exception as err:
+            err_str = str(err)
+            if 'thunk' in err_str.lower():
+                return 'fail_thunk'
+            self.warning(err_str, op.getAddr())
+            return 'fail_normal'
+        return 'success'
 
     # --- Block routines ---
 
@@ -2939,13 +3092,22 @@ class Funcdata:
     def opInsertBefore(self, op: PcodeOp, follow: PcodeOp) -> None:
         """Insert op before a specific PcodeOp in its basic block.
 
+        If the op being inserted is NOT an INDIRECT, walk backwards past
+        any preceding INDIRECT ops so that non-INDIRECT ops are placed
+        before the INDIRECT cluster.  This matches C++ semantics where
+        INDIRECTs must remain immediately before their associated CALL.
+
         C++ ref: ``Funcdata::opInsertBefore``
         """
+        from ghidra.core.opcodes import OpCode
         bl = follow.getParent()
         if bl is not None:
             ops = bl.getOpList()
             try:
                 idx = ops.index(follow)
+                if op.code() != OpCode.CPUI_INDIRECT:
+                    while idx > 0 and ops[idx - 1].code() == OpCode.CPUI_INDIRECT:
+                        idx -= 1
                 bl.insertOp(op, idx)
             except ValueError:
                 bl.addOp(op)
@@ -3013,13 +3175,162 @@ class Funcdata:
             flow.generateBlocks()
 
     def inlineFlow(self, inlinefd, flow, callop) -> int:
-        """In-line the given function. Returns 0=EZ, 1=hard, -1=fail."""
-        return -1
+        """In-line the p-code of another function into \b this function.
+
+        Raw p-code is generated for the in-lined function, then control-flow
+        information is cloned into the current FlowInfo object. This method
+        supports two in-lining models:
+          - The EZ model: the in-lined function is a single basic-block
+            with no calls or branches. P-code is cloned and simply replaces
+            the CALL op.
+          - The hard model: the in-lined function has real control-flow.
+            The CALL op is converted to a BRANCH to the in-lined body, and
+            the in-lined RETURN ops become branches back to the call site
+            fall-through.
+
+        C++ ref: ``Funcdata::inlineFlow``
+
+        Args:
+            inlinefd: Funcdata of the function being in-lined.
+            flow: FlowInfo object for the current function.
+            callop: The CALL PcodeOp being replaced.
+
+        Returns:
+            0 for EZ model success, 1 for hard model success, -1 on failure.
+        """
+        from ghidra.analysis.flow import FlowInfo
+
+        if inlinefd.getArch() is not None and hasattr(inlinefd.getArch(), 'clearAnalysis'):
+            inlinefd.getArch().clearAnalysis(inlinefd)
+
+        inlineflow = FlowInfo(inlinefd, inlinefd._obank, inlinefd._bblocks, inlinefd._qlst)
+        inlinefd._obank.setUniqId(self._obank.getUniqId())
+
+        # Generate the pcode ops to be inlined
+        baddr = Address(self._baseaddr.getSpace(), 0)
+        eaddr = Address(self._baseaddr.getSpace(), 0xFFFFFFFFFFFFFFFF)
+        inlineflow.setRange(baddr, eaddr)
+        inlineflow.setFlags(FlowInfo.error_outofbounds | FlowInfo.error_unimplemented |
+                            FlowInfo.error_reinterpreted | FlowInfo.flow_forinline)
+        inlineflow.forwardRecursion(flow)
+        inlineflow.generateOps()
+
+        if inlineflow.checkEZModel():
+            res = 0
+            # With an EZ clone there are no jumptables to clone
+            deadlist = list(self._obank.getDeadList()) if hasattr(self._obank, 'getDeadList') else []
+            lastidx = len(deadlist) - 1  # There is at least one op
+
+            flow.inlineEZClone(inlineflow, callop.getAddr())
+
+            newdeadlist = list(self._obank.getDeadList()) if hasattr(self._obank, 'getDeadList') else []
+            # Find ops that were added after the EZ clone
+            newops = newdeadlist[lastidx + 1:] if lastidx + 1 < len(newdeadlist) else []
+
+            if newops:
+                firstop = newops[0]
+                lastop = newops[-1]
+                self._obank.moveSequenceDead(firstop, lastop, callop)
+                if callop.isBlockStart():
+                    firstop.setFlag(PcodeOp.startbasic)
+                    flow.updateTarget(callop, firstop)
+                else:
+                    firstop.clearFlag(PcodeOp.startbasic)
+            self.opDestroyRaw(callop)
+        else:
+            retaddr_ref = [Address()]
+            if not flow.testHardInlineRestrictions(inlinefd, callop, retaddr_ref):
+                return -1
+            retaddr = retaddr_ref[0]
+            res = 1
+            # Clone any jumptables from inline piece
+            for jt_orig in inlinefd._jumpvec:
+                from ghidra.analysis.jumptable import JumpTable
+                jtclone = JumpTable(jt_orig)
+                self._jumpvec.append(jtclone)
+
+            flow.inlineClone(inlineflow, retaddr)
+
+            # Convert CALL op to a jump
+            while callop.numInput() > 1:
+                self.opRemoveInput(callop, callop.numInput() - 1)
+
+            self.opSetOpcode(callop, OpCode.CPUI_BRANCH)
+            inlineaddr = self.newCodeRef(inlinefd.getAddress())
+            self.opSetInput(callop, inlineaddr, 0)
+
+        self._obank.setUniqId(inlinefd._obank.getUniqId())
+
+        return res
 
     def overrideFlow(self, addr, flowtype: int) -> None:
-        """Override the flow at a specific address."""
-        if self._localoverride is not None and hasattr(self._localoverride, 'insertFlowOverride'):
-            self._localoverride.insertFlowOverride(addr, flowtype)
+        """Override the control-flow p-code for a particular instruction.
+
+        P-code in this function is modified to change the control-flow of
+        the instruction at the given address, based on the Override type.
+
+        C++ ref: ``Funcdata::overrideFlow``
+        """
+        # Override type constants (from override.hh)
+        OVERRIDE_NONE = 0
+        OVERRIDE_BRANCH = 1
+        OVERRIDE_CALL = 2
+        OVERRIDE_CALL_RETURN = 3
+        OVERRIDE_RETURN = 4
+
+        # Get iterator range for ops at this address
+        ops_at_addr = []
+        if hasattr(self._obank, 'beginDead'):
+            for op in self._obank.beginDead():
+                if op.getAddr() == addr:
+                    ops_at_addr.append(op)
+
+        op = None
+        if flowtype == OVERRIDE_BRANCH:
+            op = self.findPrimaryBranch(ops_at_addr, False, True, True)
+        elif flowtype == OVERRIDE_CALL:
+            op = self.findPrimaryBranch(ops_at_addr, True, False, True)
+        elif flowtype == OVERRIDE_CALL_RETURN:
+            op = self.findPrimaryBranch(ops_at_addr, True, True, True)
+        elif flowtype == OVERRIDE_RETURN:
+            op = self.findPrimaryBranch(ops_at_addr, True, True, False)
+
+        if op is None or not op.isDead():
+            from ghidra.core.error import LowlevelError
+            raise LowlevelError("Could not apply flowoverride")
+
+        opc = op.code()
+        if flowtype == OVERRIDE_BRANCH:
+            if opc == OpCode.CPUI_CALL:
+                self.opSetOpcode(op, OpCode.CPUI_BRANCH)
+            elif opc == OpCode.CPUI_CALLIND:
+                self.opSetOpcode(op, OpCode.CPUI_BRANCHIND)
+            elif opc == OpCode.CPUI_RETURN:
+                self.opSetOpcode(op, OpCode.CPUI_BRANCHIND)
+        elif flowtype in (OVERRIDE_CALL, OVERRIDE_CALL_RETURN):
+            if opc == OpCode.CPUI_BRANCH:
+                self.opSetOpcode(op, OpCode.CPUI_CALL)
+            elif opc == OpCode.CPUI_BRANCHIND:
+                self.opSetOpcode(op, OpCode.CPUI_CALLIND)
+            elif opc == OpCode.CPUI_CBRANCH:
+                from ghidra.core.error import LowlevelError
+                raise LowlevelError("Do not currently support CBRANCH overrides")
+            elif opc == OpCode.CPUI_RETURN:
+                self.opSetOpcode(op, OpCode.CPUI_CALLIND)
+            if flowtype == OVERRIDE_CALL_RETURN:
+                # Insert a new return op after call
+                newReturn = self.newOp(1, addr)
+                self.opSetOpcode(newReturn, OpCode.CPUI_RETURN)
+                self.opSetInput(newReturn, self.newConstant(1, 0), 0)
+                self.opDeadInsertAfter(newReturn, op)
+        elif flowtype == OVERRIDE_RETURN:
+            if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH, OpCode.CPUI_CALL):
+                from ghidra.core.error import LowlevelError
+                raise LowlevelError("Do not currently support complex overrides")
+            elif opc == OpCode.CPUI_BRANCHIND:
+                self.opSetOpcode(op, OpCode.CPUI_RETURN)
+            elif opc == OpCode.CPUI_CALLIND:
+                self.opSetOpcode(op, OpCode.CPUI_RETURN)
 
     def doLiveInject(self, payload, addr, bl, pos) -> None:
         """Inject p-code from a payload into a live basic block.
@@ -3068,7 +3379,8 @@ class Funcdata:
         # Insert each injected op into the basic block
         for op in injected:
             if hasattr(op, 'isCallOrBranch') and op.isCallOrBranch():
-                raise Exception("Illegal branching injection")
+                from ghidra.core.error import LowlevelError
+                raise LowlevelError("Illegal branching injection")
             self.opInsert(op, bl, pos)
 
     # --- Clone / Indirect ---
@@ -3103,7 +3415,8 @@ class Funcdata:
         from ghidra.core.opcodes import OpCode
         newin = self.newVarnode(sz, addr)
         newop = self.newOp(2, indeffect.getAddr())
-        newop.flags |= extraFlags
+        if extraFlags:
+            newop.setFlag(extraFlags)
         self.newVarnodeOut(sz, addr, newop)
         self.opSetOpcode(newop, OpCode.CPUI_INDIRECT)
         self.opSetInput(newop, newin, 0)
@@ -3121,11 +3434,11 @@ class Funcdata:
         from ghidra.core.opcodes import OpCode
         newin = self.newConstant(sz, 0)
         newop = self.newOp(2, indeffect.getAddr())
-        newop.flags |= PcodeOp.indirect_creation
+        newop.setFlag(PcodeOp.indirect_creation)
         newout = self.newVarnodeOut(sz, addr, newop)
         if not possibleout:
-            newin.flags |= Varnode.indirect_creation
-        newout.flags |= Varnode.indirect_creation
+            newin.setFlags(Varnode.indirect_creation)
+        newout.setFlags(Varnode.indirect_creation)
         self.opSetOpcode(newop, OpCode.CPUI_INDIRECT)
         self.opSetInput(newop, newin, 0)
         self.opSetInput(newop, self.newVarnodeIop(indeffect), 1)
@@ -4167,11 +4480,166 @@ class Funcdata:
         self._lanedMap[key] = lanedReg
 
     def recoverJumpTable(self, op, flow=None, mode_ref=None):
-        """Recover a jump-table for the given BRANCHIND op."""
-        return None
+        """Recover control-flow destinations for a BRANCHIND.
+
+        If an existing and complete JumpTable exists for the BRANCHIND, it is
+        returned immediately. Otherwise an attempt is made to analyze the
+        current partial function and recover the set of destination addresses,
+        which if successful will be returned as a new JumpTable object.
+
+        C++ ref: ``Funcdata::recoverJumpTable``
+
+        Args:
+            op: The BRANCHIND PcodeOp.
+            flow: Current FlowInfo for this function (or None).
+            mode_ref: A list [mode] that receives the recovery mode string
+                      ('success', 'fail_normal', 'fail_return', 'fail_thunk').
+                      If None, mode is not returned.
+
+        Returns:
+            The recovered JumpTable, or None on failure.
+        """
+        if mode_ref is None:
+            mode_ref = ['success']
+        mode_ref[0] = 'success'
+
+        # Search for pre-existing jumptable
+        jt = self.linkJumpTable(op)
+        if jt is not None:
+            if not (hasattr(jt, 'isOverride') and jt.isOverride()):
+                if not (hasattr(jt, 'isPartial') and jt.isPartial()):
+                    return jt  # Previously calculated (NOT override, NOT incomplete)
+            # Recover based on override / partial information
+            partial = Funcdata(self._name + "_jtpartial", self._glb,
+                               self._baseaddr, self._funcp, self._size) \
+                if hasattr(self, '_name') else Funcdata("_jtpartial", self._glb,
+                                                         self._baseaddr, self._funcp, 0)
+            mode_ref[0] = self.stageJumpTable(partial, jt, op, flow)
+            if mode_ref[0] != 'success':
+                return None
+            if hasattr(jt, 'setIndirectOp'):
+                jt.setIndirectOp(op)  # Relink table back to original op
+            return jt
+
+        if (self._flags & Funcdata.jumptablerecovery_dont) != 0:
+            return None  # Explicitly told not to recover jumptables
+
+        mode_ref[0] = self.earlyJumpTableFail(op)
+        if mode_ref[0] != 'success' and mode_ref[0] != 0:
+            return None
+
+        # Create a trial JumpTable
+        try:
+            from ghidra.analysis.jumptable import JumpTable
+        except ImportError:
+            return None
+
+        trialjt = JumpTable(self._glb)
+        partial = Funcdata(self._name + "_jtpartial", self._glb,
+                           self._baseaddr, self._funcp, self._size) \
+            if hasattr(self, '_name') else Funcdata("_jtpartial", self._glb,
+                                                     self._baseaddr, self._funcp, 0)
+        mode_ref[0] = self.stageJumpTable(partial, trialjt, op, flow)
+        if mode_ref[0] != 'success':
+            return None
+
+        # Make the jumptable permanent
+        jt = JumpTable(trialjt)
+        self._jumpvec.append(jt)
+        if hasattr(jt, 'setIndirectOp'):
+            jt.setIndirectOp(op)  # Relink table back to original op
+        return jt
 
     def earlyJumpTableFail(self, op):
-        return None
+        """Backtrack from the BRANCHIND, looking for ops that might affect the destination.
+
+        If a CALLOTHER, which is not injected/inlined in some way, is in the flow path of
+        the destination calculation, we know the jump-table analysis will fail and the
+        failure mode is returned.
+
+        C++ ref: ``Funcdata::earlyJumpTableFail``
+
+        Returns:
+            'success' if there is no early failure, or the failure mode string otherwise.
+        """
+        from ghidra.ir.op import PcodeOp as PcOp
+        vn = op.getIn(0)
+        countMax = 8
+        # Walk backward through dead list
+        if not hasattr(self._obank, 'beginDead'):
+            return 'success'
+        dead_ops = list(self._obank.beginDead())
+        # Find position of op in dead list
+        idx = -1
+        for i, dop in enumerate(dead_ops):
+            if dop is op:
+                idx = i
+                break
+        if idx < 0:
+            return 'success'
+        while idx > 0:
+            if vn.getSize() == 1:
+                return 'success'
+            countMax -= 1
+            if countMax < 0:
+                return 'success'
+            idx -= 1
+            cur = dead_ops[idx]
+            outvn = cur.getOut()
+            outhit = False
+            if outvn is not None and hasattr(vn, 'intersects'):
+                outhit = vn.intersects(outvn)
+            evaltype = cur.getEvalType() if hasattr(cur, 'getEvalType') else 0
+            if evaltype == PcOp.special:
+                if cur.isCall():
+                    opc = cur.code()
+                    if opc == OpCode.CPUI_CALLOTHER:
+                        # Check userop type for injected/jumpassist/segment
+                        uid = int(cur.getIn(0).getOffset())
+                        if self._glb is not None and hasattr(self._glb, 'userops'):
+                            userop = self._glb.userops.getOp(uid) if hasattr(self._glb.userops, 'getOp') else None
+                            if userop is not None and hasattr(userop, 'getType'):
+                                utype = userop.getType()
+                                # UserPcodeOp type constants: injected=1, jumpassist=4, segment=3
+                                if utype in (1, 3, 4):
+                                    return 'success'  # Don't backtrack through injection
+                        if outhit:
+                            return 'fail_callother'
+                        # Assume CALLOTHER will not interfere, continue backtracking
+                    else:
+                        # CALL or CALLIND - Output has not been established yet
+                        return 'success'
+                elif cur.isBranch():
+                    return 'success'
+                else:
+                    if cur.code() == OpCode.CPUI_STORE:
+                        return 'success'
+                    if outhit:
+                        return 'success'  # Some special op generates address, don't assume failure
+                    # Assume special will not interfere, continue backtracking
+            elif evaltype == PcOp.unary:
+                if outhit:
+                    invn = cur.getIn(0)
+                    if invn.getSize() != vn.getSize():
+                        return 'success'
+                    vn = invn
+                # Continue backtracking
+            elif evaltype == PcOp.binary:
+                if outhit:
+                    opc = cur.code()
+                    if opc not in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB, OpCode.CPUI_INT_XOR):
+                        return 'success'
+                    if not cur.getIn(1).isConstant():
+                        return 'success'  # Don't backtrack thru binary op, don't assume failure
+                    invn = cur.getIn(0)
+                    if invn.getSize() != vn.getSize():
+                        return 'success'
+                    vn = invn
+                # Continue backtracking
+            else:
+                if outhit:
+                    return 'success'
+        return 'success'
 
     def testForReturnAddress(self, vn) -> bool:
         """Test if the given Varnode traces back to the return address input.
@@ -4258,6 +4726,76 @@ class Funcdata:
         return resVn
 
     def moveRespectingCover(self, op, lastOp) -> bool:
+        """Move \b op past \b lastOp, only crossing COPY/CAST ops, respecting covers.
+
+        Uses HighVariable.markExpression to identify all HighVariables
+        read by the expression rooted at \b op's output. If any crossed
+        COPY/CAST writes to a marked High, there is a direct interference
+        and the move is aborted. If the expression contains address-tied
+        reads (typeVal != 0) and a crossed op writes an address-tied varnode,
+        the move is also aborted (indirect interference).
+
+        C++ ref: ``Funcdata::moveRespectingCover``
+        """
+        if op is lastOp:
+            return True
+        if op.isCall():
+            return False
+        prevOp = None
+        if op.code() == OpCode.CPUI_CAST:
+            vn = op.getIn(0)
+            if hasattr(vn, 'isExplicit') and not vn.isExplicit():
+                if not vn.isWritten():
+                    return False
+                prevOp = vn.getDef()
+                if prevOp.isCall():
+                    return False
+                if op.previousOp() is not prevOp:
+                    return False
+        rootvn = op.getOut()
+        if rootvn is None:
+            return False
+
+        # Mark expression variables for interference detection
+        highList = []
+        typeVal = 0
+        try:
+            from ghidra.ir.variable import HighVariable
+            typeVal = HighVariable.markExpression(rootvn, highList)
+        except (ImportError, Exception):
+            pass
+
+        curOp = op
+        while curOp is not lastOp:
+            nextOp = curOp.nextOp()
+            if nextOp is None:
+                break
+            opc = nextOp.code()
+            if opc != OpCode.CPUI_COPY and opc != OpCode.CPUI_CAST:
+                break
+            if rootvn is nextOp.getIn(0):
+                break  # Data-flow order dependence
+            copyVn = nextOp.getOut()
+            if copyVn is not None:
+                high = copyVn.getHigh() if hasattr(copyVn, 'getHigh') else None
+                if high is not None and hasattr(high, 'isMark') and high.isMark():
+                    break  # Direct interference: COPY writes what original op reads
+                if typeVal != 0 and hasattr(copyVn, 'isAddrTied') and copyVn.isAddrTied():
+                    break  # Possible indirect interference
+            curOp = nextOp
+
+        # Clear marks on expression
+        for h in highList:
+            if hasattr(h, 'clearMark'):
+                h.clearMark()
+
+        if curOp is lastOp:
+            self.opUninsert(op)
+            self.opInsertAfter(op, lastOp)
+            if prevOp is not None:
+                self.opUninsert(prevOp)
+                self.opInsertAfter(prevOp, lastOp)
+            return True
         return False
 
     def forceFacingType(self, parent, fieldNum: int, op, slot: int) -> None:

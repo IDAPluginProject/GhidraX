@@ -1110,12 +1110,33 @@ class FlowInfo:
         - There must be a p-code op to return to.
         - There must be a distinct return address.
         Pass back the distinct return address in retaddr_ref[0].
+        C++ ref: ``FlowInfo::testHardInlineRestrictions``
         """
         if hasattr(inlinefd, 'getFuncProto') and not inlinefd.getFuncProto().isNoReturn():
-            # Need a fallthrough op
             if self._obank is not None and hasattr(op, 'getInsertIter'):
-                # Simplified: assume fallthrough exists
-                pass
+                it = op.getInsertIter()
+                nextop = None
+                if hasattr(self._obank, 'endDead'):
+                    # Find the next op after the current one in the dead list
+                    found = False
+                    for deadop in self._obank.beginDead():
+                        if found:
+                            nextop = deadop
+                            break
+                        if deadop is op:
+                            found = True
+                if nextop is None:
+                    if hasattr(self, '_inline_head') and self._inline_head is not None:
+                        self._inline_head.warning("No fallthrough prevents inlining here", op.getAddr())
+                    return False
+                retaddr = nextop.getAddr()
+                if op.getAddr() == retaddr:
+                    if hasattr(self, '_inline_head') and self._inline_head is not None:
+                        self._inline_head.warning("Return address prevents inlining here", op.getAddr())
+                    return False
+                retaddr_ref[0] = retaddr
+                if hasattr(self._data, 'opMarkStartBasic'):
+                    self._data.opMarkStartBasic(nextop)
         return True
 
     def checkEZModel(self) -> bool:

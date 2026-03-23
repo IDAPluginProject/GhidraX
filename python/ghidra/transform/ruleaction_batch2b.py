@@ -93,13 +93,114 @@ class RuleDivTermAdd(Rule):
 
 
 class RuleDivTermAdd2(Rule):
-    """Simplify division term addition (variant 2)."""
+    """Simplify division term addition (variant 2).
+
+    Simplify: `(sub(zext(x)*c, n) + x*-1) >> 1 + sub(zext(x)*c, n)`
+    into a single optimized division form.
+    """
     def __init__(self, g): super().__init__(g, 0, "divtermadd2")
     def clone(self, gl):
         return RuleDivTermAdd2(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_ADD]
+    def getOpList(self): return [OpCode.CPUI_INT_RIGHT]
     def applyOp(self, op, data):
-        return 0  # Needs 128-bit arithmetic
+        if not op.getIn(1).isConstant():
+            return 0
+        if op.getIn(1).getOffset() != 1:
+            return 0
+        if not op.getIn(0).isWritten():
+            return 0
+        subop = op.getIn(0).getDef()
+        if subop.code() != OpCode.CPUI_INT_ADD:
+            return 0
+        x = None
+        compvn = None
+        for i in range(2):
+            compvn = subop.getIn(i)
+            if compvn.isWritten():
+                compop = compvn.getDef()
+                if compop.code() == OpCode.CPUI_INT_MULT:
+                    invn = compop.getIn(1)
+                    if invn.isConstant():
+                        if invn.getOffset() == calc_mask(invn.getSize()):
+                            x = subop.getIn(1 - i)
+                            break
+        else:
+            return 0
+        if x is None:
+            return 0
+        z = compvn.getDef().getIn(0)
+        if not z.isWritten():
+            return 0
+        subpieceop = z.getDef()
+        if subpieceop.code() != OpCode.CPUI_SUBPIECE:
+            return 0
+        n = int(subpieceop.getIn(1).getOffset()) * 8
+        if n != 8 * (subpieceop.getIn(0).getSize() - z.getSize()):
+            return 0
+        multvn = subpieceop.getIn(0)
+        if not multvn.isWritten():
+            return 0
+        multop = multvn.getDef()
+        if multop.code() != OpCode.CPUI_INT_MULT:
+            return 0
+        # Get extended constant - Python handles big ints natively
+        multConstVn = multop.getIn(1)
+        ok, multConstPair = multConstVn.isConstantExtended()
+        if not ok:
+            return 0
+        multConst = multConstPair[0] | (multConstPair[1] << 64)
+        zextvn = multop.getIn(0)
+        if not zextvn.isWritten():
+            return 0
+        zextop = zextvn.getDef()
+        if zextop.code() != OpCode.CPUI_INT_ZEXT:
+            return 0
+        if zextop.getIn(0) is not x:
+            return 0
+
+        for addop in list(op.getOut().getDescendants()):
+            if addop.code() != OpCode.CPUI_INT_ADD:
+                continue
+            if addop.getIn(0) is not z and addop.getIn(1) is not z:
+                continue
+            # Calculate 2^n and add to multConst
+            pow2n = 1 << n
+            newMultConst = multConst + pow2n
+            # Truncate to the extended size
+            extSize = zextvn.getSize()
+            extBits = extSize * 8
+            extMask = (1 << extBits) - 1
+            newMultConst &= extMask
+
+            newmultop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(newmultop, OpCode.CPUI_INT_MULT)
+            newmultvn = data.newUniqueOut(extSize, newmultop)
+            data.opSetInput(newmultop, zextvn, 0)
+            # Create the new constant - may need extended form
+            if extSize <= 8:
+                newConstVn = data.newConstant(extSize, newMultConst)
+            else:
+                lo = newMultConst & 0xFFFFFFFFFFFFFFFF
+                hi = (newMultConst >> 64) & 0xFFFFFFFFFFFFFFFF
+                if hasattr(data, 'newExtendedConstant'):
+                    newConstVn = data.newExtendedConstant(extSize, [lo, hi], op)
+                else:
+                    newConstVn = data.newConstant(extSize, lo)
+            data.opSetInput(newmultop, newConstVn, 1)
+            data.opInsertBefore(newmultop, op)
+
+            newshiftop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(newshiftop, OpCode.CPUI_INT_RIGHT)
+            newshiftvn = data.newUniqueOut(extSize, newshiftop)
+            data.opSetInput(newshiftop, newmultvn, 0)
+            data.opSetInput(newshiftop, data.newConstant(4, n + 1), 1)
+            data.opInsertBefore(newshiftop, op)
+
+            data.opSetOpcode(addop, OpCode.CPUI_SUBPIECE)
+            data.opSetInput(addop, newshiftvn, 0)
+            data.opSetInput(addop, data.newConstant(4, 0), 1)
+            return 1
+        return 0
 
 
 class RuleDivChain(Rule):
@@ -229,6 +330,8 @@ class RuleSignMod2Opt(Rule):
         if addop.code() != OpCode.CPUI_INT_ADD:
             return 0
         # Look for INT_MULT by -1 on one input
+        multSlotFound = -1
+        multop = None
         for multSlot in range(2):
             vn = addop.getIn(multSlot)
             if not vn.isWritten():
@@ -241,48 +344,335 @@ class RuleSignMod2Opt(Rule):
                 continue
             if mc.getOffset() != calc_mask(mc.getSize()):
                 continue
-            # Found mult by -1; check for sign extraction pattern
-            # Simplified: would need checkSignExtraction helper
+            multSlotFound = multSlot
             break
+        if multSlotFound < 0 or multop is None:
+            return 0
+        base = RuleSignMod2nOpt.checkSignExtraction(multop.getIn(0))
+        if base is None:
+            return 0
+        otherBase = addop.getIn(1 - multSlotFound)
+        trunc = False
+        if base is not otherBase:
+            if not base.isWritten() or not otherBase.isWritten():
+                return 0
+            subOp = base.getDef()
+            if subOp.code() != OpCode.CPUI_SUBPIECE:
+                return 0
+            truncAmt = int(subOp.getIn(1).getOffset())
+            if truncAmt + base.getSize() != subOp.getIn(0).getSize():
+                return 0
+            base = subOp.getIn(0)
+            subOp2 = otherBase.getDef()
+            if subOp2.code() != OpCode.CPUI_SUBPIECE:
+                return 0
+            if int(subOp2.getIn(1).getOffset()) != 0:
+                return 0
+            otherBase = subOp2.getIn(0)
+            if otherBase is not base:
+                return 0
+            trunc = True
+        if base.isFree():
+            return 0
+        andOut = op.getOut()
+        if trunc:
+            extOp = andOut.loneDescend()
+            if extOp is None or extOp.code() != OpCode.CPUI_INT_ZEXT:
+                return 0
+            andOut = extOp.getOut()
+        for rootOp in list(andOut.getDescendants()):
+            if rootOp.code() != OpCode.CPUI_INT_ADD:
+                continue
+            slot = rootOp.getSlot(andOut)
+            ob = RuleSignMod2nOpt.checkSignExtraction(rootOp.getIn(1 - slot))
+            if ob is not base:
+                continue
+            data.opSetOpcode(rootOp, OpCode.CPUI_INT_SREM)
+            data.opSetInput(rootOp, base, 0)
+            data.opSetInput(rootOp, data.newConstant(base.getSize(), 2), 1)
+            return 1
         return 0
 
 
 class RuleSignMod2nOpt(Rule):
-    """Detect signed mod 2^n pattern and replace with INT_SREM."""
+    """Convert INT_SREM forms: (V + (sign >> (64-n)) & (2^n-1)) - (sign >> (64-n)) => V s% 2^n."""
     def __init__(self, g): super().__init__(g, 0, "signmod2nopt")
     def clone(self, gl):
         return RuleSignMod2nOpt(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_AND]
+    def getOpList(self): return [OpCode.CPUI_INT_RIGHT]
+
+    @staticmethod
+    def checkSignExtraction(outVn):
+        """Verify outVn is a sign extraction of the form V s>> 63. Returns V or None."""
+        if not outVn.isWritten():
+            return None
+        signOp = outVn.getDef()
+        if signOp.code() != OpCode.CPUI_INT_SRIGHT:
+            return None
+        constVn = signOp.getIn(1)
+        if not constVn.isConstant():
+            return None
+        val = int(constVn.getOffset())
+        resVn = signOp.getIn(0)
+        insize = resVn.getSize()
+        if val != insize * 8 - 1:
+            return None
+        return resVn
+
     def applyOp(self, op, data):
-        constvn = op.getIn(1)
-        if not constvn.isConstant():
+        if not op.getIn(1).isConstant():
             return 0
-        val = constvn.getOffset()
-        mask = calc_mask(constvn.getSize())
-        # Check if val+1 is a power of 2 (i.e. val = 2^n - 1)
-        if val == 0 or val == mask:
+        shiftAmt = int(op.getIn(1).getOffset())
+        a = RuleSignMod2nOpt.checkSignExtraction(op.getIn(0))
+        if a is None or a.isFree():
             return 0
-        n = val + 1
-        if (n & (n - 1)) != 0:
-            return 0  # Not a power of 2
-        # Check if input is an ADD with a sign-correction term
-        addout = op.getIn(0)
-        if not addout.isWritten():
-            return 0
-        addop = addout.getDef()
-        if addop.code() != OpCode.CPUI_INT_ADD:
-            return 0
-        # Would need deeper sign-correction detection
+        correctVn = op.getOut()
+        n = a.getSize() * 8 - shiftAmt
+        mask = (1 << n) - 1
+        for multop in list(correctVn.getDescendants()):
+            if multop.code() != OpCode.CPUI_INT_MULT:
+                continue
+            negone = multop.getIn(1)
+            if not negone.isConstant():
+                continue
+            if negone.getOffset() != calc_mask(correctVn.getSize()):
+                continue
+            baseOp = multop.getOut().loneDescend()
+            if baseOp is None:
+                continue
+            if baseOp.code() != OpCode.CPUI_INT_ADD:
+                continue
+            slot = 1 - baseOp.getSlot(multop.getOut())
+            andOut = baseOp.getIn(slot)
+            if not andOut.isWritten():
+                continue
+            andOp = andOut.getDef()
+            truncSize = -1
+            if andOp.code() == OpCode.CPUI_INT_ZEXT:
+                andOut = andOp.getIn(0)
+                if not andOut.isWritten():
+                    continue
+                andOp = andOut.getDef()
+                if andOp.code() != OpCode.CPUI_INT_AND:
+                    continue
+                truncSize = andOut.getSize()
+            elif andOp.code() != OpCode.CPUI_INT_AND:
+                continue
+            constVn = andOp.getIn(1)
+            if not constVn.isConstant():
+                continue
+            if constVn.getOffset() != mask:
+                continue
+            addOut2 = andOp.getIn(0)
+            if not addOut2.isWritten():
+                continue
+            addOp = addOut2.getDef()
+            if addOp.code() != OpCode.CPUI_INT_ADD:
+                continue
+            aSlotFound = -1
+            for aSlot in range(2):
+                vn = addOp.getIn(aSlot)
+                if truncSize >= 0:
+                    if not vn.isWritten():
+                        continue
+                    subOp = vn.getDef()
+                    if subOp.code() != OpCode.CPUI_SUBPIECE:
+                        continue
+                    if int(subOp.getIn(1).getOffset()) != 0:
+                        continue
+                    vn = subOp.getIn(0)
+                if a is vn:
+                    aSlotFound = aSlot
+                    break
+            if aSlotFound < 0:
+                continue
+            extVn = addOp.getIn(1 - aSlotFound)
+            if not extVn.isWritten():
+                continue
+            shiftOp = extVn.getDef()
+            if shiftOp.code() != OpCode.CPUI_INT_RIGHT:
+                continue
+            constVn2 = shiftOp.getIn(1)
+            if not constVn2.isConstant():
+                continue
+            shiftval = int(constVn2.getOffset())
+            if truncSize >= 0:
+                shiftval += (a.getSize() - truncSize) * 8
+            if shiftval != shiftAmt:
+                continue
+            extVn2 = RuleSignMod2nOpt.checkSignExtraction(shiftOp.getIn(0))
+            if extVn2 is None:
+                continue
+            if truncSize >= 0:
+                if not extVn2.isWritten():
+                    continue
+                subOp2 = extVn2.getDef()
+                if subOp2.code() != OpCode.CPUI_SUBPIECE:
+                    continue
+                if int(subOp2.getIn(1).getOffset()) != truncSize:
+                    continue
+                extVn2 = subOp2.getIn(0)
+            if a is not extVn2:
+                continue
+            data.opSetOpcode(baseOp, OpCode.CPUI_INT_SREM)
+            data.opSetInput(baseOp, a, 0)
+            data.opSetInput(baseOp, data.newConstant(a.getSize(), mask + 1), 1)
+            return 1
         return 0
 
 
 class RuleSignMod2nOpt2(Rule):
-    """Optimize signed modulo by power of 2 (variant 2)."""
+    """Optimize signed modulo by power of 2 (variant 2).
+
+    Detect pattern: x + (-(x & mask) * -1) where mask = ~(2^n-1) and
+    convert the root INT_ADD to INT_SREM.
+    """
     def __init__(self, g): super().__init__(g, 0, "signmod2nopt2")
     def clone(self, gl):
         return RuleSignMod2nOpt2(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_ADD]
+    def getOpList(self): return [OpCode.CPUI_INT_MULT]
+
+    @staticmethod
+    def checkSignExtForm(op):
+        """Verify a form of V - (V s>> 0x3f). Returns the Varnode V or None."""
+        for slot in range(2):
+            minusVn = op.getIn(slot)
+            if not minusVn.isWritten():
+                continue
+            multOp = minusVn.getDef()
+            if multOp.code() != OpCode.CPUI_INT_MULT:
+                continue
+            constVn = multOp.getIn(1)
+            if not constVn.isConstant():
+                continue
+            if constVn.getOffset() != calc_mask(constVn.getSize()):
+                continue
+            base = op.getIn(1 - slot)
+            signExt = multOp.getIn(0)
+            if not signExt.isWritten():
+                continue
+            shiftOp = signExt.getDef()
+            if shiftOp.code() != OpCode.CPUI_INT_SRIGHT:
+                continue
+            if shiftOp.getIn(0) is not base:
+                continue
+            constVn2 = shiftOp.getIn(1)
+            if not constVn2.isConstant():
+                continue
+            if int(constVn2.getOffset()) != 8 * base.getSize() - 1:
+                continue
+            return base
+        return None
+
+    @staticmethod
+    def checkMultiequalForm(op, npow):
+        """Verify an if block like V = (V s< 0) ? V + 2^n-1 : V. Returns V or None."""
+        if op.numInput() != 2:
+            return None
+        npow_minus1 = npow - 1
+        base = None
+        slot = -1
+        for s in range(2):
+            addOut = op.getIn(s)
+            if not addOut.isWritten():
+                continue
+            addOp = addOut.getDef()
+            if addOp.code() != OpCode.CPUI_INT_ADD:
+                continue
+            constVn = addOp.getIn(1)
+            if not constVn.isConstant():
+                continue
+            if constVn.getOffset() != npow_minus1:
+                continue
+            base = addOp.getIn(0)
+            otherBase = op.getIn(1 - s)
+            if otherBase is base:
+                slot = s
+                break
+        if slot < 0:
+            return None
+        bl = op.getParent()
+        innerSlot = 0
+        inner = bl.getIn(innerSlot)
+        if inner.sizeOut() != 1 or inner.sizeIn() != 1:
+            innerSlot = 1
+            inner = bl.getIn(innerSlot)
+            if inner.sizeOut() != 1 or inner.sizeIn() != 1:
+                return None
+        decision = inner.getIn(0)
+        if bl.getIn(1 - innerSlot) is not decision:
+            return None
+        cbranch = decision.lastOp() if hasattr(decision, 'lastOp') else None
+        if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
+            return None
+        boolVn = cbranch.getIn(1)
+        if not boolVn.isWritten():
+            return None
+        lessOp = boolVn.getDef()
+        if lessOp.code() != OpCode.CPUI_INT_SLESS:
+            return None
+        if not lessOp.getIn(1).isConstant():
+            return None
+        if lessOp.getIn(1).getOffset() != 0:
+            return None
+        isBoolFlip = cbranch.isBooleanFlip() if hasattr(cbranch, 'isBooleanFlip') else False
+        negBlock = decision.getFalseOut() if not isBoolFlip else decision.getFalseOut()
+        if hasattr(decision, 'getTrueOut'):
+            negBlock = decision.getTrueOut() if not isBoolFlip else decision.getFalseOut()
+        negSlot = innerSlot if negBlock is inner else (1 - innerSlot)
+        if negSlot != slot:
+            return None
+        return base
+
     def applyOp(self, op, data):
+        constVn = op.getIn(1)
+        if not constVn.isConstant():
+            return 0
+        mask = calc_mask(constVn.getSize())
+        if constVn.getOffset() != mask:
+            return 0  # Must be INT_MULT by -1
+        andOut = op.getIn(0)
+        if not andOut.isWritten():
+            return 0
+        andOp = andOut.getDef()
+        if andOp.code() != OpCode.CPUI_INT_AND:
+            return 0
+        constVn2 = andOp.getIn(1)
+        if not constVn2.isConstant():
+            return 0
+        npow = (~constVn2.getOffset() + 1) & mask
+        if npow == 0 or (npow & (npow - 1)) != 0:
+            return 0  # npow must be a power of 2
+        if npow == 1:
+            return 0
+        adjVn = andOp.getIn(0)
+        if not adjVn.isWritten():
+            return 0
+        adjOp = adjVn.getDef()
+        if adjOp.code() == OpCode.CPUI_INT_ADD:
+            if npow != 2:
+                return 0
+            base = RuleSignMod2nOpt2.checkSignExtForm(adjOp)
+        elif adjOp.code() == OpCode.CPUI_MULTIEQUAL:
+            base = RuleSignMod2nOpt2.checkMultiequalForm(adjOp, npow)
+        else:
+            return 0
+        if base is None:
+            return 0
+        if base.isFree():
+            return 0
+        multOut = op.getOut()
+        for rootOp in list(multOut.getDescendants()):
+            if rootOp.code() != OpCode.CPUI_INT_ADD:
+                continue
+            rootSlot = rootOp.getSlot(multOut)
+            if rootOp.getIn(1 - rootSlot) is not base:
+                continue
+            if rootSlot == 0:
+                data.opSetInput(rootOp, base, 0)
+            data.opSetInput(rootOp, data.newConstant(base.getSize(), npow), 1)
+            data.opSetOpcode(rootOp, OpCode.CPUI_INT_SREM)
+            return 1
         return 0
 
 
@@ -357,28 +747,401 @@ class RuleExtensionPush(Rule):
                 return 0
         if addcount + ptrcount <= 1:
             return 0
-        # Would duplicate the extension to all descendants
-        return 0  # Needs RulePushPtr.duplicateNeed helper
+        if addcount > 0:
+            if op.getIn(0).loneDescend() is not None:
+                return 0
+        from ghidra.transform.ruleaction_batch2c import RulePushPtr
+        RulePushPtr.duplicateNeed(op, data)
+        return 1
 
 
 class RuleThreeWayCompare(Rule):
-    """Simplify three-way comparison patterns."""
+    """Simplify expressions involving three-way comparisons.
+
+    A three-way comparison is: zext(V < W) + zext(V <= W) - 1
+    giving -1, 0, or 1 depending on whether V < W, V == W, or V > W.
+    This rule simplifies secondary comparisons of the three-way result.
+    """
     def __init__(self, g): super().__init__(g, 0, "threewaycompare")
     def clone(self, gl):
         return RuleThreeWayCompare(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_SLESSEQUAL]
+    def getOpList(self): return [OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_SLESSEQUAL,
+                                  OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL]
+
+    @staticmethod
+    def testCompareEquivalence(lessop, lessequalop):
+        """Check that lessop is LESS and lessequalop is LESSEQUAL on same operands.
+        Returns 0 if matched, 1 if swapped, -1 if no match."""
+        twoLessThan = False
+        opc = lessop.code()
+        if opc == OpCode.CPUI_INT_LESS:
+            if lessequalop.code() == OpCode.CPUI_INT_LESSEQUAL:
+                twoLessThan = False
+            elif lessequalop.code() == OpCode.CPUI_INT_LESS:
+                twoLessThan = True
+            else:
+                return -1
+        elif opc == OpCode.CPUI_INT_SLESS:
+            if lessequalop.code() == OpCode.CPUI_INT_SLESSEQUAL:
+                twoLessThan = False
+            elif lessequalop.code() == OpCode.CPUI_INT_SLESS:
+                twoLessThan = True
+            else:
+                return -1
+        elif opc == OpCode.CPUI_FLOAT_LESS:
+            if lessequalop.code() == OpCode.CPUI_FLOAT_LESSEQUAL:
+                twoLessThan = False
+            else:
+                return -1
+        else:
+            return -1
+        a1 = lessop.getIn(0)
+        a2 = lessequalop.getIn(0)
+        b1 = lessop.getIn(1)
+        b2 = lessequalop.getIn(1)
+        res = 0
+        if a1 is not a2:
+            if not a1.isConstant() or not a2.isConstant():
+                return -1
+            if a1.getOffset() != a2.getOffset() and twoLessThan:
+                if a2.getOffset() + 1 == a1.getOffset():
+                    twoLessThan = False
+                elif a1.getOffset() + 1 == a2.getOffset():
+                    twoLessThan = False
+                    res = 1
+                else:
+                    return -1
+        if b1 is not b2:
+            if not b1.isConstant() or not b2.isConstant():
+                return -1
+            if b1.getOffset() != b2.getOffset() and twoLessThan:
+                if b1.getOffset() + 1 == b2.getOffset():
+                    twoLessThan = False
+                elif b2.getOffset() + 1 == b1.getOffset():
+                    twoLessThan = False
+                    res = 1
+            else:
+                return -1
+        if twoLessThan:
+            return -1
+        return res
+
+    @staticmethod
+    def detectThreeWay(op):
+        """Detect a three-way calculation from an INT_ADD root.
+        Returns (lessop, isPartial) or (None, False)."""
+        isPartial = False
+        vn2 = op.getIn(1)
+        if vn2.isConstant():
+            # Form 1: (z + z) - 1
+            mask = calc_mask(vn2.getSize())
+            if mask != vn2.getOffset():
+                return (None, False)
+            vn1 = op.getIn(0)
+            if not vn1.isWritten():
+                return (None, False)
+            addop = vn1.getDef()
+            if addop.code() != OpCode.CPUI_INT_ADD:
+                return (None, False)
+            tmpvn = addop.getIn(0)
+            if not tmpvn.isWritten():
+                return (None, False)
+            zext1 = tmpvn.getDef()
+            if zext1.code() != OpCode.CPUI_INT_ZEXT:
+                return (None, False)
+            tmpvn = addop.getIn(1)
+            if not tmpvn.isWritten():
+                return (None, False)
+            zext2 = tmpvn.getDef()
+            if zext2.code() != OpCode.CPUI_INT_ZEXT:
+                return (None, False)
+        elif vn2.isWritten():
+            tmpop = vn2.getDef()
+            if tmpop.code() == OpCode.CPUI_INT_ZEXT:
+                # Form 2: (z - 1) + z
+                zext2 = tmpop
+                vn1 = op.getIn(0)
+                if not vn1.isWritten():
+                    return (None, False)
+                addop = vn1.getDef()
+                if addop.code() != OpCode.CPUI_INT_ADD:
+                    # Partial form: (z + z)
+                    zext1 = addop
+                    if zext1.code() != OpCode.CPUI_INT_ZEXT:
+                        return (None, False)
+                    isPartial = True
+                else:
+                    tmpvn = addop.getIn(1)
+                    if not tmpvn.isConstant():
+                        return (None, False)
+                    mask = calc_mask(tmpvn.getSize())
+                    if mask != tmpvn.getOffset():
+                        return (None, False)
+                    tmpvn = addop.getIn(0)
+                    if not tmpvn.isWritten():
+                        return (None, False)
+                    zext1 = tmpvn.getDef()
+                    if zext1.code() != OpCode.CPUI_INT_ZEXT:
+                        return (None, False)
+            elif tmpop.code() == OpCode.CPUI_INT_ADD:
+                # Form 3: z + (z - 1)
+                addop = tmpop
+                vn1 = op.getIn(0)
+                if not vn1.isWritten():
+                    return (None, False)
+                zext1 = vn1.getDef()
+                if zext1.code() != OpCode.CPUI_INT_ZEXT:
+                    return (None, False)
+                tmpvn = addop.getIn(1)
+                if not tmpvn.isConstant():
+                    return (None, False)
+                mask = calc_mask(tmpvn.getSize())
+                if mask != tmpvn.getOffset():
+                    return (None, False)
+                tmpvn = addop.getIn(0)
+                if not tmpvn.isWritten():
+                    return (None, False)
+                zext2 = tmpvn.getDef()
+                if zext2.code() != OpCode.CPUI_INT_ZEXT:
+                    return (None, False)
+            else:
+                return (None, False)
+        else:
+            return (None, False)
+
+        vn1 = zext1.getIn(0)
+        if not vn1.isWritten():
+            return (None, False)
+        vn2 = zext2.getIn(0)
+        if not vn2.isWritten():
+            return (None, False)
+        lessop = vn1.getDef()
+        lessequalop = vn2.getDef()
+        opc = lessop.code()
+        if opc not in (OpCode.CPUI_INT_LESS, OpCode.CPUI_INT_SLESS, OpCode.CPUI_FLOAT_LESS):
+            lessop, lessequalop = lessequalop, lessop
+        form = RuleThreeWayCompare.testCompareEquivalence(lessop, lessequalop)
+        if form < 0:
+            return (None, False)
+        if form == 1:
+            lessop, lessequalop = lessequalop, lessop
+        return (lessop, isPartial)
+
     def applyOp(self, op, data):
-        return 0  # Needs CircleRange
+        constSlot = 0
+        tmpvn = op.getIn(constSlot)
+        if not tmpvn.isConstant():
+            constSlot = 1
+            tmpvn = op.getIn(constSlot)
+            if not tmpvn.isConstant():
+                return 0
+        val = tmpvn.getOffset()
+        if val <= 2:
+            form = int(val) + 1
+        elif val == calc_mask(tmpvn.getSize()):
+            form = 0
+        else:
+            return 0
+
+        tmpvn = op.getIn(1 - constSlot)
+        if not tmpvn.isWritten():
+            return 0
+        if tmpvn.getDef().code() != OpCode.CPUI_INT_ADD:
+            return 0
+        lessop, isPartial = RuleThreeWayCompare.detectThreeWay(tmpvn.getDef())
+        if lessop is None:
+            return 0
+        if isPartial:
+            if form == 0:
+                return 0
+            form -= 1
+
+        form <<= 1
+        if constSlot == 1:
+            form += 1
+        lessform = lessop.code()
+        form <<= 2
+        opc = op.code()
+        if opc == OpCode.CPUI_INT_SLESSEQUAL:
+            form += 1
+        elif opc == OpCode.CPUI_INT_EQUAL:
+            form += 2
+        elif opc == OpCode.CPUI_INT_NOTEQUAL:
+            form += 3
+
+        bvn = lessop.getIn(0)
+        avn = lessop.getIn(1)
+        if not avn.isConstant() and avn.isFree():
+            return 0
+        if not bvn.isConstant() and bvn.isFree():
+            return 0
+
+        if form in (1, 21):
+            # always true
+            data.opSetOpcode(op, OpCode.CPUI_INT_EQUAL)
+            data.opSetInput(op, data.newConstant(1, 0), 0)
+            data.opSetInput(op, data.newConstant(1, 0), 1)
+        elif form in (4, 16):
+            # always false
+            data.opSetOpcode(op, OpCode.CPUI_INT_NOTEQUAL)
+            data.opSetInput(op, data.newConstant(1, 0), 0)
+            data.opSetInput(op, data.newConstant(1, 0), 1)
+        elif form in (2, 5, 6, 12):
+            # a < b
+            data.opSetOpcode(op, lessform)
+            data.opSetInput(op, avn, 0)
+            data.opSetInput(op, bvn, 1)
+        elif form in (13, 19, 20, 23):
+            # a <= b
+            data.opSetOpcode(op, OpCode(int(lessform) + 1))
+            data.opSetInput(op, avn, 0)
+            data.opSetInput(op, bvn, 1)
+        elif form in (8, 17, 18, 22):
+            # a > b (swap)
+            data.opSetOpcode(op, lessform)
+            data.opSetInput(op, bvn, 0)
+            data.opSetInput(op, avn, 1)
+        elif form in (0, 3, 7, 9):
+            # a >= b (swap + lessequal)
+            data.opSetOpcode(op, OpCode(int(lessform) + 1))
+            data.opSetInput(op, bvn, 0)
+            data.opSetInput(op, avn, 1)
+        elif form in (10, 14):
+            # a == b
+            if lessform == OpCode.CPUI_FLOAT_LESS:
+                lessform = OpCode.CPUI_FLOAT_EQUAL
+            else:
+                lessform = OpCode.CPUI_INT_EQUAL
+            data.opSetOpcode(op, lessform)
+            data.opSetInput(op, avn, 0)
+            data.opSetInput(op, bvn, 1)
+        elif form in (11, 15):
+            # a != b
+            if lessform == OpCode.CPUI_FLOAT_LESS:
+                lessform = OpCode.CPUI_FLOAT_NOTEQUAL
+            else:
+                lessform = OpCode.CPUI_INT_NOTEQUAL
+            data.opSetOpcode(op, lessform)
+            data.opSetInput(op, avn, 0)
+            data.opSetInput(op, bvn, 1)
+        else:
+            return 0
+        return 1
 
 
 class RuleRangeMeld(Rule):
-    """Merge adjacent range checks into a single range."""
+    """Merge adjacent range checks (BOOL_AND/BOOL_OR of comparisons on the same variable).
+
+    Try to union or intersect the ranges to produce a more concise expression.
+    """
     def __init__(self, g): super().__init__(g, 0, "rangemeld")
     def clone(self, gl):
         return RuleRangeMeld(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [OpCode.CPUI_BOOL_AND, OpCode.CPUI_BOOL_OR]
     def applyOp(self, op, data):
-        return 0  # Needs CircleRange
+        from ghidra.analysis.rangeutil import CircleRange
+        from ghidra.core.expression import functionalEquality
+        vn1 = op.getIn(0)
+        if not vn1.isWritten():
+            return 0
+        vn2 = op.getIn(1)
+        if not vn2.isWritten():
+            return 0
+        sub1 = vn1.getDef()
+        if not (hasattr(sub1, 'isBoolOutput') and sub1.isBoolOutput()):
+            return 0
+        sub2 = vn2.getDef()
+        if not (hasattr(sub2, 'isBoolOutput') and sub2.isBoolOutput()):
+            return 0
+
+        range1 = CircleRange(0, 0, 1, 1)  # Full boolean range
+        range1._left = 1
+        range1._right = 2
+        range1._mask = 0xFF
+        range1._isempty = False
+        markup = [None]
+        A1, constMarkup1 = range1.pullBack(sub1, False)
+        if A1 is None:
+            return 0
+        if constMarkup1 is not None:
+            markup[0] = constMarkup1
+
+        range2 = CircleRange(0, 0, 1, 1)
+        range2._left = 1
+        range2._right = 2
+        range2._mask = 0xFF
+        range2._isempty = False
+        A2, constMarkup2 = range2.pullBack(sub2, False)
+        if A2 is None:
+            return 0
+        if constMarkup2 is not None:
+            markup[0] = constMarkup2
+
+        if sub1.code() == OpCode.CPUI_BOOL_NEGATE:
+            if not A1.isWritten():
+                return 0
+            A1, cm = range1.pullBack(A1.getDef(), False)
+            if A1 is None:
+                return 0
+            if cm is not None:
+                markup[0] = cm
+        if sub2.code() == OpCode.CPUI_BOOL_NEGATE:
+            if not A2.isWritten():
+                return 0
+            A2, cm = range2.pullBack(A2.getDef(), False)
+            if A2 is None:
+                return 0
+            if cm is not None:
+                markup[0] = cm
+
+        if not functionalEquality(A1, A2):
+            if A2.getSize() == A1.getSize():
+                return 0
+            if A1.getSize() < A2.getSize() and A2.isWritten():
+                A2, cm = range2.pullBack(A2.getDef(), False)
+                if cm is not None:
+                    markup[0] = cm
+            elif A1.isWritten():
+                A1, cm = range1.pullBack(A1.getDef(), False)
+                if cm is not None:
+                    markup[0] = cm
+            if A1 is None or A2 is None:
+                return 0
+            if A1 is not A2:
+                return 0
+        if not A1.isHeritageKnown():
+            return 0
+
+        if op.code() == OpCode.CPUI_BOOL_AND:
+            restype = range1.intersect(range2)
+        else:
+            restype = range1.circleUnion(range2)
+
+        if restype == 0:
+            restype2, opc, resc, resslot = range1.translate2Op()
+            if restype2 == 0:
+                newConst = data.newConstant(A1.getSize(), resc)
+                if markup[0] is not None:
+                    if hasattr(newConst, 'copySymbolIfValid'):
+                        newConst.copySymbolIfValid(markup[0])
+                data.opSetOpcode(op, opc)
+                data.opSetInput(op, A1, 1 - resslot)
+                data.opSetInput(op, newConst, resslot)
+                return 1
+
+        if restype == 2:
+            return 0
+        if restype == 1:
+            # Full range => always true
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opRemoveInput(op, 1)
+            data.opSetInput(op, data.newConstant(1, 1), 0)
+        elif restype == 3:
+            # Empty => always false
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opRemoveInput(op, 1)
+            data.opSetInput(op, data.newConstant(1, 0), 0)
+        return 1
 
 
 class RuleSwitchSingle(Rule):

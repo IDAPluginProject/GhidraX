@@ -1,0 +1,423 @@
+Flow Stage Comparison Report: cp.exe
+Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors: 0
+
+0x00401000 [MATCH] C++=1blk/39ops Py=1blk/39ops
+0x00401040 [MATCH] C++=1blk/30ops Py=1blk/30ops
+0x00401080 [MATCH] C++=26blk/394ops Py=26blk/394ops
+0x004027b0 [DIFF] C++=66blk/1438ops Py=26blk/1023ops | unexpected=55 expected=16
+  Block[0] @0x4027b0 stop: C++=0x4028c8, Py=0x402907
+  Block[0] @0x4027b0 succs: C++=[1], Py=[3, 46]
+  Block[0] @0x4027b0 ops: C++=202, Py=235
+  Block[3] @0x40290d preds: C++=[2], Py=[0]
+  Block[4] @0x40291d succs: C++=[5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 26, 27, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45], Py=[]
+  Block[4] Op[1] opcode: C++=@0x40291d#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40291d#0 void = CPUI_RETURN(const[0x3fe:4])
+  Block[4] Op[2] opcode: C++=@0x40291d#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x402924:4], unique[0x3680:4]) | Py=@0x40291d#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[4] Op[3] opcode: C++=@0x40291d#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40291d#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x402924:4], unique[0x3680:4])
+0x00403490 [MATCH] C++=4blk/478ops Py=4blk/478ops
+0x00403840 [MATCH] C++=74blk/1454ops Py=74blk/1454ops
+0x00403f00 [DIFF] C++=87blk/1452ops Py=75blk/1369ops | unexpected=177 expected=18
+  Block[0] @0x403f00 stop: C++=0x403f2a, Py=0x403f44
+  Block[0] @0x403f00 succs: C++=[1], Py=[2, 3]
+  Block[0] @0x403f00 ops: C++=42, Py=61
+  Block[2] @0x403f46 preds: C++=[1], Py=[0]
+  Block[3] @0x403f4a preds: C++=[1, 2], Py=[0, 2]
+  Block[4] Op[1] opcode: C++=@0x403f8c#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x403f8c#0 void = CPUI_RETURN(const[0x558:4])
+  Block[4] Op[2] opcode: C++=@0x403f8c#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x403f94:4], unique[0x3680:4]) | Py=@0x403f8c#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[4] Op[3] opcode: C++=@0x403f8c#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x403f8c#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x403f94:4], unique[0x3680:4])
+  Block[47] Op[15] opcode: C++=@0x4040f4#142606338 register[0x0:4] = CPUI_INT_SUB(register[0x0:4], const[0x1:4]) | Py=@0x4040ef#0 register[0x1c:4] = CPUI_COPY(unique[0xb900:4])
+  Block[47] Op[16] opcode: C++=@0x4040f4#192937986 register[0x202:1] = CPUI_INT_EQUAL(unique[0x24d00:1], const[0x0:1]) | Py=@0x4040ef#0 unique[0x3300:4] = CPUI_INT_ADD(register[0x14:4], const[0x14:4])
+0x004040e0 [MATCH] C++=24blk/479ops Py=24blk/479ops
+0x00404320 [MATCH] C++=25blk/513ops Py=25blk/513ops
+0x00404b50 [MATCH] C++=313blk/5814ops Py=313blk/5814ops
+0x00406630 [MATCH] C++=1blk/44ops Py=1blk/44ops
+0x00406670 [MATCH] C++=1blk/44ops Py=1blk/44ops
+0x00406770 [MATCH] C++=8blk/164ops Py=8blk/164ops
+0x00406870 [MATCH] C++=17blk/381ops Py=17blk/381ops
+0x00406b00 [MATCH] C++=68blk/1406ops Py=68blk/1406ops
+0x00407100 [MATCH] C++=69blk/1271ops Py=69blk/1271ops
+0x00407710 [MATCH] C++=12blk/284ops Py=12blk/284ops
+0x00407800 [MATCH] C++=3blk/89ops Py=3blk/89ops
+0x00407870 [MATCH] C++=10blk/284ops Py=10blk/284ops
+0x00407960 [MATCH] C++=3blk/79ops Py=3blk/79ops
+0x004079b0 [MATCH] C++=8blk/234ops Py=8blk/234ops
+0x00407a40 [MATCH] C++=4blk/80ops Py=4blk/80ops
+0x00407a90 [MATCH] C++=1blk/27ops Py=1blk/27ops
+0x00407b90 [MATCH] C++=37blk/655ops Py=37blk/655ops
+0x00407e30 [MATCH] C++=53blk/1869ops Py=53blk/1869ops
+0x004083d0 [MATCH] C++=14blk/216ops Py=14blk/216ops
+0x004084f0 [MATCH] C++=16blk/324ops Py=16blk/324ops
+0x00408810 [MATCH] C++=19blk/472ops Py=19blk/472ops
+0x00408cf0 [MATCH] C++=201blk/3089ops Py=201blk/3089ops
+0x00409880 [MATCH] C++=1blk/78ops Py=1blk/78ops
+0x004099a0 [MATCH] C++=16blk/454ops Py=16blk/454ops
+0x00409ad0 [MATCH] C++=11blk/221ops Py=11blk/221ops
+0x00409cc0 [MATCH] C++=9blk/124ops Py=9blk/124ops
+0x00409d60 [MATCH] C++=11blk/201ops Py=11blk/201ops
+0x00409e20 [MATCH] C++=36blk/890ops Py=36blk/890ops
+0x0040a3b0 [DIFF] C++=28blk/358ops Py=16blk/327ops | unexpected=24 expected=7
+  Block[6] @0x40a41d succs: C++=[7, 8, 17, 18, 19, 20, 21, 22, 23, 24], Py=[]
+  Block[6] @0x40a41d ops: C++=4, Py=5
+  Block[9] @0x40a460 preds: C++=[8, 17, 18, 19, 20, 21, 22, 23, 24, 25], Py=[25]
+  Block[11] @0x40a488 stop: C++=0x40a495, Py=0x40a4a3
+  Block[11] @0x40a488 succs: C++=[27], Py=[13, 15]
+  Block[6] Op[1] opcode: C++=@0x40a41d#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0xc:4], const[0x4:4]) | Py=@0x40a41d#0 void = CPUI_RETURN(const[0x146:4])
+  Block[6] Op[2] opcode: C++=@0x40a41d#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40a424:4], unique[0x3680:4]) | Py=@0x40a41d#0 unique[0x3680:4] = CPUI_INT_MULT(register[0xc:4], const[0x4:4])
+  Block[6] Op[3] opcode: C++=@0x40a41d#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40a41d#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40a424:4], unique[0x3680:4])
+0x0040a580 [MATCH] C++=1blk/52ops Py=1blk/52ops
+0x0040a5c0 [MATCH] C++=1blk/59ops Py=1blk/59ops
+0x0040a850 [MATCH] C++=21blk/424ops Py=21blk/424ops
+0x0040a880 [MATCH] C++=18blk/365ops Py=18blk/365ops
+0x0040a8e0 [MATCH] C++=14blk/250ops Py=14blk/250ops
+0x0040aa10 [MATCH] C++=13blk/268ops Py=13blk/268ops
+0x0040aa60 [MATCH] C++=10blk/185ops Py=10blk/185ops
+0x0040aae0 [MATCH] C++=15blk/308ops Py=15blk/308ops
+0x0040abd0 [MATCH] C++=1blk/60ops Py=1blk/60ops
+0x0040ac10 [MATCH] C++=16blk/167ops Py=16blk/167ops
+0x0040ac70 [MATCH] C++=9blk/125ops Py=9blk/125ops
+0x0040acc0 [MATCH] C++=14blk/186ops Py=14blk/186ops
+0x0040ad30 [MATCH] C++=20blk/298ops Py=20blk/298ops
+0x0040ae00 [MATCH] C++=13blk/382ops Py=13blk/382ops
+0x0040aeb0 [MATCH] C++=1blk/38ops Py=1blk/38ops
+0x0040aee0 [MATCH] C++=1blk/38ops Py=1blk/38ops
+0x0040af10 [MATCH] C++=1blk/35ops Py=1blk/35ops
+0x0040af40 [MATCH] C++=27blk/427ops Py=27blk/427ops
+0x0040afe0 [MATCH] C++=15blk/226ops Py=15blk/226ops
+0x0040b0d0 [MATCH] C++=1blk/95ops Py=1blk/95ops
+0x0040b140 [MATCH] C++=36blk/1010ops Py=36blk/1010ops
+0x0040b420 [DIFF] C++=25blk/293ops Py=22blk/291ops | unexpected=11 expected=3
+  Block[14] @0x40b4a0 stop: C++=0x40b4a6, Py=0x40b4af
+  Block[14] @0x40b4a0 succs: C++=[24], Py=[14, 16]
+  Block[14] @0x40b4a0 preds: C++=[13, 15], Py=[13, 14]
+  Block[14] @0x40b4a0 ops: C++=8, Py=20
+  Block[16] @0x40b4b1 preds: C++=[15], Py=[14]
+0x0040b510 [MATCH] C++=23blk/432ops Py=23blk/432ops
+0x0040b690 [MATCH] C++=31blk/1152ops Py=31blk/1152ops
+0x0040bae0 [MATCH] C++=39blk/594ops Py=39blk/594ops
+0x0040bd60 [MATCH] C++=22blk/934ops Py=22blk/934ops
+0x0040bef0 [MATCH] C++=21blk/405ops Py=21blk/405ops
+0x0040bff0 [MATCH] C++=4blk/111ops Py=4blk/111ops
+0x0040c030 [MATCH] C++=7blk/147ops Py=7blk/147ops
+0x0040c090 [DIFF] C++=184blk/3382ops Py=114blk/2521ops | unexpected=168 expected=20
+  Block[19] @0x40c1d0 stop: C++=0x40c1ee, Py=0x40c1e1
+  Block[19] @0x40c1d0 succs: C++=[22, 28], Py=[20]
+  Block[19] @0x40c1d0 ops: C++=25, Py=20
+  Block[20] @0x40c1e3 preds: C++=[25], Py=[19, 25]
+  Block[21] @0x40c1e6 stop: C++=0x40c1ed, Py=0x40c1ee
+  Block[21] Op[24] varnode: C++=@0x40c1ea#260046850 void = CPUI_STORE(const[SPACEID:8], unique[0xa800:4], unique[0xaa80:1]) | Py=@0x40c1e9#0 void = CPUI_STORE(const[SPACEID:8], register[0x10:4], unique[0x43f80:4])
+  Block[21] Op[25] varnode: C++=@0x40c1ea#243269634 register[0x1c:4] = CPUI_INT_SUB(unique[0xa880:4], unique[0xa980:4]) | Py=@0x40c1e9#0 register[0x10:4] = CPUI_INT_SUB(register[0x10:4], const[0x4:4])
+  Block[21] Op[26] varnode: C++=@0x40c1ea#209715202 unique[0xa800:4] = CPUI_COPY(register[0x1c:4]) | Py=@0x40c1e9#0 unique[0x43f80:4] = CPUI_COPY(const[0x6c6c65:4])
+  Block[21] Op[27] opcode: C++=@0x40c1ea#218103810 unique[0xa880:4] = CPUI_INT_ADD(register[0x1c:4], const[0x1:4]) | Py=@0x40c1ea#0 void = CPUI_STORE(const[SPACEID:8], unique[0xa800:4], unique[0xaa80:1])
+  Block[21] Op[28] opcode: C++=@0x40c1ea#226492418 unique[0xa900:4] = CPUI_INT_ZEXT(register[0x20a:1]) | Py=@0x40c1ea#0 register[0x1c:4] = CPUI_INT_SUB(unique[0xa880:4], unique[0xa980:4])
+0x0040c270 [DIFF] C++=150blk/2360ops Py=83blk/1499ops | unexpected=89 expected=8
+  Block[1] @0x40c2a9 succs: C++=[2, 6, 134, 137, 138], Py=[]
+  Block[1] @0x40c2a9 ops: C++=7, Py=8
+  Block[6] @0x40c2fe preds: C++=[0, 1, 5, 137, 144], Py=[0]
+  Block[20] @0x40c375 succs: C++=[21, 29, 38, 41, 42, 46, 47, 48, 49, 50, 59, 71, 114, 115, 117, 120], Py=[]
+  Block[20] @0x40c375 ops: C++=4, Py=5
+  Block[1] Op[4] opcode: C++=@0x40c2ad#33554434 unique[0x3680:4] = CPUI_INT_MULT(register[0x8:4], const[0x4:4]) | Py=@0x40c2ad#0 void = CPUI_RETURN(const[0x5d8:4])
+  Block[1] Op[5] opcode: C++=@0x40c2ad#41943042 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c2b4:4], unique[0x3680:4]) | Py=@0x40c2ad#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x8:4], const[0x4:4])
+  Block[1] Op[6] opcode: C++=@0x40c2ad#50331650 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40c2ad#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c2b4:4], unique[0x3680:4])
+  Block[20] Op[1] opcode: C++=@0x40c375#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40c375#0 void = CPUI_RETURN(const[0x5d9:4])
+  Block[20] Op[2] opcode: C++=@0x40c375#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c37c:4], unique[0x3680:4]) | Py=@0x40c375#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+0x0040cfa0 [MATCH] C++=4blk/191ops Py=4blk/191ops
+0x0040d310 [MATCH] C++=1blk/178ops Py=1blk/178ops
+0x0040d3b0 [DIFF] C++=39blk/802ops Py=39blk/802ops | unexpected=3 expected=20
+  Block[25] @0x40d5da succs: C++=[27], Py=[26]
+  Block[26] @0x40d5dd preds: C++=[21], Py=[21, 25]
+  Block[27] @0x40d5e0 preds: C++=[22, 25, 26], Py=[22, 26]
+0x0040d590 [MATCH] C++=15blk/271ops Py=15blk/271ops
+0x0040d6d0 [MATCH] C++=7blk/129ops Py=7blk/129ops
+0x0040d740 [MATCH] C++=1blk/54ops Py=1blk/54ops
+0x0040d760 [MATCH] C++=1blk/104ops Py=1blk/104ops
+0x0040d790 [MATCH] C++=5blk/143ops Py=5blk/143ops
+0x0040d7d0 [MATCH] C++=4blk/205ops Py=4blk/205ops
+0x0040d820 [MATCH] C++=12blk/151ops Py=12blk/151ops
+0x0040d880 [MATCH] C++=14blk/225ops Py=14blk/225ops
+0x0040d900 [MATCH] C++=16blk/388ops Py=16blk/388ops
+0x0040da60 [MATCH] C++=34blk/886ops Py=34blk/886ops
+0x0040fde0 [MATCH] C++=17blk/505ops Py=17blk/505ops
+0x0040ff10 [MATCH] C++=8blk/186ops Py=8blk/186ops
+0x0040ff90 [DIFF] C++=16blk/453ops Py=4blk/91ops | unexpected=19 expected=1
+  Block[1] @0x40ffbe succs: C++=[2, 4, 8, 9, 10, 13, 15], Py=[]
+  Block[1] @0x40ffbe ops: C++=4, Py=5
+  Block[6] @0x410080 preds: C++=[3, 5, 9, 13], Py=[9]
+  Block[9] @0x4100b0 preds: C++=[0, 1, 8, 10, 15], Py=[0]
+  Block[2] only in C++: Block[9] 0x410040-0x41006b ops=46 succ=[3, 7] pred=[1]
+  Block[1] Op[1] opcode: C++=@0x40ffbe#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40ffbe#0 void = CPUI_RETURN(const[0x5a:4])
+  Block[1] Op[2] opcode: C++=@0x40ffbe#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40ffc8:4], unique[0x3680:4]) | Py=@0x40ffbe#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[1] Op[3] opcode: C++=@0x40ffbe#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40ffbe#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40ffc8:4], unique[0x3680:4])
+0x00410120 [MATCH] C++=7blk/108ops Py=7blk/108ops
+0x00410350 [MATCH] C++=6blk/125ops Py=6blk/125ops
+0x00410390 [DIFF] C++=69blk/1509ops Py=13blk/333ops | unexpected=65 expected=5
+  Block[3] @0x413ff8 preds: C++=[2, 6, 11, 35, 39, 46, 48, 50, 51, 52, 53, 54, 66], Py=[2, 66]
+  Block[6] @0x41401a succs: C++=[3, 7, 10, 12, 18, 25, 35, 36, 46, 48, 54, 55, 60, 68], Py=[]
+  Block[6] @0x41401a ops: C++=4, Py=5
+  Block[8] @0x4140a0 preds: C++=[7, 17, 67], Py=[67]
+  Block[9] @0x4140a2 preds: C++=[1, 8, 44], Py=[1, 8]
+  Block[6] Op[1] opcode: C++=@0x41401a#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x41401a#0 void = CPUI_RETURN(const[0x14b:4])
+  Block[6] Op[2] opcode: C++=@0x41401a#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x414024:4], unique[0x3680:4]) | Py=@0x41401a#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[6] Op[3] opcode: C++=@0x41401a#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x41401a#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x414024:4], unique[0x3680:4])
+0x004103a0 [MATCH] C++=22blk/511ops Py=22blk/511ops
+0x00410520 [MATCH] C++=15blk/551ops Py=15blk/551ops
+0x004108e0 [MATCH] C++=7blk/118ops Py=7blk/118ops
+0x00410970 [DIFF] C++=735blk/14780ops Py=92blk/1728ops | unexpected=652 expected=11
+  Block[11] @0x410adf succs: C++=[12, 54, 100, 131, 149, 172, 207, 297, 311, 313, 500, 718, 720], Py=[]
+  Block[11] @0x410adf ops: C++=4, Py=5
+  Block[26] @0x410d86 preds: C++=[0, 15, 18, 36, 39, 49, 52, 57, 60, 71, 74, 104, 107, 118, 121, 134, 137, 155, 158, 170, 175, 178, 194, 197, 224, 227, 244, 247, 258, 261, 298, 301, 315, 318, 327, 330, 341, 344, 375, 384, 396, 403, 412, 423, 428, 435, 448, 472, 508, 511, 528, 531, 544, 547, 558, 561, 574, 577, 588, 591, 603, 606, 617, 620, 631, 634, 661, 670, 673, 686, 689], Py=[0, 36, 39, 49, 51, 57, 60, 71, 74]
+  Block[30] @0x410d9f preds: C++=[29, 83, 130, 146, 169, 192, 221, 256, 492], Py=[83]
+  Block[51] @0x410f10 stop: C++=0x410f10, Py=0x410f18
+  Block[11] Op[1] opcode: C++=@0x410adf#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x410adf#0 void = CPUI_RETURN(const[0x6bf:4])
+  Block[11] Op[2] opcode: C++=@0x410adf#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x410ae8:4], unique[0x3680:4]) | Py=@0x410adf#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[11] Op[3] opcode: C++=@0x410adf#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x410adf#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x410ae8:4], unique[0x3680:4])
+0x00413ce0 [MATCH] C++=59blk/887ops Py=59blk/887ops
+0x004143b0 [MATCH] C++=51blk/1043ops Py=51blk/1043ops
+0x00414650 [MATCH] C++=19blk/378ops Py=19blk/378ops
+0x00414760 [MATCH] C++=1blk/38ops Py=1blk/38ops
+0x004149d0 [MATCH] C++=41blk/1965ops Py=41blk/1965ops
+0x00414ac0 [MATCH] C++=14blk/367ops Py=14blk/367ops
+0x00414c30 [MATCH] C++=17blk/379ops Py=17blk/379ops
+0x00414db0 [MATCH] C++=31blk/1821ops Py=31blk/1821ops
+0x00415280 [MATCH] C++=65blk/1817ops Py=65blk/1817ops
+0x00415780 [MATCH] C++=1blk/128ops Py=1blk/128ops
+0x00415900 [MATCH] C++=8blk/108ops Py=8blk/108ops
+0x00416060 [MATCH] C++=18blk/1508ops Py=18blk/1508ops
+0x004165b0 [MATCH] C++=10blk/400ops Py=10blk/400ops
+0x00416790 [MATCH] C++=15blk/268ops Py=15blk/268ops
+0x004168b0 [MATCH] C++=1blk/38ops Py=1blk/38ops
+0x004168e0 [MATCH] C++=21blk/379ops Py=21blk/379ops
+0x00416930 [MATCH] C++=7blk/116ops Py=7blk/116ops
+0x004169b0 [MATCH] C++=7blk/135ops Py=7blk/135ops
+0x00416a90 [MATCH] C++=85blk/1263ops Py=85blk/1263ops
+0x00416e60 [MATCH] C++=6blk/55ops Py=6blk/55ops
+0x00416ee0 [MATCH] C++=6blk/55ops Py=6blk/55ops
+0x00417000 [MATCH] C++=10blk/164ops Py=10blk/164ops
+0x00417310 [MATCH] C++=20blk/525ops Py=20blk/525ops
+0x004174f0 [MATCH] C++=8blk/371ops Py=8blk/371ops
+0x00417670 [DIFF] C++=12blk/251ops Py=11blk/251ops | unexpected=7 expected=10
+  Block[0] @0x417670 stop: C++=0x417682, Py=0x417698
+  Block[0] @0x417670 succs: C++=[10], Py=[2, 9]
+  Block[0] @0x417670 ops: C++=32, Py=59
+  Block[2] @0x41769e preds: C++=[1], Py=[0]
+  Block[9] @0x417740 preds: C++=[1, 7], Py=[0, 7]
+0x00417760 [MATCH] C++=17blk/295ops Py=17blk/295ops
+0x00417880 [MATCH] C++=14blk/368ops Py=14blk/368ops
+0x00417b30 [MATCH] C++=5blk/104ops Py=5blk/104ops
+0x00417ba0 [MATCH] C++=1blk/38ops Py=1blk/38ops
+0x00417c10 [MATCH] C++=38blk/1144ops Py=38blk/1144ops
+0x004181b0 [MATCH] C++=15blk/477ops Py=15blk/477ops
+0x00418250 [MATCH] C++=8blk/113ops Py=8blk/113ops
+0x00418450 [MATCH] C++=10blk/458ops Py=10blk/458ops
+0x00418610 [MATCH] C++=10blk/262ops Py=10blk/262ops
+0x00418730 [MATCH] C++=10blk/159ops Py=10blk/159ops
+0x004187e0 [MATCH] C++=8blk/116ops Py=8blk/116ops
+0x00418880 [MATCH] C++=4blk/46ops Py=4blk/46ops
+0x004188b0 [MATCH] C++=5blk/136ops Py=5blk/136ops
+0x00418970 [MATCH] C++=1blk/12ops Py=1blk/12ops
+0x00418980 [MATCH] C++=8blk/168ops Py=8blk/168ops
+0x00418a30 [MATCH] C++=4blk/50ops Py=4blk/50ops
+0x00418a60 [MATCH] C++=9blk/137ops Py=9blk/137ops
+0x00418ae0 [MATCH] C++=6blk/73ops Py=6blk/73ops
+0x00418b30 [MATCH] C++=11blk/142ops Py=11blk/142ops
+0x00418b60 [MATCH] C++=4blk/50ops Py=4blk/50ops
+0x00418b90 [MATCH] C++=7blk/92ops Py=7blk/92ops
+0x00418c00 [MATCH] C++=15blk/275ops Py=15blk/275ops
+0x00418d60 [MATCH] C++=12blk/325ops Py=12blk/325ops
+0x00418e00 [MATCH] C++=1blk/43ops Py=1blk/43ops
+0x00418e80 [MATCH] C++=9blk/154ops Py=9blk/154ops
+0x00418ee0 [MATCH] C++=1blk/12ops Py=1blk/12ops
+0x00418ef0 [MATCH] C++=14blk/218ops Py=14blk/218ops
+0x00418fc0 [MATCH] C++=81blk/772ops Py=81blk/772ops
+0x00419250 [MATCH] C++=1blk/29ops Py=1blk/29ops
+0x00419270 [MATCH] C++=21blk/360ops Py=21blk/360ops
+0x004192a0 [MATCH] C++=1blk/32ops Py=1blk/32ops
+0x004192c0 [MATCH] C++=18blk/302ops Py=18blk/302ops
+0x00419bb0 [MATCH] C++=1blk/25ops Py=1blk/25ops
+0x00419c60 [MATCH] C++=1blk/44ops Py=1blk/44ops
+0x00419cc0 [MATCH] C++=52blk/481ops Py=52blk/481ops
+0x0041a710 [MATCH] C++=70blk/1112ops Py=70blk/1112ops
+0x0041aa40 [MATCH] C++=1blk/93ops Py=1blk/93ops
+0x0041ad20 [MATCH] C++=1blk/118ops Py=1blk/118ops
+0x0041af00 [MATCH] C++=9blk/367ops Py=9blk/367ops
+0x0041b000 [MATCH] C++=4blk/116ops Py=4blk/116ops
+0x0041b0f0 [MATCH] C++=8blk/104ops Py=8blk/104ops
+0x0041b150 [DIFF] C++=19blk/357ops Py=5blk/146ops | unexpected=24 expected=1
+  Block[1] @0x41b170 succs: C++=[2, 12, 13, 14, 15, 16, 17, 18], Py=[]
+  Block[1] @0x41b170 ops: C++=4, Py=5
+  Block[3] @0x41b1b0 preds: C++=[2, 11], Py=[5]
+  Block[5] @0x41b1d0 stop: C++=0x41b1d2, Py=0x41b1f8
+  Block[5] @0x41b1d0 succs: C++=[6], Py=[3]
+  Block[1] Op[1] opcode: C++=@0x41b170#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x41b170#0 void = CPUI_RETURN(const[0x91:4])
+  Block[1] Op[2] opcode: C++=@0x41b170#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x41b178:4], unique[0x3680:4]) | Py=@0x41b170#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+  Block[1] Op[3] opcode: C++=@0x41b170#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x41b170#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x41b178:4], unique[0x3680:4])
+0x0041b250 [MATCH] C++=13blk/845ops Py=13blk/845ops
+0x0041b5e0 [MATCH] C++=1blk/12ops Py=1blk/12ops
+0x0041b5f0 [MATCH] C++=1blk/12ops Py=1blk/12ops
+0x0041b600 [MATCH] C++=1blk/12ops Py=1blk/12ops
+0x0041b610 [DIFF] C++=2blk/1ops Py=1blk/1ops | unexpected=3 expected=0
+  Block[0] @0x41b610 succs: C++=[0], Py=[]
+  Block[0] @0x41b610 preds: C++=[0], Py=[]
+  Block[0] Op[0] varnode: C++=@0x41b610#8388610 void = CPUI_BRANCH(ram[0x41b610:1]) | Py=@0x41b610#0 void = CPUI_BRANCH(ram[0x41b610:4])
+0x0041b620 [MATCH] C++=1blk/78ops Py=1blk/78ops
+0x0041b680 [MATCH] C++=14blk/162ops Py=14blk/162ops
+0x0041b720 [MATCH] C++=6blk/127ops Py=6blk/127ops
+0x0041b7f0 [MATCH] C++=40blk/586ops Py=40blk/586ops
+0x0041bb70 [DIFF] C++=35blk/1083ops Py=33blk/1083ops | unexpected=11 expected=25
+  Block[8] @0x41bbee preds: C++=[7, 29], Py=[7, 28]
+  Block[28] @0x41bf23 stop: C++=0x41bf32, Py=0x41bf68
+  Block[28] @0x41bf23 succs: C++=[31], Py=[8]
+  Block[28] @0x41bf23 ops: C++=10, Py=188
+  Block[30] @0x41bf6d stop: C++=0x41bf84, Py=0x41bfc6
+0x0041bfa0 [MATCH] C++=3blk/164ops Py=3blk/164ops
+0x0041c000 [MATCH] C++=4blk/27ops Py=4blk/27ops
+0x0041c020 [MATCH] C++=7blk/275ops Py=7blk/275ops
+0x0041c110 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041c120 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041c130 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041d5b0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041d5c0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041d5d0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041d5e0 [MATCH] C++=3blk/66ops Py=3blk/66ops
+0x0041d610 [MATCH] C++=1blk/21ops Py=1blk/21ops
+0x0041d6b0 [MATCH] C++=11blk/135ops Py=11blk/135ops
+0x0041d720 [MATCH] C++=4blk/88ops Py=4blk/88ops
+0x0041d750 [DIFF] C++=28blk/941ops Py=28blk/941ops | unexpected=22 expected=0
+  Block[13] Op[2] opcode: C++=@0x41d800#8388610 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4]) | Py=@0x41d800#0 void = CPUI_BRANCH(const[0xfffffffb:1])
+  Block[13] Op[3] opcode: C++=@0x41d800#33554434 register[0x206:1] = CPUI_INT_EQUAL(unique[0xb900:4], const[0x0:4]) | Py=@0x41d800#0 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4])
+  Block[13] Op[4] opcode: C++=@0x41d800#8388610 unique[0x3300:4] = CPUI_INT_ADD(register[0x14:4], const[0xffffffdc:4]) | Py=@0x41d800#0 register[0x206:1] = CPUI_INT_EQUAL(unique[0xb900:4], const[0x0:4])
+  Block[13] Op[5] opcode: C++=@0x41d800#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3300:4]) | Py=@0x41d800#0 unique[0x3300:4] = CPUI_INT_ADD(register[0x14:4], const[0xffffffdc:4])
+  Block[13] Op[7] opcode: C++=@0x41d800#16777218 unique[0x2cd00:4] = CPUI_COPY(const[0x1f:4]) | Py=@0x41d800#0 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3300:4])
+0x0041d8d0 [DIFF] C++=21blk/670ops Py=21blk/670ops | unexpected=22 expected=0
+  Block[10] Op[2] opcode: C++=@0x41d960#8388610 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4]) | Py=@0x41d960#0 void = CPUI_BRANCH(const[0xfffffffc:1])
+  Block[10] Op[3] opcode: C++=@0x41d960#16777218 register[0x206:1] = CPUI_INT_EQUAL(register[0x8:4], const[0x0:4]) | Py=@0x41d960#0 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4])
+  Block[10] Op[4] opcode: C++=@0x41d960#8388610 unique[0x2cd00:4] = CPUI_COPY(const[0x1f:4]) | Py=@0x41d960#0 register[0x206:1] = CPUI_INT_EQUAL(register[0x8:4], const[0x0:4])
+  Block[10] Op[5] opcode: C++=@0x41d960#25165826 unique[0x2ce00:1] = CPUI_INT_EQUAL(register[0x206:1], const[0x1:1]) | Py=@0x41d960#0 unique[0x2cd00:4] = CPUI_COPY(const[0x1f:4])
+  Block[10] Op[6] opcode: C++=@0x41d960#8388610 unique[0x2ce80:4] = CPUI_INT_RIGHT(register[0x8:4], unique[0x2cd00:4]) | Py=@0x41d960#0 unique[0x2cd00:4] = CPUI_INT_SUB(unique[0x2cd00:4], const[0x1:4])
+0x0041d8f6 [DIFF] C++=21blk/623ops Py=21blk/623ops | unexpected=22 expected=0
+  Block[10] Op[2] opcode: C++=@0x41d960#8388610 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4]) | Py=@0x41d960#0 void = CPUI_BRANCH(const[0xfffffffc:1])
+  Block[10] Op[3] opcode: C++=@0x41d960#16777218 register[0x206:1] = CPUI_INT_EQUAL(register[0x8:4], const[0x0:4]) | Py=@0x41d960#0 register[0x0:4] = CPUI_COPY(unique[0x2cd00:4])
+  Block[10] Op[4] opcode: C++=@0x41d960#8388610 unique[0x2cd00:4] = CPUI_COPY(const[0x1f:4]) | Py=@0x41d960#0 register[0x206:1] = CPUI_INT_EQUAL(register[0x8:4], const[0x0:4])
+  Block[10] Op[5] opcode: C++=@0x41d960#25165826 unique[0x2ce00:1] = CPUI_INT_EQUAL(register[0x206:1], const[0x1:1]) | Py=@0x41d960#0 unique[0x2cd00:4] = CPUI_COPY(const[0x1f:4])
+  Block[10] Op[6] opcode: C++=@0x41d960#8388610 unique[0x2ce80:4] = CPUI_INT_RIGHT(register[0x8:4], unique[0x2cd00:4]) | Py=@0x41d960#0 unique[0x2cd00:4] = CPUI_INT_SUB(unique[0x2cd00:4], const[0x1:4])
+0x0041d9f0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041da90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041daa0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dab0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dac0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dad0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dae0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041daf0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db80 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041db90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dba0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dbb0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dbc0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dbd0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dbe0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dbf0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc80 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dc90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dca0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dcb0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dcc0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dcd0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dce0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dcf0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd80 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dd90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dda0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041ddb0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041ddc0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041ddd0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dde0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041ddf0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de80 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041de90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dea0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041deb0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dec0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041ded0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dee0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041def0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df00 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df10 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df20 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df30 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df40 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df50 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df60 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df70 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df80 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041df90 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dfa0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dfb0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dfc0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dfd0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dfe0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041dff0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e000 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e010 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e020 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e030 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e040 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e050 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e060 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e070 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e080 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e090 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0a0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0b0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0c0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0d0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0e0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e0f0 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e100 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e110 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e120 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e130 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e140 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e150 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e160 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e170 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e180 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e190 [MATCH] C++=1blk/2ops Py=1blk/2ops
+0x0041e499 [MATCH] C++=1blk/379ops Py=1blk/379ops

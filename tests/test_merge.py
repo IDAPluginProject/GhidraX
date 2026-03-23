@@ -174,7 +174,7 @@ class TestHighIntersectTest:
         h2 = _FakeHigh(cover=None)
         hit.intersection(h1, h2)
         hit.clear()
-        assert hit._cache == {}
+        assert hit._highedgemap == {}
 
 
 # ---------------------------------------------------------------------------

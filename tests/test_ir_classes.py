@@ -378,6 +378,8 @@ class TestPcodeOp:
         class _FakeSymbol:
             def isNameLocked(self):
                 return False
+            def isValueClose(self, offset, size):
+                return True
 
         class _FakeEntry:
             def __init__(self):
@@ -430,6 +432,8 @@ class TestRuleCollapseConstants:
         class _FakeSymbol:
             def isNameLocked(self):
                 return False
+            def isValueClose(self, offset, size):
+                return True
 
         class _FakeEntry:
             def __init__(self):
@@ -807,7 +811,7 @@ class TestCoverBlock:
         cb1.setEnd(op1b)
         cb2.setBegin(op2a)
         cb2.setEnd(op2b)
-        assert cb1.intersect(cb2) == 1
+        assert cb1.intersect(cb2) == 2
 
     def test_intersect_boundary_only(self, ram):
         cb1 = CoverBlock()
@@ -824,7 +828,7 @@ class TestCoverBlock:
         cb1.setEnd(op1b)
         cb2.setBegin(op2a)
         cb2.setEnd(op2b)
-        assert cb1.intersect(cb2) == 2
+        assert cb1.intersect(cb2) == 1
 
     def test_intersect_empty(self):
         cb1 = CoverBlock()
@@ -939,7 +943,7 @@ class TestCover:
         cb2 = CoverBlock()
         cb2.setAll()
         c2._cover[0] = cb2
-        assert c1.intersect(c2) == 1
+        assert c1.intersect(c2) == 2
 
     def test_intersect_by_block(self, ram):
         c1 = Cover()
@@ -950,7 +954,7 @@ class TestCover:
         cb2 = CoverBlock()
         cb2.setAll()
         c2._cover[2] = cb2
-        assert c1.intersectByBlock(2, c2) == 1
+        assert c1.intersectByBlock(2, c2) == 2
         assert c1.intersectByBlock(3, c2) == 0
 
     def test_contain(self, ram):

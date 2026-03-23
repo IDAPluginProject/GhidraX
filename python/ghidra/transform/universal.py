@@ -23,6 +23,7 @@ from ghidra.transform.ruleaction_batch1i import *
 from ghidra.transform.ruleaction_batch2a import *
 from ghidra.transform.ruleaction_batch2b import *
 from ghidra.transform.ruleaction_batch2c import *
+from ghidra.transform.ruleaction_batch2d import *
 
 
 def universalAction(allacts: ActionDatabase, conf) -> None:
@@ -74,8 +75,11 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop = ActionPool(Action.rule_repeatapply, "oppool1")
     actprop.addRule(RuleEarlyRemoval("deadcode"))
     actprop.addRule(RuleTermOrder("analysis"))
-    # RuleSelectCse - needs CSE infra
-    # RuleCollectTerms - needs TermOrder
+    actprop.addRule(RuleSelectCse("analysis"))
+    actprop.addRule(RuleCollectTerms("analysis"))
+    actprop.addRule(RulePullsubMulti("analysis"))
+    actprop.addRule(RulePullsubIndirect("analysis"))
+    actprop.addRule(RulePushMulti("nodejoin"))
     actprop.addRule(RuleSborrow("analysis"))
     actprop.addRule(RuleScarry("analysis"))
     actprop.addRule(RuleIntLessEqual("analysis"))
@@ -107,8 +111,8 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop.addRule(RuleShiftCompare("analysis"))
     actprop.addRule(RuleShift2Mult("analysis"))
     actprop.addRule(RuleShiftPiece("analysis"))
-    # RuleMultiCollapse - needs totalReplace
-    # RuleIndirectCollapse - needs getOpFromConst
+    actprop.addRule(RuleMultiCollapse("analysis"))
+    actprop.addRule(RuleIndirectCollapse("analysis"))
     actprop.addRule(Rule2Comp2Mult("analysis"))
     actprop.addRule(RuleSub2Add("analysis"))
     actprop.addRule(RuleCarryElim("analysis"))
@@ -118,11 +122,11 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop.addRule(RuleSLess2Zero("analysis"))
     actprop.addRule(RuleEqual2Zero("analysis"))
     actprop.addRule(RuleEqual2Constant("analysis"))
-    # RuleThreeWayCompare - complex
+    actprop.addRule(RuleThreeWayCompare("analysis"))
     actprop.addRule(RuleXorCollapse("analysis"))
     actprop.addRule(RuleAddMultCollapse("analysis"))
     actprop.addRule(RuleCollapseConstants("analysis"))
-    # RuleTransformCpool - needs cpool
+    actprop.addRule(RuleTransformCpool("analysis"))
     actprop.addRule(RulePropagateCopy("analysis"))
     actprop.addRule(RuleZextEliminate("analysis"))
     actprop.addRule(RuleSlessToLess("analysis"))
@@ -134,7 +138,7 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop.addRule(RuleBooleanNegate("analysis"))
     actprop.addRule(RuleLogic2Bool("analysis"))
     actprop.addRule(RuleSubExtComm("analysis"))
-    # RuleSubCommute - complex
+    actprop.addRule(RuleSubCommute("analysis"))
     actprop.addRule(RuleConcatCommute("analysis"))
     actprop.addRule(RuleConcatZext("analysis"))
     actprop.addRule(RuleZextCommute("analysis"))
@@ -151,26 +155,63 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop.addRule(RuleNegateIdentity("analysis"))
     actprop.addRule(RuleSubNormal("analysis"))
     actprop.addRule(RulePositiveDiv("analysis"))
-    # RuleDivTermAdd/2, RuleDivOpt, etc. - need 128-bit
+    actprop.addRule(RuleDivTermAdd("analysis"))
+    actprop.addRule(RuleDivTermAdd2("analysis"))
+    actprop.addRule(RuleDivOpt("analysis"))
     actprop.addRule(RuleSignForm("analysis"))
+    actprop.addRule(RuleSignForm2("analysis"))
+    actprop.addRule(RuleSignDiv2("analysis"))
+    actprop.addRule(RuleDivChain("analysis"))
     actprop.addRule(RuleSignNearMult("analysis"))
     actprop.addRule(RuleModOpt("analysis"))
+    actprop.addRule(RuleSignMod2nOpt("analysis"))
+    actprop.addRule(RuleSignMod2nOpt2("analysis"))
+    actprop.addRule(RuleSignMod2Opt("analysis"))
+    actprop.addRule(RuleSwitchSingle("analysis"))
     actprop.addRule(RuleCondNegate("analysis"))
     actprop.addRule(RuleBoolNegate("analysis"))
     actprop.addRule(RuleLessEqual("analysis"))
     actprop.addRule(RuleLessNotEqual("analysis"))
     actprop.addRule(RuleLessOne("analysis"))
+    actprop.addRule(RuleRangeMeld("analysis"))
     actprop.addRule(RuleFloatRange("analysis"))
     actprop.addRule(RulePiece2Zext("analysis"))
     actprop.addRule(RulePiece2Sext("analysis"))
     actprop.addRule(RulePopcountBoolXor("analysis"))
     actprop.addRule(RuleXorSwap("analysis"))
     actprop.addRule(RuleLzcountShiftBool("analysis"))
+    actprop.addRule(RuleFloatSign("analysis"))
     actprop.addRule(RuleOrCompare("analysis"))
+    actprop.addRule(RuleSubvarAnd("subvar"))
+    actprop.addRule(RuleSubvarSubpiece("subvar"))
+    actprop.addRule(RuleSplitFlow("subvar"))
+    actprop.addRule(RulePtrFlow("subvar"))
+    actprop.addRule(RuleSubvarCompZero("subvar"))
+    actprop.addRule(RuleSubvarShift("subvar"))
+    actprop.addRule(RuleSubvarZext("subvar"))
+    actprop.addRule(RuleSubvarSext("subvar"))
     actprop.addRule(RuleNegateNegate("analysis"))
+    actprop.addRule(RuleConditionalMove("conditionalexe"))
+    actprop.addRule(RuleOrPredicate("conditionalexe"))
     actprop.addRule(RuleFuncPtrEncoding("analysis"))
+    actprop.addRule(RuleSubfloatConvert("floatprecision"))
     actprop.addRule(RuleFloatCast("floatprecision"))
-    # Extra CPU-specific rules would be added here
+    actprop.addRule(RuleIgnoreNan("floatprecision"))
+    actprop.addRule(RuleUnsigned2Float("analysis"))
+    actprop.addRule(RuleInt2FloatCollapse("analysis"))
+    actprop.addRule(RulePtraddUndo("typerecovery"))
+    actprop.addRule(RulePtrsubUndo("typerecovery"))
+    actprop.addRule(RuleSegment("segment"))
+    actprop.addRule(RulePiecePathology("protorecovery"))
+    actprop.addRule(RuleDoubleLoad("doubleload"))
+    actprop.addRule(RuleDoubleStore("doubleprecis"))
+    actprop.addRule(RuleDoubleIn("doubleprecis"))
+    actprop.addRule(RuleDoubleOut("doubleprecis"))
+    # Add CPU-specific / dynamic rules from architecture (C++ extra_pool_rules)
+    if conf is not None and hasattr(conf, 'extra_pool_rules'):
+        for dynrule in conf.extra_pool_rules:
+            actprop.addRule(dynrule)
+        conf.extra_pool_rules.clear()
 
     actstackstall.addAction(actprop)
     actstackstall.addAction(ActionLaneDivide("base"))
@@ -186,8 +227,11 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
 
     # oppool2
     actprop2 = ActionPool(Action.rule_repeatapply, "oppool2")
-    # RulePushPtr, RuleStructOffset0, RulePtrArith - need type system
-    # RuleLoadVarnode, RuleStoreVarnode - need LOAD/STORE infra
+    actprop2.addRule(RulePushPtr("typerecovery"))
+    actprop2.addRule(RuleStructOffset0("typerecovery"))
+    actprop2.addRule(RulePtrArith("typerecovery"))
+    actprop2.addRule(RuleLoadVarnode("stackvars"))
+    actprop2.addRule(RuleStoreVarnode("stackvars"))
     actmainloop.addAction(actprop2)
 
     actmainloop.addAction(ActionDeterminedBranch("unreachable"))
@@ -215,10 +259,20 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     # cleanup pool
     actcleanup = ActionPool(Action.rule_repeatapply, "cleanup")
     actcleanup.addRule(RuleMultNegOne("cleanup"))
-    # RuleAddUnsigned - needs type system
+    actcleanup.addRule(RuleAddUnsigned("cleanup"))
     actcleanup.addRule(Rule2Comp2Sub("cleanup"))
-    # RuleSubRight - needs type system
-    # RuleExpandLoad, RulePtrsubCharConstant, etc. - need type system
+    actcleanup.addRule(RuleDumptyHumpLate("cleanup"))
+    actcleanup.addRule(RuleSubRight("cleanup"))
+    actcleanup.addRule(RuleFloatSignCleanup("cleanup"))
+    actcleanup.addRule(RuleExpandLoad("cleanup"))
+    actcleanup.addRule(RulePtrsubCharConstant("cleanup"))
+    actcleanup.addRule(RuleExtensionPush("cleanup"))
+    actcleanup.addRule(RulePieceStructure("cleanup"))
+    actcleanup.addRule(RuleSplitCopy("splitcopy"))
+    actcleanup.addRule(RuleSplitLoad("splitpointer"))
+    actcleanup.addRule(RuleSplitStore("splitpointer"))
+    actcleanup.addRule(RuleStringCopy("constsequence"))
+    actcleanup.addRule(RuleStringStore("constsequence"))
     act.addAction(actcleanup)
 
     act.addAction(ActionPreferComplement("blockrecovery"))
@@ -249,16 +303,53 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
 
 
 def buildDefaultGroups(allacts: ActionDatabase) -> None:
-    """Set up descriptions of preconfigured root Actions."""
-    groups = [
-        "base", "protorecovery", "protorecovery_a", "protorecovery_b",
-        "deindirect", "localrecovery", "deadcode", "typerecovery",
-        "stackptrflow", "blockrecovery", "stackvars", "deadcontrolflow",
-        "switchnorm", "cleanup", "merge", "dynamic", "casts", "analysis",
-        "fixateproto", "fixateglobals", "segment", "returnsplit",
-        "nodejoin", "doubleload", "doubleprecis", "unreachable",
-        "subvar", "floatprecision", "conditionalexe", "normalanalysis",
-        "normalizebranches", "noproto", "splitcopy", "splitpointer",
-        "constsequence",
+    """Set up descriptions of preconfigured root Actions.
+
+    C++ ref: ``ActionDatabase::buildDefaultGroups`` in coreaction.cc
+    """
+    if getattr(allacts, '_isDefaultGroups', False):
+        return
+    if hasattr(allacts, '_groupmap'):
+        allacts._groupmap.clear()
+
+    decompile = [
+        "base", "protorecovery", "protorecovery_a", "deindirect", "localrecovery",
+        "deadcode", "typerecovery", "stackptrflow",
+        "blockrecovery", "stackvars", "deadcontrolflow", "switchnorm",
+        "cleanup", "splitcopy", "splitpointer", "merge", "dynamic", "casts", "analysis",
+        "fixateglobals", "fixateproto", "constsequence",
+        "segment", "returnsplit", "nodejoin", "doubleload", "doubleprecis",
+        "unreachable", "subvar", "floatprecision",
+        "conditionalexe",
     ]
-    allacts.setGroup("decompile", groups)
+    allacts.setGroup("decompile", decompile)
+
+    jumptab = [
+        "base", "noproto", "localrecovery", "deadcode", "stackptrflow",
+        "stackvars", "analysis", "segment", "subvar", "normalizebranches", "conditionalexe",
+    ]
+    allacts.setGroup("jumptable", jumptab)
+
+    normalize = [
+        "base", "protorecovery", "protorecovery_b", "deindirect", "localrecovery",
+        "deadcode", "stackptrflow", "normalanalysis",
+        "stackvars", "deadcontrolflow", "analysis", "fixateproto", "nodejoin",
+        "unreachable", "subvar", "floatprecision", "normalizebranches",
+        "conditionalexe",
+    ]
+    allacts.setGroup("normalize", normalize)
+
+    paramid = [
+        "base", "protorecovery", "protorecovery_b", "deindirect", "localrecovery",
+        "deadcode", "typerecovery", "stackptrflow", "siganalysis",
+        "stackvars", "deadcontrolflow", "analysis", "fixateproto",
+        "unreachable", "subvar", "floatprecision",
+        "conditionalexe",
+    ]
+    allacts.setGroup("paramid", paramid)
+
+    allacts.setGroup("register", ["base", "analysis", "subvar"])
+
+    allacts.setGroup("firstpass", ["base"])
+
+    allacts._isDefaultGroups = True

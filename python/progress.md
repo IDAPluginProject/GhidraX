@@ -194,6 +194,35 @@ x86 binary → sleigh_native.pyd → P-code → Funcdata → 136 rules + 62 Acti
 - [x] Funcdata.clear(): clears _qlst_map/_override/_unionMap on restart
 - [x] opPtrsub ARRAY: subscript [] syntax when print_load/store_value set
 
+### Action/Rule Consolidation & Deepening
+- [x] Consolidated 7 duplicate Action classes from blockaction.py into coreaction2.py (proper Action subclasses)
+  - ActionBlockStructure: added missing installSwitchDefaults() call
+  - ActionReturnSplit: ported working gatherReturnGotos/isSplittable from blockaction.py
+  - ActionNodeJoin: fixed ConditionalJoin import path
+  - ActionPreferComplement, ActionStructureTransform, ActionNormalizeBranches, ActionFinalStructure: already adequate
+- [x] Removed 7 dead duplicate Action-like classes from blockaction.py (kept algorithm classes: CollapseStructure, ConditionalJoin, etc.)
+- [x] RuleConditionalMove: full C++ port with checkBoolean, gatherExpression, constructBool, 4-case applyOp
+  - Both non-const booleans → BOOL_OR/BOOL_AND
+  - Both const booleans → COPY/ZEXT/BOOL_NEGATE
+  - One const, one non-const → BOOL_OR/BOOL_AND with complement
+  - Note: X86_BRANCH collapse is expected C++ behavior (EAX_input not boolean → rule doesn't fire)
+- [x] ActionReturnSplit: added sizeIn() guard before nodeSplit for batch splits
+
+### Heritage Comparison: cp.exe — 292/306 (95.4%)
+- **292 exact matches** out of 306 functions (block counts, op counts, opcodes all match)
+- **14 remaining diffs**: 8 jump-table (BRANCHIND), 3 code-following, 1 non-returning call, 2 other
+- Key fixes:
+  - markAlive → _addToCodeList (130→142)
+  - RETURN EDX+ST0 output entries (142→187)
+  - structureReset() block ordering (187→216)
+  - MULTIEQUAL/SUBPIECE op normalization (216→260)
+  - block_by_entry first-block mapping (260→281)
+  - RETURN const value alignment (281→285)
+  - RETURN input count fix (285→286)
+  - Internal p-code branch relative offsets (286→289)
+  - DF COPY at function entry block (289→292)
+- Remaining diffs require: jump table recovery, FlowInfo-level code following, non-returning call detection
+
 ### Phase 3: Console / CLI (Ghidra Binary Protocol) — SCAFFOLDING DONE
 - [x] console/__init__.py — package
 - [x] console/protocol.py — binary framing (alignment bursts 0x00..0x01+code), 18 burst constants,

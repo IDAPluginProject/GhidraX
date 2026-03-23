@@ -10,6 +10,29 @@ from typing import Optional, List, Dict, Set
 from ghidra.core.address import Address
 
 
+class IndexPair:
+    """A pair (blockPosition, addressIndex) for mapping address table entries to block out-edges.
+
+    C++ ref: ``IndexPair``
+    """
+    __slots__ = ('blockPosition', 'addressIndex')
+
+    def __init__(self, blockPos: int = 0, addrIdx: int = 0) -> None:
+        self.blockPosition: int = blockPos
+        self.addressIndex: int = addrIdx
+
+    def __lt__(self, other):
+        if self.blockPosition != other.blockPosition:
+            return self.blockPosition < other.blockPosition
+        return self.addressIndex < other.addressIndex
+
+    def __eq__(self, other):
+        return self.blockPosition == other.blockPosition and self.addressIndex == other.addressIndex
+
+    def __repr__(self):
+        return f"IndexPair(block={self.blockPosition}, addr={self.addressIndex})"
+
+
 class LoadTable:
     """A description of where and how data was loaded from memory."""
 
@@ -263,6 +286,7 @@ class JumpTable:
         self.partialTable: bool = False
         self.collectloads: bool = False
         self.defaultIsFolded: bool = False
+        self.block2addr: List[IndexPair] = []
 
     def isRecovered(self) -> bool:
         return len(self.addresstable) > 0
@@ -325,15 +349,51 @@ class JumpTable:
     def getLabelByIndex(self, i: int) -> int:
         return self.label[i] if i < len(self.label) else 0
 
+    def block2Position(self, bl) -> int:
+        """Get the out-edge position of the given block relative to the switch parent.
+
+        C++ ref: ``JumpTable::block2Position``
+        """
+        parent = self.indirect.getParent() if self.indirect is not None else None
+        if parent is None:
+            raise Exception("Requested block, not in jumptable")
+        for position in range(bl.sizeIn()):
+            if bl.getIn(position) is parent:
+                if hasattr(bl, 'getInRevIndex'):
+                    return bl.getInRevIndex(position)
+                return position
+        raise Exception("Requested block, not in jumptable")
+
     def numIndicesByBlock(self, bl) -> int:
-        count = 0
-        blstart = bl.getStart() if hasattr(bl, 'getStart') else None
-        if blstart is None:
+        """Count the number of address table entries targeting the given block.
+
+        C++ ref: ``JumpTable::numIndicesByBlock``
+        """
+        if not self.block2addr:
+            # Fallback for pre-switchOver state
+            blstart = bl.getStart() if hasattr(bl, 'getStart') else None
+            if blstart is None:
+                return 0
+            return sum(1 for addr in self.addresstable if addr == blstart)
+        try:
+            pos = self.block2Position(bl)
+        except Exception:
             return 0
-        for addr in self.addresstable:
-            if addr == blstart:
+        return sum(1 for ip in self.block2addr if ip.blockPosition == pos)
+
+    def getIndexByBlock(self, bl, i: int = 0) -> int:
+        """Get the i-th address table index for the given block.
+
+        C++ ref: ``JumpTable::getIndexByBlock``
+        """
+        pos = self.block2Position(bl)
+        count = 0
+        for ip in self.block2addr:
+            if ip.blockPosition == pos:
+                if count == i:
+                    return ip.addressIndex
                 count += 1
-        return count
+        raise Exception("Could not get jumptable index for block")
 
     def recoverAddresses(self, fd) -> None:
         """Recover the raw jump-table addresses."""
@@ -385,8 +445,50 @@ class JumpTable:
         return False
 
     def switchOver(self, flow) -> None:
-        """Convert jump-table addresses to basic block indices."""
-        pass
+        """Convert jump-table addresses to basic block indices.
+
+        The address table entries are converted to out-edge indices of the
+        parent block of the BRANCHIND. The most common target becomes the
+        default block.
+
+        C++ ref: ``JumpTable::switchOver``
+        """
+        self.block2addr.clear()
+        parent = self.indirect.getParent() if self.indirect is not None else None
+        if parent is None:
+            return
+
+        for i, addr in enumerate(self.addresstable):
+            op = flow.target(addr) if hasattr(flow, 'target') else None
+            if op is None:
+                continue
+            tmpbl = op.getParent()
+            pos = -1
+            for j in range(parent.sizeOut()):
+                if parent.getOut(j) is tmpbl:
+                    pos = j
+                    break
+            if pos == -1:
+                raise Exception("Jumptable destination not linked")
+            self.block2addr.append(IndexPair(pos, i))
+
+        if self.block2addr:
+            self.lastBlock = self.block2addr[-1].blockPosition
+        self.block2addr.sort()
+
+        # Find the most common block position -> default block
+        self.defaultBlock = -1
+        maxcount = 1  # Only set default if count >= 2
+        idx = 0
+        while idx < len(self.block2addr):
+            curPos = self.block2addr[idx].blockPosition
+            count = 0
+            while idx < len(self.block2addr) and self.block2addr[idx].blockPosition == curPos:
+                count += 1
+                idx += 1
+            if count > maxcount:
+                maxcount = count
+                self.defaultBlock = curPos
 
     def recoverModel(self, fd) -> bool:
         """Recover the model for this jump-table."""
@@ -401,8 +503,23 @@ class JumpTable:
         return self.jmodel.sanityCheck(fd, self.indirect, self.addresstable)
 
     def trivialSwitchOver(self) -> None:
-        """Simple switch-over when table is already complete."""
-        pass
+        """Simple switch-over when table is already complete.
+
+        Make exactly one case for each output edge of the switch block.
+
+        C++ ref: ``JumpTable::trivialSwitchOver``
+        """
+        self.block2addr.clear()
+        parent = self.indirect.getParent() if self.indirect is not None else None
+        if parent is None:
+            return
+        numOut = parent.sizeOut()
+        if numOut != len(self.addresstable):
+            raise Exception("Trivial addresstable and switch block size do not match")
+        for i in range(numOut):
+            self.block2addr.append(IndexPair(i, i))
+        self.lastBlock = numOut - 1
+        self.defaultBlock = -1
 
     def recoverMultistage(self, fd) -> bool:
         """Attempt multistage recovery."""
@@ -492,19 +609,6 @@ class JumpTable:
         self.addresstable = list(addrtable)
         self.switchVarConsume = sv
         self.jmodel = JumpModelTrivial(self)
-
-    def getIndexByBlock(self, bl, i: int) -> int:
-        """Get the i-th address table index that targets the given block."""
-        blstart = bl.getStart() if hasattr(bl, 'getStart') else None
-        if blstart is None:
-            return -1
-        count = 0
-        for idx, addr in enumerate(self.addresstable):
-            if addr == blstart:
-                if count == i:
-                    return idx
-                count += 1
-        return -1
 
     def addBlockToSwitch(self, bl, lab: int) -> None:
         """Force a given basic-block to be a switch destination."""

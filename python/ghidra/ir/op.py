@@ -312,12 +312,49 @@ class PcodeOp:
     # --- Navigation ---
 
     def nextOp(self) -> Optional[PcodeOp]:
-        """Return the next op in control-flow from this, or None."""
-        # Simplified: requires basic block linkage
+        """Return the next op in sequence from this op.
+
+        Follows flow into successive blocks during search, so long as there is only one path.
+        C++ ref: ``PcodeOp::nextOp``
+        """
+        p = self._parent
+        if p is None:
+            return None
+        ops = p.getOps() if hasattr(p, 'getOps') else []
+        found = False
+        for op in ops:
+            if found:
+                return op
+            if op is self:
+                found = True
+        # Reached end of block, follow single-output edges
+        while True:
+            nout = p.sizeOut() if hasattr(p, 'sizeOut') else 0
+            if nout != 1 and nout != 2:
+                return None
+            p = p.getOut(0) if hasattr(p, 'getOut') else None
+            if p is None:
+                return None
+            ops = p.getOps() if hasattr(p, 'getOps') else []
+            for op in ops:
+                return op
+            # Empty block, keep going
         return None
 
     def previousOp(self) -> Optional[PcodeOp]:
-        """Return the previous op within this op's basic block, or None."""
+        """Return the previous op within this op's basic block, or None.
+
+        C++ ref: ``PcodeOp::previousOp``
+        """
+        p = self._parent
+        if p is None:
+            return None
+        prev = None
+        ops = p.getOps() if hasattr(p, 'getOps') else []
+        for op in ops:
+            if op is self:
+                return prev
+            prev = op
         return None
 
     def compareOrder(self, bop: PcodeOp) -> int:
@@ -532,8 +569,29 @@ class PcodeOp:
         return None
 
     def target(self):
-        """Return starting op for instruction associated with this op."""
-        return self  # Simplified
+        """Return starting op for instruction associated with this op.
+
+        Scan backward to find the first op marked as start of instruction.
+        C++ ref: ``PcodeOp::target``
+        """
+        p = self._parent
+        if p is None:
+            return self
+        ops = list(p.getOps()) if hasattr(p, 'getOps') else []
+        retop = self
+        idx = -1
+        for i, op in enumerate(ops):
+            if op is self:
+                idx = i
+                break
+        if idx < 0:
+            return self
+        while idx >= 0:
+            retop = ops[idx]
+            if retop._flags & PcodeOp.startmark:
+                return retop
+            idx -= 1
+        return retop
 
     def encode(self, encoder) -> None:
         """Encode a description of this op to stream.
@@ -683,7 +741,9 @@ class PcodeOpBank:
             self._deadlist.remove(op)
         except ValueError:
             pass
-        self._alivelist.append(op)
+        if op not in self._alivelist:
+            self._alivelist.append(op)
+            self._addToCodeList(op)
 
     def markDead(self, op: PcodeOp) -> None:
         """Mark the given PcodeOp as dead."""

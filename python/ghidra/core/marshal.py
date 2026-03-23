@@ -323,6 +323,8 @@ ELEM_LOCALDB = ElementId("localdb", 228)
 
 # From architecture.cc
 ATTRIB_REVERSEJUSTIFY = AttributeId("reversejustify", 111)
+ATTRIB_GROUP = AttributeId("group", 112)
+ATTRIB_ENABLE = AttributeId("enable", 113)
 ELEM_RULE = ElementId("rule", 153)
 
 # From fspec.cc
@@ -627,7 +629,23 @@ class XmlDecode(Decoder):
         return AttributeId.find(attr_name, self._scope)
 
     def getIndexedAttributeId(self, attribId: AttributeId) -> int:
-        return 0  # Simplified
+        """Return the id for an indexed attribute, matching C++ XmlDecode::getIndexedAttributeId."""
+        el = self._currentElement()
+        keys = list(el.attrib.keys())
+        if self._attributeIndex < 0 or self._attributeIndex >= len(keys):
+            return 0  # ATTRIB_UNKNOWN
+        attribName = keys[self._attributeIndex]
+        baseName = attribId.name
+        if not attribName.startswith(baseName):
+            return 0  # ATTRIB_UNKNOWN
+        suffix = attribName[len(baseName):]
+        try:
+            val = int(suffix)
+        except (ValueError, TypeError):
+            return 0
+        if val == 0:
+            return 0
+        return attribId._id + (val - 1)
 
     def rewindAttributes(self) -> None:
         self._attributeIndex = -1

@@ -1655,11 +1655,49 @@ class ProtoModel:
         return False
 
     def hasEffect(self, addr, size: int):
-        """Determine side-effect of this model on the given memory range."""
-        for eff in getattr(self, '_effectlist', []):
-            if hasattr(eff, 'getAddress') and hasattr(eff, 'getSize'):
-                if eff.getAddress() == addr and eff.getSize() >= size:
-                    return eff.getType() if hasattr(eff, 'getType') else 'unknown'
+        """Determine side-effect of this model on the given memory range.
+
+        Matches C++ ``ProtoModel::lookupEffect`` semantics:
+        - Unique (IPTR_INTERNAL) space is always unaffected.
+        - A size-0 entry means the entire space is unaffected.
+        - Otherwise check range containment.
+
+        Returns a string: 'unaffected', 'killedbycall', 'return_address', or 'unknown'.
+        """
+        # Unique space is always local to function
+        if hasattr(addr, 'getSpace') and addr.getSpace() is not None:
+            stype = addr.getSpace().getType()
+            if stype == 3:  # IPTR_INTERNAL
+                return 'unaffected'
+
+        _TYPE_TO_STR = {
+            EffectRecord.unaffected: 'unaffected',
+            EffectRecord.killedbycall: 'killedbycall',
+            EffectRecord.return_address: 'return_address',
+            EffectRecord.unknown_effect: 'unknown',
+        }
+
+        efflist = getattr(self, '_effectlist', [])
+        if not efflist:
+            return 'unknown'
+
+        a_spc = addr.getSpace() if hasattr(addr, 'getSpace') else None
+        a_off = addr.getOffset() if hasattr(addr, 'getOffset') else 0
+
+        for eff in efflist:
+            e_addr = eff.getAddress()
+            e_size = eff.getSize()
+            e_spc = e_addr.getSpace() if hasattr(e_addr, 'getSpace') else None
+            if e_spc is not a_spc:
+                continue
+            # Size 0 means whole space is unaffected
+            if e_size == 0:
+                return 'unaffected'
+            e_off = e_addr.getOffset() if hasattr(e_addr, 'getOffset') else 0
+            # Check containment: [a_off, a_off+size) ⊆ [e_off, e_off+e_size)
+            if a_off >= e_off and (a_off + size) <= (e_off + e_size):
+                return _TYPE_TO_STR.get(eff.getType(), 'unknown')
+
         return 'unknown'
 
     def deriveInputMap(self, active) -> None:
@@ -2410,10 +2448,16 @@ class FuncProto:
     def getBiggestContainedOutput(self, loc, size: int, res) -> bool:
         return self.model.getBiggestContainedOutput(loc, size, res) if self.model else False
 
-    def hasEffect(self, addr, size: int) -> int:
+    def hasEffect(self, addr, size: int):
+        """Determine effect of the function on the given memory range.
+
+        Matches C++ ``FuncProto::hasEffect``: delegates to model if own
+        effectlist is empty.  Returns a string for consistency with
+        ``guardCalls`` which uses string comparisons.
+        """
         if self.model is not None:
             return self.model.hasEffect(addr, size)
-        return EffectRecord.unknown_effect
+        return 'unknown'
 
     def deriveInputMap(self, active) -> None:
         if self.model is not None:
@@ -3541,6 +3585,13 @@ class FuncCallSpecs:
         """Determine effect, translating for stack-based addresses."""
         return self.hasEffect(addr, size)
 
+    def getSpacebase(self):
+        """Get the stack address space associated with this call.
+
+        C++ ref: ``FuncProto::getSpacebase`` — delegates to model->getSpacebase()
+        """
+        return self.proto.getSpacebase() if self.proto is not None else None
+
     def getSpacebaseOffset(self) -> int:
         """Get the offset for stack-based parameters."""
         return self.stackoffset
@@ -3720,20 +3771,21 @@ class FuncCallSpecs:
     def createPlaceholder(self, data, spacebase) -> None:
         """Create a stack-pointer placeholder input for this call.
 
-        Creates a varnode input representing the stack pointer
-        and marks it as the placeholder for stack-relative parameter analysis.
+        Uses opStackLoad to create INT_ADD(spacebase_reg, 0) + LOAD,
+        matching C++ FuncCallSpecs::createPlaceholder which calls
+        data.opStackLoad(spacebase, 0, 1, op, NULL, false).
 
         C++ ref: ``FuncCallSpecs::createPlaceholder``
         """
         if spacebase is None:
             return
-        if hasattr(data, 'newVarnode') and hasattr(data, 'opInsertInput'):
-            spaceId = spacebase
-            sz = spaceId.getAddrSize() if hasattr(spaceId, 'getAddrSize') else 4
-            phvn = data.newVarnode(sz, Address(spaceId, 0))
+        if hasattr(data, 'opStackLoad') and hasattr(data, 'opInsertInput'):
             slot = self.op.numInput() if hasattr(self.op, 'numInput') else 1
-            data.opInsertInput(self.op, phvn, slot)
+            loadval = data.opStackLoad(spacebase, 0, 1, self.op, None, False)
+            data.opInsertInput(self.op, loadval, slot)
             self.setStackPlaceholderSlot(slot)
+            if hasattr(loadval, 'setSpacebasePlaceholder'):
+                loadval.setSpacebasePlaceholder()
 
     def resolveSpacebaseRelative(self, data, phvn) -> None:
         """Resolve the spacebase-relative placeholder."""

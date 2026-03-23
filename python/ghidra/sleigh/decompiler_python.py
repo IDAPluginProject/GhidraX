@@ -39,6 +39,100 @@ def _build_shim_type_factory(spc_mgr) -> TypeFactory:
     return tf
 
 
+def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
+    """Build a minimal default ProtoModel with return register and effect list.
+
+    For x86-32: EAX (register offset 0, size 4) as return register.
+    For x86-64: RAX (register offset 0, size 8) as return register.
+    This enables Heritage's guardReturns() to identify the return register
+    and add it as input to RETURN ops via characterizeAsOutput().
+
+    Also populates the x86-32 cdecl effect list so that
+    ``Heritage::guardCalls`` can distinguish callee-saved (unaffected)
+    from volatile (killedbycall) registers, avoiding excessive INDIRECT
+    op creation.
+
+    C++ ref: ``ProtoModel::hasEffect`` → ``lookupEffect``
+    """
+    from ghidra.fspec.fspec import ProtoModel, ParamListStandard, ParamEntry, EffectRecord
+    model = ProtoModel("__cdecl", glb)
+    # Determine register space and pointer size
+    reg_space = None
+    ptr_size = 4
+    try:
+        reg_space = spc_mgr.getSpaceByName("register")
+    except Exception:
+        pass
+    code_space = getattr(spc_mgr, '_defaultCodeSpace', None)
+    if code_space is not None and hasattr(code_space, 'getAddrSize'):
+        ptr_size = code_space.getAddrSize()
+    ret_size = 8 if ptr_size == 8 else 4
+    # Build output parameter list from cspec output entries.
+    # x86-32 cdecl (from x86win.cspec / x86gcc.cspec):
+    #   <pentry minsize="4" maxsize="10" metatype="float"><register name="ST0"/></pentry>
+    #   <pentry minsize="1" maxsize="4"><register name="EAX"/></pentry>
+    #   <pentry minsize="5" maxsize="8"><addr space="join" piece1="EDX" piece2="EAX"/></pentry>
+    # For heritage, we need characterizeAsOutput() to return non-zero for both
+    # EAX (offset 0) and EDX (offset 8) so guardReturns adds both to RETURN ops.
+    # The join entry (EDX:EAX) means EDX is a potential return register piece.
+    out_list = ParamListStandard()
+    if reg_space is not None:
+        # Entry 0: ST0 (float return, register offset from SLEIGH spec)
+        entry_st0 = ParamEntry(0)
+        entry_st0.spaceid = reg_space
+        entry_st0.addressbase = 0x1100  # ST0 offset in x86 SLEIGH register space
+        entry_st0.size = 10
+        entry_st0.minsize = 4
+        entry_st0.alignment = 0
+        entry_st0.flags = ParamEntry.first_storage
+        out_list.addEntry(entry_st0)
+        # Entry 1: EAX (integer return, 1-4 bytes)
+        entry_eax = ParamEntry(0)
+        entry_eax.spaceid = reg_space
+        entry_eax.addressbase = 0  # EAX/RAX offset
+        entry_eax.size = ret_size
+        entry_eax.minsize = 1
+        entry_eax.alignment = 0
+        entry_eax.flags = ParamEntry.first_storage
+        out_list.addEntry(entry_eax)
+        if ptr_size == 4:
+            # Entry 2: EDX (part of EDX:EAX join for 5-8 byte returns)
+            # Heritage needs to recognize EDX as potential return storage.
+            entry_edx = ParamEntry(0)
+            entry_edx.spaceid = reg_space
+            entry_edx.addressbase = 0x8  # EDX offset
+            entry_edx.size = 4
+            entry_edx.minsize = 4
+            entry_edx.alignment = 0
+            entry_edx.flags = 0
+            out_list.addEntry(entry_edx)
+    model.output = out_list
+    # Build empty input parameter list with stack spacebase
+    model.input = ParamListStandard()
+    stack_space = getattr(spc_mgr, '_stackSpace', None)
+    if stack_space is not None:
+        model.input.spacebase = stack_space
+
+    # Build x86-32 cdecl effect list (from x86gcc.cspec)
+    if reg_space is not None:
+        effects = []
+        # x86-32 register offsets (from SLEIGH spec)
+        # unaffected (callee-saved): ESP=0x10, EBP=0x14, ESI=0x18, EDI=0x1c, EBX=0xc, DF=0x20a
+        for off, sz in ((0x10, 4), (0x14, 4), (0x18, 4), (0x1c, 4), (0x0c, 4), (0x20a, 1)):
+            effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.unaffected))
+        # killedbycall (volatile): ECX=0x4, EDX=0x8, ST0=0x1100, ST1=0x1110
+        # EAX=0x0 is killedbycall via autoKilledByCall (output killedbycall="true" in cspec)
+        for off, sz in ((0x00, 4), (0x04, 4), (0x08, 4), (0x1100, 10), (0x1110, 10)):
+            effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
+        # Sort by offset for lookupEffect binary search
+        effects.sort(key=lambda e: e.getAddress().getOffset())
+        model._effectlist = effects
+
+    # x86-32 cdecl: extrapop = 4 (return address popped by caller)
+    model.extrapop = 4
+    return model
+
+
 class _ArchitectureShim:
     """Minimal Architecture-like object for Heritage and Action pipeline.
 
@@ -57,6 +151,11 @@ class _ArchitectureShim:
         self.cpool = None
         self._unique_base: int = 0x10000000
         self._errors: List[str] = []
+        self.trim_recurse_max = 5
+        # Build a minimal default prototype model with return register info
+        self.defaultfp = _build_default_proto_model(spc_mgr, self)
+        self.evalfp_current = None
+        self.evalfp_called = None
 
     def numSpaces(self) -> int:
         return self._spc_mgr.numSpaces()
@@ -76,6 +175,9 @@ class _ArchitectureShim:
     def setUniqueBase(self, val: int) -> None:
         if val > self._unique_base:
             self._unique_base = val
+
+    def getSpaceByName(self, name: str):
+        return self._spc_mgr.getSpaceByName(name)
 
     def getDefaultCodeSpace(self):
         return self._spc_mgr._defaultCodeSpace
@@ -295,6 +397,53 @@ def _split_basic_blocks(fd) -> None:
     if not all_ops:
         return
 
+    # --- Step 0b: Convert BRANCHIND → CALLIND + synthetic RETURN ---
+    # C++ FlowInfo::truncateIndirectJump converts unresolved BRANCHIND ops
+    # to CALLIND and inserts a synthetic RETURN after them.
+    # We replicate this here since Python has no jump table recovery.
+    original_ops = set(id(op) for op in all_ops)  # track original block ops
+    new_all_ops = []
+    for op in all_ops:
+        new_all_ops.append(op)
+        if op.code() == OpCode.CPUI_BRANCHIND:
+            # Convert BRANCHIND → CALLIND
+            op.setOpcodeEnum(OpCode.CPUI_CALLIND)
+            # Create synthetic RETURN op after the CALLIND
+            # Matches C++ FlowInfo::artificialHalt which calls
+            # newVarnodeIop → newConstant(sizeof(op), op->getTime())
+            ret_op = fd.newOp(1, op.getSeqNum().getAddr())
+            ret_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+            # Create const varnode matching C++ newVarnodeIop behavior
+            uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
+            ret_in = fd.newConstant(4, uniq)
+            fd.opSetInput(ret_op, ret_in, 0)
+            new_all_ops.append(ret_op)
+    all_ops = new_all_ops
+
+    # --- Step 0c: Add trailing RETURN if function doesn't end with terminator ---
+    # C++ FlowInfo::artificialHalt adds a synthetic RETURN when flow falls off
+    # the end of a function without an explicit return/branch instruction.
+    if all_ops:
+        last_opc = all_ops[-1].code()
+        terminators = {OpCode.CPUI_RETURN, OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH,
+                       OpCode.CPUI_BRANCHIND, OpCode.CPUI_CALLIND}
+        if last_opc not in terminators:
+            last_addr = all_ops[-1].getSeqNum().getAddr()
+            # Compute the next address after the last instruction
+            last_off = last_addr.getOffset()
+            # Find the machine instruction length from the last op's address
+            # by looking for the next different machine address in ops
+            next_off = last_off + 1  # default: 1 byte past last op
+            # Try to find the actual instruction end from the lifting context
+            # For now, use the address right after last op
+            next_addr = Address(last_addr.getSpace(), next_off)
+            ret_op = fd.newOp(1, next_addr)
+            ret_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+            uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
+            ret_in = fd.newConstant(4, uniq)
+            fd.opSetInput(ret_op, ret_in, 0)
+            all_ops.append(ret_op)
+
     # --- Step 1: Identify basic block start indices ---
     # The first op always starts a block
     block_starts: set = {0}
@@ -305,6 +454,46 @@ def _split_basic_blocks(fd) -> None:
         pc = op.getSeqNum().getAddr().getOffset()
         if pc not in addr_to_first_idx:
             addr_to_first_idx[pc] = i
+
+    # Build per-instruction op groups for resolving constant branch targets.
+    # SLEIGH BRANCH/CBRANCH const[N] means "jump N p-code ops forward from
+    # the current op within the same instruction" (relative offset, signed).
+    # Used by REP-prefix instructions, etc.
+    insn_groups: Dict[int, List[int]] = {}  # addr -> [all_ops indices]
+    for i, op in enumerate(all_ops):
+        pc = op.getSeqNum().getAddr().getOffset()
+        insn_groups.setdefault(pc, []).append(i)
+
+    # Map all_ops index -> position within instruction group
+    op_idx_to_insn_pos: Dict[int, int] = {}
+    for pc, group in insn_groups.items():
+        for pos, idx in enumerate(group):
+            op_idx_to_insn_pos[idx] = pos
+
+    def _resolve_const_target(branch_op_idx: int, const_offset: int) -> int:
+        """Resolve a constant branch target to an all_ops index.
+
+        const_offset is a RELATIVE offset from the branch op's position
+        within the instruction.  Sign-extend for backward branches.
+        """
+        pc = all_ops[branch_op_idx].getSeqNum().getAddr().getOffset()
+        group = insn_groups.get(pc, [])
+        if not group:
+            return -1
+        # Sign-extend const_offset (treat as signed 32-bit)
+        if const_offset >= 0x80000000:
+            const_offset -= 0x100000000
+        # Current op's position within the instruction
+        cur_pos = op_idx_to_insn_pos.get(branch_op_idx, 0)
+        target_pos = cur_pos + const_offset
+        if 0 <= target_pos < len(group):
+            return group[target_pos]
+        # If target is past the end, it falls through to the next instruction
+        if target_pos >= len(group):
+            last_idx = group[-1]
+            if last_idx + 1 < len(all_ops):
+                return last_idx + 1
+        return -1
 
     for i, op in enumerate(all_ops):
         opc = op.code()
@@ -320,57 +509,64 @@ def _split_basic_blocks(fd) -> None:
                     tgt_off = tgt_addr.getOffset()
                     if tgt_off in addr_to_first_idx:
                         block_starts.add(addr_to_first_idx[tgt_off])
-        elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
-            # C++ FlowInfo splits at call sites
-            if i + 1 < len(all_ops):
-                block_starts.add(i + 1)
-            # C++ converts CALL→BRANCH, so the call target is also a block leader
-            if opc == OpCode.CPUI_CALL:
-                target_vn = op.getIn(0)
-                if target_vn is not None:
-                    tgt_addr = target_vn.getAddr()
-                    if not tgt_addr.isConstant():
-                        tgt_off = tgt_addr.getOffset()
-                        if tgt_off in addr_to_first_idx:
-                            block_starts.add(addr_to_first_idx[tgt_off])
-        elif opc in (OpCode.CPUI_BRANCHIND, OpCode.CPUI_RETURN):
-            # Op after this terminates the block
+                else:
+                    # Internal p-code branch: const[N] = Nth op in this insn
+                    tgt_idx = _resolve_const_target(i, tgt_addr.getOffset())
+                    if 0 <= tgt_idx < len(all_ops):
+                        block_starts.add(tgt_idx)
+        elif opc == OpCode.CPUI_RETURN:
+            # Op after RETURN terminates the block
             if i + 1 < len(all_ops):
                 block_starts.add(i + 1)
 
     if len(block_starts) <= 1:
-        return  # No splitting needed
+        # No splitting needed, but if we added synthetic ops (e.g. RETURN
+        # after converted CALLIND), rebuild the single block's op list.
+        if len(all_ops) != len(original_ops):
+            for op in list(old_bb.getOpList()):
+                old_bb.removeOp(op)
+                op.setParent(None)
+            for op in all_ops:
+                old_bb.addOp(op)
+                op.setParent(old_bb)
+                fd.opMarkAlive(op)
+            first_addr = all_ops[0].getSeqNum().getAddr()
+            last_addr = all_ops[-1].getSeqNum().getAddr()
+            old_bb.setInitialRange(first_addr, last_addr)
+        # Normalize branch target sizes and add self-loop edges
+        func_off = fd.getAddress().getOffset() if fd.getAddress() else None
+        for op in all_ops:
+            opc = op.code()
+            if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH):
+                target_vn = op.getIn(0)
+                if target_vn is not None and target_vn.getSize() != 1:
+                    target_vn._size = 1
+                # Add self-loop edge if branch targets own block
+                if target_vn is not None:
+                    tgt_addr = target_vn.getAddr()
+                    if not tgt_addr.isConstant():
+                        tgt_off = tgt_addr.getOffset()
+                        if tgt_off == func_off:
+                            bblocks.addEdge(old_bb, old_bb)
+        return
 
-    # --- Step 1b: Convert intra-function CALL→BRANCH (matching C++ FlowInfo) ---
-    # C++ FlowInfo converts CALL ops whose target is within the function into
-    # BRANCH ops.  Reproduce the same transformation here so that the Python
-    # IR matches the C++ IR at the flow stage.
-    for op in all_ops:
-        opc = op.code()
-        if opc == OpCode.CPUI_CALL:
-            target_vn = op.getIn(0)
-            if target_vn is not None:
-                tgt_addr = target_vn.getAddr()
-                if not tgt_addr.isConstant():
-                    tgt_off = tgt_addr.getOffset()
-                    if tgt_off in addr_to_first_idx:
-                        op.setOpcodeEnum(OpCode.CPUI_BRANCH)
-
-    # --- Step 1c: Normalize branch target varnode sizes to 1 ---
+    # --- Step 1b: Normalize branch target varnode sizes to 1 ---
     # C++ FlowInfo sets BRANCH/CBRANCH target address varnodes to size=1
-    # (they represent labels, not real data addresses).
+    # (they represent labels, not real data addresses).  This applies to
+    # both code-space labels and constant-offset relative targets.
     for op in all_ops:
         opc = op.code()
         if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH):
             target_vn = op.getIn(0)
-            if target_vn is not None and not target_vn.getAddr().isConstant():
-                if target_vn.getSize() != 1:
-                    target_vn._size = 1
+            if target_vn is not None and target_vn.getSize() != 1:
+                target_vn._size = 1
 
     # --- Step 2: Remove all ops from the old block ---
+    # Only remove ops that were originally in the block (not synthetic ones)
     for op in all_ops:
-        old_bb.removeOp(op)
-        op.setParent(None)
+        if id(op) in original_ops:
+            old_bb.removeOp(op)
+            op.setParent(None)
 
     # Remove the old block from the graph
     bblocks.clear()
@@ -402,7 +598,18 @@ def _split_basic_blocks(fd) -> None:
         bb = bblocks.getBlock(bi)
         entry = bb.getEntryAddr()
         if entry and not entry.isInvalid():
-            block_by_entry[entry.getOffset()] = bi
+            off = entry.getOffset()
+            if off not in block_by_entry:
+                block_by_entry[off] = bi
+
+    # Build identity-based maps for constant branch target resolution
+    op_id_to_allidx: Dict[int, int] = {id(op): i for i, op in enumerate(all_ops)}
+    # Map: first-op identity → block index (for finding target block)
+    first_op_id_to_bi: Dict[int, int] = {}
+    for bi in range(bblocks.getSize()):
+        bb_ops = bblocks.getBlock(bi).getOpList()
+        if bb_ops:
+            first_op_id_to_bi[id(bb_ops[0])] = bi
 
     for bi in range(bblocks.getSize()):
         bb = bblocks.getBlock(bi)
@@ -413,7 +620,7 @@ def _split_basic_blocks(fd) -> None:
         opc = last_op.code()
 
         # Fall-through edge (if not unconditional branch or return)
-        if opc not in (OpCode.CPUI_BRANCH, OpCode.CPUI_BRANCHIND, OpCode.CPUI_RETURN):
+        if opc not in (OpCode.CPUI_BRANCH, OpCode.CPUI_RETURN):
             if bi + 1 < bblocks.getSize():
                 bblocks.addEdge(bb, bblocks.getBlock(bi + 1))
 
@@ -427,12 +634,169 @@ def _split_basic_blocks(fd) -> None:
                     tgt_bi = block_by_entry.get(tgt_off)
                     if tgt_bi is not None:
                         bblocks.addEdge(bb, bblocks.getBlock(tgt_bi))
+                else:
+                    # Internal p-code branch: resolve const target to block
+                    last_op_idx = op_id_to_allidx.get(id(last_op), -1)
+                    if last_op_idx >= 0:
+                        tgt_idx = _resolve_const_target(last_op_idx, tgt_addr.getOffset())
+                        if 0 <= tgt_idx < len(all_ops):
+                            tgt_op = all_ops[tgt_idx]
+                            tgt_bi2 = first_op_id_to_bi.get(id(tgt_op))
+                            if tgt_bi2 is not None:
+                                bblocks.addEdge(bb, bblocks.getBlock(tgt_bi2))
 
         # CBRANCH also has fall-through
         if opc == OpCode.CPUI_CBRANCH:
             if bi + 1 < bblocks.getSize():
                 # Already added above in the fall-through case
                 pass
+
+
+def _inject_tracked_context(fd, lifter=None) -> None:
+    """Inject COPY ops for tracked context registers at function entry.
+
+    C++ ``ActionConstbase::apply`` reads the tracked context set from
+    ``arch->context->getTrackedSet(funcAddr)`` and inserts a COPY from a
+    constant for each tracked register at the start of block 0.
+
+    For x86-32, the only tracked context register is DF (direction flag)
+    at register offset 0x20a, size 1, value 0.
+
+    C++ ref: coreaction.cc  ActionConstbase::apply
+    """
+    bblocks = fd.getBasicBlocks()
+    if bblocks.getSize() == 0:
+        return
+
+    # Find the block at the function entry address (not necessarily block 0).
+    # For functions with backward jumps, block 0 may be before the entry.
+    func_entry = fd.getAddress()
+    func_off = func_entry.getOffset() if func_entry else None
+    bb = bblocks.getBlock(0)  # default fallback
+    for bi in range(bblocks.getSize()):
+        blk = bblocks.getBlock(bi)
+        blk_start = blk.getStart() if hasattr(blk, 'getStart') else None
+        if blk_start and blk_start.getOffset() == func_off:
+            bb = blk
+            break
+    entry_addr = bb.getStart() if hasattr(bb, 'getStart') else func_entry
+
+    # For x86-32: DF (direction flag) = 0
+    # register offset 0x20a, size 1, value 0
+    tracked_regs = []
+    arch = fd.getArch() if hasattr(fd, 'getArch') else None
+    if arch is not None:
+        reg_space = None
+        try:
+            reg_space = arch.getSpaceByName("register")
+        except Exception:
+            pass
+        if reg_space is not None:
+            # x86-32 tracked context: DF at offset 0x20a, size 1, value 0
+            tracked_regs.append((reg_space, 0x20a, 1, 0))
+
+    for reg_space, offset, size, val in tracked_regs:
+        op = fd.newOp(1, entry_addr)
+        out_addr = Address(reg_space, offset)
+        fd.newVarnodeOut(size, out_addr, op)
+        vn_const = fd.newConstant(size, val)
+        fd.opSetOpcode(op, OpCode.CPUI_COPY)
+        fd.opSetInput(op, vn_const, 0)
+        fd.opInsertBegin(op, bb)
+
+
+def _run_prerequisite_actions(fd) -> None:
+    """Run the C++ prerequisite actions before heritage.
+
+    C++ decompiler_bind.cpp runs these actions in order before opHeritage():
+      ActionStart, ActionConstbase, ActionNormalizeSetup, ActionDefaultParams,
+      ActionExtraPopSetup, ActionPrototypeTypes, ActionFuncLink,
+      ActionFuncLinkOutOnly, ActionUnreachable, ActionVarnodeProps.
+
+    ActionStart (startProcessing/FlowInfo) and ActionConstbase (tracked context)
+    are handled separately by the Lifter and _inject_tracked_context().
+    This function runs the remaining actions.
+
+    C++ ref: decompiler_bind.cpp lines 384-393
+    """
+    from ghidra.transform.coreaction2 import (
+        ActionNormalizeSetup, ActionDefaultParams, ActionExtraPopSetup,
+        ActionPrototypeTypes, ActionFuncLink, ActionFuncLinkOutOnly,
+    )
+    from ghidra.transform.coreaction import ActionVarnodeProps
+
+    arch = fd.getArch() if hasattr(fd, 'getArch') else None
+    stackspace = arch.getStackSpace() if arch is not None else None
+
+    # ActionStart normally calls startProcessing() which calls structureReset().
+    # structureReset() → structureLoops() → findSpanningTree() reorders blocks
+    # into reverse-post-order (matching C++ block numbering).
+    # We call structureReset() directly since blocks are already built.
+    if hasattr(fd, 'structureReset'):
+        fd.structureReset()
+    if hasattr(fd, 'sortCallSpecs'):
+        fd.sortCallSpecs()
+
+    actions = [
+        ActionNormalizeSetup("normalanalysis"),
+        ActionDefaultParams("base"),
+        ActionExtraPopSetup("base", stackspace),
+        ActionPrototypeTypes("protorecovery"),
+        ActionFuncLink("protorecovery"),
+        ActionFuncLinkOutOnly("noproto"),
+        # ActionUnreachable skipped — requires block structure analysis
+        ActionVarnodeProps("base"),
+    ]
+    for act in actions:
+        try:
+            act.reset(fd)
+            act.apply(fd)
+        except Exception:
+            pass  # Non-fatal: action may need infrastructure not yet available
+
+
+def _setup_call_specs(fd, lifter=None) -> None:
+    """Create FuncCallSpecs for every CALL/CALLIND op in the Funcdata.
+
+    C++ FlowInfo::setupCallSpecs / setupCallindSpecs creates these during
+    startProcessing().  The Python Lifter path skips FlowInfo, so we must
+    create them after _split_basic_blocks so that Heritage::guardCalls can
+    insert INDIRECT ops for call effects.
+
+    The default ProtoModel (with effect list) is taken from
+    ``fd.getArch().defaultfp`` if available, so that ``hasEffect()``
+    returns proper ``unaffected`` / ``killedbycall`` for x86-32 cdecl
+    registers.
+
+    C++ ref: flow.cc  FlowInfo::setupCallSpecs / setupCallindSpecs
+    """
+    from ghidra.fspec.fspec import FuncCallSpecs
+
+    # Get default model from architecture (already has effect list)
+    default_model = None
+    arch = fd.getArch() if hasattr(fd, 'getArch') else None
+    if arch is not None and hasattr(arch, 'defaultfp'):
+        default_model = arch.defaultfp
+
+    bblocks = fd.getBasicBlocks()
+    for bi in range(bblocks.getSize()):
+        bb = bblocks.getBlock(bi)
+        for op in bb.getOpList():
+            opc = op.code()
+            if opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                fc = FuncCallSpecs(op)
+                # For direct CALL, record the target address
+                if opc == OpCode.CPUI_CALL and op.numInput() > 0:
+                    tgt = op.getIn(0).getAddr()
+                    if tgt is not None and not tgt.isConstant():
+                        fc.setAddress(tgt)
+                # Attach default prototype model so hasEffect works properly.
+                # Use direct assignment (not setModel) to keep extrapop at
+                # unknown (0x8000), matching C++ heritage behavior where
+                # ExtraPopSetup creates INDIRECT(ESP) before calls.
+                if default_model is not None and hasattr(fc, 'proto'):
+                    fc.proto.model = default_model
+                fd.addCallSpecs(fc)
 
 
 def _run_mini_pipeline(fd) -> None:
@@ -517,6 +881,17 @@ def _run_full_decompile_action(fd) -> None:
 
 
 def _seed_default_return_output(fd, target: str) -> None:
+    """Lock the output prototype with the return register so that
+    ActionPrototypeTypes will wire it to RETURN ops before Heritage.
+
+    For the full actions pipeline, ActionPrototypeTypes (which runs before
+    Heritage) will add the return register as a free varnode input on each
+    RETURN op. Heritage then builds MULTIEQUALs connecting the actual
+    register writes to those inputs.
+
+    We must NOT also manually wire varnodes here, as that would create
+    duplicate inputs that ActionPrototypeTypes adds on top of.
+    """
     parts = target.split(":")
     if len(parts) < 3:
         return
@@ -536,66 +911,19 @@ def _seed_default_return_output(fd, target: str) -> None:
         return
 
     ret_addr = Address(reg_space, 0)
-    default_vn = fd.findVarnodeInput(ret_size, ret_addr)
-    if default_vn is None:
-        default_vn = fd.setInputVarnode(fd.newVarnode(ret_size, ret_addr))
 
-    ret_cache = {}
-    ret_visiting = set()
-
-    def find_reaching_ret_vn(bl):
-        bid = id(bl)
-        cached = ret_cache.get(bid)
-        if cached is not None:
-            return cached
-        if bid in ret_visiting:
-            return default_vn
-        ret_visiting.add(bid)
-        try:
-            if hasattr(bl, "getOpList"):
-                for op in bl.getOpList():
-                    if op.code() == OpCode.CPUI_MULTIEQUAL:
-                        out = op.getOut()
-                        if out is not None and out.getAddr() == ret_addr and out.getSize() == ret_size:
-                            ret_cache[bid] = out
-                            return out
-                for op in reversed(bl.getOpList()):
-                    out = op.getOut()
-                    if out is None:
-                        continue
-                    if out.getAddr() == ret_addr and out.getSize() == ret_size:
-                        ret_cache[bid] = out
-                        return out
-            if bl.sizeIn() == 0:
-                ret_cache[bid] = default_vn
-                return default_vn
-            if bl.sizeIn() == 1 and bl.sizeOut() <= 1:
-                res = find_reaching_ret_vn(bl.getIn(0))
-                ret_cache[bid] = res
-                return res
-            if bl.sizeIn() > 1 and bl.sizeOut() <= 1:
-                multi = fd.newOp(bl.sizeIn(), bl.getStart() if hasattr(bl, "getStart") else ret_addr)
-                fd.opSetOpcode(multi, OpCode.CPUI_MULTIEQUAL)
-                outvn = fd.newVarnodeOut(ret_size, ret_addr, multi)
-                ret_cache[bid] = outvn
-                for slot in range(bl.sizeIn()):
-                    fd.opSetInput(multi, find_reaching_ret_vn(bl.getIn(slot)), slot)
-                fd.opInsertBegin(multi, bl)
-                return outvn
-            ret_cache[bid] = default_vn
-            return default_vn
-        finally:
-            ret_visiting.discard(bid)
-
-    bblocks = fd.getBasicBlocks()
-    for bi in range(bblocks.getSize()):
-        bb = bblocks.getBlock(bi)
-        retop = bb.lastOp() if hasattr(bb, "lastOp") else None
-        if retop is None or retop.code() != OpCode.CPUI_RETURN:
-            continue
-        if retop.numInput() > 1:
-            continue
-        fd.opInsertInput(retop, find_reaching_ret_vn(bb), retop.numInput())
+    # Lock the output prototype with the return register so that
+    # ActionPrototypeTypes will add it to RETURN ops.
+    proto = fd.getFuncProto()
+    if not proto.isOutputLocked():
+        glb = fd.getArch()
+        int_type = None
+        if glb is not None and hasattr(glb, 'types'):
+            int_type = glb.types.getBase(ret_size, 8)  # TYPE_INT = 8
+        from ghidra.fspec.fspec import ProtoParameter
+        outparam = ProtoParameter("", int_type, ret_addr, ret_size)
+        outparam.setTypeLock(True)
+        proto.outparam = outparam
 
 
 def _printc_from_funcdata(fd) -> str:
@@ -708,6 +1036,7 @@ class DecompilerPython:
     def __init__(self) -> None:
         self._initialized: bool = False
         self._errors: str = ""
+        self._warnings: str = ""
 
         # Module flags — enable/disable each Python module
         self.use_python_ir: bool = True       # Module 1: Lifter → Python Funcdata
@@ -751,6 +1080,7 @@ class DecompilerPython:
             C-like pseudocode as a string.
         """
         self._errors = ""
+        self._warnings = ""
 
         try:
             if not self._initialized:
@@ -813,7 +1143,7 @@ class DecompilerPython:
                     import traceback
                     self._errors += traceback.format_exc()
             for msg in arch_shim.drainMessages():
-                self._errors += f"{msg}\n"
+                self._warnings += f"{msg}\n"
 
             # --- Module 5: PrintC (C code generation) ---
             if self.use_python_printc:
@@ -837,5 +1167,9 @@ class DecompilerPython:
             return f"// ERROR: {e}\n"
 
     def get_errors(self) -> str:
-        """Get error/warning messages from the last operation."""
+        """Get error messages from the last operation."""
         return self._errors
+
+    def get_warnings(self) -> str:
+        """Get warning messages from the last operation."""
+        return self._warnings

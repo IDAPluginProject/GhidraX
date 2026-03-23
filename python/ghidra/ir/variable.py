@@ -1035,9 +1035,10 @@ class HighIntersectTest:
 
     def updateHigh(self, a: HighVariable) -> bool:
         """Make sure given HighVariable's Cover is up-to-date."""
-        if not a.isCoverDirty():
+        if not hasattr(a, 'isCoverDirty') or not a.isCoverDirty():
             return True
-        a.updateCover()
+        if hasattr(a, 'updateCover'):
+            a.updateCover()
         self._purgeHigh(a)
         return False
 
@@ -1053,16 +1054,20 @@ class HighIntersectTest:
             if cached is not None:
                 return cached
         res = False
-        aCover = a.getCover()
-        bCover = b.getCover()
-        if aCover is not None and bCover is not None and hasattr(aCover, 'intersectList'):
-            blockisect = []
-            aCover.intersectList(blockisect, bCover, 2)
-            for blk in blockisect:
-                if self._blockIntersection(a, b, blk):
-                    res = True
-                    break
-        if not res:
+        aCover = a.getCover() if hasattr(a, 'getCover') else None
+        bCover = b.getCover() if hasattr(b, 'getCover') else None
+        if aCover is not None and bCover is not None:
+            if hasattr(aCover, 'intersectList') and hasattr(a, 'numInstances'):
+                blockisect = aCover.intersectList(bCover, 2)
+                for blk in blockisect:
+                    if self._blockIntersection(a, b, blk):
+                        res = True
+                        break
+            else:
+                # Fallback for objects without full HighVariable API
+                val = aCover.intersect(bCover) if hasattr(aCover, 'intersect') else 0
+                res = (val == 2)
+        if not res and hasattr(a, 'isAddrTied') and hasattr(b, 'isAddrTied'):
             aTied = a.isAddrTied()
             bTied = b.isAddrTied()
             if aTied != bTied:

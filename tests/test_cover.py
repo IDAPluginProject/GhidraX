@@ -92,7 +92,7 @@ class TestCoverBlock:
         cb2 = CoverBlock()
         cb2.setBegin(_FakeOp(10))
         cb2.setEnd(_FakeOp(20))
-        assert cb1.intersect(cb2) == 1
+        assert cb1.intersect(cb2) == 2
 
     def test_intersect_boundary(self):
         cb1 = CoverBlock()
@@ -101,7 +101,7 @@ class TestCoverBlock:
         cb2 = CoverBlock()
         cb2.setBegin(_FakeOp(10))
         cb2.setEnd(_FakeOp(20))
-        assert cb1.intersect(cb2) == 2
+        assert cb1.intersect(cb2) == 1
 
     def test_intersect_empty(self):
         cb1 = CoverBlock()
@@ -192,7 +192,7 @@ class TestCover:
         cb2 = CoverBlock()
         cb2.setAll()
         c2._cover[0] = cb2
-        assert c1.intersect(c2) == 1
+        assert c1.intersect(c2) == 2
 
     def test_intersect_by_block(self):
         c1 = Cover()
@@ -203,7 +203,7 @@ class TestCover:
         cb2 = CoverBlock()
         cb2.setAll()
         c2._cover[0] = cb2
-        assert c1.intersectByBlock(0, c2) == 1
+        assert c1.intersectByBlock(0, c2) == 2
         assert c1.intersectByBlock(1, c2) == 0
 
     def test_intersect_list(self):

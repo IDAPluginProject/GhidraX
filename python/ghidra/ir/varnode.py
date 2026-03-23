@@ -618,7 +618,7 @@ class Varnode:
             return True
         # Extended form: updateType(ct, lock, override)
         if ct is not None and hasattr(ct, 'getMetatype'):
-            from ghidra.types.datatypes import TYPE_UNKNOWN
+            from ghidra.types.datatype import TYPE_UNKNOWN
             if ct.getMetatype() == TYPE_UNKNOWN:
                 lock = False
         if self.isTypeLock() and not override:
@@ -653,8 +653,7 @@ class Varnode:
         sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
         if sym is None:
             return
-        # Simplified: just copy if both are constants
-        if self.isConstant() and vn.isConstant():
+        if hasattr(sym, 'isValueClose') and sym.isValueClose(self._loc.getOffset(), self._size):
             self.copySymbol(vn)
 
     def setSymbolProperties(self, entry) -> bool:
@@ -910,7 +909,7 @@ class Varnode:
             return False
         if (self._flags & (Varnode.input | Varnode.typelock)) == (Varnode.input | Varnode.typelock):
             if self._size == 1 and self._type is not None and hasattr(self._type, 'getMetatype'):
-                from ghidra.types.datatypes import TYPE_BOOL
+                from ghidra.types.datatype import TYPE_BOOL
                 if self._type.getMetatype() == TYPE_BOOL:
                     return True
         return False
@@ -1284,8 +1283,8 @@ class VarnodeBank:
 
     def __init__(self, manage=None) -> None:
         self._manage = manage  # AddrSpaceManager
-        self._loc_tree: List[Varnode] = []  # Sorted by location
-        self._def_tree: List[Varnode] = []  # Sorted by definition
+        self._loc_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
+        self._def_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
         self._create_index: int = 0
         self._uniq_space = None
         self._uniqbase: int = 0
@@ -1308,15 +1307,15 @@ class VarnodeBank:
         return len(self._loc_tree)
 
     def empty(self) -> bool:
-        return len(self._loc_tree) == 0
+        return not self._loc_tree
 
     def create(self, s: int, m: Address, dt=None) -> Varnode:
         """Create a new Varnode and add it to the bank."""
         vn = Varnode(s, m, dt)
         vn._create_index = self._create_index
         self._create_index += 1
-        self._loc_tree.append(vn)
-        self._def_tree.append(vn)
+        self._loc_tree[id(vn)] = vn
+        self._def_tree[id(vn)] = vn
         return vn
 
     def createDef(self, s: int, m: Address, dt, op: PcodeOp) -> Varnode:
@@ -1326,49 +1325,43 @@ class VarnodeBank:
         return vn
 
     def destroy(self, vn: Varnode) -> None:
-        """Remove a Varnode from the bank."""
-        try:
-            self._loc_tree.remove(vn)
-        except ValueError:
-            pass
-        try:
-            self._def_tree.remove(vn)
-        except ValueError:
-            pass
+        """Remove a Varnode from the bank (O(1) via dict pop)."""
+        vnid = id(vn)
+        self._loc_tree.pop(vnid, None)
+        self._def_tree.pop(vnid, None)
 
     def clearDead(self) -> None:
         """Remove Varnodes that have no def and no descendants."""
-        alive = [vn for vn in self._loc_tree
-                 if vn.isWritten() or not vn.hasNoDescend()
-                 or vn.isInput() or vn.isConstant()]
-        self._loc_tree = alive
-        alive_set = set(id(v) for v in alive)
-        self._def_tree = [vn for vn in self._def_tree if id(vn) in alive_set]
+        alive_ids = {k for k, vn in self._loc_tree.items()
+                     if vn.isWritten() or not vn.hasNoDescend()
+                     or vn.isInput() or vn.isConstant()}
+        self._loc_tree = {k: v for k, v in self._loc_tree.items() if k in alive_ids}
+        self._def_tree = {k: v for k, v in self._def_tree.items() if k in alive_ids}
 
     def getCreateIndex(self) -> int:
         return self._create_index
 
     def beginLoc(self) -> Iterator[Varnode]:
-        return iter(self._loc_tree)
+        return iter(self._loc_tree.values())
 
     def beginDef(self) -> Iterator[Varnode]:
-        return iter(self._def_tree)
+        return iter(self._def_tree.values())
 
     def findLoc(self, addr: Address, size: int) -> List[Varnode]:
         """Find all Varnodes at the given location and size."""
-        return [vn for vn in self._loc_tree
+        return [vn for vn in self._loc_tree.values()
                 if vn.getAddr() == addr and vn.getSize() == size]
 
     def findInput(self, size: int, addr: Address) -> Optional[Varnode]:
         """Find an input Varnode of given size at given address."""
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if vn.getAddr() == addr and vn.getSize() == size and vn.isInput():
                 return vn
         return None
 
     def allVarnodes(self) -> Iterator[Varnode]:
         """Iterate over all Varnodes in the bank."""
-        return iter(self._loc_tree)
+        return iter(self._loc_tree.values())
 
     def createUnique(self, s: int, dt=None) -> Varnode:
         """Create a temporary Varnode in unique space."""
@@ -1389,19 +1382,14 @@ class VarnodeBank:
 
     def makeFree(self, vn: Varnode) -> None:
         """Convert a Varnode to be free."""
-        try:
-            self._loc_tree.remove(vn)
-        except ValueError:
-            pass
-        try:
-            self._def_tree.remove(vn)
-        except ValueError:
-            pass
+        vnid = id(vn)
+        self._loc_tree.pop(vnid, None)
+        self._def_tree.pop(vnid, None)
         vn._def = None
         vn.clearFlags(Varnode.insert | Varnode.input | Varnode.written | Varnode.indirect_creation)
         vn.setFlags(Varnode.coverdirty)
-        self._loc_tree.append(vn)
-        self._def_tree.append(vn)
+        self._loc_tree[vnid] = vn
+        self._def_tree[vnid] = vn
 
     def replace(self, oldvn: Varnode, newvn: Varnode) -> None:
         """Replace every read of oldvn with newvn."""
@@ -1420,7 +1408,7 @@ class VarnodeBank:
     def xref(self, vn: Varnode) -> Varnode:
         """Insert a Varnode into the sorted lists, handling duplicates."""
         # Check for existing match in loc_tree
-        for existing in self._loc_tree:
+        for existing in self._loc_tree.values():
             if (existing.getAddr() == vn.getAddr() and
                     existing.getSize() == vn.getSize() and
                     existing.getFlags() & (Varnode.input | Varnode.written) ==
@@ -1434,8 +1422,9 @@ class VarnodeBank:
                     self.replace(vn, existing)
                     return existing
         vn.setFlags(Varnode.insert)
-        self._loc_tree.append(vn)
-        self._def_tree.append(vn)
+        vnid = id(vn)
+        self._loc_tree[vnid] = vn
+        self._def_tree[vnid] = vn
         return vn
 
     def setInput(self, vn: Varnode) -> Varnode:
@@ -1444,14 +1433,9 @@ class VarnodeBank:
             raise RuntimeError("Making input out of varnode which is not free")
         if vn.isConstant():
             raise RuntimeError("Making input out of constant varnode")
-        try:
-            self._loc_tree.remove(vn)
-        except ValueError:
-            pass
-        try:
-            self._def_tree.remove(vn)
-        except ValueError:
-            pass
+        vnid = id(vn)
+        self._loc_tree.pop(vnid, None)
+        self._def_tree.pop(vnid, None)
         vn.setInput()
         return self.xref(vn)
 
@@ -1461,20 +1445,15 @@ class VarnodeBank:
             raise RuntimeError("Defining varnode which is not free")
         if vn.isConstant():
             raise RuntimeError("Assignment to constant")
-        try:
-            self._loc_tree.remove(vn)
-        except ValueError:
-            pass
-        try:
-            self._def_tree.remove(vn)
-        except ValueError:
-            pass
+        vnid = id(vn)
+        self._loc_tree.pop(vnid, None)
+        self._def_tree.pop(vnid, None)
         vn.setDef(op)
         return self.xref(vn)
 
     def find(self, s: int, loc: Address, pc: Address = None, uniq: int = None) -> Optional[Varnode]:
         """Find a Varnode given (loc, size) and optionally the defining address."""
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if vn.getAddr() != loc or vn.getSize() != s:
                 continue
             if pc is None:
@@ -1488,7 +1467,7 @@ class VarnodeBank:
     def findCoveredInput(self, size: int, addr: Address) -> Optional[Varnode]:
         """Find an input Varnode completely contained within the given range."""
         end = addr.getOffset() + size - 1
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if not vn.isInput():
                 continue
             if vn.getAddr().getSpace() is not addr.getSpace():
@@ -1500,7 +1479,7 @@ class VarnodeBank:
 
     def findCoveringInput(self, size: int, addr: Address) -> Optional[Varnode]:
         """Find an input Varnode that completely covers the given range."""
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if not vn.isInput():
                 continue
             if vn.getAddr().getSpace() is not addr.getSpace():
@@ -1512,7 +1491,7 @@ class VarnodeBank:
 
     def hasInputIntersection(self, size: int, addr: Address) -> bool:
         """Check for input Varnode that overlaps the given range."""
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if not vn.isInput():
                 continue
             if vn.intersects(addr, size):
@@ -1527,24 +1506,24 @@ class VarnodeBank:
 
     def beginLocSpace(self, spaceid: AddrSpace) -> List[Varnode]:
         """Get Varnodes in given address space sorted by location."""
-        return [vn for vn in self._loc_tree if vn.getSpace() is spaceid]
+        return [vn for vn in self._loc_tree.values() if vn.getSpace() is spaceid]
 
     def endLocSpace(self, spaceid: AddrSpace) -> List[Varnode]:
         return []
 
     def beginLocAddr(self, addr: Address) -> List[Varnode]:
         """Get Varnodes starting at given address."""
-        return [vn for vn in self._loc_tree if vn.getAddr() == addr]
+        return [vn for vn in self._loc_tree.values() if vn.getAddr() == addr]
 
     def beginLocSize(self, s: int, addr: Address) -> List[Varnode]:
         """Get Varnodes of given size at given address."""
-        return [vn for vn in self._loc_tree
+        return [vn for vn in self._loc_tree.values()
                 if vn.getAddr() == addr and vn.getSize() == s]
 
     def beginLocFlags(self, s: int, addr: Address, fl: int) -> List[Varnode]:
         """Get Varnodes of given size at address with matching flags."""
         result = []
-        for vn in self._loc_tree:
+        for vn in self._loc_tree.values():
             if vn.getAddr() != addr or vn.getSize() != s:
                 continue
             vn_fl = vn.getFlags() & (Varnode.input | Varnode.written)
@@ -1559,16 +1538,16 @@ class VarnodeBank:
     def beginDefFlags(self, fl: int) -> List[Varnode]:
         """Get Varnodes by definition property."""
         if fl == Varnode.input:
-            return [vn for vn in self._def_tree if vn.isInput()]
+            return [vn for vn in self._def_tree.values() if vn.isInput()]
         elif fl == Varnode.written:
-            return [vn for vn in self._def_tree if vn.isWritten()]
+            return [vn for vn in self._def_tree.values() if vn.isWritten()]
         else:
-            return [vn for vn in self._def_tree if vn.isFree()]
+            return [vn for vn in self._def_tree.values() if vn.isFree()]
 
     def beginDefFlagsAddr(self, fl: int, addr: Address) -> List[Varnode]:
         """Get Varnodes by definition property and address."""
         if fl == Varnode.input:
-            return [vn for vn in self._def_tree
+            return [vn for vn in self._def_tree.values()
                     if vn.isInput() and vn.getAddr() == addr]
         return []
 
@@ -1579,21 +1558,22 @@ class VarnodeBank:
         bounds is filled with sub-range iterators (as lists of Varnodes).
         """
         # Simplified Python version: collect all overlapping varnodes
-        if not self._loc_tree:
+        all_vns = list(self._loc_tree.values())
+        if not all_vns:
             return 0
         # Find the varnode at startiter position
         start_idx = 0
         if isinstance(startiter, int):
             start_idx = startiter
-        vn = self._loc_tree[start_idx]
+        vn = all_vns[start_idx]
         spc = vn.getSpace()
         off = vn.getOffset()
         maxOff = off + (vn.getSize() - 1)
         flags = vn.getFlags()
         group = [vn]
         idx = start_idx + 1
-        while idx < len(self._loc_tree):
-            vn2 = self._loc_tree[idx]
+        while idx < len(all_vns):
+            vn2 = all_vns[idx]
             if vn2.getSpace() is not spc or vn2.getOffset() > maxOff:
                 break
             if vn2.isFree():
@@ -1613,14 +1593,12 @@ class VarnodeBank:
         if not self._loc_tree:
             return
         # Check every loc_tree entry exists in def_tree
-        def_set = set(id(v) for v in self._def_tree)
-        for vn in self._loc_tree:
-            if id(vn) not in def_set:
+        for vnid in self._loc_tree:
+            if vnid not in self._def_tree:
                 raise RuntimeError("Varbank loc missing in def")
         # Check every def_tree entry exists in loc_tree
-        loc_set = set(id(v) for v in self._loc_tree)
-        for vn in self._def_tree:
-            if id(vn) not in loc_set:
+        for vnid in self._def_tree:
+            if vnid not in self._loc_tree:
                 raise RuntimeError("Varbank def missing in loc")
 
 

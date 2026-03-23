@@ -99,7 +99,7 @@ def getNZMaskLocal(op, cliploop=True):
         for i in range(op.numInput()):
             if cliploop:
                 parent = op.getParent()
-                if parent is not None and hasattr(parent, 'isLoopIn') and parent.isLoopIn(i):
+                if parent is not None and hasattr(parent, 'isLoopIn') and (not hasattr(parent, 'sizeIn') or i < parent.sizeIn()) and parent.isLoopIn(i):
                     continue
             r |= op.getIn(i).getNZMask()
         return r

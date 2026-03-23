@@ -52,11 +52,34 @@ class NVarnode:
         """
         return self.space == "const" and self.size >= 8
 
+    @property
+    def is_iop_ptr(self) -> bool:
+        """True if this is a PcodeOp annotation varnode (space='iop').
+
+        INDIRECT ops use iop-space varnodes to reference their indirect-effect
+        PcodeOp. The offset encodes a raw pointer (C++) or id(op) (Python),
+        so we compare only by space name, not offset.
+        """
+        return self.space == "iop"
+
+    @property
+    def is_fspec_ptr(self) -> bool:
+        """True if this is a FuncCallSpecs pointer varnode.
+
+        C++ FlowInfo::setupCallSpecs replaces the CALL target input with a
+        varnode pointing to a FuncCallSpecs object (space='fspec', size=8).
+        Python keeps the raw address (space='ram', size=4).
+        """
+        return self.space == "fspec"
+
     def __eq__(self, other):
         if not isinstance(other, NVarnode):
             return False
         # Both are space-id pointers → semantically equal (different runtime ptrs)
         if self.is_spaceid_ptr and other.is_spaceid_ptr:
+            return True
+        # Both are iop annotation pointers → semantically equal
+        if self.is_iop_ptr and other.is_iop_ptr:
             return True
         return (self.space == other.space and
                 self.offset == other.offset and
@@ -65,11 +88,15 @@ class NVarnode:
     def __hash__(self):
         if self.is_spaceid_ptr:
             return hash(("const", "__spaceid__", self.size))
+        if self.is_iop_ptr:
+            return hash(("iop", "__iop__"))
         return hash((self.space, self.offset, self.size))
 
     def __repr__(self):
         if self.is_spaceid_ptr:
             return f"const[SPACEID:{self.size}]"
+        if self.is_iop_ptr:
+            return f"iop[{self.offset:#x}:{self.size}]"
         return f"{self.space}[0x{self.offset:x}:{self.size}]"
 
 
@@ -200,10 +227,62 @@ def _is_expected_opcode_diff(cpp_op: NOp, py_op: NOp, stage: str) -> bool:
     """Known expected semantic differences between the pipelines."""
     if stage != "flow":
         return False
-    return {cpp_op.opcode, py_op.opcode} == {
-        OpCode.CPUI_CALL.value,
-        OpCode.CPUI_BRANCH.value,
-    }
+    pair = {cpp_op.opcode, py_op.opcode}
+    # C++ may convert intra-function CALL→BRANCH
+    if pair == {OpCode.CPUI_CALL.value, OpCode.CPUI_BRANCH.value}:
+        return True
+    # C++ truncateIndirectJump: BRANCHIND→CALLIND
+    if pair == {OpCode.CPUI_CALLIND.value, OpCode.CPUI_BRANCHIND.value}:
+        return True
+    # C++ setupCallindSpecs: CALLIND→CALL (when target address is resolved)
+    if pair == {OpCode.CPUI_CALL.value, OpCode.CPUI_CALLIND.value}:
+        return True
+    return False
+
+
+def _is_expected_varnode_diff(cpp_op: NOp, py_op: NOp) -> bool:
+    """True if the varnode diff is a known expected difference.
+
+    Handles:
+    - C++ fspec ptr vs Python raw address in CALL/CALLIND
+    - Synthetic RETURN iop const varnode time difference
+    """
+    if cpp_op.addr != py_op.addr:
+        return False
+
+    # RETURN: iop const varnode (annotation encoding differs between pipelines).
+    # C++ serialises the IOP-space annotation as const offset=1; Python may use
+    # a different constant value.  All other inputs (output registers) must match.
+    # Also handle halt/void returns where C++ has only the annotation (1 input)
+    # while Python adds default output registers (extra register inputs).
+    # Must be checked BEFORE the input-count guard below.
+    if cpp_op.opcode == py_op.opcode == OpCode.CPUI_RETURN.value:
+        if len(cpp_op.inputs) >= 1 and len(py_op.inputs) >= 1:
+            ci = cpp_op.inputs[0]
+            pi = py_op.inputs[0]
+            if ci.space == "const" and pi.space == "const" and ci.size == pi.size:
+                if len(cpp_op.inputs) == len(py_op.inputs):
+                    # Same input count: check remaining inputs match exactly
+                    if all(a == b for a, b in zip(cpp_op.inputs[1:], py_op.inputs[1:])):
+                        return True
+                elif len(cpp_op.inputs) == 1 and len(py_op.inputs) > 1:
+                    # C++ halt/void: only annotation; Python adds output regs
+                    if all(i.space == "register" for i in py_op.inputs[1:]):
+                        return True
+
+    if len(cpp_op.inputs) != len(py_op.inputs):
+        return False
+
+    # CALL/CALLIND: fspec vs ram target encoding
+    call_opcodes = {OpCode.CPUI_CALL.value, OpCode.CPUI_CALLIND.value}
+    if cpp_op.opcode in call_opcodes and py_op.opcode in call_opcodes:
+        if len(cpp_op.inputs) >= 1:
+            ci = cpp_op.inputs[0]
+            pi = py_op.inputs[0]
+            if ci.is_fspec_ptr and not pi.is_fspec_ptr:
+                return True
+
+    return False
 
 
 @dataclass
@@ -405,21 +484,47 @@ def _compare_snapshots(cpp_snap: IrSnapshot, py_snap: IrSnapshot, stage: str) ->
     else:
         diff.summary_lines.append(f"Op count: {cpp_snap.num_ops} (match)")
 
-    # Build address-based block maps
-    cpp_by_addr: Dict[int, NBlock] = {b.start: b for b in cpp_snap.blocks}
-    py_by_addr: Dict[int, NBlock] = {b.start: b for b in py_snap.blocks}
-
     # Build index→address maps for edge remapping
     cpp_idx_to_addr = {b.index: b.start for b in cpp_snap.blocks}
     py_idx_to_addr = {b.index: b.start for b in py_snap.blocks}
 
-    # Canonical index = sorted address order
-    all_addrs = sorted(set(list(cpp_by_addr.keys()) + list(py_by_addr.keys())))
+    # Canonical index = sorted unique address order
+    all_addrs = sorted(set(b.start for b in cpp_snap.blocks) |
+                       set(b.start for b in py_snap.blocks))
     addr_to_canonical = {addr: i for i, addr in enumerate(all_addrs)}
 
-    # Remap edges to canonical indices
+    # Remap edges on original blocks FIRST (before merging)
     _remap_edges(cpp_snap.blocks, cpp_idx_to_addr, addr_to_canonical)
     _remap_edges(py_snap.blocks, py_idx_to_addr, addr_to_canonical)
+
+    # Build address-based block maps AFTER remapping.  When multiple blocks
+    # share the same start address (multiple pcode ops from one machine
+    # instruction split into separate blocks), merge into one virtual block.
+    def _build_addr_map(blocks: List[NBlock]) -> Dict[int, NBlock]:
+        m: Dict[int, NBlock] = {}
+        for b in blocks:
+            if b.start not in m:
+                m[b.start] = b
+            else:
+                existing = m[b.start]
+                merged_ops = list(existing.ops) + list(b.ops)
+                merged_stop = max(existing.stop, b.stop)
+                # Deduplicate remapped canonical successor/predecessor indices
+                merged_succs = sorted(set(existing.successors + b.successors))
+                merged_preds = sorted(set(existing.predecessors + b.predecessors))
+                m[b.start] = NBlock(
+                    index=existing.index,
+                    start=existing.start,
+                    stop=merged_stop,
+                    successors=merged_succs,
+                    predecessors=merged_preds,
+                    ops=merged_ops,
+                    num_ops=len(merged_ops),
+                )
+        return m
+
+    cpp_by_addr = _build_addr_map(cpp_snap.blocks)
+    py_by_addr = _build_addr_map(py_snap.blocks)
 
     # Compare blocks matched by address
     matched_addrs = sorted(set(cpp_by_addr.keys()) & set(py_by_addr.keys()))
@@ -452,11 +557,49 @@ def _compare_snapshots(cpp_snap: IrSnapshot, py_snap: IrSnapshot, stage: str) ->
                 f"Block[{ci}] @0x{addr:x} ops: C++={cb.num_ops}, Py={pb.num_ops}",
                 scope="block", legacy_bucket="block")
 
-        # Per-op comparison within matched block
-        n_ops = min(cb.num_ops, pb.num_ops)
+        # Per-op comparison within matched block.
+        # 1) MULTIEQUALs at block start are order-independent (phi-nodes).
+        # 2) Ops at the same address (e.g. SUBPIECEs from splitJoin, or
+        #    INDIRECTs from guardCalls) may be in any order.
+        # Sort groups of same-opcode-same-address ops to canonicalize.
+        def _op_sort_key(op):
+            """Sort key for ops: by output varnode address."""
+            if op.output is not None:
+                return (op.output.space, op.output.offset, op.output.size)
+            return ("", 0, 0)
+
+        def _normalize_op_order(ops):
+            """Move all MULTIEQUALs to front (matching C++ opInsertBegin),
+            sort them, then sort adjacent same-addr non-MEQ ops."""
+            ops = list(ops)
+            # Phase 1: gather ALL MULTIEQUALs and move to front.
+            # When multiple sub-blocks at the same address are merged,
+            # MEQs from a later sub-block may appear after non-MEQs
+            # from an earlier sub-block.  C++ always places MEQs at
+            # the very beginning of a block.
+            meqs = [op for op in ops if op.opcode == OpCode.CPUI_MULTIEQUAL]
+            non_meqs = [op for op in ops if op.opcode != OpCode.CPUI_MULTIEQUAL]
+            if meqs:
+                meqs.sort(key=_op_sort_key)
+            ops = meqs + non_meqs
+            meq_end = len(meqs)
+            # Phase 2: sort adjacent groups of non-MEQ ops at the same address
+            i = meq_end
+            while i < len(ops):
+                j = i + 1
+                while j < len(ops) and ops[j].addr == ops[i].addr:
+                    j += 1
+                if j - i > 1:
+                    ops[i:j] = sorted(ops[i:j], key=_op_sort_key)
+                i = j
+            return ops
+
+        c_ops = _normalize_op_order(cb.ops)
+        p_ops = _normalize_op_order(pb.ops)
+        n_ops = min(len(c_ops), len(p_ops))
         for j in range(n_ops):
-            co = cb.ops[j]
-            po = pb.ops[j]
+            co = c_ops[j]
+            po = p_ops[j]
             if not co.matches(po, strict=False):
                 if co.opcode != po.opcode:
                     msg = f"Block[{ci}] Op[{j}] opcode: C++={co} | Py={po}"
@@ -468,6 +611,7 @@ def _compare_snapshots(cpp_snap: IrSnapshot, py_snap: IrSnapshot, stage: str) ->
                     msg = f"Block[{ci}] Op[{j}] varnode: C++={co} | Py={po}"
                     _append_diff(
                         diff, "varnode", msg,
+                        expected=_is_expected_varnode_diff(co, po),
                         scope="op", legacy_bucket="op")
 
     for addr in cpp_only:

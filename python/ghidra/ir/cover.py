@@ -158,25 +158,33 @@ class CoverBlock:
 
         Returns:
           0 = no intersection
-          1 = partial intersection (not at boundary)
-          2 = intersection at boundary only
+          1 = boundary intersection only
+          2 = interval intersection
         """
         if self.empty() or op2.empty():
             return 0
-        # Simplified intersection test
-        s1 = CoverBlock.getUIndex(self.start) if self.start is not None else 0
-        e1 = CoverBlock.getUIndex(self.stop) if (self.stop is not None and self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-        s2 = CoverBlock.getUIndex(op2.start) if op2.start is not None else 0
-        e2 = CoverBlock.getUIndex(op2.stop) if (op2.stop is not None and op2.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-        if self.stop is None:
-            e1 = s1
-        if op2.stop is None:
-            e2 = s2
-        if e1 < s2 or e2 < s1:
-            return 0
-        if e1 == s2 or e2 == s1:
-            return 2
-        return 1
+        ustart = CoverBlock.getUIndex(self.start)
+        ustop = CoverBlock.getUIndex(self.stop)
+        u2start = CoverBlock.getUIndex(op2.start)
+        u2stop = CoverBlock.getUIndex(op2.stop)
+        if ustart <= ustop:
+            if u2start <= u2stop:
+                if ustop <= u2start or u2stop <= ustart:
+                    if ustart == u2stop or ustop == u2start:
+                        return 1
+                    return 0
+            else:
+                if ustart >= u2stop and ustop <= u2start:
+                    if ustart == u2stop or ustop == u2start:
+                        return 1
+                    return 0
+        else:
+            if u2start <= u2stop:
+                if u2start >= ustop and u2stop <= ustart:
+                    if u2start == ustop or u2stop == ustart:
+                        return 1
+                    return 0
+        return 2
 
     def merge(self, op2: CoverBlock) -> None:
         """Merge another CoverBlock into this."""
@@ -240,19 +248,20 @@ class Cover:
 
         Returns:
           0 = no intersection
-          1 = intersection exists (not just at boundary)
-          2 = intersection only at a boundary
+          1 = boundary/point intersection only
+          2 = interval intersection (immediate return)
         """
         result = 0
-        for blk, cb1 in self._cover.items():
+        for blk in sorted(self._cover.keys()):
+            cb1 = self._cover[blk]
             cb2 = op2._cover.get(blk)
             if cb2 is None:
                 continue
             val = cb1.intersect(cb2)
-            if val == 1:
-                return 1
             if val == 2:
-                result = 2
+                return 2
+            if val == 1:
+                result = 1
         return result
 
     def intersectByBlock(self, blk: int, op2: Cover) -> int:

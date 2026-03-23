@@ -13,12 +13,47 @@ from ghidra.core.address import Address
 from ghidra.core.opcodes import OpCode
 from ghidra.core.space import (
     AddrSpace, AddrSpaceManager, ConstantSpace, UniqueSpace, OtherSpace,
-    IPTR_PROCESSOR, IPTR_CONSTANT, IPTR_INTERNAL,
+    IPTR_PROCESSOR, IPTR_CONSTANT, IPTR_INTERNAL, IPTR_IOP, IPTR_FSPEC,
+    IPTR_SPACEBASE,
 )
 from ghidra.ir.varnode import Varnode
 from ghidra.ir.op import PcodeOp
 from ghidra.block.block import BlockBasic
 from ghidra.analysis.funcdata import Funcdata
+
+
+class _SpacebasePoint:
+    """Minimal stand-in for VarnodeData used by getSpacebase()."""
+    __slots__ = ('space', 'offset', 'size')
+    def __init__(self, space, offset: int, size: int):
+        self.space = space
+        self.offset = offset
+        self.size = size
+
+
+class _StackSpace(AddrSpace):
+    """Minimal stack space (IPTR_SPACEBASE) backed by ESP for x86-32.
+
+    C++ creates this from the .cspec <stackpointer> element. We hardcode
+    x86-32 values: ESP at register offset 0x10, size 4, stack grows negative.
+    """
+    def __init__(self, mgr, reg_space, idx: int, flags: int):
+        super().__init__(mgr, None, IPTR_SPACEBASE, "stack", False, 4, 1, idx,
+                         flags, 1, 1)  # delay=1, deadcodedelay=1
+        self._reg_space = reg_space
+        # x86-32: ESP = register[0x10:4]
+        self._spacebase = _SpacebasePoint(reg_space, 0x10, 4)
+
+    def numSpacebase(self) -> int:
+        return 1
+
+    def getSpacebase(self, i: int):
+        if i != 0:
+            raise IndexError(f"Stack space has only 1 spacebase, got index {i}")
+        return self._spacebase
+
+    def stackGrowsNegative(self) -> bool:
+        return True
 
 
 class Lifter:
@@ -64,12 +99,41 @@ class Lifter:
             else:
                 tp = IPTR_PROCESSOR
                 flags = AddrSpace.hasphysical | AddrSpace.heritaged | AddrSpace.does_deadcode
-                spc = AddrSpace(self._spc_mgr, None, tp, name, False, 4, 1, idx, flags, 0, 0)
+                # C++ .sla sets delay=1 for RAM (code/data) space so that
+                # Heritage skips it on pass 0.  Register space keeps delay=0.
+                dl = 1 if (name == code_space_name) else 0
+                spc = AddrSpace(self._spc_mgr, None, tp, name, False, 4, 1, idx, flags, dl, dl)
                 self._spc_mgr._insertSpace(spc)
                 if name == code_space_name:
                     self._spc_mgr.setDefaultCodeSpace(spc)
                     self._spc_mgr.setDefaultDataSpace(spc)
             self._spaces[name] = spc
+            idx += 1
+
+        # Create IOP space for INDIRECT op references (C++ OtherSpace "iop")
+        iop_spc = AddrSpace(self._spc_mgr, None, IPTR_IOP, "iop", False, 8, 1, idx, 0, 0, 0)
+        self._spc_mgr._insertSpace(iop_spc)
+        self._spc_mgr._iopSpace = iop_spc
+        self._spaces["iop"] = iop_spc
+        idx += 1
+
+        # Create FSPEC space for call-spec references
+        fspec_spc = AddrSpace(self._spc_mgr, None, IPTR_FSPEC, "fspec", False, 8, 1, idx, 0, 0, 0)
+        self._spc_mgr._insertSpace(fspec_spc)
+        self._spc_mgr._fspecSpace = fspec_spc
+        self._spaces["fspec"] = fspec_spc
+        idx += 1
+
+        # Create stack space (IPTR_SPACEBASE) backed by ESP for x86-32.
+        # This enables ActionExtraPopSetup to insert INT_ADD ops for
+        # stack-pointer adjustment at call sites.
+        reg_space = self._spaces.get("register")
+        if reg_space is not None:
+            stack_flags = AddrSpace.hasphysical | AddrSpace.heritaged | AddrSpace.does_deadcode
+            stack_spc = _StackSpace(self._spc_mgr, reg_space, idx, stack_flags)
+            self._spc_mgr._insertSpace(stack_spc)
+            self._spc_mgr._stackSpace = stack_spc
+            self._spaces["stack"] = stack_spc
             idx += 1
 
     def _get_space(self, name: str) -> AddrSpace:
@@ -83,8 +147,9 @@ class Lifter:
             self._spc_mgr._insertSpace(spc)
             self._spc_mgr._uniqueSpace = spc
         else:
+            # Non-register IPTR_PROCESSOR spaces default to delay=1
             spc = AddrSpace(self._spc_mgr, None, IPTR_PROCESSOR, name, False, 4, 1, idx,
-                            AddrSpace.hasphysical, 0, 0)
+                            AddrSpace.hasphysical, 1, 1)
             self._spc_mgr._insertSpace(spc)
         self._spaces[name] = spc
         return spc
@@ -131,7 +196,7 @@ class Lifter:
             addr = worklist.pop(0)
             if addr in visited:
                 continue
-            if addr < entry or addr >= end_addr:
+            if addr >= end_addr:
                 continue
             visited.add(addr)
 
@@ -186,21 +251,16 @@ class Lifter:
         bb.setInitialRange(Address(code_spc, first_addr),
                            Address(code_spc, last_addr))
 
-        # Cache for defined (output) varnodes: (space_name, offset, size) -> Varnode
-        # Only outputs are cached; inputs always get a fresh varnode because
-        # free varnodes in Ghidra's model can have at most one descendant.
-        defined_vn: Dict[Tuple[str, int, int], Varnode] = {}
+        # In C++, PcodeEmitFd::dump() always creates fresh Varnodes for
+        # both outputs and inputs.  Heritage (SSA construction) then connects
+        # free input reads to the correct definitions via the renaming
+        # algorithm.  We must do the same: never reuse output varnodes as
+        # inputs, so that heritage sees proper free reads and can place
+        # MULTIEQUALs at join points for shared addresses.
 
         def make_vn(space_name: str, offset: int, sz: int) -> Varnode:
             spc = self._get_space(space_name)
             return fd.newVarnode(sz, Address(spc, offset))
-
-        def get_input_vn(space_name: str, offset: int, sz: int) -> Varnode:
-            key = (space_name, offset, sz)
-            vn = defined_vn.get(key)
-            if vn is not None:
-                return vn
-            return make_vn(space_name, offset, sz)
 
         # Convert each native PcodeResult -> Python PcodeOps
         for insn in insn_list:
@@ -210,16 +270,15 @@ class Lifter:
                 op = fd.newOp(num_in, Address(code_spc, insn.addr))
                 op.setOpcodeEnum(opc)
 
-                # Output — register in cache so later inputs can find it
+                # Output — always fresh varnode
                 if native_op.has_output:
                     o = native_op.output
                     out_vn = make_vn(o.space, o.offset, o.size)
                     fd.opSetOutput(op, out_vn)
-                    defined_vn[(o.space, o.offset, o.size)] = out_vn
 
-                # Inputs — look up defined varnodes, else create fresh
+                # Inputs — always fresh varnode (heritage connects via rename)
                 for i, inp in enumerate(native_op.inputs):
-                    in_vn = get_input_vn(inp.space, inp.offset, inp.size)
+                    in_vn = make_vn(inp.space, inp.offset, inp.size)
                     fd.opSetInput(op, in_vn, i)
 
                 fd.opInsertEnd(op, bb)

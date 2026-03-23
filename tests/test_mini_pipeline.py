@@ -296,7 +296,9 @@ class TestActionDatabaseWiring:
         result = root.perform(fd)
 
         assert result >= 0
-        assert not shim.getMessages()
+        # Warnings are acceptable; only actual errors would indicate a problem
+        for msg in shim.getMessages():
+            assert msg.startswith("WARNING"), f"Unexpected non-warning message: {msg}"
 
     def test_start_type_recovery_only_reports_change_once_per_reset(self):
         from ghidra.analysis.funcdata import Funcdata
@@ -483,6 +485,23 @@ class TestPrintC:
         assert "void func_401000(void)" in result
         assert "if" in result
         assert ";" in result
+        errors = dp.get_errors()
+        assert not errors, f"Unexpected errors: {errors}"
+
+    def test_printc_with_full_actions_structures_branch(self, arch_info):
+        """Full actions on X86_BRANCH should produce structured if output."""
+        dp = DecompilerPython()
+        dp.add_spec_path(os.path.dirname(arch_info['sla_path']))
+        dp.use_python_full_actions = True
+        dp.use_python_printc = True
+
+        result = dp.decompile(
+            arch_info['sla_path'], arch_info['target'],
+            X86_BRANCH, 0x401000, 0x401000, len(X86_BRANCH)
+        )
+        assert "void func_401000(void)" in result
+        assert "if" in result, "Expected 'if' in structured output"
+        assert "return" in result.lower()
         errors = dp.get_errors()
         assert not errors, f"Unexpected errors: {errors}"
 

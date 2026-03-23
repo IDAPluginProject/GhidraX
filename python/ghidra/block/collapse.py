@@ -110,22 +110,37 @@ class CollapseStructure:
 
     # --- Rule: DoWhile ---
     def _ruleBlockDoWhile(self, bl: FlowBlock) -> bool:
-        """Block with single in, CBRANCH where one out loops back to in."""
-        if bl.sizeOut() != 2 or bl.sizeIn() != 1:
+        """Block with binary condition where one out loops back to itself.
+
+        C++ ref: ``CollapseStructure::ruleBlockDoWhile``
+        """
+        if bl.sizeOut() != 2:
             return False
-        out0 = bl.getOut(0)
-        out1 = bl.getOut(1)
-        inbl = bl.getIn(0)
-        if out0 is inbl and not self._isGotoOut(bl, 0):
-            return False  # TODO: need more complex check
-        if out1 is inbl and not self._isGotoOut(bl, 1):
+        if hasattr(bl, 'isSwitchOut') and bl.isSwitchOut():
             return False
+        if self._isGotoOut(bl, 0):
+            return False
+        if self._isGotoOut(bl, 1):
+            return False
+        for i in range(2):
+            if bl.getOut(i) is not bl:
+                continue
+            if i == 0:
+                if hasattr(bl, 'negateCondition') and bl.negateCondition(True):
+                    self._dataflow_changecount = getattr(self, '_dataflow_changecount', 0) + 1
+            self._graph.newBlockDoWhile(bl)
+            return True
         return False
 
     # --- Rule: InfLoop ---
     def _ruleBlockInfLoop(self, bl: FlowBlock) -> bool:
-        """Single out-edge back to itself → infinite loop."""
+        """Single out-edge back to itself → infinite loop.
+
+        C++ ref: ``CollapseStructure::ruleBlockInfLoop``
+        """
         if bl.sizeOut() != 1:
+            return False
+        if self._isGotoOut(bl, 0):
             return False
         if bl.getOut(0) is not bl:
             return False

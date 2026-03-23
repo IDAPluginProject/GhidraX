@@ -115,8 +115,29 @@ class ContextInternal(ContextDatabase):
         cbr.setValue(self._contextMap[key], val)
 
     def setVariableRegion(self, name: str, addr1: Address, addr2: Address, val: int) -> None:
-        # Simplified: just set at the start address
-        self.setVariable(name, addr1, val)
+        """Set a context variable across an address range.
+
+        C++ ref: ``ContextDatabase::setVariableRegion``
+        Sets the variable at the start address and propagates to all existing
+        context map entries within [addr1, addr2].
+        """
+        cbr = self._variables.get(name)
+        if cbr is None:
+            return
+        spc_idx = addr1.getSpace().getIndex()
+        beg_off = addr1.getOffset()
+        end_off = addr2.getOffset()
+        # Set at start address (ensures entry exists)
+        key = (spc_idx, beg_off)
+        if key not in self._contextMap:
+            self._contextMap[key] = list(self._defaultContext)
+        cbr.setValue(self._contextMap[key], val)
+        # Propagate to all existing entries in range
+        for (si, off), ctx in list(self._contextMap.items()):
+            if si != spc_idx:
+                continue
+            if off > beg_off and off <= end_off:
+                cbr.setValue(ctx, val)
 
     def getTrackedSet(self, addr: Address):
         """Get tracked register set at the given address. Returns empty list."""

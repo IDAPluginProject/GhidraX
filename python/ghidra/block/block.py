@@ -1412,14 +1412,14 @@ class BlockBasic(FlowBlock):
             outvn = bop.getOut()
             if outvn is None: continue
             if outvn.isAddrTied(): return False
-            for desc in outvn.getDescend():
+            for desc in outvn.getDescendants():
                 if desc.getParent() is not self: return False
         return True
 
     def findMultiequal(self, varArray: list):
         from ghidra.core.opcodes import OpCode
         vn = varArray[0]
-        for op in vn.getDescend():
+        for op in vn.getDescendants():
             if op.code() == OpCode.CPUI_MULTIEQUAL and op.getParent() is self:
                 for i in range(op.numInput()):
                     if op.getIn(i) is not varArray[i]: return None
@@ -1428,7 +1428,7 @@ class BlockBasic(FlowBlock):
 
     def earliestUse(self, vn):
         res = None
-        for op in vn.getDescend():
+        for op in vn.getDescendants():
             if op.getParent() is not self: continue
             if res is None or op.getSeqNum().getOrder() < res.getSeqNum().getOrder():
                 res = op

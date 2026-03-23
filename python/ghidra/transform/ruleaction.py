@@ -171,6 +171,8 @@ class RuleOrMask(Rule):
         return [int(OpCode.CPUI_INT_OR)]
 
     def applyOp(self, op, data) -> int:
+        if op.getOut() is None:
+            return 0
         size = op.getOut().getSize()
         if size > 8:
             return 0
@@ -1126,19 +1128,33 @@ class RuleNotDistribute(Rule):
         return [int(OpCode.CPUI_INT_NEGATE)]
 
     def applyOp(self, op, data) -> int:
-        invn = op.getIn(0)
-        if invn is None or not invn.isWritten(): return 0
-        outvn = op.getOut()
-        if outvn.hasNoDescend(): return 0
-        defop = invn.getDef()
-        opc = defop.code()
-        if opc == OpCode.CPUI_INT_AND:
-            # ~(A & B) - check if result is used in OR context
-            pass
-        elif opc == OpCode.CPUI_INT_OR:
-            # ~(A | B) - check if result is used in AND context
-            pass
-        return 0  # Conservative: full DeMorgan requires more context
+        compop = op.getIn(0).getDef()
+        if compop is None:
+            return 0
+        opc_in = compop.code()
+        if opc_in == OpCode.CPUI_BOOL_AND:
+            opc = OpCode.CPUI_BOOL_OR
+        elif opc_in == OpCode.CPUI_BOOL_OR:
+            opc = OpCode.CPUI_BOOL_AND
+        else:
+            return 0
+
+        newneg1 = data.newOp(1, op.getAddr())
+        newout1 = data.newUniqueOut(1, newneg1)
+        data.opSetOpcode(newneg1, OpCode.CPUI_BOOL_NEGATE)
+        data.opSetInput(newneg1, compop.getIn(0), 0)
+        data.opInsertBefore(newneg1, op)
+
+        newneg2 = data.newOp(1, op.getAddr())
+        newout2 = data.newUniqueOut(1, newneg2)
+        data.opSetOpcode(newneg2, OpCode.CPUI_BOOL_NEGATE)
+        data.opSetInput(newneg2, compop.getIn(1), 0)
+        data.opInsertBefore(newneg2, op)
+
+        data.opSetOpcode(op, opc)
+        data.opSetInput(op, newout1, 0)
+        data.opInsertInput(op, newout2, 1)
+        return 1
 
 
 # =========================================================================
@@ -1291,6 +1307,32 @@ class RuleHighOrderAnd(Rule):
             data.opSetInput(op, xalign, 0)
             data.opSetInput(op, data.newConstant(size, val & cvn2.getOffset()), 1)
             return 1
+        else:
+            if addop.getOut().loneDescend() is not op: return 0
+            for i in range(2):
+                zerovn = addop.getIn(i)
+                mask2 = zerovn.getNZMask()
+                if (mask2 & val) != mask2:
+                    continue
+                nonzerovn = addop.getIn(1 - i)
+                if not nonzerovn.isWritten():
+                    continue
+                addop2 = nonzerovn.getDef()
+                if addop2.code() != OpCode.CPUI_INT_ADD:
+                    continue
+                if nonzerovn.loneDescend() is not addop:
+                    continue
+                cvn2 = addop2.getIn(1)
+                if not cvn2.isConstant():
+                    continue
+                xalign = addop2.getIn(0)
+                mask2 = xalign.getNZMask()
+                if (mask2 & val) != mask2:
+                    continue
+                data.opSetInput(addop2, data.newConstant(size, val & cvn2.getOffset()), 1)
+                data.opRemoveInput(op, 1)
+                data.opSetOpcode(op, OpCode.CPUI_COPY)
+                return 1
         return 0
 
 

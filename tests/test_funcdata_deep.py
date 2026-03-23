@@ -93,6 +93,8 @@ def _make_fd(name="test_func", addr_off=0x401000):
     fd._qlst_map = {}
     fd._jumpvec = []
     fd._heritage = None
+    fd._override = None
+    fd._unionMap = None
     fd._clean_up_index = 0
     fd._high_level_index = 0
     fd._cast_phase_index = 0
@@ -685,6 +687,344 @@ class TestCSEFindInBlock:
 
         result = Funcdata.cseFindInBlock(op1, vn, bb, None)
         assert result is None
+
+
+# ===========================================================================
+# Tests for newly deepened methods (inlineFlow, overrideFlow, earlyJumpTableFail,
+# stageJumpTable, recoverJumpTable, moveRespectingCover)
+# ===========================================================================
+
+class TestInlineFlow:
+    """Tests for Funcdata.inlineFlow (ported from funcdata_op.cc).
+
+    These tests use monkeypatching to avoid actual instruction decoding,
+    which requires a real translation engine not available in unit tests.
+    """
+
+    def test_inline_flow_ez_model_empty_inline(self, monkeypatch):
+        """EZ model with no ops in inline target → returns 0, destroys CALL."""
+        from ghidra.analysis.flow import FlowInfo
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        callop = fd.newOp(1, Address(spc, 0x401000))
+        callop.setOpcodeEnum(OpCode.CPUI_CALL)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(callop, coderef, 0)
+
+        # Patch generateOps to be a no-op (no real translator)
+        monkeypatch.setattr(FlowInfo, "generateOps", lambda self: None)
+
+        inlinefd = _make_fd("inline_target", 0x402000)
+        flow = FlowInfo(fd, fd._obank, fd._bblocks, fd._qlst)
+        result = fd.inlineFlow(inlinefd, flow, callop)
+        assert result == 0  # EZ model (no calls/branches in empty inline)
+
+    def test_inline_flow_uniq_id_propagation(self, monkeypatch):
+        """inlineFlow propagates unique IDs between caller and inline obanks."""
+        from ghidra.analysis.flow import FlowInfo
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        callop = fd.newOp(1, Address(spc, 0x401000))
+        callop.setOpcodeEnum(OpCode.CPUI_CALL)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(callop, coderef, 0)
+
+        monkeypatch.setattr(FlowInfo, "generateOps", lambda self: None)
+
+        inlinefd = _make_fd("inline_target", 0x402000)
+        orig_uniq = fd._obank.getUniqId()
+
+        flow = FlowInfo(fd, fd._obank, fd._bblocks, fd._qlst)
+        fd.inlineFlow(inlinefd, flow, callop)
+
+        # After inlineFlow, caller's uniq should be updated from inlinefd's obank
+        assert fd._obank.getUniqId() == inlinefd._obank.getUniqId()
+
+
+class TestOverrideFlow:
+    """Tests for deepened Funcdata.overrideFlow."""
+
+    def test_override_branch_call_to_branch(self):
+        """Override CALL to BRANCH."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        callop = fd.newOp(1, addr)
+        callop.setOpcodeEnum(OpCode.CPUI_CALL)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(callop, coderef, 0)
+        # Op must be dead for override
+        assert callop.isDead()
+
+        fd.overrideFlow(addr, 1)  # OVERRIDE_BRANCH
+        assert callop.code() == OpCode.CPUI_BRANCH
+
+    def test_override_branch_callind_to_branchind(self):
+        """Override CALLIND to BRANCHIND."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        callindop = fd.newOp(1, addr)
+        callindop.setOpcodeEnum(OpCode.CPUI_CALLIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(callindop, vn, 0)
+
+        fd.overrideFlow(addr, 1)  # OVERRIDE_BRANCH
+        assert callindop.code() == OpCode.CPUI_BRANCHIND
+
+    def test_override_call_branch_to_call(self):
+        """Override BRANCH to CALL."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        branchop = fd.newOp(1, addr)
+        branchop.setOpcodeEnum(OpCode.CPUI_BRANCH)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(branchop, coderef, 0)
+
+        fd.overrideFlow(addr, 2)  # OVERRIDE_CALL
+        assert branchop.code() == OpCode.CPUI_CALL
+
+    def test_override_return_branchind_to_return(self):
+        """Override BRANCHIND to RETURN."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        branchindop = fd.newOp(1, addr)
+        branchindop.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(branchindop, vn, 0)
+
+        fd.overrideFlow(addr, 4)  # OVERRIDE_RETURN
+        assert branchindop.code() == OpCode.CPUI_RETURN
+
+    def test_override_call_return_inserts_return(self):
+        """Override CALL_RETURN inserts a RETURN op after the converted CALL."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        branchop = fd.newOp(1, addr)
+        branchop.setOpcodeEnum(OpCode.CPUI_BRANCH)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(branchop, coderef, 0)
+
+        fd.overrideFlow(addr, 3)  # OVERRIDE_CALL_RETURN
+        assert branchop.code() == OpCode.CPUI_CALL
+        # A RETURN op should have been inserted after in dead list
+        dead_ops = list(fd._obank.getDeadList()) if hasattr(fd._obank, 'getDeadList') else []
+        return_found = any(op.code() == OpCode.CPUI_RETURN for op in dead_ops)
+        assert return_found, "Should have inserted a RETURN op"
+
+    def test_override_no_matching_op_raises(self):
+        """Override with no matching op should raise."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+        # No ops at this address
+        with pytest.raises(Exception, match="Could not apply flowoverride"):
+            fd.overrideFlow(addr, 1)
+
+    def test_override_cbranch_to_call_raises(self):
+        """Override CBRANCH to CALL should raise (unsupported)."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        addr = Address(spc, 0x401000)
+
+        cbrop = fd.newOp(2, addr)
+        cbrop.setOpcodeEnum(OpCode.CPUI_CBRANCH)
+        vn1 = fd.newVarnode(4, Address(spc, 0x402000))
+        vn2 = fd.newVarnode(1, Address(spc, 0x200))
+        fd.opSetInput(cbrop, vn1, 0)
+        fd.opSetInput(cbrop, vn2, 1)
+
+        with pytest.raises(Exception, match="CBRANCH"):
+            fd.overrideFlow(addr, 2)  # OVERRIDE_CALL
+
+
+class TestEarlyJumpTableFail:
+    """Tests for deepened Funcdata.earlyJumpTableFail."""
+
+    def test_success_for_simple_op(self):
+        """Simple case: no problematic ops before BRANCHIND → success."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        # Create a BRANCHIND op
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(branchind, vn, 0)
+
+        result = fd.earlyJumpTableFail(branchind)
+        assert result == 'success'
+
+    def test_success_with_preceding_copy(self):
+        """COPY op before BRANCHIND that feeds into it → success."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        # Target varnode
+        targetvn = fd.newVarnode(4, Address(spc, 0x100))
+
+        # COPY op
+        copyop = fd.newOp(1, Address(spc, 0x400FFC))
+        copyop.setOpcodeEnum(OpCode.CPUI_COPY)
+        copyin = fd.newVarnode(4, Address(spc, 0x200))
+        fd.opSetInput(copyop, copyin, 0)
+        outvn = fd.newVarnode(4, Address(spc, 0x100))
+        copyop.setOutput(outvn)
+
+        # BRANCHIND op
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        fd.opSetInput(branchind, targetvn, 0)
+
+        result = fd.earlyJumpTableFail(branchind)
+        assert result == 'success'
+
+    def test_success_on_small_varnode(self):
+        """1-byte destination varnode → immediate success."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        # Create some preceding op
+        prevop = fd.newOp(1, Address(spc, 0x400FFC))
+        prevop.setOpcodeEnum(OpCode.CPUI_COPY)
+        fd.opSetInput(prevop, fd.newVarnode(1, Address(spc, 0x100)), 0)
+
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        # 1-byte varnode
+        vn = fd.newVarnode(1, Address(spc, 0x100))
+        fd.opSetInput(branchind, vn, 0)
+
+        result = fd.earlyJumpTableFail(branchind)
+        assert result == 'success'
+
+
+class TestRecoverJumpTable:
+    """Tests for deepened Funcdata.recoverJumpTable."""
+
+    def test_returns_none_when_recovery_disabled(self):
+        """With jumptablerecovery_dont flag, returns None."""
+        fd = _make_fd()
+        fd._flags |= Funcdata.jumptablerecovery_dont
+        spc = fd._glb.getDefaultCodeSpace()
+
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(branchind, vn, 0)
+
+        result = fd.recoverJumpTable(branchind)
+        assert result is None
+
+    def test_returns_existing_complete_jumptable(self):
+        """If a complete JumpTable exists, return it directly."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(branchind, vn, 0)
+
+        # Create a mock JumpTable
+        class MockJT:
+            def __init__(self):
+                self._op = None
+            def getIndirectOp(self):
+                return self._op
+            def setIndirectOp(self, op):
+                self._op = op
+            def isOverride(self):
+                return False
+            def isPartial(self):
+                return False
+            def getOpAddress(self):
+                return Address(spc, 0x401000)
+
+        jt = MockJT()
+        jt.setIndirectOp(branchind)
+        fd._jumpvec.append(jt)
+
+        result = fd.recoverJumpTable(branchind)
+        assert result is jt
+
+
+class TestStageJumpTable:
+    """Tests for deepened Funcdata.stageJumpTable."""
+
+    def test_raises_on_bad_partial_clone(self):
+        """stageJumpTable raises when partial doesn't have matching op."""
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+
+        branchind = fd.newOp(1, Address(spc, 0x401000))
+        branchind.setOpcodeEnum(OpCode.CPUI_BRANCHIND)
+        vn = fd.newVarnode(4, Address(spc, 0x100))
+        fd.opSetInput(branchind, vn, 0)
+
+        partial = _make_fd("partial", 0x401000)
+        partial._flags |= Funcdata.jumptablerecovery_on  # Skip staging
+
+        class MockJT:
+            pass
+
+        from ghidra.core.error import LowlevelError
+        with pytest.raises(LowlevelError, match="Bad partial clone"):
+            fd.stageJumpTable(partial, MockJT(), branchind, None)
+
+
+class TestMoveRespectingCover:
+    """Tests for deepened Funcdata.moveRespectingCover."""
+
+    def test_same_op_returns_true(self):
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        op = fd.newOp(1, Address(spc, 0x401000))
+        op.setOpcodeEnum(OpCode.CPUI_COPY)
+        assert fd.moveRespectingCover(op, op) is True
+
+    def test_call_op_returns_false(self):
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        bb = fd._bblocks.newBlockBasic(fd)
+
+        callop = fd.newOp(1, Address(spc, 0x401000))
+        callop.setOpcodeEnum(OpCode.CPUI_CALL)
+        coderef = fd.newVarnode(4, Address(spc, 0x402000))
+        fd.opSetInput(callop, coderef, 0)
+        fd.opInsertEnd(callop, bb)
+
+        lastop = fd.newOp(1, Address(spc, 0x401004))
+        lastop.setOpcodeEnum(OpCode.CPUI_COPY)
+        fd.opSetInput(lastop, fd.newVarnode(4, Address(spc, 0x100)), 0)
+        fd.opInsertEnd(lastop, bb)
+
+        assert fd.moveRespectingCover(callop, lastop) is False
+
+    def test_no_output_returns_false(self):
+        fd = _make_fd()
+        spc = fd._glb.getDefaultCodeSpace()
+        bb = fd._bblocks.newBlockBasic(fd)
+
+        op = fd.newOp(0, Address(spc, 0x401000))
+        op.setOpcodeEnum(OpCode.CPUI_COPY)
+        fd.opInsertEnd(op, bb)
+
+        lastop = fd.newOp(0, Address(spc, 0x401004))
+        lastop.setOpcodeEnum(OpCode.CPUI_COPY)
+        fd.opInsertEnd(lastop, bb)
+
+        assert fd.moveRespectingCover(op, lastop) is False
 
 
 if __name__ == "__main__":

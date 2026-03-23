@@ -8,13 +8,98 @@ from ghidra.core.opcodes import OpCode
 
 
 class RulePushPtr(Rule):
-    """Push pointer type information through arithmetic operations."""
+    """Push pointer type information through INT_ADD.
+
+    If one input to INT_ADD is a pointer, push (a + b) + c => a + (b + c)
+    so that the pointer stays at the top level.
+    """
     def __init__(self, g): super().__init__(g, 0, "pushptr")
     def clone(self, gl):
         return RulePushPtr(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [OpCode.CPUI_INT_ADD]
+
+    @staticmethod
+    def collectDuplicateNeeds(dupList, vn):
+        """Collect ops that need duplication because vn has multiple descendants."""
+        if vn.isConstant():
+            return
+        if not vn.isWritten():
+            return
+        defOp = vn.getDef()
+        if defOp.code() not in (OpCode.CPUI_INT_MULT, OpCode.CPUI_INT_LEFT):
+            return
+        if vn.loneDescend() is not None:
+            return
+        dupList.append(defOp)
+
+    @staticmethod
+    def duplicateNeed(defOp, data):
+        """Duplicate an op so each descendant gets its own copy."""
+        outvn = defOp.getOut()
+        descList = list(outvn.getDescendants())
+        for i in range(1, len(descList)):
+            desc = descList[i]
+            slot = desc.getSlot(outvn)
+            newop = data.newOp(defOp.numInput(), desc.getAddr())
+            data.opSetOpcode(newop, defOp.code())
+            newout = data.newUniqueOut(outvn.getSize(), newop)
+            for j in range(defOp.numInput()):
+                data.opSetInput(newop, defOp.getIn(j), j)
+            data.opInsertBefore(newop, desc)
+            data.opSetInput(desc, newout, slot)
+
     def applyOp(self, op, data):
-        return 0  # Needs type propagation infrastructure
+        if not hasattr(data, 'hasTypeRecoveryStarted') or not data.hasTypeRecoveryStarted():
+            return 0
+        from ghidra.types.datatype import TYPE_PTR
+        vni = None
+        slot = -1
+        for s in range(op.numInput()):
+            vni = op.getIn(s)
+            tp = vni.getTypeReadFacing(op) if hasattr(vni, 'getTypeReadFacing') else None
+            if tp is not None and hasattr(tp, 'getMetatype') and tp.getMetatype() == TYPE_PTR:
+                slot = s
+                break
+        if slot < 0:
+            return 0
+
+        # Check evaluatePointerExpression equivalent
+        if hasattr(RulePtrArith, 'evaluatePointerExpression'):
+            if RulePtrArith.evaluatePointerExpression(op, slot) != 1:
+                return 0
+        else:
+            return 0
+
+        vn = op.getOut()
+        vnadd2 = op.getIn(1 - slot)
+        duplicateList = []
+        if vn.loneDescend() is None:
+            RulePushPtr.collectDuplicateNeeds(duplicateList, vnadd2)
+
+        while True:
+            descIter = list(vn.getDescendants())
+            if not descIter:
+                break
+            decop = descIter[0]
+            j = decop.getSlot(vn)
+            vnadd1 = decop.getIn(1 - j)
+
+            newop = data.newOp(2, decop.getAddr())
+            data.opSetOpcode(newop, OpCode.CPUI_INT_ADD)
+            newout = data.newUniqueOut(vnadd1.getSize(), newop)
+
+            data.opSetInput(decop, vni, 0)
+            data.opSetInput(decop, newout, 1)
+            data.opSetInput(newop, vnadd1, 0)
+            data.opSetInput(newop, vnadd2, 1)
+            data.opInsertBefore(newop, decop)
+
+        isAutoLive = vn.isAutoLive() if hasattr(vn, 'isAutoLive') else False
+        if not isAutoLive:
+            data.opDestroy(op)
+        for dupOp in duplicateList:
+            RulePushPtr.duplicateNeed(dupOp, data)
+        return 1
 
 
 class RuleStructOffset0(Rule):

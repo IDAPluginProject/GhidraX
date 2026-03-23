@@ -61,17 +61,39 @@ class Override:
     def insertForceGoto(self, targetpc: Address, destpc: Address) -> None:
         self._forcegoto[targetpc.getOffset()] = destpc
 
+    @staticmethod
+    def generateDeadcodeDelayMessage(index: int, glb) -> str:
+        """Generate warning message related to a dead code delay.
+
+        C++ ref: ``Override::generateDeadcodeDelayMessage``
+        """
+        spc = glb.getSpace(index) if glb is not None and hasattr(glb, 'getSpace') else None
+        name = spc.getName() if spc is not None and hasattr(spc, 'getName') else f"space_{index}"
+        return f"Restarted to delay deadcode elimination for space: {name}"
+
     def insertDeadcodeDelay(self, spc, delay: int) -> None:
+        """Override the dead-code delay for a specific address space.
+
+        C++ ref: ``Override::insertDeadcodeDelay``
+        """
         idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
         while idx >= len(self._deadcodedelay):
-            self._deadcodedelay.append(0)
+            self._deadcodedelay.append(-1)
         self._deadcodedelay[idx] = delay
 
     def hasDeadcodeDelay(self, spc) -> bool:
+        """Check if a delay override is already installed for an address space.
+
+        C++ ref: ``Override::hasDeadcodeDelay``
+        """
         idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
         if idx >= len(self._deadcodedelay):
             return False
-        return self._deadcodedelay[idx] != 0
+        val = self._deadcodedelay[idx]
+        if val == -1:
+            return False
+        default_delay = spc.getDeadcodeDelay() if hasattr(spc, 'getDeadcodeDelay') else 0
+        return val != default_delay
 
     def getDeadcodeDelay(self, spc) -> int:
         idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
@@ -83,7 +105,17 @@ class Override:
         self._indirectover[callpoint.getOffset()] = directcall
 
     def insertProtoOverride(self, callpoint: Address, proto) -> None:
-        self._protoover[callpoint.getOffset()] = proto
+        """Override the assumed function prototype at a specific call site.
+
+        C++ ref: ``Override::insertProtoOverride``
+        """
+        key = callpoint.getOffset()
+        # Delete pre-existing override if present
+        if key in self._protoover:
+            del self._protoover[key]
+        if hasattr(proto, 'setOverride'):
+            proto.setOverride(True)
+        self._protoover[key] = proto
 
     def insertMultistageJump(self, addr: Address) -> None:
         self._multistagejump.append(addr)
@@ -116,30 +148,63 @@ class Override:
         return self._protoover.get(callpoint.getOffset())
 
     def applyPrototype(self, data, fspecs) -> None:
-        """Apply any prototype override to a FuncCallSpecs."""
-        addr = fspecs.getOp().getAddr() if hasattr(fspecs, 'getOp') else None
-        if addr is None:
+        """Look for and apply a function prototype override.
+
+        C++ ref: ``Override::applyPrototype``
+        """
+        if not self._protoover:
             return
-        proto = self.getProtoOverride(addr)
-        if proto is not None and hasattr(fspecs, 'setForcedPrototype'):
-            fspecs.setForcedPrototype(proto)
+        op = fspecs.getOp() if hasattr(fspecs, 'getOp') else None
+        if op is None:
+            return
+        addr = op.getAddr()
+        proto = self._protoover.get(addr.getOffset())
+        if proto is not None:
+            if hasattr(fspecs, 'copy'):
+                fspecs.copy(proto)
+            elif hasattr(fspecs, 'setForcedPrototype'):
+                fspecs.setForcedPrototype(proto)
 
     def applyIndirect(self, data, fspecs) -> None:
-        """Apply any indirect call override."""
-        addr = fspecs.getOp().getAddr() if hasattr(fspecs, 'getOp') else None
-        if addr is None:
+        """Look for and apply destination overrides of indirect calls.
+
+        C++ ref: ``Override::applyIndirect``
+        """
+        if not self._indirectover:
             return
-        direct = self.getIndirectOverride(addr)
-        if direct is not None and hasattr(fspecs, 'setDirectCall'):
-            fspecs.setDirectCall(direct)
+        op = fspecs.getOp() if hasattr(fspecs, 'getOp') else None
+        if op is None:
+            return
+        addr = op.getAddr()
+        direct = self._indirectover.get(addr.getOffset())
+        if direct is not None:
+            if hasattr(fspecs, 'setAddress'):
+                fspecs.setAddress(direct)
+            elif hasattr(fspecs, 'setDirectCall'):
+                fspecs.setDirectCall(direct)
 
     def applyDeadCodeDelay(self, data) -> None:
-        """Apply dead code delay overrides to the function."""
-        pass
+        """Apply any dead-code delay overrides to Heritage.
+
+        C++ ref: ``Override::applyDeadCodeDelay``
+        """
+        glb = data.getArch() if hasattr(data, 'getArch') else None
+        for i, delay in enumerate(self._deadcodedelay):
+            if delay < 0:
+                continue
+            spc = glb.getSpace(i) if glb is not None and hasattr(glb, 'getSpace') else None
+            if spc is not None and hasattr(data, 'setDeadCodeDelay'):
+                data.setDeadCodeDelay(spc, delay)
 
     def applyForceGoto(self, data) -> None:
-        """Apply forced goto overrides."""
-        pass
+        """Push all the force-goto overrides into the function.
+
+        C++ ref: ``Override::applyForceGoto``
+        """
+        if hasattr(data, 'forceGoto'):
+            for targetpc_off, destpc in self._forcegoto.items():
+                targetpc = Address(destpc.getSpace() if hasattr(destpc, 'getSpace') else None, targetpc_off)
+                data.forceGoto(targetpc, destpc)
 
     def printRaw(self, s, glb=None) -> None:
         """Dump a description of the overrides to stream."""
@@ -159,13 +224,14 @@ class Override:
             s.write(f"override flow at {addr:#x} to {Override.typeToString(tp)}\n")
 
     def generateOverrideMessages(self, glb=None) -> list:
-        """Create warning messages that describe current overrides."""
+        """Create warning messages that describe current overrides.
+
+        C++ ref: ``Override::generateOverrideMessages``
+        """
         messagelist = []
         for i, delay in enumerate(self._deadcodedelay):
             if delay >= 0:
-                spc_name = glb.getSpace(i).getName() if glb and hasattr(glb, 'getSpace') else f"space_{i}"
-                messagelist.append(
-                    f"Restarted to delay deadcode elimination for space: {spc_name}")
+                messagelist.append(Override.generateDeadcodeDelayMessage(i, glb))
         return messagelist
 
     def encode(self, encoder, glb=None) -> None:

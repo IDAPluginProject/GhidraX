@@ -109,59 +109,10 @@ class StackAffectingOps(PcodeOpSet):
 
 
 # =========================================================================
-# HighIntersectTest  (simplified cache)
+# HighIntersectTest — use full C++ port from variable.py
 # =========================================================================
 
-class HighIntersectTest:
-    """Cached intersection tests between HighVariables."""
-
-    def __init__(self, stackOps: Optional[StackAffectingOps] = None) -> None:
-        self._stackOps = stackOps
-        self._cache: dict = {}
-
-    def updateHigh(self, high: HighVariable) -> bool:
-        """Update cache information for a HighVariable.
-
-        Checks if the HighVariable's cover is dirty, and if so,
-        updates it and purges stale cache entries.
-
-        C++ ref: ``HighIntersectTest::updateHigh``
-        """
-        if hasattr(high, 'isCoverDirty') and not high.isCoverDirty():
-            return True
-        if hasattr(high, 'updateCover'):
-            high.updateCover()
-        self._purgeHigh(high)
-        return False
-
-    def _purgeHigh(self, high: HighVariable) -> None:
-        """Remove all cached intersection results involving a given HighVariable."""
-        hid = id(high)
-        to_remove = [k for k in self._cache if k[0] == hid or k[1] == hid]
-        for k in to_remove:
-            del self._cache[k]
-
-    def intersection(self, a: HighVariable, b: HighVariable) -> bool:
-        """Test if two HighVariables have intersecting covers.
-
-        Returns True if there IS an intersection (merge would fail).
-        """
-        if a is b:
-            return False
-        key = (id(a), id(b)) if id(a) < id(b) else (id(b), id(a))
-        if key in self._cache:
-            return self._cache[key]
-        ca = a.getCover() if hasattr(a, 'getCover') else None
-        cb = b.getCover() if hasattr(b, 'getCover') else None
-        if ca is None or cb is None:
-            self._cache[key] = False
-            return False
-        result = ca.intersect(cb) == 2
-        self._cache[key] = result
-        return result
-
-    def clear(self) -> None:
-        self._cache.clear()
+from ghidra.ir.variable import HighIntersectTest
 
 
 # =========================================================================
@@ -564,19 +515,42 @@ class Merge:
             self.eliminateIntersect(vn, blocksort)
 
     def trimOpOutput(self, op: PcodeOp) -> None:
-        """Trim the output HighVariable of the given PcodeOp so its Cover is tiny."""
+        """Trim the output HighVariable of the given PcodeOp so its Cover is tiny.
+
+        C++ ref: ``Merge::trimOpOutput``
+        """
         if not hasattr(self._data, 'newOp'):
             return
+        if op.code() == OpCode.CPUI_INDIRECT:
+            # Insert copyop AFTER the source of the indirect
+            afterop = None
+            if op.numInput() > 1:
+                iop_vn = op.getIn(1)
+                if hasattr(PcodeOp, 'getOpFromConst') and iop_vn is not None:
+                    afterop = PcodeOp.getOpFromConst(iop_vn.getAddr())
+            if afterop is None:
+                afterop = op
+        else:
+            afterop = op
         vn = op.getOut()
         ct = vn.getType()
         copyop = self._data.newOp(1, op.getAddr())
         self._data.opSetOpcode(copyop, OpCode.CPUI_COPY)
+        if ct is not None and hasattr(ct, 'needsResolution') and ct.needsResolution():
+            if hasattr(self._data, 'inheritResolution'):
+                fieldNum = self._data.inheritResolution(ct, copyop, -1, op, -1)
+                if hasattr(self._data, 'forceFacingType'):
+                    self._data.forceFacingType(ct, fieldNum, copyop, 0)
+            if hasattr(ct, 'getMetatype'):
+                from ghidra.types.datatype import TYPE_PARTIALUNION
+                if ct.getMetatype() == TYPE_PARTIALUNION:
+                    ct = vn.getTypeDefFacing() if hasattr(vn, 'getTypeDefFacing') else ct
         uniq = self._data.newUnique(vn.getSize(), ct)
         self._data.opSetOutput(op, uniq)
         self._data.opSetOutput(copyop, vn)
         self._data.opSetInput(copyop, uniq, 0)
         if hasattr(self._data, 'opInsertAfter'):
-            self._data.opInsertAfter(copyop, op)
+            self._data.opInsertAfter(copyop, afterop)
 
     def trimOpInput(self, op: PcodeOp, slot: int) -> None:
         """Trim the input HighVariable of the given PcodeOp so its Cover is tiny."""
@@ -680,7 +654,23 @@ class Merge:
             return
         for h in highvec:
             self._testCache.updateHigh(h)
-        highvec.sort(key=lambda h: id(h))  # Simplified sort
+        def _compareHighByBlock(h):
+            """Sort key matching C++ Merge::compareHighByBlock."""
+            cover = h.getCover() if hasattr(h, 'getCover') else None
+            # Primary: cover compareTo order
+            cover_key = cover.compareTo_key() if cover is not None and hasattr(cover, 'compareTo_key') else 0
+            # Secondary: first instance address and def address
+            v = h.getInstance(0) if hasattr(h, 'getInstance') and h.numInstances() > 0 else None
+            addr_key = (v.getAddr().getSpace().getIndex() if v and v.getAddr().getSpace() else 0,
+                        v.getAddr().getOffset() if v else 0) if v else (0, 0)
+            defop = v.getDef() if v else None
+            def_key = (0, defop.getAddr().getSpace().getIndex() if defop and defop.getAddr().getSpace() else 0,
+                       defop.getAddr().getOffset() if defop else 0) if defop else (1, 0, 0)
+            return (cover_key, addr_key, def_key)
+        try:
+            highvec.sort(key=_compareHighByBlock)
+        except Exception:
+            highvec.sort(key=lambda h: id(h))  # Fallback if cover comparison not available
         highstack: List[HighVariable] = []
         for high in highvec:
             merged = False
@@ -703,7 +693,7 @@ class Merge:
             bl = bblocks.getBlock(i)
             if not hasattr(bl, 'beginOp'):
                 continue
-            for op in bl.getOpRange():
+            for op in bl.beginOp():
                 if op.code() != opc:
                     continue
                 vn1 = op.getOut()
@@ -742,23 +732,75 @@ class Merge:
             self.mergeLinear(group)
 
     def mergeAddrTied(self) -> None:
-        """Force the merge of address-tied Varnodes."""
-        # Simplified: iterate all varnodes and group by address
+        """Force the merge of address-tied Varnodes.
+
+        C++ ref: ``Merge::mergeAddrTied``
+        Filters by space type (processor/spacebase), collects overlapping
+        ranges, unifies addresses, merges ranges, and groups overlapping highs.
+        """
+        from ghidra.core.space import IPTR_PROCESSOR, IPTR_SPACEBASE
         if not hasattr(self._data, 'beginLoc'):
             return
-        groups: dict = {}
+        # Group by space, then collect overlapping ranges
+        space_groups: dict = {}
         for vn in self._data.beginLoc():
-            if vn.isFree() or not vn.isAddrTied():
+            if vn.isFree():
                 continue
-            key = (id(vn.getSpace()), vn.getOffset(), vn.getSize())
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(vn)
-        for group in groups.values():
-            if len(group) <= 1:
+            spc = vn.getSpace()
+            if spc is None:
                 continue
-            self.unifyAddress(group)
-            self.mergeRangeMust(group)
+            stype = spc.getType() if hasattr(spc, 'getType') else -1
+            if stype != IPTR_PROCESSOR and stype != IPTR_SPACEBASE:
+                continue
+            spc_id = id(spc)
+            if spc_id not in space_groups:
+                space_groups[spc_id] = []
+            space_groups[spc_id].append(vn)
+        for vn_list in space_groups.values():
+            # Sort by (offset, size) to find overlapping ranges
+            vn_list.sort(key=lambda v: (v.getOffset(), v.getSize()))
+            i = 0
+            while i < len(vn_list):
+                vn = vn_list[i]
+                if vn.isFree():
+                    i += 1
+                    continue
+                # Collect maximally overlapping range
+                maxOff = vn.getOffset() + vn.getSize() - 1
+                has_addrtied = vn.isAddrTied()
+                group = [vn]
+                j = i + 1
+                while j < len(vn_list):
+                    vn2 = vn_list[j]
+                    if vn2.isFree():
+                        j += 1
+                        continue
+                    if vn2.getOffset() > maxOff:
+                        break
+                    endOff = vn2.getOffset() + vn2.getSize() - 1
+                    if endOff > maxOff:
+                        maxOff = endOff
+                    if vn2.isAddrTied():
+                        has_addrtied = True
+                    group.append(vn2)
+                    j += 1
+                if has_addrtied and len(group) > 1:
+                    self.unifyAddress(group)
+                    self.mergeRangeMust(group)
+                    # groupWith for overlapping sub-ranges
+                    if len(group) > 2:
+                        vn1 = group[0]
+                        for k in range(1, len(group)):
+                            vn2 = group[k]
+                            off = int(vn2.getOffset() - vn1.getOffset())
+                            h1 = vn1.getHigh() if hasattr(vn1, 'getHigh') else None
+                            h2 = vn2.getHigh() if hasattr(vn2, 'getHigh') else None
+                            if h1 is not None and h2 is not None and hasattr(h2, 'groupWith'):
+                                try:
+                                    h2.groupWith(off, h1)
+                                except Exception:
+                                    pass
+                i = j
 
     def mergeMarker(self) -> None:
         """Force the merge of input/output Varnodes to MULTIEQUAL and INDIRECT ops."""

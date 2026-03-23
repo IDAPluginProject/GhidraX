@@ -95,13 +95,26 @@ class SymbolEntry:
         return Address()
 
     def getSizedType(self, addr: Address, sz: int) -> Optional[Datatype]:
-        """Get the data-type associated with (a piece of) this."""
-        tp = self.symbol.getType()
-        if tp is None:
+        """Get the data-type associated with (a piece of) this.
+
+        C++ ref: ``SymbolEntry::getSizedType``
+        """
+        if self.isDynamic():
+            off = self.offset
+        else:
+            off = int(addr.getOffset() - self.addr.getOffset()) + self.offset
+        cur = self.symbol.getType()
+        if cur is None:
             return None
-        if sz == tp.getSize() and self.offset == 0:
-            return tp
-        return None  # Simplified - full impl would do sub-type lookup
+        scope = self.symbol.getScope() if hasattr(self.symbol, 'getScope') else None
+        if scope is not None and hasattr(scope, 'getArch'):
+            arch = scope.getArch()
+            if arch is not None and hasattr(arch, 'types') and hasattr(arch.types, 'getExactPiece'):
+                return arch.types.getExactPiece(cur, off, sz)
+        # Fallback: exact match only
+        if sz == cur.getSize() and off == 0:
+            return cur
+        return None
 
     def encode(self, encoder) -> None:
         """Encode this SymbolEntry to a stream.
@@ -775,16 +788,62 @@ class Scope(ABC):
         return self.findContainer(addr, size, usepoint)
 
     def queryFunction(self, addr: Address) -> Optional[FunctionSymbol]:
+        """Find a function starting at the given address.
+
+        C++ ref: ``Scope::queryFunction`` in database.cc
+        """
+        res = self.findFunction(addr) if hasattr(self, 'findFunction') else None
+        if res is not None:
+            return res
+        if self.parent is not None:
+            return self.parent.queryFunction(addr)
         return None
 
     def queryExternalRefFunction(self, addr: Address) -> Optional[ExternRefSymbol]:
+        """Find an external reference at the given address."""
+        res = self.findExternalRef(addr) if hasattr(self, 'findExternalRef') else None
+        if res is not None:
+            return res
+        if self.parent is not None:
+            return self.parent.queryExternalRefFunction(addr)
         return None
 
     def queryCodeLabel(self, addr: Address) -> Optional[LabSymbol]:
+        """Find a code label at the given address.
+
+        C++ ref: ``Scope::queryCodeLabel`` in database.cc
+        """
+        res = self.findCodeLabel(addr) if hasattr(self, 'findCodeLabel') else None
+        if res is not None:
+            return res
+        if self.parent is not None:
+            return self.parent.queryCodeLabel(addr)
         return None
 
     def queryProperties(self, addr: Address, size: int, usepoint, flags_ref) -> None:
-        pass
+        """Query boolean properties of a memory range (base Scope implementation).
+
+        C++ ref: ``Scope::queryProperties`` in database.cc
+        Delegates to findClosestFit/findAddr, then falls back to scope-based flags.
+        """
+        from ghidra.ir.varnode import Varnode
+        up = usepoint if usepoint else Address()
+        entry = self.findClosestFit(addr, size, up) if hasattr(self, 'findClosestFit') else None
+        if entry is None and hasattr(self, 'findAddr'):
+            entry = self.findAddr(addr, up)
+        flags = 0
+        if entry is not None:
+            flags = entry.getAllFlags()
+        else:
+            flags = Varnode.mapped | Varnode.addrtied
+            if self.isGlobal():
+                flags |= Varnode.persist
+            if hasattr(self, 'glb') and self.glb is not None:
+                db = getattr(self.glb, 'symboltab', None)
+                if db is not None and hasattr(db, 'getProperty'):
+                    flags |= db.getProperty(addr)
+        if isinstance(flags_ref, list) and flags_ref:
+            flags_ref[0] = flags
 
     # --- Symbol creation methods ---
 
@@ -913,18 +972,88 @@ class Scope(ABC):
     # --- Scope query/search ---
 
     def findOverlap(self, addr: Address, size: int) -> Optional[SymbolEntry]:
+        """Find a SymbolEntry whose range overlaps the given range.
+
+        C++ ref: ``ScopeInternal::findOverlap``
+        """
+        end = addr.getOffset() + size - 1
+        for entries_list in self._entriesByAddr.values():
+            for entry in entries_list:
+                if entry.addr.getSpace() is not addr.getSpace():
+                    continue
+                if entry.isDynamic():
+                    continue
+                eFirst = entry.getFirst()
+                eLast = entry.getLast()
+                # Check for overlap: ranges [eFirst, eLast] and [addr.getOffset(), end]
+                if eFirst <= end and eLast >= addr.getOffset():
+                    return entry
         return None
 
     def findClosestFit(self, addr: Address, size: int, usepoint: Address) -> Optional[SymbolEntry]:
-        return self.findContainer(addr, size, usepoint)
+        """Find the SymbolEntry whose size most closely matches the given range.
+
+        C++ ref: ``ScopeInternal::findClosestFit``
+        The entry must contain the start address. Prefer entries whose size
+        is closest to the requested size (exact match preferred, then smallest
+        larger, then largest smaller).
+        """
+        bestentry = None
+        olddiff = -10000
+        for entries_list in self._entriesByAddr.values():
+            for entry in entries_list:
+                if entry.addr.getSpace() is not addr.getSpace():
+                    continue
+                if entry.isDynamic():
+                    continue
+                if entry.getLast() < addr.getOffset():
+                    continue
+                if entry.getFirst() > addr.getOffset():
+                    continue
+                newdiff = entry.getSize() - size
+                if (olddiff < 0 and newdiff > olddiff) or \
+                   (olddiff >= 0 and newdiff >= 0 and newdiff < olddiff):
+                    if entry.inUse(usepoint):
+                        bestentry = entry
+                        if newdiff == 0:
+                            return bestentry
+                        olddiff = newdiff
+        return bestentry
 
     def findFunction(self, addr: Address) -> Optional[FunctionSymbol]:
+        """Find a FunctionSymbol at the given address.
+
+        C++ ref: ``ScopeInternal::findFunction`` in database.cc
+        """
+        entry = self.findAddr(addr, Address())
+        if entry is not None:
+            sym = entry.getSymbol()
+            if isinstance(sym, FunctionSymbol):
+                return sym
         return None
 
     def findExternalRef(self, addr: Address) -> Optional[ExternRefSymbol]:
+        """Find an ExternRefSymbol at the given address.
+
+        C++ ref: ``ScopeInternal::findExternalRef`` in database.cc
+        """
+        entry = self.findAddr(addr, Address())
+        if entry is not None:
+            sym = entry.getSymbol()
+            if isinstance(sym, ExternRefSymbol):
+                return sym
         return None
 
     def findCodeLabel(self, addr: Address) -> Optional[LabSymbol]:
+        """Find a LabSymbol at the given address.
+
+        C++ ref: ``ScopeInternal::findCodeLabel`` in database.cc
+        """
+        entry = self.findAddr(addr, Address())
+        if entry is not None:
+            sym = entry.getSymbol()
+            if isinstance(sym, LabSymbol):
+                return sym
         return None
 
     def findDistinguishingScope(self, op2: 'Scope') -> Optional['Scope']:
@@ -1014,22 +1143,76 @@ class Scope(ABC):
         pass
 
     def clearUnlocked(self) -> None:
-        pass
+        """Remove all symbols that are not type-locked.
+
+        C++ ref: ``ScopeInternal::clearUnlocked`` in database.cc
+        """
+        from ghidra.ir.varnode import Varnode
+        for sym in list(self._symbolsByName.values()):
+            for s in list(sym):
+                if s.isTypeLocked():
+                    if not s.isNameLocked():
+                        if not s.isNameUndefined():
+                            self.renameSymbol(s, self.buildUndefinedName())
+                    self.clearAttribute(s, Varnode.nolocalalias)
+                    if hasattr(s, 'isSizeTypeLocked') and s.isSizeTypeLocked():
+                        if hasattr(self, 'resetSizeLockType'):
+                            self.resetSizeLockType(s)
+                elif hasattr(s, 'getCategory') and s.getCategory() == Symbol.equate:
+                    continue
+                else:
+                    self.removeSymbol(s)
 
     def clearUnlockedCategory(self, cat: int) -> None:
-        pass
+        """Remove unlocked symbols in a specific category.
+
+        C++ ref: ``ScopeInternal::clearUnlockedCategory`` in database.cc
+        """
+        if cat < 0:
+            self.clearUnlocked()
+            return
+        catlist = self._category.get(cat, [])
+        for sym in list(catlist):
+            if sym.isTypeLocked():
+                if not sym.isNameLocked():
+                    if not sym.isNameUndefined():
+                        self.renameSymbol(sym, self.buildUndefinedName())
+                if hasattr(sym, 'isSizeTypeLocked') and sym.isSizeTypeLocked():
+                    if hasattr(self, 'resetSizeLockType'):
+                        self.resetSizeLockType(sym)
+            else:
+                self.removeSymbol(sym)
 
     def clearCategory(self, cat: int) -> None:
-        pass
+        """Remove all symbols in a given category."""
+        catlist = self._category.get(cat, [])
+        for sym in list(catlist):
+            self.removeSymbol(sym)
 
     def adjustCaches(self) -> None:
         pass
 
     def getCategorySize(self, cat: int) -> int:
-        return 0
+        """Return the number of symbols in a given category.
+
+        C++ ref: ``ScopeInternal::getCategorySize`` in database.cc
+        """
+        if cat < 0:
+            return 0
+        catlist = self._category.get(cat, [])
+        return len(catlist)
 
     def getCategorySymbol(self, cat: int, index: int) -> Optional[Symbol]:
-        return None
+        """Return a specific symbol in a given category by index.
+
+        C++ ref: ``ScopeInternal::getCategorySymbol`` in database.cc
+        """
+        if cat < 0:
+            return None
+        catlist = self._category.get(cat, [])
+        if index < 0 or index >= len(catlist):
+            return None
+        return catlist[index]
 
     # --- Encode / Decode ---
 
@@ -1176,16 +1359,29 @@ class ScopeInternal(Scope):
 
     def findContainer(self, addr: Address, size: int,
                       usepoint: Address) -> Optional[SymbolEntry]:
-        # Simplified: linear scan
+        """Find the smallest SymbolEntry containing the given range.
+
+        C++ ref: ``ScopeInternal::findContainer``
+        """
+        bestentry = None
+        oldsize = -1
+        end = addr.getOffset() + size - 1
         for entries_list in self._entriesByAddr.values():
             for entry in entries_list:
                 if entry.addr.getSpace() is not addr.getSpace():
                     continue
-                if entry.getFirst() <= addr.getOffset() and \
-                   addr.getOffset() + size - 1 <= entry.getLast():
+                if entry.getFirst() > addr.getOffset():
+                    continue
+                if entry.getLast() < end:
+                    continue
+                esz = entry.getSize()
+                if esz < oldsize or oldsize == -1:
                     if entry.inUse(usepoint):
-                        return entry
-        return None
+                        bestentry = entry
+                        if esz == size:
+                            return bestentry
+                        oldsize = esz
+        return bestentry
 
     def addMapEntry(self, sym: Symbol, entry: SymbolEntry) -> SymbolEntry:
         entry.symbol = sym
@@ -1273,13 +1469,31 @@ class ScopeInternal(Scope):
         return None
 
     def queryProperties(self, addr: Address, size: int, usepoint, flags_ref) -> None:
-        """Query boolean properties of the given address range."""
-        entry = self.findAddr(addr, usepoint if usepoint else Address())
+        """Query boolean properties of the given address range.
+
+        C++ ref: ``Scope::queryProperties`` in database.cc
+        """
+        from ghidra.ir.varnode import Varnode
+        up = usepoint if usepoint else Address()
+        # Try to find a containing symbol entry
+        entry = self.findClosestFit(addr, size, up)
+        if entry is None:
+            entry = self.findAddr(addr, up)
+        flags = 0
         if entry is not None:
-            if isinstance(flags_ref, list) and flags_ref:
-                flags_ref[0] = entry.getAllFlags()
-            elif isinstance(flags_ref, int):
-                pass  # Can't mutate int
+            flags = entry.getAllFlags()
+        else:
+            # No symbol found — set flags based on scope properties
+            flags = Varnode.mapped | Varnode.addrtied
+            if self.isGlobal():
+                flags |= Varnode.persist
+            # Add property flags from the database
+            if hasattr(self, 'glb') and self.glb is not None:
+                db = getattr(self.glb, 'symboltab', None)
+                if db is not None and hasattr(db, 'getProperty'):
+                    flags |= db.getProperty(addr)
+        if isinstance(flags_ref, list) and flags_ref:
+            flags_ref[0] = flags
 
     def renameSymbol(self, sym: Symbol, newname: str) -> None:
         """Rename a symbol."""
@@ -1535,6 +1749,7 @@ class Database:
         self._globalScope: Optional[ScopeInternal] = None
         self._scopeMap: Dict[int, Scope] = {}
         self._nextScopeId: int = 1
+        self._flagbase: Dict = {}  # addr offset -> flags (simplified partmap)
 
     def getGlobalScope(self) -> Optional[ScopeInternal]:
         return self._globalScope
@@ -1766,6 +1981,63 @@ class Database:
 
     def getScopeById(self, uid: int):
         return self._scopeMap.get(uid, None)
+
+    def getProperty(self, addr: Address) -> int:
+        """Get boolean properties associated with the given address.
+
+        C++ ref: ``Database::getProperty`` — looks up flagbase partmap.
+        """
+        spc = addr.getSpace()
+        if spc is None:
+            return 0
+        key = (id(spc), addr.getOffset())
+        return self._flagbase.get(key, 0)
+
+    def setPropertyRange(self, flags: int, rng) -> None:
+        """Set boolean properties on an address range.
+
+        C++ ref: ``Database::setPropertyRange`` in database.cc
+        """
+        if hasattr(rng, 'getFirstAddr') and hasattr(rng, 'getLastAddr'):
+            first = rng.getFirstAddr()
+            last = rng.getLastAddr()
+        elif hasattr(rng, 'getSpace'):
+            first = rng
+            last = rng
+        else:
+            return
+        spc = first.getSpace()
+        if spc is None:
+            return
+        start = first.getOffset()
+        end = last.getOffset() if last is not None else start
+        for off in range(start, end + 1):
+            key = (id(spc), off)
+            self._flagbase[key] = self._flagbase.get(key, 0) | flags
+
+    def clearPropertyRange(self, flags: int, rng) -> None:
+        """Clear boolean properties on an address range.
+
+        C++ ref: ``Database::clearPropertyRange`` in database.cc
+        """
+        if hasattr(rng, 'getFirstAddr') and hasattr(rng, 'getLastAddr'):
+            first = rng.getFirstAddr()
+            last = rng.getLastAddr()
+        elif hasattr(rng, 'getSpace'):
+            first = rng
+            last = rng
+        else:
+            return
+        spc = first.getSpace()
+        if spc is None:
+            return
+        start = first.getOffset()
+        end = last.getOffset() if last is not None else start
+        mask = ~flags & 0xFFFFFFFF
+        for off in range(start, end + 1):
+            key = (id(spc), off)
+            if key in self._flagbase:
+                self._flagbase[key] &= mask
 
     def __repr__(self) -> str:
         n = len(self._scopeMap)
