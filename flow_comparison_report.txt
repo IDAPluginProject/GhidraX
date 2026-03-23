@@ -1,31 +1,23 @@
 Flow Stage Comparison Report: cp.exe
-Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors: 0
+Total: 306, Match: 300, Expected-only: 0, Effective: 300, Unexpected: 6, Errors: 0
 
 0x00401000 [MATCH] C++=1blk/39ops Py=1blk/39ops
 0x00401040 [MATCH] C++=1blk/30ops Py=1blk/30ops
 0x00401080 [MATCH] C++=26blk/394ops Py=26blk/394ops
-0x004027b0 [DIFF] C++=66blk/1438ops Py=26blk/1023ops | unexpected=55 expected=16
-  Block[0] @0x4027b0 stop: C++=0x4028c8, Py=0x402907
-  Block[0] @0x4027b0 succs: C++=[1], Py=[3, 46]
-  Block[0] @0x4027b0 ops: C++=202, Py=235
-  Block[3] @0x40290d preds: C++=[2], Py=[0]
-  Block[4] @0x40291d succs: C++=[5, 6, 9, 10, 11, 12, 13, 14, 15, 16, 18, 19, 20, 21, 22, 23, 24, 26, 27, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45], Py=[]
-  Block[4] Op[1] opcode: C++=@0x40291d#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40291d#0 void = CPUI_RETURN(const[0x3fe:4])
-  Block[4] Op[2] opcode: C++=@0x40291d#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x402924:4], unique[0x3680:4]) | Py=@0x40291d#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[4] Op[3] opcode: C++=@0x40291d#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40291d#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x402924:4], unique[0x3680:4])
+0x004027b0 [MATCH] C++=66blk/1438ops Py=66blk/1438ops
 0x00403490 [MATCH] C++=4blk/478ops Py=4blk/478ops
 0x00403840 [MATCH] C++=74blk/1454ops Py=74blk/1454ops
-0x00403f00 [DIFF] C++=87blk/1452ops Py=75blk/1369ops | unexpected=177 expected=18
-  Block[0] @0x403f00 stop: C++=0x403f2a, Py=0x403f44
-  Block[0] @0x403f00 succs: C++=[1], Py=[2, 3]
-  Block[0] @0x403f00 ops: C++=42, Py=61
-  Block[2] @0x403f46 preds: C++=[1], Py=[0]
-  Block[3] @0x403f4a preds: C++=[1, 2], Py=[0, 2]
-  Block[4] Op[1] opcode: C++=@0x403f8c#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x403f8c#0 void = CPUI_RETURN(const[0x558:4])
-  Block[4] Op[2] opcode: C++=@0x403f8c#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x403f94:4], unique[0x3680:4]) | Py=@0x403f8c#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[4] Op[3] opcode: C++=@0x403f8c#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x403f8c#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x403f94:4], unique[0x3680:4])
+0x00403f00 [DIFF] C++=87blk/1452ops Py=85blk/1451ops | unexpected=149 expected=19
+  Block[13] @0x404010 succs: C++=[14, 25], Py=[14]
+  Block[14] @0x40402c succs: C++=[15, 25], Py=[15]
+  Block[18] @0x404043 stop: C++=0x40406a, Py=0x404062
+  Block[18] @0x404043 succs: C++=[20, 42], Py=[19]
+  Block[18] @0x404043 preds: C++=[17, 19], Py=[17]
   Block[47] Op[15] opcode: C++=@0x4040f4#142606338 register[0x0:4] = CPUI_INT_SUB(register[0x0:4], const[0x1:4]) | Py=@0x4040ef#0 register[0x1c:4] = CPUI_COPY(unique[0xb900:4])
   Block[47] Op[16] opcode: C++=@0x4040f4#192937986 register[0x202:1] = CPUI_INT_EQUAL(unique[0x24d00:1], const[0x0:1]) | Py=@0x4040ef#0 unique[0x3300:4] = CPUI_INT_ADD(register[0x14:4], const[0x14:4])
+  Block[47] Op[17] opcode: C++=@0x4040f4#159383554 register[0x206:1] = CPUI_INT_EQUAL(register[0x0:4], const[0x0:4]) | Py=@0x4040ef#0 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3300:4])
+  Block[47] Op[18] opcode: C++=@0x4040f4#150994946 register[0x207:1] = CPUI_INT_SLESS(register[0x0:4], const[0x0:4]) | Py=@0x4040f1#0 register[0x0:1] = CPUI_INT_ADD(unique[0x24280:1], unique[0x24080:1])
+  Block[47] Op[19] opcode: C++=@0x4040f4#134217730 register[0x20b:1] = CPUI_INT_SBORROW(register[0x0:4], const[0x1:4]) | Py=@0x4040f1#0 register[0x200:1] = CPUI_INT_CARRY(register[0x0:1], const[0xe8:1])
 0x004040e0 [MATCH] C++=24blk/479ops Py=24blk/479ops
 0x00404320 [MATCH] C++=25blk/513ops Py=25blk/513ops
 0x00404b50 [MATCH] C++=313blk/5814ops Py=313blk/5814ops
@@ -54,15 +46,7 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x00409cc0 [MATCH] C++=9blk/124ops Py=9blk/124ops
 0x00409d60 [MATCH] C++=11blk/201ops Py=11blk/201ops
 0x00409e20 [MATCH] C++=36blk/890ops Py=36blk/890ops
-0x0040a3b0 [DIFF] C++=28blk/358ops Py=16blk/327ops | unexpected=24 expected=7
-  Block[6] @0x40a41d succs: C++=[7, 8, 17, 18, 19, 20, 21, 22, 23, 24], Py=[]
-  Block[6] @0x40a41d ops: C++=4, Py=5
-  Block[9] @0x40a460 preds: C++=[8, 17, 18, 19, 20, 21, 22, 23, 24, 25], Py=[25]
-  Block[11] @0x40a488 stop: C++=0x40a495, Py=0x40a4a3
-  Block[11] @0x40a488 succs: C++=[27], Py=[13, 15]
-  Block[6] Op[1] opcode: C++=@0x40a41d#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0xc:4], const[0x4:4]) | Py=@0x40a41d#0 void = CPUI_RETURN(const[0x146:4])
-  Block[6] Op[2] opcode: C++=@0x40a41d#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40a424:4], unique[0x3680:4]) | Py=@0x40a41d#0 unique[0x3680:4] = CPUI_INT_MULT(register[0xc:4], const[0x4:4])
-  Block[6] Op[3] opcode: C++=@0x40a41d#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40a41d#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40a424:4], unique[0x3680:4])
+0x0040a3b0 [MATCH] C++=28blk/358ops Py=28blk/358ops
 0x0040a580 [MATCH] C++=1blk/52ops Py=1blk/52ops
 0x0040a5c0 [MATCH] C++=1blk/59ops Py=1blk/59ops
 0x0040a850 [MATCH] C++=21blk/424ops Py=21blk/424ops
@@ -84,12 +68,7 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x0040afe0 [MATCH] C++=15blk/226ops Py=15blk/226ops
 0x0040b0d0 [MATCH] C++=1blk/95ops Py=1blk/95ops
 0x0040b140 [MATCH] C++=36blk/1010ops Py=36blk/1010ops
-0x0040b420 [DIFF] C++=25blk/293ops Py=22blk/291ops | unexpected=11 expected=3
-  Block[14] @0x40b4a0 stop: C++=0x40b4a6, Py=0x40b4af
-  Block[14] @0x40b4a0 succs: C++=[24], Py=[14, 16]
-  Block[14] @0x40b4a0 preds: C++=[13, 15], Py=[13, 14]
-  Block[14] @0x40b4a0 ops: C++=8, Py=20
-  Block[16] @0x40b4b1 preds: C++=[15], Py=[14]
+0x0040b420 [MATCH] C++=25blk/293ops Py=25blk/293ops
 0x0040b510 [MATCH] C++=23blk/432ops Py=23blk/432ops
 0x0040b690 [MATCH] C++=31blk/1152ops Py=31blk/1152ops
 0x0040bae0 [MATCH] C++=39blk/594ops Py=39blk/594ops
@@ -97,7 +76,7 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x0040bef0 [MATCH] C++=21blk/405ops Py=21blk/405ops
 0x0040bff0 [MATCH] C++=4blk/111ops Py=4blk/111ops
 0x0040c030 [MATCH] C++=7blk/147ops Py=7blk/147ops
-0x0040c090 [DIFF] C++=184blk/3382ops Py=114blk/2521ops | unexpected=168 expected=20
+0x0040c090 [DIFF] C++=184blk/3382ops Py=182blk/3382ops | unexpected=78 expected=17
   Block[19] @0x40c1d0 stop: C++=0x40c1ee, Py=0x40c1e1
   Block[19] @0x40c1d0 succs: C++=[22, 28], Py=[20]
   Block[19] @0x40c1d0 ops: C++=25, Py=20
@@ -108,23 +87,10 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
   Block[21] Op[26] varnode: C++=@0x40c1ea#209715202 unique[0xa800:4] = CPUI_COPY(register[0x1c:4]) | Py=@0x40c1e9#0 unique[0x43f80:4] = CPUI_COPY(const[0x6c6c65:4])
   Block[21] Op[27] opcode: C++=@0x40c1ea#218103810 unique[0xa880:4] = CPUI_INT_ADD(register[0x1c:4], const[0x1:4]) | Py=@0x40c1ea#0 void = CPUI_STORE(const[SPACEID:8], unique[0xa800:4], unique[0xaa80:1])
   Block[21] Op[28] opcode: C++=@0x40c1ea#226492418 unique[0xa900:4] = CPUI_INT_ZEXT(register[0x20a:1]) | Py=@0x40c1ea#0 register[0x1c:4] = CPUI_INT_SUB(unique[0xa880:4], unique[0xa980:4])
-0x0040c270 [DIFF] C++=150blk/2360ops Py=83blk/1499ops | unexpected=89 expected=8
-  Block[1] @0x40c2a9 succs: C++=[2, 6, 134, 137, 138], Py=[]
-  Block[1] @0x40c2a9 ops: C++=7, Py=8
-  Block[6] @0x40c2fe preds: C++=[0, 1, 5, 137, 144], Py=[0]
-  Block[20] @0x40c375 succs: C++=[21, 29, 38, 41, 42, 46, 47, 48, 49, 50, 59, 71, 114, 115, 117, 120], Py=[]
-  Block[20] @0x40c375 ops: C++=4, Py=5
-  Block[1] Op[4] opcode: C++=@0x40c2ad#33554434 unique[0x3680:4] = CPUI_INT_MULT(register[0x8:4], const[0x4:4]) | Py=@0x40c2ad#0 void = CPUI_RETURN(const[0x5d8:4])
-  Block[1] Op[5] opcode: C++=@0x40c2ad#41943042 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c2b4:4], unique[0x3680:4]) | Py=@0x40c2ad#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x8:4], const[0x4:4])
-  Block[1] Op[6] opcode: C++=@0x40c2ad#50331650 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40c2ad#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c2b4:4], unique[0x3680:4])
-  Block[20] Op[1] opcode: C++=@0x40c375#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40c375#0 void = CPUI_RETURN(const[0x5d9:4])
-  Block[20] Op[2] opcode: C++=@0x40c375#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40c37c:4], unique[0x3680:4]) | Py=@0x40c375#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
+0x0040c270 [MATCH] C++=150blk/2360ops Py=150blk/2360ops
 0x0040cfa0 [MATCH] C++=4blk/191ops Py=4blk/191ops
 0x0040d310 [MATCH] C++=1blk/178ops Py=1blk/178ops
-0x0040d3b0 [DIFF] C++=39blk/802ops Py=39blk/802ops | unexpected=3 expected=20
-  Block[25] @0x40d5da succs: C++=[27], Py=[26]
-  Block[26] @0x40d5dd preds: C++=[21], Py=[21, 25]
-  Block[27] @0x40d5e0 preds: C++=[22, 25, 26], Py=[22, 26]
+0x0040d3b0 [MATCH] C++=39blk/802ops Py=39blk/802ops
 0x0040d590 [MATCH] C++=15blk/271ops Py=15blk/271ops
 0x0040d6d0 [MATCH] C++=7blk/129ops Py=7blk/129ops
 0x0040d740 [MATCH] C++=1blk/54ops Py=1blk/54ops
@@ -137,38 +103,14 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x0040da60 [MATCH] C++=34blk/886ops Py=34blk/886ops
 0x0040fde0 [MATCH] C++=17blk/505ops Py=17blk/505ops
 0x0040ff10 [MATCH] C++=8blk/186ops Py=8blk/186ops
-0x0040ff90 [DIFF] C++=16blk/453ops Py=4blk/91ops | unexpected=19 expected=1
-  Block[1] @0x40ffbe succs: C++=[2, 4, 8, 9, 10, 13, 15], Py=[]
-  Block[1] @0x40ffbe ops: C++=4, Py=5
-  Block[6] @0x410080 preds: C++=[3, 5, 9, 13], Py=[9]
-  Block[9] @0x4100b0 preds: C++=[0, 1, 8, 10, 15], Py=[0]
-  Block[2] only in C++: Block[9] 0x410040-0x41006b ops=46 succ=[3, 7] pred=[1]
-  Block[1] Op[1] opcode: C++=@0x40ffbe#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x40ffbe#0 void = CPUI_RETURN(const[0x5a:4])
-  Block[1] Op[2] opcode: C++=@0x40ffbe#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x40ffc8:4], unique[0x3680:4]) | Py=@0x40ffbe#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[1] Op[3] opcode: C++=@0x40ffbe#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x40ffbe#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x40ffc8:4], unique[0x3680:4])
+0x0040ff90 [MATCH] C++=16blk/453ops Py=16blk/453ops
 0x00410120 [MATCH] C++=7blk/108ops Py=7blk/108ops
 0x00410350 [MATCH] C++=6blk/125ops Py=6blk/125ops
-0x00410390 [DIFF] C++=69blk/1509ops Py=13blk/333ops | unexpected=65 expected=5
-  Block[3] @0x413ff8 preds: C++=[2, 6, 11, 35, 39, 46, 48, 50, 51, 52, 53, 54, 66], Py=[2, 66]
-  Block[6] @0x41401a succs: C++=[3, 7, 10, 12, 18, 25, 35, 36, 46, 48, 54, 55, 60, 68], Py=[]
-  Block[6] @0x41401a ops: C++=4, Py=5
-  Block[8] @0x4140a0 preds: C++=[7, 17, 67], Py=[67]
-  Block[9] @0x4140a2 preds: C++=[1, 8, 44], Py=[1, 8]
-  Block[6] Op[1] opcode: C++=@0x41401a#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x41401a#0 void = CPUI_RETURN(const[0x14b:4])
-  Block[6] Op[2] opcode: C++=@0x41401a#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x414024:4], unique[0x3680:4]) | Py=@0x41401a#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[6] Op[3] opcode: C++=@0x41401a#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x41401a#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x414024:4], unique[0x3680:4])
+0x00410390 [MATCH] C++=69blk/1509ops Py=69blk/1509ops
 0x004103a0 [MATCH] C++=22blk/511ops Py=22blk/511ops
 0x00410520 [MATCH] C++=15blk/551ops Py=15blk/551ops
 0x004108e0 [MATCH] C++=7blk/118ops Py=7blk/118ops
-0x00410970 [DIFF] C++=735blk/14780ops Py=92blk/1728ops | unexpected=652 expected=11
-  Block[11] @0x410adf succs: C++=[12, 54, 100, 131, 149, 172, 207, 297, 311, 313, 500, 718, 720], Py=[]
-  Block[11] @0x410adf ops: C++=4, Py=5
-  Block[26] @0x410d86 preds: C++=[0, 15, 18, 36, 39, 49, 52, 57, 60, 71, 74, 104, 107, 118, 121, 134, 137, 155, 158, 170, 175, 178, 194, 197, 224, 227, 244, 247, 258, 261, 298, 301, 315, 318, 327, 330, 341, 344, 375, 384, 396, 403, 412, 423, 428, 435, 448, 472, 508, 511, 528, 531, 544, 547, 558, 561, 574, 577, 588, 591, 603, 606, 617, 620, 631, 634, 661, 670, 673, 686, 689], Py=[0, 36, 39, 49, 51, 57, 60, 71, 74]
-  Block[30] @0x410d9f preds: C++=[29, 83, 130, 146, 169, 192, 221, 256, 492], Py=[83]
-  Block[51] @0x410f10 stop: C++=0x410f10, Py=0x410f18
-  Block[11] Op[1] opcode: C++=@0x410adf#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x410adf#0 void = CPUI_RETURN(const[0x6bf:4])
-  Block[11] Op[2] opcode: C++=@0x410adf#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x410ae8:4], unique[0x3680:4]) | Py=@0x410adf#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[11] Op[3] opcode: C++=@0x410adf#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x410adf#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x410ae8:4], unique[0x3680:4])
+0x00410970 [MATCH] C++=735blk/14780ops Py=735blk/14780ops
 0x00413ce0 [MATCH] C++=59blk/887ops Py=59blk/887ops
 0x004143b0 [MATCH] C++=51blk/1043ops Py=51blk/1043ops
 0x00414650 [MATCH] C++=19blk/378ops Py=19blk/378ops
@@ -193,12 +135,7 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x00417000 [MATCH] C++=10blk/164ops Py=10blk/164ops
 0x00417310 [MATCH] C++=20blk/525ops Py=20blk/525ops
 0x004174f0 [MATCH] C++=8blk/371ops Py=8blk/371ops
-0x00417670 [DIFF] C++=12blk/251ops Py=11blk/251ops | unexpected=7 expected=10
-  Block[0] @0x417670 stop: C++=0x417682, Py=0x417698
-  Block[0] @0x417670 succs: C++=[10], Py=[2, 9]
-  Block[0] @0x417670 ops: C++=32, Py=59
-  Block[2] @0x41769e preds: C++=[1], Py=[0]
-  Block[9] @0x417740 preds: C++=[1, 7], Py=[0, 7]
+0x00417670 [MATCH] C++=12blk/251ops Py=12blk/251ops
 0x00417760 [MATCH] C++=17blk/295ops Py=17blk/295ops
 0x00417880 [MATCH] C++=14blk/368ops Py=14blk/368ops
 0x00417b30 [MATCH] C++=5blk/104ops Py=5blk/104ops
@@ -240,33 +177,17 @@ Total: 306, Match: 289, Expected-only: 0, Effective: 289, Unexpected: 17, Errors
 0x0041af00 [MATCH] C++=9blk/367ops Py=9blk/367ops
 0x0041b000 [MATCH] C++=4blk/116ops Py=4blk/116ops
 0x0041b0f0 [MATCH] C++=8blk/104ops Py=8blk/104ops
-0x0041b150 [DIFF] C++=19blk/357ops Py=5blk/146ops | unexpected=24 expected=1
-  Block[1] @0x41b170 succs: C++=[2, 12, 13, 14, 15, 16, 17, 18], Py=[]
-  Block[1] @0x41b170 ops: C++=4, Py=5
-  Block[3] @0x41b1b0 preds: C++=[2, 11], Py=[5]
-  Block[5] @0x41b1d0 stop: C++=0x41b1d2, Py=0x41b1f8
-  Block[5] @0x41b1d0 succs: C++=[6], Py=[3]
-  Block[1] Op[1] opcode: C++=@0x41b170#8388610 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4]) | Py=@0x41b170#0 void = CPUI_RETURN(const[0x91:4])
-  Block[1] Op[2] opcode: C++=@0x41b170#16777218 unique[0x3780:4] = CPUI_INT_ADD(const[0x41b178:4], unique[0x3680:4]) | Py=@0x41b170#0 unique[0x3680:4] = CPUI_INT_MULT(register[0x0:4], const[0x4:4])
-  Block[1] Op[3] opcode: C++=@0x41b170#25165826 unique[0xb900:4] = CPUI_LOAD(const[SPACEID:8], unique[0x3780:4]) | Py=@0x41b170#0 unique[0x3780:4] = CPUI_INT_ADD(const[0x41b178:4], unique[0x3680:4])
+0x0041b150 [MATCH] C++=19blk/357ops Py=19blk/357ops
 0x0041b250 [MATCH] C++=13blk/845ops Py=13blk/845ops
 0x0041b5e0 [MATCH] C++=1blk/12ops Py=1blk/12ops
 0x0041b5f0 [MATCH] C++=1blk/12ops Py=1blk/12ops
 0x0041b600 [MATCH] C++=1blk/12ops Py=1blk/12ops
-0x0041b610 [DIFF] C++=2blk/1ops Py=1blk/1ops | unexpected=3 expected=0
-  Block[0] @0x41b610 succs: C++=[0], Py=[]
-  Block[0] @0x41b610 preds: C++=[0], Py=[]
-  Block[0] Op[0] varnode: C++=@0x41b610#8388610 void = CPUI_BRANCH(ram[0x41b610:1]) | Py=@0x41b610#0 void = CPUI_BRANCH(ram[0x41b610:4])
+0x0041b610 [DIFF] C++=2blk/1ops Py=1blk/1ops | unexpected=0 expected=0
 0x0041b620 [MATCH] C++=1blk/78ops Py=1blk/78ops
 0x0041b680 [MATCH] C++=14blk/162ops Py=14blk/162ops
 0x0041b720 [MATCH] C++=6blk/127ops Py=6blk/127ops
 0x0041b7f0 [MATCH] C++=40blk/586ops Py=40blk/586ops
-0x0041bb70 [DIFF] C++=35blk/1083ops Py=33blk/1083ops | unexpected=11 expected=25
-  Block[8] @0x41bbee preds: C++=[7, 29], Py=[7, 28]
-  Block[28] @0x41bf23 stop: C++=0x41bf32, Py=0x41bf68
-  Block[28] @0x41bf23 succs: C++=[31], Py=[8]
-  Block[28] @0x41bf23 ops: C++=10, Py=188
-  Block[30] @0x41bf6d stop: C++=0x41bf84, Py=0x41bfc6
+0x0041bb70 [MATCH] C++=35blk/1083ops Py=35blk/1083ops
 0x0041bfa0 [MATCH] C++=3blk/164ops Py=3blk/164ops
 0x0041c000 [MATCH] C++=4blk/27ops Py=4blk/27ops
 0x0041c020 [MATCH] C++=7blk/275ops Py=7blk/275ops

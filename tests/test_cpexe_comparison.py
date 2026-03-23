@@ -229,7 +229,7 @@ def run_flow_comparison(cpp_engine, pe_info: PeInfo, func_addr: int) -> FuncFlow
         lifter.set_image(pe_info.image_base, pe_info.image)
         func_name = f"func_{func_addr:x}"
         fd = lifter.lift_function(func_name, func_addr, 0)
-        _split_basic_blocks(fd)
+        _split_basic_blocks(fd, lifter=lifter)
         py_snap = _snapshot_from_python_fd('flow', fd)
         result.py_blocks = py_snap.num_blocks
         result.py_ops = py_snap.num_ops
@@ -556,7 +556,7 @@ def run_heritage_comparison(cpp_engine, pe_info: PeInfo, func_addr: int) -> Func
         lifter.set_image(pe_info.image_base, pe_info.image)
         func_name = f"func_{func_addr:x}"
         fd = lifter.lift_function(func_name, func_addr, 0)
-        _split_basic_blocks(fd)
+        _split_basic_blocks(fd, lifter=lifter)
         arch_shim = _ArchitectureShim(lifter._spc_mgr)
         fd.setArch(arch_shim)
         _inject_tracked_context(fd, lifter)

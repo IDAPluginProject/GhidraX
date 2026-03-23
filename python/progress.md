@@ -208,10 +208,10 @@ x86 binary → sleigh_native.pyd → P-code → Funcdata → 136 rules + 62 Acti
   - Note: X86_BRANCH collapse is expected C++ behavior (EAX_input not boolean → rule doesn't fire)
 - [x] ActionReturnSplit: added sizeIn() guard before nodeSplit for batch splits
 
-### Heritage Comparison: cp.exe — 292/306 (95.4%)
-- **292 exact matches** out of 306 functions (block counts, op counts, opcodes all match)
-- **14 remaining diffs**: 8 jump-table (BRANCHIND), 3 code-following, 1 non-returning call, 2 other
-- Key fixes:
+### Heritage Comparison: cp.exe — 303/306 (99.0%)
+- **303 exact matches** out of 306 functions (block counts, op counts, opcodes all match)
+- **3 remaining diffs** — rooted in instruction overlap and data-as-code
+- Key fixes (chronological):
   - markAlive → _addToCodeList (130→142)
   - RETURN EDX+ST0 output entries (142→187)
   - structureReset() block ordering (187→216)
@@ -221,7 +221,30 @@ x86 binary → sleigh_native.pyd → P-code → Funcdata → 136 rules + 62 Acti
   - RETURN input count fix (285→286)
   - Internal p-code branch relative offsets (286→289)
   - DF COPY at function entry block (289→292)
-- Remaining diffs require: jump table recovery, FlowInfo-level code following, non-returning call detection
+  - **Jump table recovery** (292→298): pattern-match BRANCHIND(LOAD(ADD(const,MULT(reg,4)))),
+    read table entries from image, deduplicate edges, add targets to worklist
+  - ActionUnreachable added to prerequisite actions (correctness, no match change)
+  - X86_LOOP test pattern JNZ displacement fix (0xFC→0xFB)
+  - **Instruction overlap fall-through fix** (298→299): track insn_fall_throughs in lifter,
+    use actual instruction end address (not next block) for fall-through edges when x86
+    variable-length instructions overlap at block boundaries (fixed 0x40d3b0)
+  - **checkContainedCall PIC fix** (299→301): convert CALL→BRANCH when call target is an
+    already-decoded instruction within the function (C++ FlowInfo::checkContainedCall).
+    Excludes self-recursive calls. Fixed 0x41bb70, 0x417670.
+  - **Range limit removal + thunk following** (301→302): removed lifter's 0x10000 address
+    range limit (C++ uses full address space baddr=0, eaddr=MAX). Now follows branches to
+    JMP [IAT] thunks at any address. Added fillinBranchStubs for out-of-range targets.
+    Fixed 0x40a3b0.
+  - **checkContainedCall iterator skip** (302→303): replicated C++ iterator skip bug where
+    qlst.erase(iter) + for-loop ++iter skips every other matching CALL. Fixed 0x40b420.
+- **Remaining 3 diffs**:
+  - **Instruction overlap** (1): 0x403f00 — large function (87 vs 83 blocks), minor op count
+    diffs in first few blocks due to x86 instruction overlap at block boundaries.
+  - **Data-as-code overlap** (1): 0x40c090 — string data ("literal\0shell\0shell-...") decoded
+    as instructions by both C++ and Python, but C++ linear-first ordering produces different
+    branch paths through the data. Fundamental lifter ordering issue.
+  - **Trivial self-loop** (1): 0x41b610 — `JMP 0x41b610` (eb fe) infinite loop. C++ splits
+    into 2 blocks, Python keeps 1. 0 unexpected diffs.
 
 ### Phase 3: Console / CLI (Ghidra Binary Protocol) — SCAFFOLDING DONE
 - [x] console/__init__.py — package

@@ -7,6 +7,7 @@ Python Varnode/PcodeOp/BlockBasic objects, ready for analysis and PrintC output.
 
 from __future__ import annotations
 
+import struct
 from typing import Optional, Dict, List, Tuple
 
 from ghidra.core.address import Address
@@ -78,6 +79,14 @@ class Lifter:
         self._spc_mgr = AddrSpaceManager()
         self._spaces: Dict[str, AddrSpace] = {}
         self._setup_spaces()
+
+        # Image data for jump table recovery
+        self._image_base: int = 0
+        self._image_data: bytes = b''
+        # Resolved jump tables: branchind_addr -> [target_addrs]
+        self._jumptables: Dict[int, List[int]] = {}  # addr -> [targets]
+        self._insn_fall_throughs: Dict[int, int] = {}  # addr -> addr+length
+        self._unprocessed: List[int] = []  # out-of-range branch targets (fillinBranchStubs)
 
     def _setup_spaces(self) -> None:
         """Create Python AddrSpace objects matching the native SLEIGH spaces."""
@@ -157,6 +166,8 @@ class Lifter:
     def set_image(self, base_addr: int, data: bytes) -> None:
         """Set the binary image to analyze."""
         self._native.set_image(base_addr, data)
+        self._image_base = base_addr
+        self._image_data = data
 
     def get_registers(self) -> dict:
         """Get all register definitions from the native engine."""
@@ -169,6 +180,96 @@ class Lifter:
     def disassemble_range(self, start: int, end: int):
         """Disassemble a range of instructions."""
         return self._native.disassemble_range(start, end)
+
+    def _try_resolve_jumptable(self, ops) -> Optional[List[int]]:
+        """Try to resolve jump table targets from BRANCHIND p-code pattern.
+
+        Detects the common x86 pattern:
+            tmp1 = INT_MULT(reg, 4)
+            tmp2 = INT_ADD(const[table_base], tmp1)
+            target = LOAD(space, tmp2)
+            BRANCHIND(target)
+
+        Reads 4-byte LE entries from the image starting at table_base.
+        Uses heuristic: entries must be valid code addresses within image.
+        Returns list of target addresses or None if pattern not matched.
+
+        C++ ref: jumptable.cc JumpTable::recoverModel
+        """
+        if not self._image_data:
+            return None
+
+        # Build output→op map for this instruction's ops
+        out_map: Dict[Tuple[str, int], object] = {}
+        for op in ops:
+            if op.output:
+                out_map[(op.output.space, op.output.offset)] = op
+
+        # Find BRANCHIND
+        branchind = None
+        for op in ops:
+            if op.opcode == OpCode.CPUI_BRANCHIND.value:
+                branchind = op
+                break
+        if branchind is None or not branchind.inputs:
+            return None
+
+        # Trace: BRANCHIND input ← LOAD ← INT_ADD(const, INT_MULT(reg, 4))
+        bi_in = branchind.inputs[0]
+        load_op = out_map.get((bi_in.space, bi_in.offset))
+        if load_op is None or load_op.opcode != OpCode.CPUI_LOAD.value:
+            return None
+        if len(load_op.inputs) < 2:
+            return None
+
+        addr_vn = load_op.inputs[1]
+        add_op = out_map.get((addr_vn.space, addr_vn.offset))
+        if add_op is None or add_op.opcode != OpCode.CPUI_INT_ADD.value:
+            return None
+        if len(add_op.inputs) < 2:
+            return None
+
+        # One input should be const (table_base), other from INT_MULT
+        table_base = None
+        mult_vn = None
+        for inp in add_op.inputs:
+            if inp.space == "const":
+                table_base = inp.offset
+            else:
+                mult_vn = inp
+        if table_base is None or mult_vn is None:
+            return None
+
+        mult_op = out_map.get((mult_vn.space, mult_vn.offset))
+        if mult_op is None or mult_op.opcode != OpCode.CPUI_INT_MULT.value:
+            return None
+
+        # Verify multiplier is 4 (sizeof pointer for 32-bit)
+        entry_size = 0
+        for inp in mult_op.inputs:
+            if inp.space == "const":
+                entry_size = inp.offset
+        if entry_size not in (4, 8):
+            return None
+
+        # Read table entries from image
+        image_end = self._image_base + len(self._image_data)
+        targets: List[int] = []
+        fmt = '<I' if entry_size == 4 else '<Q'
+        max_entries = 512
+
+        for i in range(max_entries):
+            entry_addr = table_base + i * entry_size
+            file_off = entry_addr - self._image_base
+            if file_off < 0 or file_off + entry_size > len(self._image_data):
+                break
+            val = struct.unpack_from(fmt, self._image_data, file_off)[0]
+            # Heuristic: target must be a valid address within the image
+            if val < self._image_base or val >= image_end:
+                break
+            targets.append(val)
+
+        return targets if targets else None
 
     def lift_function(self, name: str, entry: int, size: int) -> Funcdata:
         """Lift a function starting at entry for size bytes into a Funcdata.
@@ -187,16 +288,25 @@ class Lifter:
         fd = Funcdata(name, name, None, Address(code_spc, entry), None, size)
 
         # --- Control-flow-following instruction collection ---
-        end_addr = entry + size if size > 0 else entry + 0x10000
-        worklist: List[int] = [entry]
+        # C++ uses baddr=0, eaddr=~0 (full address space).  Safety is
+        # ensured by only following BRANCH/CBRANCH targets (not CALLs) and
+        # BRANCHIND→CALLIND+RETURN termination at indirect jumps.
+        # max_instructions mirrors C++ glb->max_instructions.
+        max_instructions = 200000
+        # C++ FlowInfo processes fall-throughs linearly (immediate) before
+        # branch targets (queued in addrlist FIFO).  We simulate this with a
+        # deque: fall-throughs → front (left), branch targets → back (right).
+        from collections import deque
+        worklist: deque = deque([entry])
         visited: set = set()
         insn_list: List = []  # (addr, native_result) in address order
 
         while worklist:
-            addr = worklist.pop(0)
+            addr = worklist.popleft()
             if addr in visited:
                 continue
-            if addr >= end_addr:
+            if len(insn_list) >= max_instructions:
+                self._unprocessed.append(addr)
                 continue
             visited.add(addr)
 
@@ -209,6 +319,7 @@ class Lifter:
 
             insn_list.append(insn)
             next_addr = addr + insn.length
+            self._insn_fall_throughs[addr] = next_addr
 
             # Determine control flow from the last pcode op
             has_branch = False
@@ -217,26 +328,32 @@ class Lifter:
                 opc_val = native_op.opcode
                 if opc_val == OpCode.CPUI_BRANCH.value:
                     has_branch = True
-                    # Target is input[0]
+                    # Target is input[0] → back (branch target)
                     if native_op.inputs:
                         tgt = native_op.inputs[0]
                         if tgt.space != "const":
                             worklist.append(tgt.offset)
                 elif opc_val == OpCode.CPUI_CBRANCH.value:
-                    # Conditional: both target and fallthrough
+                    # Branch target → back; fall-through → front
                     if native_op.inputs:
                         tgt = native_op.inputs[0]
                         if tgt.space != "const":
                             worklist.append(tgt.offset)
-                    worklist.append(next_addr)
+                    worklist.appendleft(next_addr)
                 elif opc_val == OpCode.CPUI_BRANCHIND.value:
                     has_branch = True
+                    # Try to resolve jump table targets → back
+                    targets = self._try_resolve_jumptable(insn.ops)
+                    if targets:
+                        self._jumptables[addr] = targets
+                        for tgt in targets:
+                            worklist.append(tgt)
                 elif opc_val == OpCode.CPUI_RETURN.value:
                     has_return = True
 
-            # If no explicit branch/return, fall through to next instruction
+            # If no explicit branch/return, fall through → front
             if not has_branch and not has_return:
-                worklist.append(next_addr)
+                worklist.appendleft(next_addr)
 
         if not insn_list:
             return fd

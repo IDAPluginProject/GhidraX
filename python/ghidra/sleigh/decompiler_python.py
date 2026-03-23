@@ -379,7 +379,7 @@ def _op_str(op) -> str:
     return f"{opc.name}({arg_str})"
 
 
-def _split_basic_blocks(fd) -> None:
+def _split_basic_blocks(fd, lifter=None) -> None:
     """Module 2: Split a single-block Funcdata into proper basic blocks.
 
     Analyzes PcodeOps for branch/return instructions and splits the
@@ -397,15 +397,29 @@ def _split_basic_blocks(fd) -> None:
     if not all_ops:
         return
 
+    # Resolved jump tables from lifter (branchind_addr -> [target_addrs])
+    jumptables: Dict[int, list] = {}
+    if lifter is not None and hasattr(lifter, '_jumptables'):
+        jumptables = lifter._jumptables
+
+    # Instruction fall-through map (addr -> addr+length) for x86 overlap handling
+    insn_fall_throughs: Dict[int, int] = {}
+    if lifter is not None and hasattr(lifter, '_insn_fall_throughs'):
+        insn_fall_throughs = lifter._insn_fall_throughs
+
     # --- Step 0b: Convert BRANCHIND → CALLIND + synthetic RETURN ---
     # C++ FlowInfo::truncateIndirectJump converts unresolved BRANCHIND ops
     # to CALLIND and inserts a synthetic RETURN after them.
-    # We replicate this here since Python has no jump table recovery.
+    # For resolved jump tables, keep BRANCHIND as-is.
     original_ops = set(id(op) for op in all_ops)  # track original block ops
     new_all_ops = []
     for op in all_ops:
         new_all_ops.append(op)
         if op.code() == OpCode.CPUI_BRANCHIND:
+            op_addr = op.getSeqNum().getAddr().getOffset()
+            if op_addr in jumptables:
+                # Jump table resolved — keep BRANCHIND, don't convert
+                continue
             # Convert BRANCHIND → CALLIND
             op.setOpcodeEnum(OpCode.CPUI_CALLIND)
             # Create synthetic RETURN op after the CALLIND
@@ -443,6 +457,69 @@ def _split_basic_blocks(fd) -> None:
             ret_in = fd.newConstant(4, uniq)
             fd.opSetInput(ret_op, ret_in, 0)
             all_ops.append(ret_op)
+
+    # --- Step 0d: checkContainedCall — convert CALL→BRANCH for PIC ---
+    # C++ FlowInfo::checkContainedCall converts CALL ops whose target
+    # address is an already-decoded instruction within the function to
+    # BRANCH ops.  This handles Position Independent Code constructions
+    # where a CALL is used as a jump within the same function.
+    # C++ skips conversion when the callee has a known Funcdata (which
+    # includes self-recursion).  Since Python has no function database,
+    # we exclude calls to the function's own entry point.
+    # NOTE: must run BEFORE fillinBranchStubs so stub addresses don't
+    # appear in decoded_addrs.
+    func_entry = fd.getAddress().getOffset() if fd.getAddress() else None
+    decoded_addrs: set = set()
+    for op in all_ops:
+        decoded_addrs.add(op.getSeqNum().getAddr().getOffset())
+
+    # C++ iterates qlst (call specs) with a for-loop that does ++iter
+    # after the body.  After qlst.erase(iter), the returned iter already
+    # points to the next element, so ++iter skips one.  We replicate
+    # this by collecting CALL ops in qlst order and applying the skip.
+    call_ops = [op for op in all_ops if op.code() == OpCode.CPUI_CALL]
+    skip_next = False
+    for op in call_ops:
+        if skip_next:
+            skip_next = False
+            continue
+        target_vn = op.getIn(0)
+        if target_vn is None:
+            continue
+        tgt_addr = target_vn.getAddr()
+        if tgt_addr.isConstant():
+            continue
+        tgt_off = tgt_addr.getOffset()
+        # Skip self-recursive calls (callee is the current function)
+        if tgt_off == func_entry:
+            continue
+        # Only convert if target is an already-decoded instruction start
+        if tgt_off in decoded_addrs:
+            op.setOpcodeEnum(OpCode.CPUI_BRANCH)
+            skip_next = True  # C++ iterator skip after erase
+
+    # --- Step 0e: fillinBranchStubs — stub blocks for out-of-range targets ---
+    # C++ FlowInfo::fillinBranchStubs creates artificial halt (RETURN) ops at
+    # branch targets that fell outside the function's address range.  These
+    # become single-op stub blocks so that BRANCH ops have valid edge targets.
+    unprocessed: List[int] = []
+    if lifter is not None and hasattr(lifter, '_unprocessed'):
+        unprocessed = lifter._unprocessed
+    if unprocessed:
+        code_spc = all_ops[0].getSeqNum().getAddr().getSpace() if all_ops else None
+        seen_unproc: set = set()
+        for uaddr in unprocessed:
+            if uaddr in seen_unproc:
+                continue
+            seen_unproc.add(uaddr)
+            if code_spc is not None:
+                stub_addr = Address(code_spc, uaddr)
+                stub_op = fd.newOp(1, stub_addr)
+                stub_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+                uniq = stub_op.getSeqNum().getTime() if hasattr(stub_op.getSeqNum(), 'getTime') else 0
+                stub_in = fd.newConstant(4, uniq)
+                fd.opSetInput(stub_op, stub_in, 0)
+                all_ops.append(stub_op)
 
     # --- Step 1: Identify basic block start indices ---
     # The first op always starts a block
@@ -514,6 +591,16 @@ def _split_basic_blocks(fd) -> None:
                     tgt_idx = _resolve_const_target(i, tgt_addr.getOffset())
                     if 0 <= tgt_idx < len(all_ops):
                         block_starts.add(tgt_idx)
+        elif opc == OpCode.CPUI_BRANCHIND:
+            # Resolved jump table: op after BRANCHIND starts a new block,
+            # and each jump table target starts a new block
+            if i + 1 < len(all_ops):
+                block_starts.add(i + 1)
+            op_addr = op.getSeqNum().getAddr().getOffset()
+            if op_addr in jumptables:
+                for tgt_off in jumptables[op_addr]:
+                    if tgt_off in addr_to_first_idx:
+                        block_starts.add(addr_to_first_idx[tgt_off])
         elif opc == OpCode.CPUI_RETURN:
             # Op after RETURN terminates the block
             if i + 1 < len(all_ops):
@@ -548,6 +635,8 @@ def _split_basic_blocks(fd) -> None:
                         tgt_off = tgt_addr.getOffset()
                         if tgt_off == func_off:
                             bblocks.addEdge(old_bb, old_bb)
+        # --- C++ generateBlocks: ensure entry block has no incoming edges ---
+        _ensure_entry_no_incoming(bblocks, fd)
         return
 
     # --- Step 1b: Normalize branch target varnode sizes to 1 ---
@@ -619,10 +708,41 @@ def _split_basic_blocks(fd) -> None:
         last_op = ops[-1]
         opc = last_op.code()
 
-        # Fall-through edge (if not unconditional branch or return)
-        if opc not in (OpCode.CPUI_BRANCH, OpCode.CPUI_RETURN):
-            if bi + 1 < bblocks.getSize():
+        # Fall-through edge (if not unconditional branch/branchind or return)
+        if opc not in (OpCode.CPUI_BRANCH, OpCode.CPUI_BRANCHIND, OpCode.CPUI_RETURN):
+            # Use instruction-level fall-through to handle x86 overlaps:
+            # when a mid-instruction branch target creates a block between
+            # the original instruction and its real fall-through address.
+            # BUT only at real instruction boundaries — not at internal
+            # p-code splits within the same instruction (e.g. REP prefix).
+            ft_target_bi = None
+            if insn_fall_throughs and bi + 1 < bblocks.getSize():
+                last_insn_addr = last_op.getSeqNum().getAddr().getOffset()
+                next_bb = bblocks.getBlock(bi + 1)
+                next_ops = next_bb.getOpList()
+                if next_ops:
+                    next_insn_addr = next_ops[0].getSeqNum().getAddr().getOffset()
+                    # Only use instruction fall-through when next block is
+                    # at a different instruction address (real boundary).
+                    if next_insn_addr != last_insn_addr:
+                        ft_addr = insn_fall_throughs.get(last_insn_addr)
+                        if ft_addr is not None and ft_addr != next_insn_addr:
+                            ft_target_bi = block_by_entry.get(ft_addr)
+            if ft_target_bi is not None:
+                bblocks.addEdge(bb, bblocks.getBlock(ft_target_bi))
+            elif bi + 1 < bblocks.getSize():
                 bblocks.addEdge(bb, bblocks.getBlock(bi + 1))
+
+        # Resolved BRANCHIND: add edges to all unique jump table targets
+        if opc == OpCode.CPUI_BRANCHIND:
+            op_addr = last_op.getSeqNum().getAddr().getOffset()
+            if op_addr in jumptables:
+                seen_targets: set = set()
+                for tgt_off in jumptables[op_addr]:
+                    tgt_bi = block_by_entry.get(tgt_off)
+                    if tgt_bi is not None and tgt_bi not in seen_targets:
+                        seen_targets.add(tgt_bi)
+                        bblocks.addEdge(bb, bblocks.getBlock(tgt_bi))
 
         # Branch edge
         if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH):
@@ -650,6 +770,44 @@ def _split_basic_blocks(fd) -> None:
             if bi + 1 < bblocks.getSize():
                 # Already added above in the fall-through case
                 pass
+
+    # --- C++ generateBlocks: ensure entry block has no incoming edges ---
+    _ensure_entry_no_incoming(bblocks, fd)
+
+
+def _ensure_entry_no_incoming(bblocks, fd) -> None:
+    """If the entry block has incoming edges, create an empty front block.
+
+    C++ FlowInfo::generateBlocks (flow.cc) checks if the start block has
+    sizeIn != 0.  If so, it creates a new empty BasicBlock that flows into
+    the old entry block and sets the new block as the start.  This happens
+    for self-loop functions like ``JMP self`` and for functions where the
+    entry instruction is a loop target.
+    """
+    if bblocks.getSize() == 0:
+        return
+    # In C++, block 0 is the entry block (set by setStartBlock in splitBasic).
+    # In Python, blocks are ordered by address, so find the entry block by
+    # matching the function entry address.
+    func_addr = fd.getAddress()
+    if func_addr is None:
+        return
+    func_off = func_addr.getOffset()
+    startblock = None
+    for bi in range(bblocks.getSize()):
+        blk = bblocks.getBlock(bi)
+        entry = blk.getEntryAddr()
+        if entry and entry.getOffset() == func_off:
+            startblock = blk
+            break
+    if startblock is None:
+        return
+    if startblock.sizeIn() == 0:
+        return
+    newfront = bblocks.newBlockBasic(fd)
+    newfront.setInitialRange(func_addr, func_addr)
+    bblocks.addEdge(newfront, startblock)
+    bblocks.setStartBlock(newfront)
 
 
 def _inject_tracked_context(fd, lifter=None) -> None:
@@ -723,7 +881,7 @@ def _run_prerequisite_actions(fd) -> None:
         ActionNormalizeSetup, ActionDefaultParams, ActionExtraPopSetup,
         ActionPrototypeTypes, ActionFuncLink, ActionFuncLinkOutOnly,
     )
-    from ghidra.transform.coreaction import ActionVarnodeProps
+    from ghidra.transform.coreaction import ActionUnreachable, ActionVarnodeProps
 
     arch = fd.getArch() if hasattr(fd, 'getArch') else None
     stackspace = arch.getStackSpace() if arch is not None else None
@@ -744,7 +902,7 @@ def _run_prerequisite_actions(fd) -> None:
         ActionPrototypeTypes("protorecovery"),
         ActionFuncLink("protorecovery"),
         ActionFuncLinkOutOnly("noproto"),
-        # ActionUnreachable skipped — requires block structure analysis
+        ActionUnreachable("base"),
         ActionVarnodeProps("base"),
     ]
     for act in actions:
@@ -1104,7 +1262,7 @@ class DecompilerPython:
             # --- Module 2: FlowInfo (basic block construction) ---
             if self.use_python_flow:
                 try:
-                    _split_basic_blocks(fd)
+                    _split_basic_blocks(fd, lifter=lifter)
                 except Exception as e:
                     self._errors += f"FlowInfo error: {e}\n"
 
