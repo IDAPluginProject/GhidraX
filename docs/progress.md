@@ -1,0 +1,281 @@
+# PyGhidra Progress
+
+## Completed Modules (44 Python + sleigh_native.pyd)
+
+### core/ (18 files)
+- address.py, error.py, expression.py, float_format.py, globalcontext.py
+- int128.py, marshal.py, opbehavior.py, opcodes.py, pcoderaw.py
+- space.py, translate.py, types.py
+- compression.py (zlib wrapper — compression.hh/crc32.hh port)
+- capability.py (CapabilityPoint static registration — capability.hh port)
+- filemanage.py (FileManage path/dir utilities — filemanage.cc port via pathlib) — 27 tests
+- libdecomp.py (startDecompilerLibrary/shutdownDecompilerLibrary — libdecomp.cc port) — 7 tests
+- float_format.py **C++ faithful rewrite**: extractExpSig, createFloat, roundToNearestEven, convertEncoding, top-aligned fractional codes — 69 tests
+
+### ir/ (5 files)
+- cover.py, op.py, typeop.py (with push() dispatch), variable.py, varnode.py
+
+### transform/ (21 files)
+- action.py, condexe.py, coreaction.py, coreaction2.py, deadcode.py
+- nzmask.py, ruleaction.py + batch1a-1i + batch2a-2c, universal.py
+- **136/136 rules (130 real), 62/62 Actions**
+
+### output/ (3 files) — **JUST REWRITTEN**
+- prettyprint.py: Emit, EmitMarkup, SyntaxHighlight, tagCaseLabel, brace helpers
+- printlanguage.py: **RPN stack** (ReversePolish, Atom, NodePending, pushOp/pushAtom/pushVn, parentheses, emitOp/emitAtom, recurse, opBinary/opUnary)
+- printc.py: **50+ OpTokens**, 70+ opXxx handlers, pushConstant/Symbol/Type, 11 block emitters, docFunction
+
+### analysis/ (5 files)
+- dynamic.py, flow.py, funcdata.py, heritage.py, merge.py
+
+### block/ (2 files)
+- block.py (10 block types), collapse.py
+
+### database/ (4 files)
+- database.py, comment.py, cpool.py, stringmanage.py
+
+### types/ (2 files)
+- datatype.py (TypeFactory, 18 metatypes), cast.py (CastStrategyC/Java)
+
+### fspec/ (3 files)
+- fspec.py (FuncProto, ProtoModel, FuncCallSpecs, ParamListStandard extended), paramactive.py
+- modelrules.py (PrimitiveExtractor, DatatypeFilter hierarchy, QualifierFilter hierarchy, AssignAction hierarchy, ModelRule)
+
+### arch/ (3 files)
+- architecture.py, loadimage.py
+- loadimage_xml.py (LoadImageXml XML-backed binary image — loadimage_xml.cc port)
+
+### sleigh/ (4 files + .pyd)
+- lifter.py, slaformat.py, sleigh.py, sleighbase.py
+- sleigh_native.cp314-win_amd64.pyd (pybind11, zlib static)
+
+### emulate/ (3 files)
+- emulate.py, memstate.py
+- emulateutil.py (EmulatePcodeOp, EmulateSnippet, PcodeEmitCache)
+
+### analysis/ — new additions
+- callgraph.py (CallGraph, CallGraphNode, CallGraphEdge) — full callgraph.cc port with cycle detection, leaf-first walk
+
+### fspec/ — new additions
+- paramid.py (ParamMeasure, ParamIDAnalysis, ParamRank, ParamIDIO) — full paramid.cc port
+
+### core/ — new additions
+- int128.py extended with: subtract128, uless128, ulessequal128, udiv128, count_leading_zeros (full multiprecision.cc port)
+
+### transform/ — new additions
+- transform.py (LanedRegister, LanedIterator, LaneDescription, TransformVar, TransformOp, TransformManager)
+- condexe.py (ConditionalExecution, RuleOrPredicate, _MultiPredicate) — full C++ faithful port
+
+## End-to-End Pipeline
+```
+x86 binary → sleigh_native.pyd → P-code → Funcdata → 136 rules + 62 Actions → Heritage SSA → PrintC (RPN stack) → C output
+```
+
+## Current Session: RPN Stack Architecture (Phases 1-5 DONE)
+
+1. **PrintLanguage RPN Core** — pushOp/pushAtom/pushVn/recurse/emitOp/emitAtom/parentheses
+2. **PrintC 50+ OpTokens** — correct precedence/associativity/spacing
+3. **PrintC 70+ opXxx handlers** — all INT/BOOL/FLOAT/control-flow/memory ops
+4. **PrintC block emission** — 11 emitBlock* methods + docFunction
+5. **TypeOp.push()** — 70+ opcode→handler dispatch bridge
+6. **Emit infrastructure** — tagCaseLabel, brace helpers, indent/comment
+
+## Remaining Gaps vs C++ Ghidra
+
+### High Priority
+- [x] EmitPrettyPrint (simplified Oppen, line-width tracking + break insertion)
+- [x] FlowBlock.emit() on all 10 block types (BlockBasic/Copy/Goto/Condition/If/WhileDo/DoWhile/InfLoop/Switch/List)
+- [x] Block helpers: getBlock/getSize/nextInFlow/isJumpTarget/getFrontLeaf/gotoPrints/getSwitchBlock/getCaseBlock etc.
+- [x] PrintC: emitInplaceOp (+=, -=, *=, /=, %=, <<=, >>=, &=, |=, ^=)
+- [x] PrintC: emitLocalVarDecls (iterate HighVariables from VarnodeBank)
+- [x] PrintC: emitVarDecl/emitVarDeclStatement
+- [x] PrintC: opPtrsub with struct/union field access (-> / . syntax)
+- [x] PrintC: pushPartialSymbol with field traversal (a.b.c syntax)
+- [x] PrintC: checkArrayDeref + opLoad/opStore array syntax
+- [x] PrintC: opPtradd with array subscript [] syntax
+- [x] PrintC: pushPtrCharConstant, pushPtrCodeConstant, pushEquate
+- [x] PrintC: checkAddressOfCast (& operator on array casts)
+- [x] CommentSorter (setupFunctionList/BlockList/OpList/Header, hasNext/getNext)
+- [x] options.py — OptionDatabase + 39 ArchOption classes (extrapop, nullprinting, inplaceops, nocast, etc.)
+- [x] userop.py — UserPcodeOp + UserOpManage registry (UnspecializedPcodeOp, InjectedUserOp, VolatileRead/Write)
+
+### Medium Priority
+- [x] override.py — Override system (forcegoto, deadcode delay, indirect/proto override, flow override, multistage)
+- [x] inject.py — PcodeInjectLibrary (InjectPayload, InjectContext, call/callother fixups)
+- [x] jumptable.py — JumpTable, JumpModel, JumpModelTrivial, LoadTable, PathMeld, GuardRecord
+- [x] rangeutil.py — CircleRange (intersect/union/contains/pullBack/pushForward/setNZMask)
+- [x] subflow.py — SubvariableFlow (trace/replace sub-register logical values)
+- [x] varmap.py — ScopeLocal, MapState, RangeHint, NameRecommend, DynamicRecommend, TypeRecommend
+- [x] double.py — SplitVarnode + AddForm/SubForm/LogicalForm/ShiftForm/MultForm
+- [x] constseq.py — ConstSequence for constant store detection (string/array init)
+- [x] prefersplit.py — PreferSplitRecord + LanedRegister + PreferSplitManager
+- [x] resolve.py — ResolvedUnion + UnionResolveMap for union field resolution
+- [x] Architecture wired: UserOpManage, OptionDatabase, PcodeInjectLibrary, Override
+- [x] test_printc_rpn.py — 12 RPN stack tests (binary/parens/unary/deref/subscript/arrow/dot/cast/assign/int/bool)
+- [x] blockaction.py — FloatingEdge, LoopBody, CollapseStructure (sequence collapsing)
+- [x] Funcdata wired: getVarnodeBank, getOverride, JumpTable, UnionResolveMap, getFirstReturnOp
+- [x] VarnodeBank.allVarnodes() iterator
+- [x] PrintC: emitLabel/emitLabelStatement/emitAnyLabelStatement/emitGotoStatement (break/continue/goto)
+- [x] PrintC: emitForLoop with for(init;cond;iter) + auto-detect in emitBlockWhileDo
+- [x] PrintC: CommentSorter wired into docFunction (emitCommentFuncHeader/emitCommentGroup/emitLineComment)
+- [x] PrintC: emitSwitchCase with tagCaseLabel + data-type constants + break for exit cases
+- [x] emitBlockBasic: comment wiring, label emission, only_branch mode, flat nofallthru goto
+- [x] emitBlockWhileDo: overflow syntax (while(true) { body; if(cond) break; })
+- [x] emitBlockLs: proper no_branch/nofallthru/nextInFlow flow control (matches C++ exactly)
+- [x] emitBlockIf: else-if chain merging via pending_brace (else if syntax)
+- [x] emitBlockCondition: RPN-based && || operator emission
+- [x] emitBlockDoWhile + emitBlockInfLoop: emitAnyLabelStatement added
+- [x] opReturn: halt/baddata/unimplemented/missing variants
+- [x] opCall: improved name lookup from Funcdata callspecs
+- [x] opCallind: hidden this parameter handling via callspecs
+- [x] opSubpiece: field extraction via doesSpecialPrinting + isPieceStructured
+- [x] pushCharConstant: emit 'A', '\\n' etc for character-typed constants
+- [x] pushEnumConstant: emit ENUM_NAME for enum-typed constants
+- [x] pushConstant: wired isCharPrint/isEnumType detection for TYPE_UINT/TYPE_INT
+- [x] opIntZext/opIntSext: castStrategy-based hide-extension logic (opHiddenFunc for implied)
+- [x] opFloatInt2Float: ZEXT absorption pattern from C++
+- [x] printUnicode + printCharHexEscape methods for string/char emission
+- [x] opFloatInt2Float: ZEXT absorption pattern from C++
+- [x] opCbranch: isFallthruTrue + falsebranch + negatetoken chain for flat mode
+- [x] emitBlockCopy: emitAnyLabelStatement + sub.emit() virtual dispatch
+- [x] graph.py — DominatorTree + LoopDetector + IntervalGraph + SCCDetector (4 algorithms)
+- [x] opCallother: annotation_assignment/no_operator/display_string display modes
+- [x] opNewOp: new Type[size] array allocation syntax
+- [x] docAllGlobals: emit global variable declarations recursively
+- [x] docTypeDefinitions + emitStructDefinition + emitEnumDefinition
+- [x] pushTypeStart/End: full type stack with ptr/array/code adornments + pushPrototypeInputs_rpn
+- [x] docSingleGlobal: emit single global symbol declaration
+- [x] emitCommentBlockTree: recursive comment emission within control-flow subtree
+- [x] setCommentStyle/setCStyleComments/setCPlusPlusStyleComments
+- [x] initializeFromArchitecture: sizeSuffix from long/int sizes + castStrategy wiring
+- [x] adjustTypeOperators: scope/shift operator configuration
+- [x] emitPrototypeOutput: output type with return varnode link
+- [x] emitFunctionDeclaration: beginFuncProto + convention printing + scope push + openGroup
+- [x] emitExpression: constructor/new syntax for doesSpecialPrinting ops
+- [x] resetDefaultsPrintC + resetDefaults override + setCStyleComments
+- [x] docFunction: popScope after emitBlockGraph + flat mode support
+- [x] emitBlockIf: emitCommentBlockTree after condition block + condBlock.emit()
+- [x] emitBlockWhileDo: emitCommentBlockTree + condBlock.emit() in normal path
+- [x] emitBlockGoto: sub.emit() for proper virtual dispatch
+- [x] Funcdata getScopeLocal alias added
+- [x] pushSymbolScope/emitSymbolScope: namespace resolution with depth calculation
+- [x] pushSymbol: syntax highlighting by category (volatile/global/param/var) + scope resolution
+- [x] Funcdata getCallSpecs(op): fast PcodeOp→FuncCallSpecs lookup with _qlst_map cache
+- [x] Funcdata addCallSpecs(fc): register with _qlst_map
+
+**PrintC printc.cc 100% ported — ALL methods from C++ now in Python (~2500 lines)**
+
+### Latest Session Additions
+- [x] pushImpliedField: full field.subfield access with type traversal for hasImpliedField varnodes
+- [x] opConstructor: full withNew=True for new Type(args) syntax with ptr deref
+- [x] opCall: emitSymbolScope wired for function namespace resolution in calls
+- [x] All block emitters converted to .emit() for proper virtual dispatch (no more _emitBlockDispatch for blocks)
+- [x] emitBlockDoWhile: bl.getBlock(0).emit() for both body and condition
+- [x] emitBlockWhileDo: bl.getBlock(1).emit() for body
+- [x] emitBlockForLoop: bl.getBlock(1).emit() for body
+- [x] PrintLanguage: escapeCharacterData + setPackedOutput
+- [x] Funcdata: getCallSpecs with _qlst_map cache + addCallSpecs + getScopeLocal alias
+- [x] emitStatement: CommentSorter wired via emitCommentGroup before each statement
+- [x] opCpoolRefOp: full 7-tag dispatch (string/class/method/field/array_length/instanceof/check_cast)
+- [x] opInsertOp/opExtractOp: bitfield emission with doesSpecialPrinting + isPieceStructured
+- [x] type_instanceOf OpToken added for Java instanceof
+- [x] emitBlockSwitch: emitAnyLabelStatement at top
+- [x] emitBlockBasic: cleaned duplicate emitCommentGroup (now in emitStatement)
+- [x] emitBlockGraph: sub.emit() replaces _emitBlockDispatch fallback
+- [x] printCharacterConstant + doEmitWideCharPrefix (u/U/L prefixes)
+- [x] getHiddenThisSlot: detect hidden this parameter in calls
+- [x] emitPrototypeInputs: fixed first param + RPN pushTypeStart/End + dotdotdot
+- [x] opCallother display_string: StringManager lookup for InternalStringOp
+- [x] emitBlockSwitch: emitCommentBlockTree for switch header condition
+- [x] opPtrsub: checkAddressOfCast wired for array addressof elimination
+- [x] opCallother outvn bug fix
+- [x] opCall: getHiddenThisSlot wired for hidden this skipping in direct calls
+- [x] StringManager getString(addr): quoted string lookup for opCallother display_string
+- [x] Funcdata.clear(): clears _qlst_map/_override/_unionMap on restart
+- [x] opPtrsub ARRAY: subscript [] syntax when print_load/store_value set
+
+### Action/Rule Consolidation & Deepening
+- [x] Consolidated 7 duplicate Action classes from blockaction.py into coreaction2.py (proper Action subclasses)
+  - ActionBlockStructure: added missing installSwitchDefaults() call
+  - ActionReturnSplit: ported working gatherReturnGotos/isSplittable from blockaction.py
+  - ActionNodeJoin: fixed ConditionalJoin import path
+  - ActionPreferComplement, ActionStructureTransform, ActionNormalizeBranches, ActionFinalStructure: already adequate
+- [x] Removed 7 dead duplicate Action-like classes from blockaction.py (kept algorithm classes: CollapseStructure, ConditionalJoin, etc.)
+- [x] RuleConditionalMove: full C++ port with checkBoolean, gatherExpression, constructBool, 4-case applyOp
+  - Both non-const booleans → BOOL_OR/BOOL_AND
+  - Both const booleans → COPY/ZEXT/BOOL_NEGATE
+  - One const, one non-const → BOOL_OR/BOOL_AND with complement
+  - Note: X86_BRANCH collapse is expected C++ behavior (EAX_input not boolean → rule doesn't fire)
+- [x] ActionReturnSplit: added sizeIn() guard before nodeSplit for batch splits
+
+### Heritage Comparison: cp.exe — 304/306 (99.3%)
+- **304 exact matches** out of 306 functions (block counts, op counts, opcodes all match)
+- **2 remaining diffs** — rooted in instruction overlap in data-as-code regions
+- Key fixes (chronological):
+  - markAlive → _addToCodeList (130→142)
+  - RETURN EDX+ST0 output entries (142→187)
+  - structureReset() block ordering (187→216)
+  - MULTIEQUAL/SUBPIECE op normalization (216→260)
+  - block_by_entry first-block mapping (260→281)
+  - RETURN const value alignment (281→285)
+  - RETURN input count fix (285→286)
+  - Internal p-code branch relative offsets (286→289)
+  - DF COPY at function entry block (289→292)
+  - **Jump table recovery** (292→298): pattern-match BRANCHIND(LOAD(ADD(const,MULT(reg,4)))),
+    read table entries from image, deduplicate edges, add targets to worklist
+  - ActionUnreachable added to prerequisite actions (correctness, no match change)
+  - X86_LOOP test pattern JNZ displacement fix (0xFC→0xFB)
+  - **Instruction overlap fall-through fix** (298→299): track insn_fall_throughs in lifter,
+    use actual instruction end address (not next block) for fall-through edges when x86
+    variable-length instructions overlap at block boundaries (fixed 0x40d3b0)
+  - **checkContainedCall PIC fix** (299→301): convert CALL→BRANCH when call target is an
+    already-decoded instruction within the function (C++ FlowInfo::checkContainedCall).
+    Excludes self-recursive calls. Fixed 0x41bb70, 0x417670.
+  - **Range limit removal + thunk following** (301→302): removed lifter's 0x10000 address
+    range limit (C++ uses full address space baddr=0, eaddr=MAX). Now follows branches to
+    JMP [IAT] thunks at any address. Added fillinBranchStubs for out-of-range targets.
+    Fixed 0x40a3b0.
+  - **checkContainedCall iterator skip** (302→303): replicated C++ iterator skip bug where
+    qlst.erase(iter) + for-loop ++iter skips every other matching CALL. Fixed 0x40b420.
+  - **Empty entry block for self-loops** (303→304): C++ FlowInfo::generateBlocks creates an
+    empty entry block when the start block has incoming edges (e.g. self-loop `JMP self`).
+    Added `_ensure_entry_no_incoming()` to replicate this. Fixed 0x41b610.
+  - **Hybrid deque worklist**: changed lifter from FIFO to deque with fall-throughs→front,
+    branch targets→back, matching C++ FlowInfo fall-through-first processing. No match
+    change but closer to C++ behavior.
+- **Remaining 2 diffs** (instruction overlap in data-as-code, unfixable without op ordering rewrite):
+  - **0x403f00** (87 vs 83 blocks, 1929 unexpected): string data "failed to..." decoded as
+    instructions. C++ and Python decode the same overlapping instructions but assign them to
+    different blocks due to C++'s decoding-order op storage vs Python's address-sorted ops.
+    C++ has 7 unique block addrs, Python has 5 unique — both from different paths through
+    the same overlapping byte ranges.
+  - **0x40c090** (184 vs 182 blocks, 467 unexpected): string data "literal\0shell\0shell-..."
+    decoded as instructions. Same root cause — C++ keeps overlapping instruction ops in
+    separate blocks (decoding order), Python merges them by address sort. Attempted fixes:
+    global overlap block-start detection (14 regressions), DFS worklist (3 regressions),
+    hybrid deque (neutral). Would require maintaining per-path op sequences to fix.
+
+### Phase 3: Console / CLI (Ghidra Binary Protocol) — SCAFFOLDING DONE
+- [x] console/__init__.py — package
+- [x] console/protocol.py — binary framing (alignment bursts 0x00..0x01+code), 18 burst constants,
+      read/write string/bool/bytes streams, query/response helpers, exception passing
+- [x] console/ghidra_arch.py — ArchitectureGhidra (extends Architecture), 15+ query methods
+      (getBytes, getRegister, getMappedSymbols, getDataType, getComments, getPcode, etc.),
+      build*() overrides for all Ghidra-backed subsystems
+- [x] console/subsystems.py — 9 Ghidra-backed subsystem proxies:
+      LoadImageGhidra, ScopeGhidra, TypeFactoryGhidra, CommentDatabaseGhidra,
+      GhidraStringManager, ConstantPoolGhidra, GhidraTranslate, ContextGhidra,
+      PcodeInjectLibraryGhidra
+- [x] console/ghidra_process.py — 7 command handlers (RegisterProgram, DeregisterProgram,
+      FlushNative, DecompileAt, StructureGraph, SetAction, SetOptions) + dispatch loop
+- [x] console/consolemain.py — main entry point (binary stdin/stdout, Windows O_BINARY)
+- [x] tests/test_console_protocol.py — 30 tests (burst R/W, string/bool/bytes streams,
+      query responses, exception framing, command map, constants, XML helpers)
+- [x] console/interface.py — IfaceStatus, IfaceCommand, IfaceCommandDummy, IfaceCapability,
+      IfaceBaseCommand + 6 built-in commands (Quit/History/Openfile/OpenfileAppend/Closefile/Echo)
+      — 40 tests
+- [x] console/ifaceterm.py — IfaceTerm (terminal-based concrete IfaceStatus with readline,
+      script stacking, mainloop) — 17 tests
+- [ ] Full XML response parsing in subsystems (symbols, types, comments, pcode)
+- [ ] Funcdata.encode() for syntax tree serialization
+- [ ] End-to-end Ghidra client integration test

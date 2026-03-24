@@ -1,154 +1,136 @@
-# PyGhidra — Pure-Python Ghidra Decompiler Engine
+# GhidraX — Pure-Python Ghidra Decompiler Engine
 
-A Python port of Ghidra's decompiler core, with a native SLEIGH instruction decoder compiled as a `.pyd` extension module.
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
 
-## Development Rules
-
-- The original C++ implementation under `cpp/` is the absolute source of truth for behavior and semantics.
-- Any logic fix in Python, bindings, tests, or surrounding glue should be backed by corresponding evidence in the original C++ source.
-- When Python behavior diverges from C++, prefer aligning Python to C++ unless the project intentionally documents the deviation.
-- When writing Python code, prefer using type hints wherever practical.
-- See [`AGENTS.md`](AGENTS.md) for the project-level Windsurf/Cascade rule set.
+A faithful Python port of Ghidra's C++ decompiler core. SLEIGH instruction decoding is provided via a pybind11 native module (`sleigh_native.pyd`); everything else — IR, data-flow analysis, SSA construction, optimization rules, control-flow structuring, and C output — is pure Python.
 
 ## Project Structure
 
 ```
-pyghidra/
-├── cpp/                    # C++ sources (Ghidra decompiler + SLEIGH pybind11 binding)
-│   ├── sleigh_bind.cpp     # pybind11 wrapper → sleigh_native.pyd
-│   ├── CMakeLists.txt      # CMake build configuration
-│   └── build.bat           # One-click Windows build script
-├── python/
-│   └── ghidra/             # Python decompiler package
-│       ├── sleigh/          # SLEIGH engine (native + Python helpers)
-│       │   ├── sleigh_native.*.pyd   # Compiled native module
-│       │   ├── arch_map.py           # Architecture → SLA file resolver
-│       │   ├── lifter.py             # High-level P-code lifting API
-│       │   └── sleigh.py             # Python SLEIGH wrapper
-│       ├── core/            # Core types (Address, AddrSpace, opcodes, marshal)
-│       ├── block/           # Basic block and control flow
-│       ├── database/        # Symbol database, variable mapping
-│       └── ...              # Other ported modules
-├── specs/                   # Pre-compiled SLEIGH .sla specification files
-│   ├── x86.sla             # x86 (32-bit)
-│   ├── x86-64.sla          # x86-64
-│   ├── AARCH64.sla         # AArch64 / ARM64
-│   ├── ARM8_le.sla         # ARMv8 little-endian
-│   ├── ARM8_be.sla         # ARMv8 big-endian
-│   ├── mips32le.sla        # MIPS32 little-endian
-│   ├── mips32be.sla        # MIPS32 big-endian
-│   ├── mips64le.sla        # MIPS64 little-endian
-│   ├── mips64be.sla        # MIPS64 big-endian
-│   ├── ppc_32_be.sla       # PowerPC 32-bit big-endian
-│   ├── ppc_32_le.sla       # PowerPC 32-bit little-endian
-│   ├── ppc_64_be.sla       # PowerPC 64-bit big-endian
-│   └── ppc_64_le.sla       # PowerPC 64-bit little-endian
-├── ida_plugin/              # IDA Pro integration
-├── deploy.bat               # Deploy to IDA plugins directory
+GhidraX/
+├── src/                        # Python decompiler package (src-layout)
+│   └── ghidra/
+│       ├── analysis/           # Heritage (SSA), flow, data-flow
+│       ├── arch/               # Architecture abstraction
+│       ├── block/              # Control-flow structuring
+│       ├── core/               # Address, AddrSpace, opcodes, marshal
+│       ├── database/           # Symbol database, variable mapping
+│       ├── fspec/              # Function signatures, calling conventions
+│       ├── ir/                 # Varnode, PcodeOp, Funcdata
+│       ├── output/             # PrintC / PrintLanguage emission
+│       ├── sleigh/             # SLEIGH engine + native .pyd modules
+│       ├── transform/          # Action/Rule optimization chain
+│       └── types/              # Type system, casts
+├── native/                     # C++ source (Ghidra decompiler + pybind11)
+│   ├── CMakeLists.txt
+│   ├── build.bat               # One-click Windows build
+│   ├── sleigh_bind.cpp         # sleigh_native.pyd binding
+│   └── decompiler_bind.cpp     # decompiler_native.pyd binding
+├── specs/                      # Ghidra processor specifications
+│   └── Processors/x86/data/languages/
+├── tools/                      # Deployment & utilities
+│   ├── deploy.bat              # IDA plugin deployer
+│   └── console.py              # CLI dual-engine comparison tool
+├── docs/                       # Documentation
+│   ├── ARCHITECTURE.md         # Porting roadmap & design
+│   ├── AUDIT.md                # Code audit notes
+│   └── progress.md             # Module porting progress
+├── pyproject.toml              # Build config + pytest settings
+├── LICENSE
 └── README.md
 ```
 
-## Building sleigh_native.pyd
+## Quick Start
 
-### Prerequisites
-
-| Tool | Version | Install |
-|------|---------|---------|
-| **Visual Studio 2022** | Community or above | [Download](https://visualstudio.microsoft.com/) — install "Desktop development with C++" |
-| **CMake** | ≥ 3.15 | `winget install Kitware.CMake` |
-| **Ninja** | any | `winget install Ninja-build.Ninja` |
-| **Python** | ≥ 3.10 | [python.org](https://www.python.org/) |
-| **pybind11** | any | `pip install pybind11` |
-| **zlib** (static) | any | `vcpkg install zlib:x64-windows-static` |
-
-### One-Click Build
+### 1. Build Native Modules
 
 ```bat
-cd cpp
+cd native
 build.bat
 ```
 
-The script will:
-1. Auto-detect MSVC (VS 2022 Community/Professional/Enterprise)
-2. Auto-detect CMake, Ninja, Python, pybind11
-3. Auto-detect zlib via vcpkg or `ZLIB_ROOT`
-4. Configure with CMake, build with Ninja
-5. Copy the resulting `sleigh_native.*.pyd` to `python/ghidra/sleigh/`
+Auto-detects MSVC 2022, CMake, Ninja, Python, pybind11, and zlib. Outputs are copied to `src/ghidra/sleigh/`.
 
-### Environment Variable Overrides
+<details>
+<summary>Prerequisites</summary>
 
-If auto-detection fails, set these before running `build.bat`:
+| Tool | Install |
+|------|---------|
+| Visual Studio 2022 | "Desktop development with C++" workload |
+| CMake ≥ 3.15 | `winget install Kitware.CMake` |
+| Ninja | `winget install Ninja-build.Ninja` |
+| Python ≥ 3.10 | [python.org](https://www.python.org/) |
+| pybind11 | `pip install pybind11` |
+| zlib (static) | `vcpkg install zlib:x64-windows-static` |
 
-```bat
-set PYTHON_EXE=C:\Python314\python.exe
-set PYBIND11_DIR=C:\Python314\Lib\site-packages\pybind11\share\cmake\pybind11
-set ZLIB_ROOT=C:\vcpkg\installed\x64-windows-static
-set VCPKG_ROOT=C:\vcpkg
+</details>
+
+### 2. Decompile a Function
+
+```python
+from ghidra.sleigh.decompiler_python import DecompilerPython
+
+dp = DecompilerPython()
+dp.use_python_heritage = True
+dp.use_python_rules = True
+dp.use_python_printc = True
+dp.initialize()
+
+code = dp.decompile(
+    sla_path="specs/Processors/x86/data/languages/x86-64.sla",
+    target="x86:LE:64:default",
+    image=binary_bytes,
+    base_addr=0x140000000,
+    entry=0x140001000,
+)
+print(code)
 ```
 
-### Manual CMake Build
+### 3. Use the C++ Native Engine
 
-```bat
-cd cpp
-mkdir build && cd build
-cmake .. -G Ninja ^
-    -DCMAKE_BUILD_TYPE=Release ^
-    -DPython_EXECUTABLE=<python_path> ^
-    -Dpybind11_DIR=<pybind11_cmake_dir> ^
-    -DZLIB_ROOT=<zlib_prefix>
-ninja -j%NUMBER_OF_PROCESSORS%
+```python
+from ghidra.sleigh.decompiler_native import DecompilerNative
+
+dn = DecompilerNative()
+dn.add_spec_path("specs/Processors/x86/data/languages")
+dn.initialize()
+
+code = dn.decompile(
+    "specs/Processors/x86/data/languages/x86-64.sla",
+    "x86:LE:64:default",
+    binary_bytes, 0x140000000, 0x140001000, 0,
+)
+print(code)
 ```
+
+## Architecture
+
+| Layer | Implementation | Purpose |
+|-------|---------------|---------|
+| **SLEIGH Engine** | C++ pybind11 `.pyd` | Instruction decode & P-code lifting |
+| **Decompiler Core** | Pure Python | IR, SSA, optimization, structuring, C output |
+| **Native Baseline** | C++ pybind11 `.pyd` | Full C++ Ghidra decompiler for comparison |
+
+The C++ source under `native/` is the **ground truth** — Python must produce semantically equivalent output. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full porting plan.
 
 ## SLA Specification Files
 
-The `specs/` directory contains pre-compiled SLEIGH `.sla` files extracted from Ghidra 12.0.
-These files define instruction semantics for each processor architecture.
+Processor specs live under `specs/Processors/`. The SLA search order:
 
-**Adding more architectures:** Copy `.sla` files from your Ghidra installation:
-```
-<GHIDRA_INSTALL>/Ghidra/Processors/<ARCH>/data/languages/<name>.sla
-```
-into the `specs/` directory, then add a matching entry in `python/ghidra/sleigh/arch_map.py`.
-
-The SLA search order is:
-1. Paths added via `arch_map.add_sla_search_dir(path)`
+1. Paths added via `arch_map.add_sla_search_dir()`
 2. `PYGHIDRA_SLA_DIR` environment variable
-3. `<project_root>/specs/`
+3. `<project_root>/specs/Processors/<arch>/data/languages/`
 
-## Quick Usage
+To add architectures, copy `.sla` + `.pspec` + `.cspec` from your Ghidra install and add an entry in `src/ghidra/sleigh/arch_map.py`.
 
-```python
-from ghidra.sleigh.arch_map import resolve_arch
-from ghidra.sleigh.lifter import SleighLifter
+## Development
 
-# Resolve architecture
-arch = resolve_arch("metapc", 64, False)  # x86-64, little-endian
-
-# Create lifter
-lifter = SleighLifter(arch["sla_path"], arch["context"])
-
-# Set binary image
-lifter.set_image(0x140001000, binary_bytes)
-
-# Disassemble
-insn = lifter.disassemble(0x140001000)
-print(f"{insn.mnemonic} {insn.body}")
-
-# Lift to P-code
-pcode = lifter.pcode(0x140001000)
-for op in pcode.ops:
-    print(op)
+```bash
+pip install -e ".[dev]"
+pytest                      # runs with --timeout=120 (from pyproject.toml)
 ```
-
-## IDA Pro Plugin Deployment
-
-```bat
-deploy.bat                          # Deploy to default IDA path
-deploy.bat "D:\IDA\plugins"        # Deploy to custom path
-```
-
-Then press **Alt+F1** in IDA to decompile with PyGhidra.
 
 ## License
 
-See [LICENSE](LICENSE).
+[Apache 2.0](LICENSE)

@@ -8,9 +8,9 @@ dist/
 *.egg
 .eggs/
 
-# Built .pyd files (keep in python package for deployment)
+# Built .pyd files (keep in src package for deployment)
 *.pyd
-!python/ghidra/sleigh/*.pyd
+!src/ghidra/sleigh/*.pyd
 
 # Virtual environments
 .venv/
@@ -31,12 +31,12 @@ Thumbs.db
 Desktop.ini
 
 # C++ build artifacts
-cpp/build/
-cpp/build_decomp/
-cpp/CMakeFiles/
-cpp/CMakeCache.txt
-cpp/cmake_install.cmake
-cpp/Makefile
+native/build/
+native/build_decomp/
+native/CMakeFiles/
+native/CMakeCache.txt
+native/cmake_install.cmake
+native/Makefile
 *.obj
 *.o
 *.lib
@@ -45,8 +45,8 @@ cpp/Makefile
 *.pdb
 *.idb
 
-# Compiled SLA files in Ghidra layout are tracked (binary format)
-# Keep: Ghidra/Processors/*/data/languages/*.sla
+# Compiled SLA files in specs layout are tracked (binary format)
+# Keep: specs/Processors/*/data/languages/*.sla
 
 # Test artifacts
 .pytest_cache/

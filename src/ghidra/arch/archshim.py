@@ -1,0 +1,290 @@
+"""
+Standalone Architecture shim for the pure-Python decompiler pipeline.
+
+Provides a minimal Architecture-like object that wraps the Lifter's
+AddrSpaceManager, builds a default ProtoModel with return register
+and effect list, and exposes the contract expected by Heritage,
+Action/Rule, and PrintC subsystems.
+
+C++ ref: architecture.hh / architecture.cc (subset)
+"""
+
+from __future__ import annotations
+
+from typing import List
+
+from ghidra.core.address import Address
+from ghidra.types.datatype import TypeFactory
+
+
+def _build_shim_type_factory(spc_mgr) -> TypeFactory:
+    tf = TypeFactory()
+    tf.setupCoreTypes()
+    code_space = getattr(spc_mgr, '_defaultCodeSpace', None)
+    if code_space is not None and hasattr(code_space, 'getAddrSize'):
+        ptr_size = code_space.getAddrSize()
+        if ptr_size:
+            tf._sizeOfPointer = ptr_size
+    return tf
+
+
+def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
+    """Build a minimal default ProtoModel with return register and effect list.
+
+    For x86-32: EAX (register offset 0, size 4) as return register.
+    For x86-64: RAX (register offset 0, size 8) as return register.
+    This enables Heritage's guardReturns() to identify the return register
+    and add it as input to RETURN ops via characterizeAsOutput().
+
+    Also populates the effect list so that ``Heritage::guardCalls`` can
+    distinguish callee-saved (unaffected) from volatile (killedbycall)
+    registers, avoiding excessive INDIRECT op creation.
+
+    C++ ref: ``ProtoModel::hasEffect`` → ``lookupEffect``
+    """
+    from ghidra.fspec.fspec import ProtoModel, ParamListStandard, ParamEntry, EffectRecord
+    model = ProtoModel("__cdecl", glb)
+    # Determine register space and pointer size
+    reg_space = None
+    ptr_size = 4
+    try:
+        reg_space = spc_mgr.getSpaceByName("register")
+    except Exception:
+        pass
+    code_space = getattr(spc_mgr, '_defaultCodeSpace', None)
+    if code_space is not None and hasattr(code_space, 'getAddrSize'):
+        ptr_size = code_space.getAddrSize()
+    ret_size = 8 if ptr_size == 8 else 4
+    is_64 = (ptr_size == 8)
+
+    # Build output parameter list
+    out_list = ParamListStandard()
+    if reg_space is not None:
+        if is_64:
+            # x86-64 Windows __fastcall (from x86-64-win.cspec):
+            #   <pentry minsize="4" maxsize="8" metatype="float"><register name="XMM0_Qa"/></pentry>
+            #   <pentry minsize="1" maxsize="8"><register name="RAX"/></pentry>
+            entry_xmm0 = ParamEntry(0)
+            entry_xmm0.spaceid = reg_space
+            entry_xmm0.addressbase = 0x1200  # XMM0_Qa offset in x86-64 SLEIGH register space
+            entry_xmm0.size = 8
+            entry_xmm0.minsize = 4
+            entry_xmm0.alignment = 0
+            entry_xmm0.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+            out_list.addEntry(entry_xmm0)
+            entry_rax = ParamEntry(0)
+            entry_rax.spaceid = reg_space
+            entry_rax.addressbase = 0  # RAX offset
+            entry_rax.size = 8
+            entry_rax.minsize = 1
+            entry_rax.alignment = 0
+            entry_rax.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+            out_list.addEntry(entry_rax)
+        else:
+            # x86-32 cdecl (from x86win.cspec / x86gcc.cspec):
+            #   <pentry minsize="4" maxsize="10" metatype="float"><register name="ST0"/></pentry>
+            #   <pentry minsize="1" maxsize="4"><register name="EAX"/></pentry>
+            #   <pentry minsize="5" maxsize="8"><addr space="join" piece1="EDX" piece2="EAX"/></pentry>
+            entry_st0 = ParamEntry(0)
+            entry_st0.spaceid = reg_space
+            entry_st0.addressbase = 0x1100  # ST0 offset in x86-32 SLEIGH register space
+            entry_st0.size = 10
+            entry_st0.minsize = 4
+            entry_st0.alignment = 0
+            entry_st0.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+            out_list.addEntry(entry_st0)
+            entry_eax = ParamEntry(0)
+            entry_eax.spaceid = reg_space
+            entry_eax.addressbase = 0  # EAX offset
+            entry_eax.size = 4
+            entry_eax.minsize = 1
+            entry_eax.alignment = 0
+            entry_eax.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+            out_list.addEntry(entry_eax)
+            # EDX (part of EDX:EAX join for 5-8 byte returns)
+            entry_edx = ParamEntry(0)
+            entry_edx.spaceid = reg_space
+            entry_edx.addressbase = 0x8  # EDX offset
+            entry_edx.size = 4
+            entry_edx.minsize = 4
+            entry_edx.alignment = 0
+            entry_edx.flags = ParamEntry.force_left_justify
+            out_list.addEntry(entry_edx)
+    model.output = out_list
+    # Build input parameter list from cspec
+    in_list = ParamListStandard()
+    if reg_space is not None:
+        if is_64:
+            # x86-64 Windows __fastcall input params (from x86-64-win.cspec)
+            # Group 0: XMM0_Qa (float) / RCX (int)
+            # Group 1: XMM1_Qa (float) / RDX (int)
+            # Group 2: XMM2_Qa (float) / R8 (int)
+            # Group 3: XMM3_Qa (float) / R9 (int)
+            # Register offsets: RCX=0x08, RDX=0x10, R8=0x80, R9=0x88
+            # XMM0_Qa=0x1200, XMM1_Qa=0x1240, XMM2_Qa=0x1280, XMM3_Qa=0x12c0
+            input_regs = [
+                # (group, offset, size, minsize, is_float)
+                (0, 0x1200, 8, 4, True),   # XMM0_Qa
+                (0, 0x08,   8, 1, False),  # RCX
+                (1, 0x1240, 8, 4, True),   # XMM1_Qa
+                (1, 0x10,   8, 1, False),  # RDX
+                (2, 0x1280, 8, 4, True),   # XMM2_Qa
+                (2, 0x80,   8, 1, False),  # R8
+                (3, 0x12c0, 8, 4, True),   # XMM3_Qa
+                (3, 0x88,   8, 1, False),  # R9
+            ]
+            for grp, off, sz, minsz, is_float in input_regs:
+                e = ParamEntry(grp)
+                e.spaceid = reg_space
+                e.addressbase = off
+                e.size = sz
+                e.minsize = minsz
+                e.alignment = 0
+                e.flags = ParamEntry.is_grouped | ParamEntry.first_storage | ParamEntry.force_left_justify
+                if is_float:
+                    from ghidra.types.datatype import TypeClass
+                    e.type = TypeClass.TYPECLASS_FLOAT
+                in_list.addEntry(e)
+        else:
+            # x86-32: no register input params for cdecl (all stack)
+            pass
+    model.input = in_list
+    stack_space = getattr(spc_mgr, '_stackSpace', None)
+    if stack_space is not None:
+        model.input.spacebase = stack_space
+
+    # Build effect list from cspec
+    if reg_space is not None:
+        effects = []
+        if is_64:
+            # x86-64 Windows __fastcall (from x86-64-win.cspec)
+            # Register offsets from x86-64.sla get_registers():
+            # RAX=0x00/8, RCX=0x08/8, RDX=0x10/8, RBX=0x18/8, RSP=0x20/8,
+            # RBP=0x28/8, RSI=0x30/8, RDI=0x38/8, R8=0x80/8, R9=0x88/8,
+            # R10=0x90/8, R11=0x98/8, R12=0xa0/8, R13=0xa8/8, R14=0xb0/8,
+            # R15=0xb8/8, DF=0x20a/1, GS_OFFSET=0x118/8, XMM0=0x1200/16,
+            # XMM6-15 at 0x1380,0x13c0,0x1400,0x1440,0x1480,0x14c0,0x1500,
+            # 0x1540,0x1580,0x15c0 (each 16 bytes)
+
+            # unaffected (callee-saved)
+            for off, sz in (
+                (0x18, 8),   # RBX
+                (0x28, 8),   # RBP
+                (0x38, 8),   # RDI
+                (0x30, 8),   # RSI
+                (0x20, 8),   # RSP
+                (0xa0, 8),   # R12
+                (0xa8, 8),   # R13
+                (0xb0, 8),   # R14
+                (0xb8, 8),   # R15
+                (0x20a, 1),  # DF
+                (0x118, 8),  # GS_OFFSET
+                (0x1380, 16),  # XMM6
+                (0x13c0, 16),  # XMM7
+                (0x1400, 16),  # XMM8
+                (0x1440, 16),  # XMM9
+                (0x1480, 16),  # XMM10
+                (0x14c0, 16),  # XMM11
+                (0x1500, 16),  # XMM12
+                (0x1540, 16),  # XMM13
+                (0x1580, 16),  # XMM14
+                (0x15c0, 16),  # XMM15
+            ):
+                effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.unaffected))
+            # killedbycall (volatile): RAX, XMM0
+            for off, sz in ((0x00, 8), (0x1200, 16)):
+                effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
+        else:
+            # x86-32 cdecl effect list (from x86gcc.cspec)
+            # unaffected (callee-saved): ESP=0x10, EBP=0x14, ESI=0x18, EDI=0x1c, EBX=0xc, DF=0x20a
+            for off, sz in ((0x10, 4), (0x14, 4), (0x18, 4), (0x1c, 4), (0x0c, 4), (0x20a, 1)):
+                effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.unaffected))
+            # killedbycall (volatile): ECX=0x4, EDX=0x8, ST0=0x1100, ST1=0x1110
+            # EAX=0x0 is killedbycall via autoKilledByCall (output killedbycall="true" in cspec)
+            for off, sz in ((0x00, 4), (0x04, 4), (0x08, 4), (0x1100, 10), (0x1110, 10)):
+                effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
+        # Sort by offset for lookupEffect binary search
+        effects.sort(key=lambda e: e.getAddress().getOffset())
+        model._effectlist = effects
+
+    model.extrapop = 8 if is_64 else 4
+    return model
+
+
+class ArchitectureStandalone:
+    """Minimal Architecture-like object for Heritage and Action pipeline.
+
+    Heritage needs Architecture to enumerate address spaces via
+    numSpaces()/getSpace(). The Action pipeline also needs printMessage(),
+    clearAnalysis(), getStackSpace(), and a context attribute.
+    This shim wraps the Lifter's AddrSpaceManager.
+    """
+
+    def __init__(self, spc_mgr) -> None:
+        self._spc_mgr = spc_mgr
+        self.context = None  # No tracked context by default
+        self.types = _build_shim_type_factory(spc_mgr)
+        self.analyze_for_loops = False
+        self.nan_ignore_all = False
+        self.cpool = None
+        self._unique_base: int = 0x10000000
+        self._errors: List[str] = []
+        self.trim_recurse_max = 5
+        # Build a minimal default prototype model with return register info
+        self.defaultfp = _build_default_proto_model(spc_mgr, self)
+        self.evalfp_current = None
+        self.evalfp_called = None
+
+    def numSpaces(self) -> int:
+        return self._spc_mgr.numSpaces()
+
+    def getSpace(self, i):
+        return self._spc_mgr.getSpaceByIndex(i)
+
+    def getConstantSpace(self):
+        return self._spc_mgr._constantSpace
+
+    def getUniqueSpace(self):
+        return self._spc_mgr._uniqueSpace
+
+    def getUniqueBase(self) -> int:
+        return self._unique_base
+
+    def setUniqueBase(self, val: int) -> None:
+        if val > self._unique_base:
+            self._unique_base = val
+
+    def getSpaceByName(self, name: str):
+        return self._spc_mgr.getSpaceByName(name)
+
+    def getDefaultCodeSpace(self):
+        return self._spc_mgr._defaultCodeSpace
+
+    def getDefaultDataSpace(self):
+        return self._spc_mgr._defaultDataSpace
+
+    def getJoinSpace(self):
+        return getattr(self._spc_mgr, '_joinSpace', None)
+
+    def getIopSpace(self):
+        return getattr(self._spc_mgr, '_iopSpace', None)
+
+    def getStackSpace(self):
+        """Return the stack space (may be None for raw binaries)."""
+        return getattr(self._spc_mgr, '_stackSpace', None)
+
+    def printMessage(self, msg: str) -> None:
+        """Collect messages from the action pipeline."""
+        self._errors.append(msg)
+
+    def getMessages(self) -> List[str]:
+        return list(self._errors)
+
+    def drainMessages(self) -> List[str]:
+        msgs = list(self._errors)
+        self._errors.clear()
+        return msgs
+
+    def clearAnalysis(self, data) -> None:
+        """Called by ActionRestartGroup between restart iterations."""
+        pass
