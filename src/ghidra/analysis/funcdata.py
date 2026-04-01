@@ -71,9 +71,11 @@ class Funcdata:
 
         self._qlst: List[FuncCallSpecs] = []
         self._qlst_map: dict = {}  # PcodeOp id -> FuncCallSpecs
+        self._iop_lookup: dict = {}  # id(op) -> PcodeOp for IOP space lookup
         self._jumpvec = []  # List[JumpTable]
         self._override = None  # Override
         self._unionMap = None  # UnionResolveMap
+        self._heritage = None
 
         self._vbank: VarnodeBank = VarnodeBank()
         self._obank: PcodeOpBank = PcodeOpBank()
@@ -99,6 +101,23 @@ class Funcdata:
 
     def setArch(self, glb) -> None:
         self._glb = glb
+        # Auto-create a ScopeLocal if none exists yet
+        if self._localmap is None and glb is not None:
+            stack_spc = glb.getStackSpace() if hasattr(glb, 'getStackSpace') else None
+            if stack_spc is not None:
+                from ghidra.database.varmap import ScopeLocal
+                self._localmap = ScopeLocal(0, stack_spc, self, glb)
+                # Attach to global scope so isGlobal() returns False.
+                # Without this, queryProperties falls back to setting persist on
+                # ALL unrecognised register addresses (flags, segment regs, etc.),
+                # which causes Heritage to create addrforce COPY guards for them
+                # and dead-code removal to leave them alive in the output.
+                # C++ ref: Funcdata ctor attaches ScopeLocal to the Database tree.
+                db = getattr(glb, 'symboltab', None)
+                if db is not None:
+                    global_scope = db.getGlobalScope() if hasattr(db, 'getGlobalScope') else None
+                    if global_scope is not None and hasattr(global_scope, 'attachScope'):
+                        global_scope.attachScope(self._localmap)
 
     def getSymbol(self):
         return self._functionSymbol
@@ -306,7 +325,7 @@ class Funcdata:
             self.followFlow(baddr, eaddr)
         self.structureReset()
         self.sortCallSpecs()
-        if hasattr(self, '_heritage') and self._heritage is not None and hasattr(self._heritage, 'buildInfoList'):
+        if self._heritage is not None:
             self._heritage.buildInfoList()
         if hasattr(self, '_localoverride') and self._localoverride is not None and hasattr(self._localoverride, 'applyDeadCodeDelay'):
             self._localoverride.applyDeadCodeDelay(self)
@@ -338,7 +357,7 @@ class Funcdata:
 
     def opHeritage(self) -> None:
         """Build SSA representation (heritage pass)."""
-        if not hasattr(self, '_heritage'):
+        if self._heritage is None:
             from ghidra.analysis.heritage import Heritage
             self._heritage = Heritage(self)
         if not self._heritage._infolist:
@@ -347,7 +366,7 @@ class Funcdata:
 
     def getHeritagePass(self) -> int:
         """Get the current heritage pass number."""
-        if hasattr(self, '_heritage'):
+        if self._heritage is not None:
             return self._heritage.getPass()
         return 0
 
@@ -371,24 +390,6 @@ class Funcdata:
         """Clear the active output recovery object."""
         self._activeoutput = None
 
-    def initActiveOutput(self) -> None:
-        """Initialize active output parameter recovery.
-
-        C++ ref: ``Funcdata::initActiveOutput``
-        """
-        from ghidra.fspec.paramactive import ParamActive
-        self._activeoutput = ParamActive(False)
-        maxdelay = self._funcp.getMaxOutputDelay() if hasattr(self._funcp, 'getMaxOutputDelay') else 0
-        if maxdelay > 0:
-            maxdelay = 3
-        if hasattr(self._activeoutput, 'setMaxPass'):
-            self._activeoutput.setMaxPass(maxdelay)
-
-    def calcNZMask(self) -> None:
-        """Calculate the non-zero mask property on all Varnodes."""
-        from ghidra.transform.nzmask import calcNZMask as _calcNZMask
-        _calcNZMask(self)
-
     def clearDeadVarnodes(self) -> None:
         """Free any Varnodes not attached to anything.
 
@@ -408,13 +409,17 @@ class Funcdata:
                 if vn.isFree():
                     self._vbank.destroy(vn)
 
+    def calcNZMask(self) -> None:
+        from ghidra.transform.nzmask import calcNZMask
+        calcNZMask(self)
+
     def clearDeadOps(self) -> None:
         """Remove PcodeOps that have been marked as dead."""
         self._obank.clearDead()
 
     def seenDeadcode(self, spc) -> None:
         """Record that dead code has been seen for a given space."""
-        if hasattr(self, '_heritage') and self._heritage is not None:
+        if self._heritage is not None:
             self._heritage.seenDeadCode(spc)
 
     def spacebase(self) -> None:
@@ -490,7 +495,7 @@ class Funcdata:
             alivejumps.append(jt)
         self._jumpvec = alivejumps
         self._sblocks.clear()
-        if hasattr(self, '_heritage') and hasattr(self._heritage, 'forceRestructure'):
+        if self._heritage is not None:
             self._heritage.forceRestructure()
 
     def opZeroMulti(self, op) -> None:
@@ -709,7 +714,7 @@ class Funcdata:
         self._qlst_map.clear()
         self._jumpvec.clear()
         # Do not clear overrides
-        if hasattr(self, '_heritage') and self._heritage is not None:
+        if self._heritage is not None:
             self._heritage.clear()
         if hasattr(self, '_covermerge') and self._covermerge is not None and hasattr(self._covermerge, 'clear'):
             self._covermerge.clear()
@@ -915,20 +920,33 @@ class Funcdata:
         opaddr = op.getAddr() if hasattr(op, 'getAddr') else Address()
         addr = Address(iopSpc, id(op)) if iopSpc is not None else opaddr
         vn = self._vbank.create(_PTR_SIZE, addr)
+        vn._iop_ref = op  # Store direct reference for Python resolution
+        self._iop_lookup[id(op)] = op  # Register for getOpFromConst
         self.assignHigh(vn)
         return vn
+
+    def getOpFromConst(self, addr: Address):
+        """Get the PcodeOp encoded in an IOP-space annotation address.
+
+        C++ ref: ``Funcdata::getOpFromConst``
+        """
+        return self._iop_lookup.get(addr.getOffset())
 
     def newVarnodeSpace(self, spc):
         """Create a constant varnode encoding an address space identifier.
 
         C++ encodes the AddrSpace* pointer as a sizeof(void*)-byte constant.
         We use 8 bytes to match the C++ 64-bit build output.
+        The varnode is tagged with ``setSpaceFromConst`` so that
+        ``getSpaceFromConst`` returns the actual target space.
 
-        C++ ref: ``Funcdata::newVarnodeSpace``
+        C++ ref: ``Funcdata::newVarnodeSpace``  (funcdata_varnode.cc:190-198)
         """
         cs = self._glb.getConstantSpace() if self._glb else None
         idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
-        return self._vbank.create(8, Address(cs, idx) if cs else Address())
+        vn = self._vbank.create(8, Address(cs, idx) if cs else Address())
+        vn.setSpaceFromConst(spc)
+        return vn
 
     def newVarnodeCallSpecs(self, fc):
         """Create an annotation Varnode encoding a reference to a FuncCallSpecs.
@@ -960,19 +978,19 @@ class Funcdata:
         return vn
 
     def numHeritagePasses(self, spc):
-        return self._heritage.numHeritagePasses(spc) if hasattr(self, '_heritage') else 0
+        return self._heritage.numHeritagePasses(spc) if self._heritage is not None else 0
 
     def deadRemovalAllowed(self, spc):
-        return self._heritage.deadRemovalAllowed(spc) if hasattr(self, '_heritage') else True
+        return self._heritage.deadRemovalAllowed(spc) if self._heritage is not None else True
 
     def deadRemovalAllowedSeen(self, spc):
-        return self._heritage.deadRemovalAllowedSeen(spc) if hasattr(self, '_heritage') else False
+        return self._heritage.deadRemovalAllowedSeen(spc) if self._heritage is not None else False
 
     def isHeritaged(self, vn):
-        return self._heritage.heritagePass(vn.getAddr()) >= 0 if hasattr(self, '_heritage') else False
+        return self._heritage.heritagePass(vn.getAddr()) >= 0 if self._heritage is not None else False
 
     def setDeadCodeDelay(self, spc, delay):
-        if hasattr(self, '_heritage'):
+        if self._heritage is not None:
             self._heritage.setDeadCodeDelay(spc, delay)
 
     def getMerge(self):
@@ -1351,12 +1369,23 @@ class Funcdata:
     def opSetOutput(self, op: PcodeOp, vn: Varnode) -> None:
         """Set the output of a PcodeOp.
 
-        C++ ref: ``Funcdata::opSetOutput``
+        C++ ref: ``Funcdata::opSetOutput``  (funcdata_op.cc:70-87)
+        C++ calls ``vbank.setDef(vn, op)`` which triggers ``xref()`` and
+        sets the ``insert`` flag — required for ``isHeritageKnown()``.
         """
         if vn is op.getOut():
             return
+        old_out = op.getOut()
+        if old_out is not None:
+            self.opUnsetOutput(op)
+        if vn.getDef() is not None:
+            self.opUnsetOutput(vn.getDef())
+        if vn.isFree():
+            vn = self._vbank.setDef(vn, op)
+        else:
+            vn.setDef(op)
+        self.setVarnodeProperties(vn)
         op.setOutput(vn)
-        vn.setDef(op)
 
     def opSetInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
         """Set an input of a PcodeOp.
@@ -1393,22 +1422,37 @@ class Funcdata:
         op.removeInput(slot)
 
     def opInsertInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
-        """Insert a new input into a PcodeOp at the given slot."""
+        """Insert a new input into a PcodeOp at the given slot.
+
+        If *vn* is a free varnode that already has a descendant, clone it
+        first so the "free varnode has one descendant" invariant is preserved.
+        This matches the clone logic in opSetInput.
+        """
+        # Clone free varnodes that already have a descendant
+        if vn.isFree() and not vn.isSpacebase() and len(vn._descend) > 0:
+            addr = vn.getAddr()
+            clone = self.newVarnode(vn.getSize(), addr)
+            clone._flags = vn._flags
+            vn = clone
         op.insertInput(slot)
         op.setInput(vn, slot)
         vn.addDescend(op)
 
     def opSetAllInput(self, op: PcodeOp, inputs: List[Varnode]) -> None:
-        """Set all inputs of a PcodeOp at once."""
-        # Clear old
+        """Set all inputs of a PcodeOp at once.
+
+        C++ ref: Funcdata::opSetAllInput in funcdata_op.cc — calls opUnsetInput
+        then opSetInput for each slot, which handles constant-cloning.
+        """
+        # Unset all current inputs first (null slots to prevent double-erase)
         for i in range(op.numInput()):
             old = op.getIn(i)
             if old is not None:
                 old.eraseDescend(op)
+                op.setInput(None, i)
         op.setNumInputs(len(inputs))
         for i, vn in enumerate(inputs):
-            op.setInput(vn, i)
-            vn.addDescend(op)
+            self.opSetInput(op, vn, i)
 
     def opUnsetOutput(self, op: PcodeOp) -> None:
         """Remove the output from a PcodeOp, making it free.
@@ -2167,6 +2211,10 @@ class Funcdata:
                    Varnode.volatil | Varnode.mapped)
         vflags = vn.getFlags() & allowed
         newvn.setFlags(vflags)
+        # Preserve space-from-const reference for LOAD/STORE space constants
+        space_ref = vn._space_ref
+        if space_ref is not None:
+            newvn._space_ref = space_ref
         return newvn
 
     def splitUses(self, vn) -> None:
@@ -2250,10 +2298,9 @@ class Funcdata:
         C++ ref: ``Funcdata::assignHigh``
         """
         if (self._flags & Funcdata.highlevel_on) != 0:
-            if hasattr(vn, 'hasCover') and vn.hasCover():
-                if hasattr(vn, 'calcCover'):
-                    vn.calcCover()
-            if not (hasattr(vn, 'isAnnotation') and vn.isAnnotation()):
+            if vn.hasCover():
+                vn.calcCover()
+            if not vn.isAnnotation():
                 return HighVariable(vn)
         return None
 
@@ -2361,36 +2408,33 @@ class Funcdata:
         if entry is None:
             return None
         # Simple cases: input, addrtied, persist, constant, or dynamic entry
-        if vn.isInput() or (hasattr(vn, 'isAddrTied') and vn.isAddrTied()) or \
-           vn.isPersist() or vn.isConstant() or \
+        if vn.isInput() or vn.isAddrTied() or vn.isPersist() or vn.isConstant() or \
            (hasattr(entry, 'isDynamic') and entry.isDynamic()):
-            if hasattr(vn, 'setSymbolEntry'):
-                vn.setSymbolEntry(entry)
+            vn.setSymbolEntry(entry)
             return entry.getSymbol() if hasattr(entry, 'getSymbol') else None
 
-        high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+        high = vn.getHigh()
         otherHigh = None
-        # Look for a conflicting HighVariable at same size/addr
-        if hasattr(self, 'beginLoc') and hasattr(entry, 'getSize') and hasattr(entry, 'getAddr'):
-            for othervn in self.beginLoc(entry.getSize(), entry.getAddr()):
-                if othervn.getSize() != entry.getSize():
-                    break
-                if othervn.getAddr() != entry.getAddr():
-                    break
-                tmpHigh = othervn.getHigh() if hasattr(othervn, 'getHigh') else None
+        # Look for a conflicting HighVariable at same size/addr using O(K) index
+        eaddr = entry.getAddr() if hasattr(entry, 'getAddr') else None
+        esz = entry.getSize() if hasattr(entry, 'getSize') else None
+        if eaddr is not None and esz is not None:
+            espc = eaddr.base
+            for othervn in self._vbank.findLoc(eaddr, esz):
+                if othervn._loc.base is not espc:
+                    continue
+                tmpHigh = othervn.getHigh()
                 if tmpHigh is not None and tmpHigh is not high:
                     otherHigh = tmpHigh
                     break
 
         if otherHigh is None:
-            if hasattr(vn, 'setSymbolEntry'):
-                vn.setSymbolEntry(entry)
+            vn.setSymbolEntry(entry)
             return entry.getSymbol() if hasattr(entry, 'getSymbol') else None
 
         # Conflicting variable - build a dynamic symbol
-        if hasattr(self, 'buildDynamicSymbol'):
-            self.buildDynamicSymbol(vn)
-        se = vn.getSymbolEntry() if hasattr(vn, 'getSymbolEntry') else None
+        self.buildDynamicSymbol(vn)
+        se = vn.getSymbolEntry()
         return se.getSymbol() if se is not None and hasattr(se, 'getSymbol') else None
 
     def applyUnionFacet(self, entry, dhash) -> bool:
@@ -2745,6 +2789,25 @@ class Funcdata:
         if hasattr(self._vbank, 'overlapLoc'):
             return self._vbank.overlapLoc(iterobj, bounds)
         return 0
+
+    def iterLocVarnodes(self, spaceid):
+        """Iterate varnodes whose address space matches *spaceid*.
+
+        C++ ref: ``VarnodeLocSet`` iteration filtered by space.
+        """
+        spc_bucket = self._vbank._space_varnodes.get(id(spaceid), ())
+        for vn in spc_bucket:
+            yield vn
+
+    def iterDefVarnodes(self, flags: int):
+        """Iterate varnodes whose flags include all bits in *flags*.
+
+        Typically used with ``Varnode.input`` (0x1) to iterate input varnodes.
+        C++ ref: ``VarnodeDefSet`` iteration filtered by flags.
+        """
+        for vn in self._vbank.beginLoc():
+            if (vn.getFlags() & flags) == flags:
+                yield vn
 
     def beginLaneAccess(self):
         """Beginning iterator over laned accesses."""
@@ -3627,6 +3690,8 @@ class Funcdata:
                 if hasattr(vn, 'isAddrTied') and vn.isAddrTied():
                     usepoint = Address()
                 ct = high.getType() if high is not None and hasattr(high, 'getType') else None
+                if ct is None and self._glb is not None and hasattr(self._glb, 'types'):
+                    ct = self._glb.types.getBase(vn.getSize(), 'unknown')
                 if hasattr(self._localmap, 'addSymbol'):
                     entry = self._localmap.addSymbol("", ct, vn.getAddr(), usepoint)
                     if entry is not None:
@@ -3769,9 +3834,7 @@ class Funcdata:
                 if entry is not None and hasattr(vn, 'setSymbolEntry'):
                     vn.setSymbolEntry(entry)
         except (ImportError, Exception):
-            # DynamicHash may not be available yet; fallback to simple addDynamicSymbol
-            if hasattr(self._localmap, 'addDynamicSymbol'):
-                self._localmap.addDynamicSymbol(vn)
+            pass  # DynamicHash unavailable; skip dynamic symbol creation
 
     def combineInputVarnodes(self, vnHi, vnLo) -> None:
         """Combine two contiguous input Varnodes into one.
@@ -4143,7 +4206,7 @@ class Funcdata:
         spaceId = lm.getSpaceId() if hasattr(lm, 'getSpaceId') else None
         if spaceId is None:
             return False
-        vnlist = list(self._vbank.beginLoc(spaceId)) if hasattr(self._vbank, 'beginLoc') else []
+        vnlist = list(self.iterLocVarnodes(spaceId))
         i = 0
         while i < len(vnlist):
             vnexemplar = vnlist[i]
@@ -5009,3 +5072,133 @@ class Funcdata:
         return (f"Funcdata({self._name!r} @ {self._baseaddr}, "
                 f"varnodes={self._vbank.size()}, "
                 f"blocks={self._bblocks.getSize()})")
+
+
+class CloneBlockOps:
+    """Clone p-code ops when splitting control-flow at a merge point.
+
+    Used for duplicating either a whole basic block, or an expression
+    subset within a basic block.
+
+    C++ ref: ``funcdata.hh / funcdata_block.cc``
+    """
+
+    def __init__(self, fd: Funcdata) -> None:
+        self.data: Funcdata = fd
+        self.cloneList: List[tuple] = []  # List of (cloneOp, origOp) pairs
+        self.origToClone: dict = {}  # Map from original PcodeOp to clone
+
+    def buildOpClone(self, op: PcodeOp) -> Optional[PcodeOp]:
+        """Produce a skeleton copy of the given PcodeOp.
+
+        C++ ref: CloneBlockOps::buildOpClone
+        """
+        if op.isBranch():
+            if op.code() != OpCode.CPUI_BRANCH:
+                raise RuntimeError("Cannot duplicate 2-way or n-way branch in nodesplit")
+            return None
+        dup = self.data.newOp(op.numInput(), op.getAddr())
+        self.data.opSetOpcode(dup, op.code())
+        fl = op.flags & (PcodeOp.startbasic | PcodeOp.nocollapse | PcodeOp.startmark |
+                         PcodeOp.nonprinting | PcodeOp.halt | PcodeOp.badinstruction |
+                         PcodeOp.unimplemented | PcodeOp.noreturn | PcodeOp.missing |
+                         PcodeOp.indirect_creation | PcodeOp.indirect_store |
+                         PcodeOp.no_indirect_collapse | PcodeOp.calculated_bool | PcodeOp.ptrflow)
+        dup.setFlag(fl)
+        if hasattr(op, 'addlflags') and hasattr(dup, 'setAdditionalFlag'):
+            afl = op.addlflags & (PcodeOp.special_prop | PcodeOp.special_print |
+                                  PcodeOp.incidental_copy | PcodeOp.is_cpool_transformed |
+                                  PcodeOp.stop_type_propagation | PcodeOp.store_unmapped)
+            dup.setAdditionalFlag(afl)
+        self.cloneList.append((dup, op))
+        self.origToClone[id(op)] = dup
+        return dup
+
+    def buildVarnodeOutput(self, origOp: PcodeOp, cloneOp: PcodeOp) -> None:
+        """Clone the output Varnode of the given op onto its clone.
+
+        C++ ref: CloneBlockOps::buildVarnodeOutput
+        """
+        opvn = origOp.getOut()
+        if opvn is None:
+            return
+        newvn = self.data.newVarnodeOut(opvn.getSize(), opvn.getAddr(), cloneOp)
+        vflags = opvn.getFlags()
+        vflags &= (Varnode.externref | Varnode.volatil | Varnode.incidental_copy |
+                   Varnode.readonly | Varnode.persist | Varnode.addrtied |
+                   Varnode.addrforce | Varnode.nolocalalias | Varnode.spacebase |
+                   Varnode.indirect_creation | Varnode.return_address |
+                   Varnode.precislo | Varnode.precishi | Varnode.incidental_copy)
+        newvn.setFlags(vflags)
+        if hasattr(opvn, 'addlflags') and hasattr(newvn, 'addlflags'):
+            aflags = opvn.addlflags & (Varnode.writemask | Varnode.ptrflow | Varnode.stack_store)
+            newvn.addlflags |= aflags
+
+    def patchInputs(self, inedge: int) -> None:
+        """Set the input Varnodes of all cloned ops.
+
+        C++ ref: CloneBlockOps::patchInputs
+        """
+        for cloneOp, origOp in self.cloneList:
+            if origOp.code() == OpCode.CPUI_MULTIEQUAL:
+                cloneOp.setNumInputs(1)
+                self.data.opSetOpcode(cloneOp, OpCode.CPUI_COPY)
+                self.data.opSetInput(cloneOp, origOp.getIn(inedge), 0)
+                self.data.opRemoveInput(origOp, inedge)
+                if origOp.numInput() == 1:
+                    self.data.opSetOpcode(origOp, OpCode.CPUI_COPY)
+            elif origOp.code() == OpCode.CPUI_INDIRECT:
+                raise RuntimeError("Can't clone INDIRECTs")
+            elif origOp.isCall():
+                raise RuntimeError("Can't clone CALLs")
+            else:
+                for i in range(cloneOp.numInput()):
+                    origVn = origOp.getIn(i)
+                    if origVn.isConstant():
+                        cloneVn = origVn
+                    elif hasattr(origVn, 'isAnnotation') and origVn.isAnnotation():
+                        cloneVn = self.data.newCodeRef(origVn.getAddr())
+                    elif origVn.isFree():
+                        raise RuntimeError("Can't clone free varnode")
+                    else:
+                        if origVn.isWritten():
+                            defOp = origVn.getDef()
+                            clonedDef = self.origToClone.get(id(defOp))
+                            if clonedDef is not None:
+                                cloneVn = clonedDef.getOut()
+                            else:
+                                cloneVn = origVn
+                        else:
+                            cloneVn = origVn
+                    self.data.opSetInput(cloneOp, cloneVn, i)
+
+    def cloneBlock(self, b: BlockBasic, bprime: BlockBasic, inedge: int) -> None:
+        """Clone all p-code ops from a block into its copy.
+
+        C++ ref: CloneBlockOps::cloneBlock
+        """
+        for origOp in b.getOpList():
+            cloneOp = self.buildOpClone(origOp)
+            if cloneOp is None:
+                continue
+            self.buildVarnodeOutput(origOp, cloneOp)
+            self.data.opInsertEnd(cloneOp, bprime)
+        self.patchInputs(inedge)
+
+    def cloneExpression(self, ops: List[PcodeOp], followOp: PcodeOp) -> Varnode:
+        """Clone p-code ops in an expression before followOp.
+
+        C++ ref: CloneBlockOps::cloneExpression
+        """
+        cloneOp = None
+        for origOp in ops:
+            cloneOp = self.buildOpClone(origOp)
+            if cloneOp is None:
+                continue
+            self.buildVarnodeOutput(origOp, cloneOp)
+            self.data.opInsertBefore(cloneOp, followOp)
+        if not self.cloneList:
+            raise RuntimeError("No expression to clone")
+        self.patchInputs(0)
+        lastCloneOp = self.cloneList[-1][0]
+        return lastCloneOp.getOut()

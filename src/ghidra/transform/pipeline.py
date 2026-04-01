@@ -35,8 +35,8 @@ def _run_mini_pipeline(fd) -> None:
         RulePropagateCopy, Rule2Comp2Mult, RuleSub2Add,
         RuleXorCollapse,
     )
-    from ghidra.transform.ruleaction_batch1a import RuleTrivialShift
-    from ghidra.transform.ruleaction_batch1d import RuleBoolNegate
+    from ghidra.transform.rules_compare import RuleTrivialShift
+    from ghidra.transform.rules_zerocomp import RuleBoolNegate
 
     # Build a mini action group: heritage → rules → deadcode
     act = ActionGroup(0, "mini_pipeline")
@@ -79,15 +79,42 @@ def _run_mini_pipeline(fd) -> None:
     act.perform(fd)
 
 
-def _run_full_decompile_action(fd) -> None:
-    from ghidra.transform.action import ActionDatabase
+def _run_full_decompile_action(fd, timeout_seconds: float = 30.0) -> None:
+    """Run the full universal decompiler action chain on *fd*.
 
-    allacts = ActionDatabase()
-    allacts.universalAction(fd.getArch())
-    allacts.resetDefaults()
-    root = allacts.getCurrent()
-    root.reset(fd)
-    root.perform(fd)
+    Parameters
+    ----------
+    fd:
+        The Funcdata to decompile.
+    timeout_seconds:
+        Per-function wall-clock budget.  0 = no deadline (use with caution —
+        oscillating rules can cause an infinite loop).  Default is 30 s, which
+        is generous for functions with < 500 ops and still catches runaway loops.
+    """
+    from ghidra.transform.action import Action, ActionDatabase
+    from ghidra.transform.irlogger import PCodeIRLogger
+
+    func_name = fd.getName() if hasattr(fd, "getName") else "unknown"
+
+    # Reset per-function oscillation state and log header
+    PCodeIRLogger.reset_for_function(func_name)
+
+    # Arm the wall-clock deadline
+    if timeout_seconds > 0:
+        Action.set_deadline(timeout_seconds)
+    else:
+        Action.clear_deadline()
+
+    try:
+        allacts = ActionDatabase()
+        allacts.universalAction(fd.getArch())
+        allacts.resetDefaults()
+        root = allacts.getCurrent()
+        root.reset(fd)
+        root.perform(fd)
+    finally:
+        # Always disarm the deadline so it doesn't bleed into the next call
+        Action.clear_deadline()
 
 
 def _seed_default_return_output(fd, target: str) -> None:

@@ -2,8 +2,19 @@
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
+[![Repository](https://img.shields.io/badge/repository-GitHub-black.svg)](https://github.com/fjqisba/GhidraX)
 
 A faithful Python port of Ghidra's C++ decompiler core. SLEIGH instruction decoding is provided via a pybind11 native module (`sleigh_native.pyd`); everything else — IR, data-flow analysis, SSA construction, optimization rules, control-flow structuring, and C output — is pure Python.
+
+## Git Repository
+
+- Canonical repository: `https://github.com/fjqisba/GhidraX.git`
+- Documentation: `https://github.com/fjqisba/GhidraX/tree/main/docs`
+
+```bash
+git clone https://github.com/fjqisba/GhidraX.git
+cd GhidraX
+```
 
 ## Project Structure
 
@@ -29,9 +40,10 @@ GhidraX/
 │   └── decompiler_bind.cpp     # decompiler_native.pyd binding
 ├── specs/                      # Ghidra processor specifications
 │   └── Processors/x86/data/languages/
-├── tools/                      # Deployment & utilities
+├── tools/                      # Utilities, comparison, and deployment helpers
 │   ├── deploy.bat              # IDA plugin deployer
-│   └── console.py              # CLI dual-engine comparison tool
+│   ├── console.py              # CLI utility
+│   └── action_compare.py       # Python/native staged action comparison
 ├── docs/                       # Documentation
 │   ├── ARCHITECTURE.md         # Porting roadmap & design
 │   ├── AUDIT.md                # Code audit notes
@@ -128,7 +140,7 @@ To add architectures, copy `.sla` + `.pspec` + `.cspec` from your Ghidra install
 
 ```bash
 pip install -e ".[dev]"
-pytest                      # runs with --timeout=120 (from pyproject.toml)
+python -m pytest tests -v --timeout=120
 ```
 
 ## License

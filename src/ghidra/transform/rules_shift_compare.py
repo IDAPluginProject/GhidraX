@@ -229,7 +229,10 @@ class RuleAndPiece(Rule):
         return [int(OpCode.CPUI_INT_AND)]
 
     def applyOp(self, op, data) -> int:
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         found_i = -1
         opc = OpCode.CPUI_PIECE
         highvn = lowvn = None
@@ -302,7 +305,10 @@ class RuleAndCommute(Rule):
         return [int(OpCode.CPUI_INT_AND)]
 
     def applyOp(self, op, data) -> int:
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         if size > 8:
             return 0
         fullmask = calc_mask(size)

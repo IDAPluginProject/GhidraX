@@ -2103,13 +2103,482 @@ class LessThreeWay:
     def __init__(self) -> None:
         self.inv = SplitVarnode()
         self.in2 = SplitVarnode()
+        self.hilessbl = None
+        self.lolessbl = None
+        self.hieqbl = None
+        self.hilesstrue = None
+        self.hilessfalse = None
+        self.hieqtrue = None
+        self.hieqfalse = None
+        self.lolesstrue = None
+        self.lolessfalse = None
+        self.hilessbool = None
+        self.lolessbool = None
+        self.hieqbool = None
+        self.hiless = None
+        self.hiequal = None
+        self.loless = None
+        self.vnhil1 = None
+        self.vnhil2 = None
+        self.vnhie1 = None
+        self.vnhie2 = None
+        self.vnlo1 = None
+        self.vnlo2 = None
+        self.hi = None
+        self.lo = None
+        self.hi2 = None
+        self.lo2 = None
+        self.hislot: int = 0
+        self.hiflip: bool = False
+        self.equalflip: bool = False
+        self.loflip: bool = False
+        self.lolessiszerocomp: bool = False
+        self.lolessequalform: bool = False
+        self.hilessequalform: bool = False
+        self.signcompare: bool = False
+        self.midlessform: bool = False
+        self.midlessequal: bool = False
+        self.midsigncompare: bool = False
+        self.hiconstform: bool = False
+        self.midconstform: bool = False
+        self.loconstform: bool = False
+        self.hival: int = 0
+        self.midval: int = 0
+        self.loval: int = 0
+        self.finalopc = OpCode.CPUI_INT_LESS
 
-    def applyRule(self, i, op, workishi: bool, data) -> bool:
-        """Apply the less-three-way rule.
-        Corresponds to LessThreeWay::applyRule in double.cc."""
-        # Stub: requires very complex three-way comparison pattern matching
-        # across multiple basic blocks
+    def mapBlocksFromLow(self, lobl) -> bool:
+        """Map out blocks from the low-precision comparison block.
+
+        C++ ref: LessThreeWay::mapBlocksFromLow
+        """
+        self.lolessbl = lobl
+        if self.lolessbl.sizeIn() != 1:
+            return False
+        if self.lolessbl.sizeOut() != 2:
+            return False
+        self.hieqbl = self.lolessbl.getIn(0)
+        if self.hieqbl.sizeIn() != 1:
+            return False
+        if self.hieqbl.sizeOut() != 2:
+            return False
+        self.hilessbl = self.hieqbl.getIn(0)
+        if self.hilessbl.sizeOut() != 2:
+            return False
+        return True
+
+    def mapOpsFromBlocks(self) -> bool:
+        """Map CBRANCH ops and comparison ops from the three blocks.
+
+        C++ ref: LessThreeWay::mapOpsFromBlocks
+        """
+        self.lolessbool = self.lolessbl.lastOp()
+        if self.lolessbool is None:
+            return False
+        if self.lolessbool.code() != OpCode.CPUI_CBRANCH:
+            return False
+        self.hieqbool = self.hieqbl.lastOp()
+        if self.hieqbool is None:
+            return False
+        if self.hieqbool.code() != OpCode.CPUI_CBRANCH:
+            return False
+        self.hilessbool = self.hilessbl.lastOp()
+        if self.hilessbool is None:
+            return False
+        if self.hilessbool.code() != OpCode.CPUI_CBRANCH:
+            return False
+
+        self.hiflip = False
+        self.equalflip = False
+        self.loflip = False
+        self.midlessform = False
+        self.lolessiszerocomp = False
+
+        vn = self.hieqbool.getIn(1)
+        if not vn.isWritten():
+            return False
+        self.hiequal = vn.getDef()
+        opc = self.hiequal.code()
+        if opc == OpCode.CPUI_INT_EQUAL:
+            self.midlessform = False
+        elif opc == OpCode.CPUI_INT_NOTEQUAL:
+            self.midlessform = False
+        elif opc == OpCode.CPUI_INT_LESS:
+            self.midlessequal = False
+            self.midsigncompare = False
+            self.midlessform = True
+        elif opc == OpCode.CPUI_INT_LESSEQUAL:
+            self.midlessequal = True
+            self.midsigncompare = False
+            self.midlessform = True
+        elif opc == OpCode.CPUI_INT_SLESS:
+            self.midlessequal = False
+            self.midsigncompare = True
+            self.midlessform = True
+        elif opc == OpCode.CPUI_INT_SLESSEQUAL:
+            self.midlessequal = True
+            self.midsigncompare = True
+            self.midlessform = True
+        else:
+            return False
+
+        vn = self.lolessbool.getIn(1)
+        if not vn.isWritten():
+            return False
+        self.loless = vn.getDef()
+        opc = self.loless.code()
+        if opc == OpCode.CPUI_INT_LESS:
+            self.lolessequalform = False
+        elif opc == OpCode.CPUI_INT_LESSEQUAL:
+            self.lolessequalform = True
+        elif opc == OpCode.CPUI_INT_EQUAL:
+            if not self.loless.getIn(1).isConstant():
+                return False
+            if self.loless.getIn(1).getOffset() != 0:
+                return False
+            self.lolessiszerocomp = True
+            self.lolessequalform = True
+        elif opc == OpCode.CPUI_INT_NOTEQUAL:
+            if not self.loless.getIn(1).isConstant():
+                return False
+            if self.loless.getIn(1).getOffset() != 0:
+                return False
+            self.lolessiszerocomp = True
+            self.lolessequalform = False
+        else:
+            return False
+
+        vn = self.hilessbool.getIn(1)
+        if not vn.isWritten():
+            return False
+        self.hiless = vn.getDef()
+        opc = self.hiless.code()
+        if opc == OpCode.CPUI_INT_LESS:
+            self.hilessequalform = False
+            self.signcompare = False
+        elif opc == OpCode.CPUI_INT_LESSEQUAL:
+            self.hilessequalform = True
+            self.signcompare = False
+        elif opc == OpCode.CPUI_INT_SLESS:
+            self.hilessequalform = False
+            self.signcompare = True
+        elif opc == OpCode.CPUI_INT_SLESSEQUAL:
+            self.hilessequalform = True
+            self.signcompare = True
+        else:
+            return False
+        return True
+
+    def checkSignedness(self) -> bool:
+        """Verify signedness consistency between hi and mid comparisons.
+
+        C++ ref: LessThreeWay::checkSignedness
+        """
+        if self.midlessform:
+            if self.midsigncompare != self.signcompare:
+                return False
+        return True
+
+    def normalizeHi(self) -> bool:
+        """Normalize the hi comparison so constant is on right and form is strict less.
+
+        C++ ref: LessThreeWay::normalizeHi
+        """
+        self.vnhil1 = self.hiless.getIn(0)
+        self.vnhil2 = self.hiless.getIn(1)
+        if self.vnhil1.isConstant():
+            self.hiflip = not self.hiflip
+            self.hilessequalform = not self.hilessequalform
+            self.vnhil1, self.vnhil2 = self.vnhil2, self.vnhil1
+        self.hiconstform = False
+        if self.vnhil2.isConstant():
+            if self.inv.getSize() > 8:
+                return False
+            self.hiconstform = True
+            self.hival = self.vnhil2.getOffset()
+            self.hilesstrue, self.hilessfalse = SplitVarnode.getTrueFalse(self.hilessbool, self.hiflip)
+            inc = 1
+            if self.hilessfalse is not self.hieqbl:
+                self.hiflip = not self.hiflip
+                self.hilessequalform = not self.hilessequalform
+                self.vnhil1, self.vnhil2 = self.vnhil2, self.vnhil1
+                inc = -1
+            if self.hilessequalform:
+                self.hival += inc
+                self.hival &= calc_mask(self.inv.getSize())
+                self.hilessequalform = False
+            lo_vn = self.inv.getLo()
+            if lo_vn is not None:
+                self.hival >>= lo_vn.getSize() * 8
+        else:
+            if self.hilessequalform:
+                self.hilessequalform = False
+                self.hiflip = not self.hiflip
+                self.vnhil1, self.vnhil2 = self.vnhil2, self.vnhil1
+        return True
+
+    def normalizeMid(self) -> bool:
+        """Normalize the mid (equality) comparison.
+
+        C++ ref: LessThreeWay::normalizeMid
+        """
+        self.vnhie1 = self.hiequal.getIn(0)
+        self.vnhie2 = self.hiequal.getIn(1)
+        if self.vnhie1.isConstant():
+            self.vnhie1, self.vnhie2 = self.vnhie2, self.vnhie1
+            if self.midlessform:
+                self.equalflip = not self.equalflip
+                self.midlessequal = not self.midlessequal
+        self.midconstform = False
+        if self.vnhie2.isConstant():
+            if not self.hiconstform:
+                return False
+            self.midconstform = True
+            self.midval = self.vnhie2.getOffset()
+            if self.vnhie2.getSize() == self.inv.getSize():
+                lo_vn = self.inv.getLo()
+                losize = lo_vn.getSize() if lo_vn else 0
+                lopart = self.midval & calc_mask(losize)
+                self.midval >>= losize * 8
+                if self.midlessform:
+                    if self.midlessequal:
+                        if lopart != calc_mask(losize):
+                            return False
+                    else:
+                        if lopart != 0:
+                            return False
+                else:
+                    return False
+            if self.midval != self.hival:
+                if not self.midlessform:
+                    return False
+                self.midval += 1 if self.midlessequal else -1
+                lo_vn = self.inv.getLo()
+                losize = lo_vn.getSize() if lo_vn else 0
+                self.midval &= calc_mask(losize)
+                self.midlessequal = not self.midlessequal
+                if self.midval != self.hival:
+                    return False
+        if self.midlessform:
+            if not self.midlessequal:
+                self.equalflip = not self.equalflip
+        else:
+            if self.hiequal.code() == OpCode.CPUI_INT_NOTEQUAL:
+                self.equalflip = not self.equalflip
+        return True
+
+    def normalizeLo(self) -> bool:
+        """Normalize the lo comparison.
+
+        C++ ref: LessThreeWay::normalizeLo
+        """
+        self.vnlo1 = self.loless.getIn(0)
+        self.vnlo2 = self.loless.getIn(1)
+        if self.lolessiszerocomp:
+            self.loconstform = True
+            if self.lolessequalform:
+                self.loval = 1
+                self.lolessequalform = False
+            else:
+                self.loflip = not self.loflip
+                self.loval = 1
+            return True
+        if self.vnlo1.isConstant():
+            self.loflip = not self.loflip
+            self.lolessequalform = not self.lolessequalform
+            self.vnlo1, self.vnlo2 = self.vnlo2, self.vnlo1
+        self.loconstform = False
+        if self.vnlo2.isConstant():
+            self.loconstform = True
+            self.loval = self.vnlo2.getOffset()
+            if self.lolessequalform:
+                self.loval += 1
+                self.loval &= calc_mask(self.vnlo2.getSize())
+                self.lolessequalform = False
+        else:
+            if self.lolessequalform:
+                self.lolessequalform = False
+                self.loflip = not self.loflip
+                self.vnlo1, self.vnlo2 = self.vnlo2, self.vnlo1
+        return True
+
+    def checkBlockForm(self) -> bool:
+        """Check that block edges match the expected three-way pattern.
+
+        C++ ref: LessThreeWay::checkBlockForm
+        """
+        self.hilesstrue, self.hilessfalse = SplitVarnode.getTrueFalse(self.hilessbool, self.hiflip)
+        self.lolesstrue, self.lolessfalse = SplitVarnode.getTrueFalse(self.lolessbool, self.loflip)
+        self.hieqtrue, self.hieqfalse = SplitVarnode.getTrueFalse(self.hieqbool, self.equalflip)
+        if (self.hilesstrue is self.lolesstrue and
+                self.hieqfalse is self.lolessfalse and
+                self.hilessfalse is self.hieqbl and
+                self.hieqtrue is self.lolessbl):
+            if SplitVarnode.otherwiseEmpty(self.hieqbool) and SplitVarnode.otherwiseEmpty(self.lolessbool):
+                return True
         return False
+
+    def checkOpForm(self) -> bool:
+        """Verify that the comparisons use matching hi/lo pieces.
+
+        C++ ref: LessThreeWay::checkOpForm
+        """
+        self.lo = self.inv.getLo()
+        self.hi = self.inv.getHi()
+
+        if self.midconstform:
+            if not self.hiconstform:
+                return False
+            if self.vnhie2.getSize() == self.inv.getSize():
+                if self.vnhie1 is not self.vnhil1 and self.vnhie1 is not self.vnhil2:
+                    return False
+            else:
+                if self.vnhie1 is not self.inv.getHi():
+                    return False
+        else:
+            if (self.vnhil1 is not self.vnhie1 and self.vnhil1 is not self.vnhie2):
+                return False
+            if (self.vnhil2 is not self.vnhie1 and self.vnhil2 is not self.vnhie2):
+                return False
+
+        if self.hi is not None and self.hi is self.vnhil1:
+            if self.hiconstform:
+                return False
+            self.hislot = 0
+            self.hi2 = self.vnhil2
+            if self.vnlo1 is not self.lo:
+                self.vnlo1, self.vnlo2 = self.vnlo2, self.vnlo1
+                if self.vnlo1 is not self.lo:
+                    return False
+                self.loflip = not self.loflip
+                self.lolessequalform = not self.lolessequalform
+            self.lo2 = self.vnlo2
+        elif self.hi is not None and self.hi is self.vnhil2:
+            if self.hiconstform:
+                return False
+            self.hislot = 1
+            self.hi2 = self.vnhil1
+            if self.vnlo2 is not self.lo:
+                self.vnlo1, self.vnlo2 = self.vnlo2, self.vnlo1
+                if self.vnlo2 is not self.lo:
+                    return False
+                self.loflip = not self.loflip
+                self.lolessequalform = not self.lolessequalform
+            self.lo2 = self.vnlo1
+        elif self.inv.getWhole() is not None and self.inv.getWhole() is self.vnhil1:
+            if not self.hiconstform:
+                return False
+            if not self.loconstform:
+                return False
+            if self.vnlo1 is not self.lo:
+                return False
+            self.hislot = 0
+        elif self.inv.getWhole() is not None and self.inv.getWhole() is self.vnhil2:
+            if not self.hiconstform:
+                return False
+            if not self.loconstform:
+                return False
+            if self.vnlo2 is not self.lo:
+                self.loflip = not self.loflip
+                self.loval -= 1
+                if self.lo is not None:
+                    self.loval &= calc_mask(self.lo.getSize())
+                if self.vnlo1 is not self.lo:
+                    return False
+            self.hislot = 1
+        else:
+            return False
+        return True
+
+    def setOpCode(self) -> None:
+        """Decide on the opcode of the final double precision compare.
+
+        C++ ref: LessThreeWay::setOpCode
+        """
+        if self.lolessequalform != self.hiflip:
+            self.finalopc = OpCode.CPUI_INT_SLESSEQUAL if self.signcompare else OpCode.CPUI_INT_LESSEQUAL
+        else:
+            self.finalopc = OpCode.CPUI_INT_SLESS if self.signcompare else OpCode.CPUI_INT_LESS
+        if self.hiflip:
+            self.hislot = 1 - self.hislot
+            self.hiflip = False
+
+    def setBoolOp(self) -> bool:
+        """Prepare the final boolean operation.
+
+        C++ ref: LessThreeWay::setBoolOp
+        """
+        if self.hislot == 0:
+            return SplitVarnode.prepareBoolOp(self.inv, self.in2, self.hilessbool)
+        else:
+            return SplitVarnode.prepareBoolOp(self.in2, self.inv, self.hilessbool)
+
+    def mapFromLow(self, op) -> bool:
+        """Map the three-way form starting from the low comparison op.
+
+        C++ ref: LessThreeWay::mapFromLow
+        """
+        loop = op.getOut().loneDescend()
+        if loop is None:
+            return False
+        if not self.mapBlocksFromLow(loop.getParent()):
+            return False
+        if not self.mapOpsFromBlocks():
+            return False
+        if not self.checkSignedness():
+            return False
+        if not self.normalizeHi():
+            return False
+        if not self.normalizeMid():
+            return False
+        if not self.normalizeLo():
+            return False
+        if not self.checkOpForm():
+            return False
+        if not self.checkBlockForm():
+            return False
+        return True
+
+    def testReplace(self) -> bool:
+        """Test if the replacement can be made.
+
+        C++ ref: LessThreeWay::testReplace
+        """
+        self.setOpCode()
+        if self.hiconstform:
+            lo_vn = self.inv.getLo()
+            losize = lo_vn.getSize() if lo_vn else 0
+            self.in2.initPartial(self.inv.getSize(), (self.hival << (8 * losize)) | self.loval)
+            if not self.setBoolOp():
+                return False
+        else:
+            self.in2.initPartial(self.inv.getSize(), self.lo2, self.hi2)
+            if not self.setBoolOp():
+                return False
+        return True
+
+    def applyRule(self, i, loop, workishi: bool, data) -> bool:
+        """Apply the less-three-way rule.
+
+        C++ ref: LessThreeWay::applyRule
+        """
+        if workishi:
+            return False
+        if i.getLo() is None:
+            return False
+        self.inv = i
+        if not self.mapFromLow(loop):
+            return False
+        res = self.testReplace()
+        if res:
+            if self.in2.exceedsConstPrecision():
+                return False
+            if self.hislot == 0:
+                SplitVarnode.createBoolOp(data, self.hilessbool, self.inv, self.in2, self.finalopc)
+            else:
+                SplitVarnode.createBoolOp(data, self.hilessbool, self.in2, self.inv, self.finalopc)
+            data.opSetInput(self.hieqbool, data.newConstant(1, 1 if self.equalflip else 0), 1)
+        return res
 
 
 class PhiForm:

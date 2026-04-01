@@ -72,6 +72,9 @@ class PcodeOp:
     no_indirect_collapse = 0x200
     store_unmapped       = 0x400
 
+    __slots__ = ('_opcode', '_opcode_enum', '_flags', '_addlflags',
+                 '_start', '_parent', '_output', '_inrefs')
+
     def __init__(self, num_inputs: int, sq: SeqNum) -> None:
         self._opcode = None  # TypeOp reference
         self._opcode_enum: OpCode = OpCode.CPUI_BLANK
@@ -531,6 +534,29 @@ class PcodeOp:
         self._setMarkedInput(markedInput, marked)
         return res
 
+    def executeSimple(self, inputs: list) -> tuple:
+        """Execute this op on constant inputs.
+
+        C++ ref: PcodeOp::executeSimple
+        Returns (result, evalError).
+        """
+        evalType = self.getEvalType()
+        try:
+            if evalType == PcodeOp.unary:
+                res = self._opcode.evaluateUnary(
+                    self._output.getSize(), self._inrefs[0].getSize(), inputs[0])
+            elif evalType == PcodeOp.binary:
+                res = self._opcode.evaluateBinary(
+                    self._output.getSize(), self._inrefs[0].getSize(), inputs[0], inputs[1])
+            elif evalType == PcodeOp.ternary:
+                res = self._opcode.evaluateTernary(
+                    self._output.getSize(), self._inrefs[0].getSize(), inputs[0], inputs[1], inputs[2])
+            else:
+                raise Exception("Cannot perform simple execution of " + str(self.code()))
+        except Exception:
+            return 0, True
+        return res, False
+
     def collapseConstantSymbol(self, vn):
         if vn is None:
             return
@@ -672,18 +698,30 @@ class PcodeOpBank:
 
     def __init__(self) -> None:
         self._optree: Dict[SeqNum, PcodeOp] = {}  # Main sequence number sort
-        self._deadlist: List[PcodeOp] = []
-        self._alivelist: List[PcodeOp] = []
-        self._storelist: List[PcodeOp] = []
-        self._loadlist: List[PcodeOp] = []
-        self._returnlist: List[PcodeOp] = []
-        self._useroplist: List[PcodeOp] = []
+        self._deadlist: dict = {}   # id(op) -> op, O(1) membership/removal
+        self._alivelist: dict = {}  # id(op) -> op, O(1) membership/removal
+        self._storelist: dict = {}  # id(op) -> op
+        self._loadlist: dict = {}   # id(op) -> op
+        self._returnlist: dict = {} # id(op) -> op
+        self._useroplist: dict = {} # id(op) -> op
+        self._opcode_idx: dict = {}  # opcode_int -> {id(op): op} for O(1) beginByOpcode
         self._uniqid: int = 0
 
     def clear(self) -> None:
         self._optree.clear()
         self._deadlist.clear()
         self._alivelist.clear()
+        self._storelist.clear()
+        self._loadlist.clear()
+        self._returnlist.clear()
+        self._useroplist.clear()
+        self._opcode_idx.clear()
+
+    def clearCodeLists(self) -> None:
+        """Clear the opcode-specific code lists.
+
+        C++ ref: PcodeOpBank::clearCodeLists
+        """
         self._storelist.clear()
         self._loadlist.clear()
         self._returnlist.clear()
@@ -711,7 +749,7 @@ class PcodeOpBank:
             sq = addr_or_sq
         op = PcodeOp(inputs, sq)
         self._optree[sq] = op
-        self._deadlist.append(op)
+        self._deadlist[id(op)] = op  # O(1) insert
         op.setFlag(PcodeOp.dead)
         return op
 
@@ -719,99 +757,108 @@ class PcodeOpBank:
         """Destroy/retire the given PcodeOp."""
         sq = op.getSeqNum()
         self._optree.pop(sq, None)
-        try:
-            self._deadlist.remove(op)
-        except ValueError:
-            pass
-        try:
-            self._alivelist.remove(op)
-        except ValueError:
-            pass
+        oid = id(op)
+        self._deadlist.pop(oid, None)   # O(1)
+        if self._alivelist.pop(oid, None) is not None:
+            if op._opcode is not None:
+                bucket = self._opcode_idx.get(int(op._opcode))
+                if bucket is not None:
+                    bucket.pop(oid, None)
         self._removeFromCodeList(op)
 
     def destroyDead(self) -> None:
         """Destroy/retire all PcodeOps in the dead list."""
-        for op in list(self._deadlist):
+        for op in list(self._deadlist.values()):
             self.destroy(op)
 
     def markAlive(self, op: PcodeOp) -> None:
         """Mark the given PcodeOp as alive."""
         op.clearFlag(PcodeOp.dead)
-        try:
-            self._deadlist.remove(op)
-        except ValueError:
-            pass
-        if op not in self._alivelist:
-            self._alivelist.append(op)
+        oid = id(op)
+        self._deadlist.pop(oid, None)   # O(1)
+        if oid not in self._alivelist:  # O(1)
+            self._alivelist[oid] = op
             self._addToCodeList(op)
+            if op._opcode is not None:
+                opc_int = int(op._opcode)
+                bucket = self._opcode_idx.get(opc_int)
+                if bucket is None:
+                    self._opcode_idx[opc_int] = {oid: op}
+                else:
+                    bucket[oid] = op
 
     def markDead(self, op: PcodeOp) -> None:
         """Mark the given PcodeOp as dead."""
         op.setFlag(PcodeOp.dead)
-        try:
-            self._alivelist.remove(op)
-        except ValueError:
-            pass
-        self._deadlist.append(op)
+        oid = id(op)
+        if self._alivelist.pop(oid, None) is not None:
+            if op._opcode is not None:
+                bucket = self._opcode_idx.get(int(op._opcode))
+                if bucket is not None:
+                    bucket.pop(oid, None)
+        self._deadlist[oid] = op        # O(1)
         self._removeFromCodeList(op)
 
     def _addToCodeList(self, op: PcodeOp) -> None:
         opc = op.code()
+        oid = id(op)
         if opc == OpCode.CPUI_STORE:
-            self._storelist.append(op)
+            self._storelist[oid] = op
         elif opc == OpCode.CPUI_LOAD:
-            self._loadlist.append(op)
+            self._loadlist[oid] = op
         elif opc == OpCode.CPUI_RETURN:
-            self._returnlist.append(op)
+            self._returnlist[oid] = op
         elif opc == OpCode.CPUI_CALLOTHER:
-            self._useroplist.append(op)
+            self._useroplist[oid] = op
 
     def _removeFromCodeList(self, op: PcodeOp) -> None:
-        opc = op.code()
-        for lst in (self._storelist, self._loadlist, self._returnlist, self._useroplist):
-            try:
-                lst.remove(op)
-            except ValueError:
-                pass
+        oid = id(op)
+        self._storelist.pop(oid, None)   # O(1)
+        self._loadlist.pop(oid, None)    # O(1)
+        self._returnlist.pop(oid, None)  # O(1)
+        self._useroplist.pop(oid, None)  # O(1)
 
     def findOp(self, num: SeqNum) -> Optional[PcodeOp]:
         return self._optree.get(num)
 
+    def _orderedOptreeItems(self) -> List[tuple[SeqNum, PcodeOp]]:
+        return sorted(self._optree.items(), key=lambda item: item[0])
+
     def target(self, addr: Address) -> Optional[PcodeOp]:
         """Find the first executing PcodeOp for a target address."""
-        for sq, op in self._optree.items():
+        for sq, op in self._orderedOptreeItems():
             if sq.getAddr() == addr:
                 return op
         return None
 
     def beginAll(self) -> Iterator[PcodeOp]:
-        return iter(self._optree.values())
+        return iter(op for _, op in self._orderedOptreeItems())
 
     def beginAlive(self) -> Iterator[PcodeOp]:
-        return iter(self._alivelist)
+        return iter(self._alivelist.values())
 
     def beginDead(self) -> Iterator[PcodeOp]:
-        return iter(self._deadlist)
+        return iter(self._deadlist.values())
 
     def getStoreList(self) -> List[PcodeOp]:
-        return self._storelist
+        return list(self._storelist.values())
 
     def getReturnList(self) -> List[PcodeOp]:
-        return self._returnlist
+        return list(self._returnlist.values())
 
     def getLoadList(self) -> List[PcodeOp]:
-        return self._loadlist
+        return list(self._loadlist.values())
 
     def getUserOpList(self) -> List[PcodeOp]:
-        return self._useroplist
+        return list(self._useroplist.values())
 
     def getDeadList(self) -> List[PcodeOp]:
         """Get all PcodeOps in the dead list."""
-        return self._deadlist
+        return list(self._deadlist.values())
 
     def getAliveList(self) -> List[PcodeOp]:
         """Get all PcodeOps in the alive list."""
-        return self._alivelist
+        return list(self._alivelist.values())
 
     def endDead(self):
         """End sentinel for dead list iteration."""
@@ -837,9 +884,22 @@ class PcodeOpBank:
 
     def changeOpcode(self, op: PcodeOp, newopc) -> None:
         """Change the op-code for the given PcodeOp."""
+        oid = id(op)
+        if oid in self._alivelist:
+            if op._opcode is not None:
+                bucket = self._opcode_idx.get(int(op._opcode))
+                if bucket is not None:
+                    bucket.pop(oid, None)
         self._removeFromCodeList(op)
         op.setOpcode(newopc)
         self._addToCodeList(op)
+        if oid in self._alivelist and newopc is not None:
+            opc_int = int(newopc)
+            bucket = self._opcode_idx.get(opc_int)
+            if bucket is None:
+                self._opcode_idx[opc_int] = {oid: op}
+            else:
+                bucket[oid] = op
 
     def insertAfterDead(self, op: PcodeOp, prev: PcodeOp) -> None:
         """Insert the given PcodeOp after a point in the dead list."""
@@ -885,19 +945,12 @@ class PcodeOpBank:
 
     def beginByAddr(self, addr: Address) -> List[PcodeOp]:
         """Get all PcodeOps at the given address."""
-        return [op for sq, op in self._optree.items() if sq.getAddr() == addr]
+        return [op for sq, op in self._orderedOptreeItems() if sq.getAddr() == addr]
 
     def beginByOpcode(self, opc: OpCode) -> List[PcodeOp]:
         """Get all alive PcodeOps with the given opcode."""
-        if opc == OpCode.CPUI_STORE:
-            return list(self._storelist)
-        elif opc == OpCode.CPUI_LOAD:
-            return list(self._loadlist)
-        elif opc == OpCode.CPUI_RETURN:
-            return list(self._returnlist)
-        elif opc == OpCode.CPUI_CALLOTHER:
-            return list(self._useroplist)
-        return [op for op in self._alivelist if op.code() == opc]
+        bucket = self._opcode_idx.get(int(opc))
+        return list(bucket.values()) if bucket else []
 
 
 # =========================================================================

@@ -14,6 +14,16 @@ from ghidra.core.error import LowlevelError
 from ghidra.core.address import calc_mask, pcode_left, pcode_right, leastsigbit_set, signbit_negative
 from ghidra.transform.action import Rule, ActionGroupList
 
+# Hot-path inline constants (avoids repeated attribute lookups in tight loops)
+_CPUI_COPY     = 1        # OpCode.CPUI_COPY
+_VN_WRITTEN    = 0x10     # Varnode.written
+_VN_CONST      = 0x02     # Varnode.constant
+_VN_ANNOT      = 0x04     # Varnode.annotation
+_VN_INSERT     = 0x20     # Varnode.insert
+_VN_HK         = 0x26     # isHeritageKnown: insert|constant|annotation
+_VN_ADDRFORCE  = 0x100000  # Varnode.addrforce
+_OP_MARKER_FL  = 0x40     # PcodeOp.marker
+
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
     from ghidra.ir.varnode import Varnode
@@ -38,19 +48,20 @@ class RuleEarlyRemoval(Rule):
 
     # This rule applies to all ops (no getOpList override)
 
+    _OP_CALL_OR_INDSRC = 0x404   # PcodeOp.call | PcodeOp.indirect_source
+    _VN_AUTOLIVE = 0x40100000   # Varnode.addrforce | Varnode.autolive_hold
+
     def applyOp(self, op: PcodeOp, data: Funcdata) -> int:
-        if op.isCall():
+        if op._flags & self._OP_CALL_OR_INDSRC:
             return 0
-        if op.isIndirectSource():
-            return 0
-        vn = op.getOut()
+        vn = op._output
         if vn is None:
             return 0
-        if not vn.hasNoDescend():
+        if vn._descend:
             return 0
-        if vn.isAutoLive():
+        if vn._flags & self._VN_AUTOLIVE:
             return 0
-        spc = vn.getSpace()
+        spc = vn._loc.base
         if spc is not None and spc.doesDeadcode():
             if not data.deadRemovalAllowedSeen(spc):
                 return 0
@@ -349,6 +360,8 @@ class RuleNegateIdentity(Rule):
     def applyOp(self, op, data) -> int:
         vn = op.getIn(0)
         outVn = op.getOut()
+        if outVn is None:
+            return 0
         for logicOp in outVn.getDescendants():
             opc = logicOp.code()
             if opc not in (OpCode.CPUI_INT_AND, OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR):
@@ -387,6 +400,8 @@ class RuleOrConsume(Rule):
 
     def applyOp(self, op, data) -> int:
         outvn = op.getOut()
+        if outvn is None:
+            return 0
         size = outvn.getSize()
         if size > 8:
             return 0
@@ -574,32 +589,29 @@ class RuleCollapseConstants(Rule):
 
     # Applies to all opcodes (no getOpList)
 
+    _VN_CONST = 0x02  # Varnode.constant
+
     def applyOp(self, op, data) -> int:
-        out = op.getOut()
+        out = op._output
         if out is None or not op.isCollapsible():
             return 0
-        opc = op.code()
+        opc = op._opcode_enum
         # Skip ops that must not be constant-folded (matches C++ truth)
-        if opc in (OpCode.CPUI_COPY, OpCode.CPUI_LOAD, OpCode.CPUI_STORE,
-                    OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH, OpCode.CPUI_BRANCHIND,
-                    OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CALLOTHER,
-                    OpCode.CPUI_RETURN, OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INDIRECT,
-                    OpCode.CPUI_CAST, OpCode.CPUI_PTRADD, OpCode.CPUI_PTRSUB,
-                    OpCode.CPUI_NEW, OpCode.CPUI_SEGMENTOP, OpCode.CPUI_CPOOLREF,
-                    OpCode.CPUI_INSERT, OpCode.CPUI_EXTRACT):
+        if opc in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68):
             return 0
         # Need all constant inputs for binary/unary ops
-        numinput = op.numInput()
+        inrefs = op._inrefs
+        numinput = len(inrefs)
         if numinput == 0:
             return 0
+        _VC = self._VN_CONST
         # Check all inputs are constant
-        for i in range(numinput):
-            inv = op.getIn(i)
-            if inv is None or not inv.isConstant():
+        for inv in inrefs:
+            if inv is None or not (inv._flags & _VC):
                 return 0
         marked_input = [False]
         try:
-            sizeout = out.getSize()
+            sizeout = out._size
             result = op.collapse(marked_input)
         except LowlevelError:
             data.opMarkNoCollapse(op)
@@ -634,24 +646,24 @@ class RulePropagateCopy(Rule):
     # Applies to all opcodes (no getOpList)
 
     def applyOp(self, op, data) -> int:
-        for i in range(op.numInput()):
-            vn = op.getIn(i)
-            if vn is None or not vn.isWritten():
+        op_is_marker = op._flags & _OP_MARKER_FL
+        for i, vn in enumerate(op._inrefs):
+            if vn is None or not (vn._flags & _VN_WRITTEN):
                 continue
-            copyop = vn.getDef()
-            if copyop.code() != OpCode.CPUI_COPY:
+            copyop = vn._def
+            if copyop._opcode_enum != _CPUI_COPY:
                 continue
-            invn = copyop.getIn(0)
+            invn = copyop._inrefs[0] if copyop._inrefs else None
             if invn is None:
                 continue
-            if not invn.isHeritageKnown():
+            if not (invn._flags & _VN_HK):  # isHeritageKnown
                 continue
             if invn is vn:
                 continue  # Self-defined
-            if op.isMarker():
-                if invn.isConstant():
+            if op_is_marker:
+                if invn._flags & _VN_CONST:
                     continue
-                if vn.isAddrForce():
+                if vn._flags & _VN_ADDRFORCE:
                     continue
             data.opSetInput(op, invn, i)
             return 1
@@ -772,6 +784,8 @@ class RuleZextEliminate(Rule):
         if vn is None:
             return 0
         outvn = op.getOut()
+        if outvn is None:
+            return 0
         if vn.getSize() >= outvn.getSize():
             data.opSetOpcode(op, OpCode.CPUI_COPY)
             return 1
@@ -1177,7 +1191,7 @@ class RuleLogic2Bool(Rule):
 
     def applyOp(self, op, data) -> int:
         outvn = op.getOut()
-        if outvn.getSize() != 1: return 0
+        if outvn is None or outvn.getSize() != 1: return 0
         # Check if both inputs produce boolean (1-bit) values
         in0 = op.getIn(0)
         in1 = op.getIn(1)
@@ -1200,7 +1214,15 @@ class RuleLogic2Bool(Rule):
 # =========================================================================
 
 class RuleAddMultCollapse(Rule):
-    """Collapse ADD into MULT: (V * c1) + (V * c2) => V * (c1+c2)."""
+    """Collapse constants in an additive or multiplicative expression.
+
+    Forms include:
+      - ``((V + c) + d)  =>  V + (c+d)``
+      - ``((V * c) * d)  =>  V * (c*d)``
+      - ``((V + (W + c)) + d)  =>  (W + (c+d)) + V``  (spacebase case)
+
+    C++ ref: ``RuleAddMultCollapse::applyOp`` (ruleaction.cc:4093-4162)
+    """
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "addmultcollapse")
@@ -1210,27 +1232,72 @@ class RuleAddMultCollapse(Rule):
         return RuleAddMultCollapse(self._basegroup)
 
     def getOpList(self) -> List[int]:
-        return [int(OpCode.CPUI_INT_ADD)]
+        return [int(OpCode.CPUI_INT_ADD), int(OpCode.CPUI_INT_MULT)]
 
     def applyOp(self, op, data) -> int:
-        in0 = op.getIn(0)
-        in1 = op.getIn(1)
-        if in0 is None or in1 is None: return 0
-        if not in0.isWritten() or not in1.isWritten(): return 0
-        def0 = in0.getDef()
-        def1 = in1.getDef()
-        if def0.code() != OpCode.CPUI_INT_MULT or def1.code() != OpCode.CPUI_INT_MULT: return 0
-        if not def0.getIn(1).isConstant() or not def1.getIn(1).isConstant(): return 0
-        if def0.getIn(0) is not def1.getIn(0): return 0
-        # V * c1 + V * c2 => V * (c1 + c2)
-        basevn = def0.getIn(0)
-        c1 = def0.getIn(1).getOffset()
-        c2 = def1.getIn(1).getOffset()
-        size = basevn.getSize()
-        newc = (c1 + c2) & calc_mask(size)
-        data.opSetOpcode(op, OpCode.CPUI_INT_MULT)
-        data.opSetInput(op, basevn, 0)
-        data.opSetInput(op, data.newConstant(size, newc), 1)
+        opc = op.code()
+        # c[0] is the constant at this level, sub is the other input
+        c0 = op.getIn(1)
+        if not c0.isConstant():
+            return 0
+        sub = op.getIn(0)
+        if not sub.isWritten():
+            return 0
+        subop = sub.getDef()
+        if subop.code() != opc:
+            return 0  # Must be same exact operation
+        c1 = subop.getIn(1)
+        if not c1.isConstant():
+            # Extended form: ((V + (W + c)) + d) => (W + (c+d)) + V
+            # Only for INT_ADD with spacebase
+            if opc != OpCode.CPUI_INT_ADD:
+                return 0
+            for i in range(2):
+                othervn = subop.getIn(i)
+                if othervn.isConstant():
+                    continue
+                if othervn.isFree():
+                    continue
+                sub2 = subop.getIn(1 - i)
+                if not sub2.isWritten():
+                    continue
+                baseop = sub2.getDef()
+                if baseop.code() != OpCode.CPUI_INT_ADD:
+                    continue
+                c1inner = baseop.getIn(1)
+                if not c1inner.isConstant():
+                    continue
+                basevn = baseop.getIn(0)
+                if not basevn.isSpacebase():
+                    continue
+                if not basevn.isInput():
+                    continue
+                # Fold the two constants
+                sz = c0.getSize()
+                val = (c0.getOffset() + c1inner.getOffset()) & calc_mask(sz)
+                newvn = data.newConstant(sz, val)
+                newop = data.newOp(2, op.getAddr())
+                data.opSetOpcode(newop, OpCode.CPUI_INT_ADD)
+                newout = data.newUniqueOut(sz, newop)
+                data.opSetInput(newop, basevn, 0)
+                data.opSetInput(newop, newvn, 1)
+                data.opInsertBefore(newop, op)
+                data.opSetInput(op, newout, 0)
+                data.opSetInput(op, othervn, 1)
+                return 1
+            return 0
+        # Simple form: ((V op c1) op c0) => V op (c0 op c1)
+        sub2 = subop.getIn(0)
+        if sub2.isFree():
+            return 0
+        sz = c0.getSize()
+        if opc == OpCode.CPUI_INT_ADD:
+            val = (c0.getOffset() + c1.getOffset()) & calc_mask(sz)
+        else:  # CPUI_INT_MULT
+            val = (c0.getOffset() * c1.getOffset()) & calc_mask(sz)
+        newvn = data.newConstant(sz, val)
+        data.opSetInput(op, newvn, 1)
+        data.opSetInput(op, sub2, 0)
         return 1
 
 
@@ -1359,6 +1426,7 @@ class RuleBoolZext(Rule):
         if invn is None: return 0
         if invn.getSize() != 1: return 0
         outvn = op.getOut()
+        if outvn is None: return 0
         # Check if output is only used in boolean context
         if outvn.getNZMask() > 1: return 0
         # All uses must treat it as boolean
@@ -1654,6 +1722,8 @@ class RuleSignShift(Rule):
 
         doConversion = False
         outVn = op.getOut()
+        if outVn is None:
+            return 0
         for arithOp in outVn.getDescendants():
             opc = arithOp.code()
             if opc in (OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL):

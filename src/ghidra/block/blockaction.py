@@ -1045,13 +1045,19 @@ class CollapseStructure:
         return isolated_count
 
     def collapseConditions(self):
-        """Simplify conditionals."""
+        """Simplify conditionals.
+
+        C++ ref: CollapseStructure::collapseConditions — re-checks graph.getSize()
+        on every iteration so mid-loop block merges don't produce out-of-range access.
+        """
         change = True
         while change:
             change = False
-            for i in range(self._graph.getSize()):
+            i = 0
+            while i < self._graph.getSize():
                 if self.ruleBlockOr(self._graph.getBlock(i)):
                     change = True
+                i += 1
 
     def ruleBlockGoto(self, bl) -> bool:
         """Attempt to apply the BlockGoto structure."""

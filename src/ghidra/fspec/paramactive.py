@@ -244,7 +244,16 @@ class ParamActive:
         self._slotbase += 1
 
     def freePlaceholderSlot(self) -> None:
-        self._stackplaceholder = -1
+        """Free the stack placeholder slot, adjusting trial slots.
+
+        C++ ref: ``ParamActive::freePlaceholderSlot`` (fspec.cc:1994-2008)
+        """
+        for t in self._trial:
+            if t.getSlot() > self._stackplaceholder:
+                t.setSlot(t.getSlot() - 1)
+        self._stackplaceholder = -2
+        self._slotbase -= 1
+        self._maxpass = 0
 
     def getNumPasses(self) -> int:
         return self._numpasses

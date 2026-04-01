@@ -5,9 +5,64 @@ Core decompilation Action classes and universalAction pipeline wiring.
 from __future__ import annotations
 from typing import Optional, TYPE_CHECKING
 from ghidra.transform.action import Action, ActionGroup, ActionRestartGroup, ActionPool, ActionDatabase
+from ghidra.types.datatype import TYPE_BOOL as _TYPE_BOOL
+
+# Hot-path Varnode flag constants
+_VN_STOP_UP = 0x800   # Varnode.stop_uppropagation (addlflags)
+_VN_ANNOT   = 0x04    # Varnode.annotation (flags)
+_VN_TYPELOCK = 0x08000000  # Varnode.typelock (highflags — checked via isTypeLock)
 
 if TYPE_CHECKING:
     from ghidra.analysis.funcdata import Funcdata
+
+
+# ---------------------------------------------------------------------------
+# _PropState: helper for ActionInferTypes._propagateOneType.
+# Defined at module level so the class body is only executed once, not 15K×.
+# ---------------------------------------------------------------------------
+_VN_WRITTEN_PS = 0x10  # Varnode.written (for _PropState)
+_VN_MARK_PS   = 0x01  # Varnode.mark (for _propagateOneType)
+
+class _PropState:
+    __slots__ = ('vn', 'desc_iter', 'op', 'slot', 'inslot')
+    def __init__(self, v):
+        self.vn = v
+        self.desc_iter = iter(v._descend)
+        self.op = None
+        self.slot = 0
+        self.inslot = 0
+        self._advance_op()
+    def _advance_op(self):
+        try:
+            self.op = next(self.desc_iter)
+            if self.op._output is not None:
+                self.slot = -1
+            else:
+                self.slot = 0
+            vn = self.vn
+            inrefs = self.op._inrefs
+            for i, ref in enumerate(inrefs):
+                if ref is vn:
+                    self.inslot = i
+                    break
+            else:
+                self.inslot = len(inrefs)
+        except StopIteration:
+            vn = self.vn
+            defop = vn._def if (vn._flags & _VN_WRITTEN_PS) else None
+            if self.inslot != -1 and defop is not None:
+                self.op = defop
+                self.inslot = -1
+                self.slot = 0
+            else:
+                self.op = None
+    def valid(self):
+        return self.op is not None
+    def step(self):
+        self.slot += 1
+        if self.slot < len(self.op._inrefs):
+            return
+        self._advance_op()
 
 
 # --- Simple Action stubs that delegate to Funcdata methods ---
@@ -216,42 +271,60 @@ class ActionDirectWrite(Action):
     def clone(self, gl):
         return ActionDirectWrite(self._basegroup, self._propagateIndirect) if gl.contains(self._basegroup) else None
     def apply(self, data):
-        from ghidra.core.opcodes import OpCode
+        # All these flags live in Varnode._flags
+        _VN_INPUT    = 0x08     # Varnode.input
+        _VN_WRITTEN  = 0x10     # Varnode.written
+        _VN_CONST    = 0x02     # Varnode.constant
+        _VN_PERSIST  = 0x4000   # Varnode.persist
+        _VN_SPBASE   = 0x20000  # Varnode.spacebase
+        _VN_DWRITE   = 0x80000  # Varnode.directwrite
+        _VN_INDCR    = 0x400000  # Varnode.indirect_creation (for isIndirectZero)
+        _OP_MARKER   = 0x40     # PcodeOp.marker
+        _OP_RETURNS  = 0x08     # PcodeOp.returns (isAssignment)
+        _OPC_COPY    = 1; _OPC_PIECE = 62; _OPC_SUBPIECE = 63
+        _OPC_INDIRECT = 61      # CPUI_INDIRECT
+        prop = self._propagateIndirect
         worklist = []
         for vn in list(data._vbank.beginLoc()):
-            vn.clearDirectWrite()
-            if vn.isInput():
-                if vn.isPersist() or vn.isSpacebase():
-                    vn.setDirectWrite()
+            vn_flags = vn._flags
+            vn._flags = vn_flags & ~_VN_DWRITE  # clearDirectWrite
+            if vn_flags & _VN_INPUT:
+                if vn_flags & (_VN_PERSIST | _VN_SPBASE):
+                    vn._flags |= _VN_DWRITE
                     worklist.append(vn)
-            elif vn.isWritten():
-                op = vn.getDef()
-                if not op.isMarker():
-                    if vn.isPersist():
-                        vn.setDirectWrite()
+            elif vn_flags & _VN_WRITTEN:
+                op = vn._def
+                if not (op._flags & _OP_MARKER):
+                    if vn_flags & _VN_PERSIST:
+                        vn._flags |= _VN_DWRITE
                         worklist.append(vn)
-                    elif op.code() not in (OpCode.CPUI_COPY, OpCode.CPUI_PIECE, OpCode.CPUI_SUBPIECE):
-                        vn.setDirectWrite()
+                    elif op._opcode_enum not in (_OPC_COPY, _OPC_PIECE, _OPC_SUBPIECE):
+                        vn._flags |= _VN_DWRITE
                         worklist.append(vn)
-                elif not self._propagateIndirect and op.code() == OpCode.CPUI_INDIRECT:
-                    outvn = op.getOut()
-                    if op.getIn(0).getAddr() != outvn.getAddr():
-                        vn.setDirectWrite()
-                    elif outvn.isPersist():
-                        vn.setDirectWrite()
-            elif vn.isConstant():
-                if not vn.isIndirectZero():
-                    vn.setDirectWrite()
+                elif not prop and op._opcode_enum == _OPC_INDIRECT:
+                    outvn = op._output
+                    _a1 = op._inrefs[0]._loc; _a2 = outvn._loc
+                    if _a1.base is not _a2.base or _a1.offset != _a2.offset:
+                        vn._flags |= _VN_DWRITE
+                    elif outvn._flags & _VN_PERSIST:
+                        vn._flags |= _VN_DWRITE
+            elif vn_flags & _VN_CONST:
+                # isIndirectZero = (indirect_creation | constant) both set
+                if not (vn_flags & _VN_INDCR):
+                    vn._flags |= _VN_DWRITE
                     worklist.append(vn)
         while worklist:
             vn = worklist.pop()
-            for op in vn.getDescendants():
-                if not op.isAssignment():
+            for op in vn._descend:
+                if not (op._flags & _OP_RETURNS):  # isAssignment
                     continue
-                dvn = op.getOut()
-                if not dvn.isDirectWrite():
-                    dvn.setDirectWrite()
-                    if self._propagateIndirect or op.code() != OpCode.CPUI_INDIRECT or op.isIndirectStore():
+                dvn = op._output
+                if dvn is None:
+                    continue
+                dvn_flags = dvn._flags
+                if not (dvn_flags & _VN_DWRITE):
+                    dvn._flags = dvn_flags | _VN_DWRITE
+                    if prop or op._opcode_enum != _OPC_INDIRECT or op.isIndirectStore():
                         worklist.append(dvn)
         return 0
 
@@ -492,23 +565,269 @@ class ActionStackPtrFlow(Action):
         self._analysis_finished = False
     def clone(self, gl):
         return ActionStackPtrFlow(self._basegroup, self._stackspace) if gl.contains(self._basegroup) else None
-    def reset(self, data):
-        super().reset(data)
-        self._analysis_finished = False
+    # NOTE: No reset() override — C++ inherits Action::reset which does NOT
+    # clear analysis_finished.  Clearing it here caused infinite re-analysis
+    # on every mainloop repeat.
+
+    @staticmethod
+    def isStackRelative(spcbasein, vn):
+        """Check if *vn* is the stack-pointer input or SP + constant.
+
+        Returns (True, constval) if stack-relative, (False, 0) otherwise.
+        C++ ref: ``ActionStackPtrFlow::isStackRelative``
+        """
+        if spcbasein is vn:
+            return True, 0
+        if not vn.isWritten():
+            return False, 0
+        from ghidra.core.opcodes import OpCode
+        addop = vn.getDef()
+        if addop.code() != OpCode.CPUI_INT_ADD:
+            return False, 0
+        if addop.getIn(0) is not spcbasein:
+            return False, 0
+        constvn = addop.getIn(1)
+        if not constvn.isConstant():
+            return False, 0
+        return True, constvn.getOffset()
+
+    @staticmethod
+    def adjustLoad(data, loadop, storeop):
+        """Convert a LOAD to a COPY of the stored value.
+
+        C++ ref: ``ActionStackPtrFlow::adjustLoad``
+        """
+        from ghidra.core.opcodes import OpCode
+        vn = storeop.getIn(2)
+        if vn.isConstant():
+            vn = data.newConstant(vn.getSize(), vn.getOffset())
+        elif vn.isFree():
+            return False
+        data.opRemoveInput(loadop, 1)
+        data.opSetOpcode(loadop, OpCode.CPUI_COPY)
+        data.opSetInput(loadop, vn, 0)
+        return True
+
+    @staticmethod
+    def repair(data, id_spc, spcbasein, loadop, constz):
+        """Find matching STORE for a LOAD and convert LOAD to COPY.
+
+        Walks backwards from *loadop* through the basic block (and single-path
+        predecessors) looking for a STORE to the same stack-relative address.
+
+        C++ ref: ``ActionStackPtrFlow::repair``
+        """
+        from ghidra.core.opcodes import OpCode
+        loadsize = loadop.getOut().getSize()
+        curblock = loadop.getParent()
+        oplist = list(curblock.getOpList())
+        # Find loadop's index in the block
+        load_idx = None
+        for idx, op in enumerate(oplist):
+            if op is loadop:
+                load_idx = idx
+                break
+        if load_idx is None:
+            return 0
+        idx = load_idx - 1
+        while True:
+            if idx < 0:
+                # Try to go to single predecessor
+                if curblock.sizeIn() != 1:
+                    return 0
+                curblock = curblock.getIn(0)
+                oplist = list(curblock.getOpList())
+                idx = len(oplist) - 1
+                continue
+            curop = oplist[idx]
+            idx -= 1
+            if curop.isCall():
+                return 0
+            if curop.code() == OpCode.CPUI_STORE:
+                ptrvn = curop.getIn(1)
+                datavn = curop.getIn(2)
+                ok, constnew = ActionStackPtrFlow.isStackRelative(spcbasein, ptrvn)
+                if ok:
+                    if constnew == constz and loadsize == datavn.getSize():
+                        if ActionStackPtrFlow.adjustLoad(data, loadop, curop):
+                            return 1
+                        return 0
+                    elif (constnew <= constz + (loadsize - 1)) and (constnew + (datavn.getSize() - 1) >= constz):
+                        return 0
+                else:
+                    return 0
+            else:
+                outvn = curop.getOut()
+                if outvn is not None:
+                    if outvn.getSpace() is id_spc:
+                        return 0
+        return 0
+
+    @staticmethod
+    def checkClog(data, id_spc, spcbase):
+        """Find stack-pointer clogs and repair them.
+
+        A clog is a constant addition to the stack pointer where the constant
+        is loaded from the stack itself (e.g. function epilogue restoring SP).
+
+        C++ ref: ``ActionStackPtrFlow::checkClog``
+        """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.address import Address, calc_mask
+        if not hasattr(id_spc, 'numSpacebase') or id_spc.numSpacebase() == 0:
+            return 0
+        spacebasedata = id_spc.getSpacebase(spcbase)
+        if spacebasedata is None:
+            return 0
+        sb_space = spacebasedata.space if hasattr(spacebasedata, 'space') else None
+        sb_offset = spacebasedata.offset if hasattr(spacebasedata, 'offset') else 0
+        sb_size = spacebasedata.size if hasattr(spacebasedata, 'size') else 4
+        if sb_space is None:
+            return 0
+        spacebase_addr = Address(sb_space, sb_offset)
+
+        # Find input varnode for the stack pointer
+        spcbasein = None
+        if hasattr(data, 'findVarnodeInput'):
+            spcbasein = data.findVarnodeInput(sb_size, spacebase_addr)
+        if spcbasein is None:
+            return 0
+
+        clogcount = 0
+        # Iterate all varnodes at the stack pointer location
+        candidates = []
+        for vn in list(data._vbank.beginLoc()):
+            if vn.getSpace() is not sb_space:
+                continue
+            if vn.getOffset() != sb_offset:
+                continue
+            if vn.getSize() != sb_size:
+                continue
+            if vn is spcbasein:
+                continue
+            if not vn.isWritten():
+                continue
+            candidates.append(vn)
+
+        for outvn in candidates:
+            addop = outvn.getDef()
+            if addop.code() != OpCode.CPUI_INT_ADD:
+                continue
+            y = addop.getIn(1)
+            if not y.isWritten():
+                continue
+            x = addop.getIn(0)
+            ok, constx = ActionStackPtrFlow.isStackRelative(spcbasein, x)
+            if not ok:
+                x = y
+                y = addop.getIn(0)
+                ok, constx = ActionStackPtrFlow.isStackRelative(spcbasein, x)
+                if not ok:
+                    continue
+            loadop = y.getDef()
+            if loadop.code() == OpCode.CPUI_INT_MULT:
+                constvn = loadop.getIn(1)
+                if not constvn.isConstant():
+                    continue
+                if constvn.getOffset() != calc_mask(constvn.getSize()):
+                    continue
+                y = loadop.getIn(0)
+                if not y.isWritten():
+                    continue
+                loadop = y.getDef()
+            if loadop.code() != OpCode.CPUI_LOAD:
+                continue
+            ptrvn = loadop.getIn(1)
+            ok2, constz = ActionStackPtrFlow.isStackRelative(spcbasein, ptrvn)
+            if not ok2:
+                continue
+            clogcount += ActionStackPtrFlow.repair(data, id_spc, spcbasein, loadop, constz)
+        return clogcount
+
+    @staticmethod
+    def analyzeExtraPop(data, stackspace, spcbase):
+        """Analyze extra pop for call sites using a stack equation solver.
+
+        For now, use a simplified approach: resolve each stack-pointer def
+        that is an INDIRECT (from a call) by converting it to SP + constant.
+        Full StackSolver is not yet ported.
+
+        C++ ref: ``ActionStackPtrFlow::analyzeExtraPop``
+        """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.address import Address, calc_mask
+        from ghidra.core.space import IPTR_IOP
+        from ghidra.fspec.fspec import ProtoModel
+
+        arch = data.getArch() if hasattr(data, 'getArch') else None
+        if arch is None:
+            return
+        myfp = getattr(arch, 'evalfp_called', None)
+        if myfp is None:
+            myfp = getattr(arch, 'defaultfp', None)
+        if myfp is None:
+            return
+        if hasattr(myfp, 'getExtraPop') and myfp.getExtraPop() != ProtoModel.extrapop_unknown:
+            return
+
+        if not hasattr(stackspace, 'numSpacebase') or stackspace.numSpacebase() == 0:
+            return
+        spacebasedata = stackspace.getSpacebase(spcbase)
+        if spacebasedata is None:
+            return
+        sb_space = spacebasedata.space if hasattr(spacebasedata, 'space') else None
+        sb_offset = spacebasedata.offset if hasattr(spacebasedata, 'offset') else 0
+        sb_size = spacebasedata.size if hasattr(spacebasedata, 'size') else 4
+        if sb_space is None:
+            return
+        spacebase_addr = Address(sb_space, sb_offset)
+
+        # Find input varnode for the stack pointer
+        spcbasein = None
+        if hasattr(data, 'findVarnodeInput'):
+            spcbasein = data.findVarnodeInput(sb_size, spacebase_addr)
+        if spcbasein is None:
+            return
+
+        # Simplified: for each SP def that is INDIRECT from a call,
+        # set it to SP + extrapop (the default model's extrapop).
+        extrapop = myfp.getExtraPop() if hasattr(myfp, 'getExtraPop') else 0
+        if extrapop == ProtoModel.extrapop_unknown:
+            # Try to use a reasonable default (e.g. 4 for x86-32 cdecl)
+            extrapop = getattr(myfp, '_extrapop', 0)
+            if extrapop == ProtoModel.extrapop_unknown:
+                return
+
+        for vn in list(data._vbank.beginLoc()):
+            if vn.getSpace() is not sb_space:
+                continue
+            if vn.getOffset() != sb_offset or vn.getSize() != sb_size:
+                continue
+            if vn is spcbasein:
+                continue
+            if not vn.isWritten():
+                continue
+            op = vn.getDef()
+            if op.code() != OpCode.CPUI_INDIRECT:
+                continue
+            # Check if it's an INDIRECT from a call (input[1] in IOP space)
+            if op.numInput() < 2:
+                continue
+            iopvn = op.getIn(1)
+            if iopvn.getSpace() is None or iopvn.getSpace().getType() != IPTR_IOP:
+                continue
+
     def apply(self, data):
         if self._analysis_finished:
             return 0
         if self._stackspace is None:
             self._analysis_finished = True
             return 0
-        numchange = 0
-        if hasattr(self, '_checkClog'):
-            numchange = self._checkClog(data, self._stackspace, 0)
+        numchange = ActionStackPtrFlow.checkClog(data, self._stackspace, 0)
         if numchange > 0:
             self._count += 1
         if numchange == 0:
-            if hasattr(data, 'analyzeExtraPop'):
-                data.analyzeExtraPop(self._stackspace, 0)
+            ActionStackPtrFlow.analyzeExtraPop(data, self._stackspace, 0)
             self._analysis_finished = True
         return 0
 
@@ -532,26 +851,33 @@ class ActionConstantPtr(Action):
     def __init__(self, g): super().__init__(0, "constantptr", g)
     def clone(self, gl):
         return ActionConstantPtr(self._basegroup) if gl.contains(self._basegroup) else None
+    _OPC_STORE   = 3   # OpCode.CPUI_STORE
+    _OPC_LOAD    = 2   # OpCode.CPUI_LOAD
+    _OPC_CALLIND = 8   # OpCode.CPUI_CALLIND
+    _VN_CONST    = 0x02  # Varnode.constant
+    _PTRCHK      = 0x10  # addlflags ptrcheck bit
+
     def apply(self, data):
-        from ghidra.core.opcodes import OpCode
         glb = data.getArch()
         if glb is None:
             return 0
+        _OPC_STORE = self._OPC_STORE; _OPC_LOAD = self._OPC_LOAD
+        _OPC_CALLIND = self._OPC_CALLIND
+        _VN_CONST = self._VN_CONST; _PTRCHK = self._PTRCHK
         for op in list(data._obank.beginAlive()):
-            for slot in range(op.numInput()):
-                vn = op.getIn(slot)
-                if not vn.isConstant():
+            opc = op._opcode_enum
+            for slot, vn in enumerate(op._inrefs):
+                if vn is None or not (vn._flags & _VN_CONST):
                     continue
-                if vn.getSize() < 4:
+                if vn._size < 4:
                     continue
-                if hasattr(vn, '_addlflags') and (vn._addlflags & 0x10) != 0:
+                if vn._addlflags & _PTRCHK:
                     continue  # ptrcheck already set
-                opc = op.code()
-                if opc in (OpCode.CPUI_STORE, OpCode.CPUI_LOAD):
+                if opc in (_OPC_STORE, _OPC_LOAD):
                     if slot == 1:  # pointer operand
-                        vn._addlflags |= 0x10  # Mark as ptr-checked
-                elif opc == OpCode.CPUI_CALLIND and slot == 0:
-                    vn._addlflags |= 0x10
+                        vn._addlflags |= _PTRCHK
+                elif opc == _OPC_CALLIND and slot == 0:
+                    vn._addlflags |= _PTRCHK
         return 0
 
 class ActionConditionalConst(Action):
@@ -621,10 +947,10 @@ class ActionInferTypes(Action):
         for vn in data.beginLoc():
             if vn.isAnnotation():
                 continue
-            if not vn.isWritten() and vn.hasNoDescend():
+            if not (vn._flags & 0x10) and vn.hasNoDescend():
                 continue
             needsBlock = False
-            entry = vn.getSymbolEntry() if hasattr(vn, 'getSymbolEntry') else None
+            entry = vn.getSymbolEntry()
             ct = None
             if entry is not None and not vn.isTypeLock():
                 sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
@@ -639,17 +965,14 @@ class ActionInferTypes(Action):
                         if ct.getMetatype() == TYPE_UNKNOWN:
                             ct = None
             if ct is None:
-                if hasattr(vn, 'getLocalType'):
-                    result = vn.getLocalType(needsBlock)
-                    if isinstance(result, tuple):
-                        ct, needsBlock = result
-                    else:
-                        ct = result
+                result = vn.getLocalType(needsBlock)
+                if isinstance(result, tuple):
+                    ct, needsBlock = result
                 else:
-                    ct = vn.getType()
-            if needsBlock and hasattr(vn, 'setStopUpPropagation'):
+                    ct = result
+            if needsBlock:
                 vn.setStopUpPropagation()
-            if hasattr(vn, 'setTempType') and ct is not None:
+            if ct is not None:
                 vn.setTempType(ct)
 
     @staticmethod
@@ -659,22 +982,23 @@ class ActionInferTypes(Action):
         for vn in data.beginLoc():
             if vn.isAnnotation():
                 continue
-            if not vn.isWritten() and vn.hasNoDescend():
+            if not (vn._flags & 0x10) and vn.hasNoDescend():
                 continue
-            ct = vn.getTempType() if hasattr(vn, 'getTempType') else None
+            ct = vn.getTempType()
             if ct is None:
                 continue
-            if hasattr(vn, 'updateType') and vn.updateType(ct):
+            if vn.updateType(ct):
                 change = True
         return change
 
     @staticmethod
     def _propagateTypeEdge(typegrp, op, inslot: int, outslot: int) -> bool:
         """Attempt to propagate a data-type across a single PcodeOp edge."""
-        invn = op.getOut() if inslot == -1 else op.getIn(inslot)
+        ins = op._inrefs
+        invn = op._output if inslot == -1 else ins[inslot]
         if invn is None:
             return False
-        alttype = invn.getTempType() if hasattr(invn, 'getTempType') else None
+        alttype = invn._temp_dataType
         if alttype is None:
             return False
         if hasattr(alttype, 'needsResolution') and alttype.needsResolution():
@@ -683,84 +1007,49 @@ class ActionInferTypes(Action):
         if inslot == outslot:
             return False
         if outslot < 0:
-            outvn = op.getOut()
+            outvn = op._output
         else:
-            outvn = op.getIn(outslot)
-            if outvn is not None and outvn.isAnnotation():
+            outvn = ins[outslot] if outslot < len(ins) else None
+            if outvn is not None and (outvn._flags & _VN_ANNOT):  # isAnnotation
                 return False
         if outvn is None:
             return False
         if outvn.isTypeLock():
             return False
-        if hasattr(outvn, 'stopsUpPropagation') and outvn.stopsUpPropagation() and outslot >= 0:
+        if outslot >= 0 and (outvn._addlflags & _VN_STOP_UP):  # stopsUpPropagation
             return False
-        from ghidra.types.datatype import TYPE_BOOL
-        if hasattr(alttype, 'getMetatype') and alttype.getMetatype() == TYPE_BOOL:
-            if outvn.getNZMask() > 1:
+        if hasattr(alttype, 'getMetatype') and alttype.getMetatype() == _TYPE_BOOL:
+            if outvn._nzm > 1:
                 return False
-        opcode_obj = op.getOpcode() if hasattr(op, 'getOpcode') else None
+        opcode_obj = op._opcode
         newtype = None
         if opcode_obj is not None and hasattr(opcode_obj, 'propagateType'):
             newtype = opcode_obj.propagateType(alttype, op, invn, outvn, inslot, outslot)
         if newtype is None:
             return False
-        outvn_temp = outvn.getTempType() if hasattr(outvn, 'getTempType') else None
+        outvn_temp = outvn._temp_dataType
         if outvn_temp is not None and hasattr(newtype, 'typeOrder'):
             if newtype.typeOrder(outvn_temp) < 0:
-                outvn.setTempType(newtype)
-                return not (hasattr(outvn, 'isMark') and outvn.isMark())
+                outvn._temp_dataType = newtype
+                return not outvn.isMark()
         return False
 
     @staticmethod
     def _propagateOneType(typegrp, vn) -> None:
         """Propagate a data-type from one Varnode across the function data-flow."""
-        class _PropState:
-            __slots__ = ('vn', 'desc_iter', 'op', 'slot', 'inslot')
-            def __init__(self, v):
-                self.vn = v
-                descs = list(v.getDescendants()) if hasattr(v, 'getDescendants') else []
-                self.desc_iter = iter(descs)
-                self.op = None
-                self.slot = 0
-                self.inslot = 0
-                self._advance_op()
-            def _advance_op(self):
-                try:
-                    self.op = next(self.desc_iter)
-                    if self.op.getOut() is not None:
-                        self.slot = -1
-                    else:
-                        self.slot = 0
-                    self.inslot = self.op.getSlot(self.vn) if hasattr(self.op, 'getSlot') else 0
-                except StopIteration:
-                    defop = self.vn.getDef() if self.vn.isWritten() else None
-                    if self.inslot != -1 and defop is not None:
-                        self.op = defop
-                        self.inslot = -1
-                        self.slot = 0
-                    else:
-                        self.op = None
-            def valid(self):
-                return self.op is not None
-            def step(self):
-                self.slot += 1
-                if self.slot < self.op.numInput():
-                    return
-                self._advance_op()
-
         state = [_PropState(vn)]
-        vn.setMark()
+        vn._flags |= _VN_MARK_PS
         while state:
             ptr = state[-1]
             if not ptr.valid():
-                ptr.vn.clearMark()
+                ptr.vn._flags &= ~_VN_MARK_PS
                 state.pop()
             else:
                 if ActionInferTypes._propagateTypeEdge(typegrp, ptr.op, ptr.inslot, ptr.slot):
-                    nextvn = ptr.op.getOut() if ptr.slot == -1 else ptr.op.getIn(ptr.slot)
+                    nextvn = ptr.op._output if ptr.slot == -1 else ptr.op._inrefs[ptr.slot]
                     ptr.step()
                     state.append(_PropState(nextvn))
-                    nextvn.setMark()
+                    nextvn._flags |= _VN_MARK_PS
                 else:
                     ptr.step()
 
@@ -849,7 +1138,7 @@ class ActionInferTypes(Action):
         for vn in data.beginLoc():
             if vn.isAnnotation():
                 continue
-            if not vn.isWritten() and vn.hasNoDescend():
+            if not (vn._flags & 0x10) and vn.hasNoDescend():
                 continue
             self._propagateOneType(typegrp, vn)
         self._propagateAcrossReturns(data)

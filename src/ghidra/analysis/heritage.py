@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from collections import defaultdict
+from bisect import bisect_left, bisect_right
 
 from ghidra.core.address import Address, calc_mask
 from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_SPACEBASE, IPTR_INTERNAL, IPTR_PROCESSOR, IPTR_IOP
@@ -42,6 +43,7 @@ class LocationMap:
 
     def __init__(self) -> None:
         self._map: Dict[Address, LocationMap.SizePass] = {}
+        self._by_base: dict = {}  # base → {addr: SizePass} for fast same-space lookup
 
     def add(self, addr: Address, size: int, pass_: int, intersect_ref: list = None) -> Address:
         """Mark new address as heritaged. Returns the key of the containing entry.
@@ -55,52 +57,64 @@ class LocationMap:
             intersect_ref = [0]
         intersect_ref[0] = 0
 
-        # Find any existing range that overlaps
-        for existing_addr, sp in list(self._map.items()):
-            where = addr.overlap(0, existing_addr, sp.size)
-            if where == -1:
-                # Check if existing range overlaps our range
-                where2 = existing_addr.overlap(0, addr, size)
-                if where2 == -1:
+        addr_base = addr.base
+        addr_off = addr.offset
+        highest = addr_base._highest
+
+        # Only iterate same-base entries via _by_base index (avoids O(N) base-check filter)
+        base_bucket = self._by_base.get(addr_base)
+        if base_bucket:
+            to_delete = None  # Deferred deletions — avoids list(items()) copy
+            for existing_addr, sp in base_bucket.items():
+                ex_off = existing_addr.offset
+                dist = addr_off - ex_off
+                if dist < 0 or dist > highest:
+                    dist = -1
+                if dist == -1 or dist >= sp.size:
+                    dist2 = ex_off - addr_off
+                    if dist2 < 0 or dist2 > highest or dist2 >= size:
+                        continue
+                    end1 = addr_off + size
+                    end2 = ex_off + sp.size
+                    new_end = end1 if end1 > end2 else end2
+                    size = new_end - addr_off
+                    if sp.pass_ < pass_:
+                        intersect_ref[0] = 1
+                        pass_ = sp.pass_
+                    if to_delete is None:
+                        to_delete = [existing_addr]
+                    else:
+                        to_delete.append(existing_addr)
                     continue
-                # existing_addr is inside [addr, addr+size)
-                # Merge: extend addr's range to cover existing
-                end1 = addr.getOffset() + size
-                end2 = existing_addr.getOffset() + sp.size
-                new_end = max(end1, end2)
-                size = new_end - addr.getOffset()
+
+                if dist + size <= sp.size:
+                    intersect_ref[0] = 2 if sp.pass_ < pass_ else 0
+                    return existing_addr
+
+                new_size = dist + size
                 if sp.pass_ < pass_:
                     intersect_ref[0] = 1
                     pass_ = sp.pass_
-                del self._map[existing_addr]
-                continue
-
-            # addr overlaps with existing_addr at position 'where'
-            if where + size <= sp.size:
-                # Completely contained in previous element
-                intersect_ref[0] = 2 if sp.pass_ < pass_ else 0
-                return existing_addr
-
-            # Partial overlap - extend
-            addr_to_use = existing_addr
-            new_size = where + size
-            if sp.pass_ < pass_:
-                intersect_ref[0] = 1
-                pass_ = sp.pass_
-            del self._map[existing_addr]
-            addr = addr_to_use
-            size = new_size
+                addr = existing_addr
+                addr_off = ex_off
+                size = new_size
+                if to_delete is None:
+                    to_delete = [existing_addr]
+                else:
+                    to_delete.append(existing_addr)
+            if to_delete:
+                for ea in to_delete:
+                    del base_bucket[ea]
+                    del self._map[ea]
 
         sp = LocationMap.SizePass(size, pass_)
         self._map[addr] = sp
+        if base_bucket is None:
+            base_bucket = {}
+            self._by_base[addr_base] = base_bucket
+        base_bucket[addr] = sp
         return addr
 
-    def find(self, addr: Address) -> Optional[Tuple[Address, 'LocationMap.SizePass']]:
-        """Look up if/how given address was heritaged."""
-        for k, sp in self._map.items():
-            if addr.overlap(0, k, sp.size) != -1:
-                return (k, sp)
-        return None
 
     def findPass(self, addr: Address) -> int:
         """Look up if/how given address was heritaged. Returns pass number or -1."""
@@ -112,9 +126,13 @@ class LocationMap:
     def erase(self, addr: Address) -> None:
         if addr in self._map:
             del self._map[addr]
+            bb = self._by_base.get(addr.base)
+            if bb is not None and addr in bb:
+                del bb[addr]
 
     def clear(self) -> None:
         self._map.clear()
+        self._by_base.clear()
 
     def begin(self):
         return iter(self._map.items())
@@ -371,6 +389,71 @@ class LoadGuard:
             return False
         off = addr.getOffset()
         return self.minimumOffset <= off <= self.maximumOffset
+
+    def establishRange(self, valueSet) -> None:
+        """Establish the range of stack offsets that might be accessed.
+
+        C++ ref: LoadGuard::establishRange
+        """
+        rng = valueSet.getRange()
+        rangeSize = rng.getSize()
+        if rng.isEmpty():
+            self.minimumOffset = self.pointerBase
+            size = 0x1000
+        elif rng.isFull() or rangeSize > 0xFFFFFF:
+            self.minimumOffset = self.pointerBase
+            size = 0x1000
+            self.analysisState = 1
+        else:
+            self.step = rng.getStep() if rangeSize == 3 else 0
+            size = 0x1000
+            if valueSet.isLeftStable():
+                self.minimumOffset = rng.getMin()
+            elif valueSet.isRightStable():
+                if self.pointerBase < rng.getEnd():
+                    self.minimumOffset = self.pointerBase
+                    size = rng.getEnd() - self.pointerBase
+                else:
+                    self.minimumOffset = rng.getMin()
+                    size = rangeSize * rng.getStep()
+            else:
+                self.minimumOffset = self.pointerBase
+        maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+        if self.minimumOffset > maxAddr:
+            self.minimumOffset = maxAddr
+            self.maximumOffset = self.minimumOffset
+        else:
+            maxSize = (maxAddr - self.minimumOffset) + 1
+            if size > maxSize:
+                size = maxSize
+            self.maximumOffset = self.minimumOffset + size - 1
+
+    def finalizeRange(self, valueSet) -> None:
+        """Finalize the range using a converged value set.
+
+        C++ ref: LoadGuard::finalizeRange
+        """
+        self.analysisState = 1
+        rng = valueSet.getRange()
+        rangeSize = rng.getSize()
+        if rangeSize == 0x100 or rangeSize == 0x10000:
+            if self.step == 0:
+                rangeSize = 0
+        if 1 < rangeSize < 0xFFFFFF:
+            self.analysisState = 2
+            if rangeSize > 2:
+                self.step = rng.getStep()
+            self.minimumOffset = rng.getMin()
+            self.maximumOffset = (rng.getEnd() - 1) & rng.getMask()
+            if self.maximumOffset < self.minimumOffset:
+                maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+                self.maximumOffset = maxAddr
+                self.analysisState = 1
+        maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+        if self.minimumOffset > maxAddr:
+            self.minimumOffset = maxAddr
+        if self.maximumOffset > maxAddr:
+            self.maximumOffset = maxAddr
 
     def isRangeLocked(self) -> bool:
         return self.analysisState == 2
@@ -706,8 +789,9 @@ class Heritage:
             off = addr.getOffset()
             tryregister = True
             if spc.getType() == IPTR_SPACEBASE:
+                from ghidra.fspec.fspec import FuncCallSpecs as _FCS
                 sboff = fc.getSpacebaseOffset() if hasattr(fc, 'getSpacebaseOffset') else None
-                if sboff is not None and sboff != -1:  # offset_unknown == -1 typically
+                if sboff is not None and sboff != _FCS.offset_unknown:
                     off = spc.wrapOffset(off - sboff) if hasattr(spc, 'wrapOffset') else (off - sboff)
                 else:
                     tryregister = False
@@ -1125,7 +1209,8 @@ class Heritage:
     # ----------------------------------------------------------------
 
     def collect(self, memrange: MemRange, read: list, write: list,
-                inputvars: list, remove: list) -> int:
+                inputvars: list, remove: list,
+                _sorted_idx: dict = None) -> int:
         """Collect free reads, writes, and inputs in the given address range.
 
         Returns the maximum size of a write.
@@ -1137,30 +1222,73 @@ class Heritage:
         if self._fd is None:
             return 0
         maxsize = 0
-        # Iterate varnodes overlapping the memory range
-        for vn in list(self._fd._vbank.beginLoc()):
-            if vn.getSpace() is not memrange.addr.getSpace():
+        target_spc = memrange.addr.getSpace()
+        range_off = memrange.addr.offset
+        range_end = range_off + memrange.size
+        _WM = 0x02    # Varnode.writemask (addlflags)
+        _WR = 0x10    # Varnode.written (flags)
+        _IP = 0x08    # Varnode.input (flags)
+        _HK = 0x26    # Varnode.insert|constant|annotation (isHeritageKnown mask)
+        _OP_MARKER = 0x40     # PcodeOp.marker flag
+        _OP_RETCPY = 0x80000  # PcodeOp.return_copy flag
+        if _sorted_idx is not None:
+            # Fast path: binary search using parallel offset list (Python 3.9 compatible)
+            spc_entry = _sorted_idx.get(id(target_spc))
+            if spc_entry is not None:
+                sorted_offsets, sorted_vns = spc_entry
+                # All varnodes with offset < range_end can potentially overlap
+                hi = bisect_right(sorted_offsets, range_end - 1)
+                # Start from varnodes with offset >= range_off - 128 (max varnode size bound)
+                lo = bisect_left(sorted_offsets, range_off - 128)
+                lo = max(0, lo)
+                for i in range(lo, hi):
+                    vn_off, vn_sz, vn = sorted_vns[i]
+                    if vn_off + vn_sz <= range_off:
+                        continue  # Doesn't reach range start
+                    if vn._addlflags & _WM:
+                        continue
+                    vn_flags = vn._flags
+                    if vn_flags & _WR:
+                        op = vn._def
+                        op_flags = op._flags
+                        if op_flags & (_OP_MARKER | _OP_RETCPY):
+                            if vn_sz < memrange.size:
+                                remove.append(vn)
+                                continue
+                            memrange.clearProperty(MemRange.new_addresses)
+                        if vn_sz > maxsize:
+                            maxsize = vn_sz
+                        write.append(vn)
+                    elif not (vn_flags & _HK) and vn._descend:
+                        read.append(vn)
+                    elif vn_flags & _IP:
+                        inputvars.append(vn)
+                return maxsize
+        # Fallback: linear scan via space index (vn objects stored directly)
+        vbank = self._fd._vbank
+        spc_bucket = vbank._space_varnodes.get(id(target_spc), ())
+        for vn in spc_bucket:
+            vn_off = vn._loc.offset
+            vn_sz = vn._size
+            if vn_off + vn_sz <= range_off or vn_off >= range_end:
                 continue
-            vn_off = vn.getOffset()
-            range_off = memrange.addr.getOffset()
-            range_end = range_off + memrange.size
-            if vn_off + vn.getSize() <= range_off or vn_off >= range_end:
+            vn_flags = vn._flags
+            if vn._addlflags & _WM:
                 continue
-            if vn.isWriteMask():
-                continue
-            if vn.isWritten():
-                op = vn.getDef()
-                if (op.isMarker() or (hasattr(op, 'isReturnCopy') and op.isReturnCopy())):
-                    if vn.getSize() < memrange.size:
+            if vn_flags & _WR:
+                op = vn._def
+                op_flags = op._flags
+                if op_flags & (_OP_MARKER | _OP_RETCPY):
+                    if vn_sz < memrange.size:
                         remove.append(vn)
                         continue
                     memrange.clearProperty(MemRange.new_addresses)
-                if vn.getSize() > maxsize:
-                    maxsize = vn.getSize()
+                if vn_sz > maxsize:
+                    maxsize = vn_sz
                 write.append(vn)
-            elif not vn.isHeritageKnown() and not vn.hasNoDescend():
+            elif not (vn_flags & _HK) and vn._descend:
                 read.append(vn)
-            elif vn.isInput():
+            elif vn_flags & _IP:
                 inputvars.append(vn)
         return maxsize
 
@@ -2422,11 +2550,22 @@ class Heritage:
         writevars: list = []
         inputvars: list = []
         removevars: list = []
+        # Build sorted-by-offset index for collect() binary search (one build, N binary searches)
+        # Format: {spc_id: (sorted_offsets_list, sorted_entries_list)} for Python 3.9 compatible bisect
+        _sorted_idx: dict = {}
+        if self._fd is not None:
+            vbank = self._fd._vbank
+            for spc_id, vn_set in vbank._space_varnodes.items():
+                entries = [(vn._loc.offset, vn._size, vn) for vn in vn_set]
+                if entries:
+                    entries.sort(key=lambda x: (x[0], x[1]))
+                    sorted_offsets = [e[0] for e in entries]
+                    _sorted_idx[spc_id] = (sorted_offsets, entries)
         # Use index-based iteration because refinement can modify the list
         idx = 0
         while idx < len(self._disjoint):
             memrange = self._disjoint[idx]
-            maxsize = self.collect(memrange, readvars, writevars, inputvars, removevars)
+            maxsize = self.collect(memrange, readvars, writevars, inputvars, removevars, _sorted_idx)
             size = memrange.size
             # C++ refinement: split large ranges into sub-ranges (heritage.cc placeMultiequals)
             if size > 4 and maxsize < size:
@@ -2434,7 +2573,7 @@ class Heritage:
                 if ref_idx >= 0:
                     idx = ref_idx
                     memrange = self._disjoint[idx]
-                    self.collect(memrange, readvars, writevars, inputvars, removevars)
+                    self.collect(memrange, readvars, writevars, inputvars, removevars, _sorted_idx)
                     size = memrange.size
             if not readvars:
                 if not writevars and not inputvars:
@@ -2477,17 +2616,12 @@ class Heritage:
         need to be renamed.
         """
         writelist = []
-        if not hasattr(bl, 'getOpRange'):
-            # Fallback: use getOpList if available
-            ops = list(bl.getOpList()) if hasattr(bl, 'getOpList') else []
-        else:
-            ops = list(bl.getOpRange())
+        ops = list(bl.getOpList())
 
         for op in ops:
             if op.code() != OpCode.CPUI_MULTIEQUAL:
-                for slot in range(op.numInput()):
-                    vnin = op.getIn(slot)
-                    if vnin.isHeritageKnown():
+                for slot, vnin in enumerate(op._inrefs):
+                    if vnin is None or vnin.isHeritageKnown():
                         continue
                     if not vnin.isActiveHeritage():
                         continue
@@ -2503,18 +2637,17 @@ class Heritage:
                     # Check for INDIRECT at-same-time issue
                     if vnnew.isWritten() and vnnew.getDef().code() == OpCode.CPUI_INDIRECT:
                         from ghidra.ir.op import PcodeOp as PcodeOpCls
-                        if hasattr(PcodeOpCls, 'getOpFromConst'):
-                            iop_addr = vnnew.getDef().getIn(1).getAddr()
-                            if PcodeOpCls.getOpFromConst(iop_addr) is op:
-                                if len(stack) == 1:
-                                    vnnew2 = self._fd.newVarnode(vnin.getSize(), vnin.getAddr())
-                                    vnnew2 = self._fd.setInputVarnode(vnnew2)
-                                    stack.insert(0, vnnew2)
-                                    vnnew = vnnew2
-                                else:
-                                    vnnew = stack[-2]
+                        iop_addr = vnnew.getDef()._inrefs[1].getAddr()
+                        if PcodeOpCls.getOpFromConst(iop_addr) is op:
+                            if len(stack) == 1:
+                                vnnew2 = self._fd.newVarnode(vnin.getSize(), vnin.getAddr())
+                                vnnew2 = self._fd.setInputVarnode(vnnew2)
+                                stack.insert(0, vnnew2)
+                                vnnew = vnnew2
+                            else:
+                                vnnew = stack[-2]
                     self._fd.opSetInput(op, vnnew, slot)
-                    if vnin.hasNoDescend() and hasattr(self._fd, 'deleteVarnode'):
+                    if vnin.hasNoDescend():
                         self._fd.deleteVarnode(vnin)
             # Push writes onto stack
             vnout = op.getOut()
@@ -2529,14 +2662,14 @@ class Heritage:
         # Process MULTIEQUAL inputs in successor blocks
         for i in range(bl.sizeOut()):
             subbl = bl.getOut(i)
-            slot = bl.getOutRevIndex(i) if hasattr(bl, 'getOutRevIndex') else i
-            sub_ops = list(subbl.getOpList()) if hasattr(subbl, 'getOpList') else []
-            for multiop in sub_ops:
+            slot = bl.getOutRevIndex(i)
+            for multiop in subbl.getOpList():
                 if multiop.code() != OpCode.CPUI_MULTIEQUAL:
                     break
-                if slot >= multiop.numInput():
+                inrefs = multiop._inrefs
+                if slot >= len(inrefs):
                     continue
-                vnin = multiop.getIn(slot)
+                vnin = inrefs[slot]
                 if vnin.isHeritageKnown():
                     continue
                 addr_key = vnin.getAddr()
@@ -2548,7 +2681,7 @@ class Heritage:
                 else:
                     vnnew = stack[-1]
                 self._fd.opSetInput(multiop, vnnew, slot)
-                if vnin.hasNoDescend() and hasattr(self._fd, 'deleteVarnode'):
+                if vnin.hasNoDescend():
                     self._fd.deleteVarnode(vnin)
 
         # Recurse to dominator tree children
@@ -2607,11 +2740,12 @@ class Heritage:
 
             needwarning = False
             warnvn = None
-            # Collect free varnodes in this space
-            for vn in list(self._fd._vbank.beginLoc()):
-                if vn.getSpace() is not info.space:
-                    continue
-                if not vn.isWritten() and vn.hasNoDescend() and not vn.isUnaffected() and not vn.isInput():
+            # Collect free varnodes in this space — use space index to avoid full scan
+            _vbank = self._fd._vbank
+            _spc_bucket = _vbank._space_varnodes.get(id(info.space), ())
+            _VN_WR = 0x10; _VN_IP = 0x08; _VN_UNAFF = 0x10000
+            for vn in list(_spc_bucket):
+                if not (vn._flags & _VN_WR) and vn.hasNoDescend() and not vn.isUnaffected() and not vn.isInput():
                     continue
                 if vn.isWriteMask():
                     continue

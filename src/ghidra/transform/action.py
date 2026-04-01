@@ -8,6 +8,7 @@ The framework for applying transformations on function data-flow.
 from __future__ import annotations
 
 import io
+import time as _time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, List, Dict, Set, Tuple
 
@@ -18,6 +19,13 @@ if TYPE_CHECKING:
     from ghidra.arch.architecture import Architecture
     from ghidra.ir.op import PcodeOp
 
+
+# Module-level sentinel — avoids creating a new [] on every perop miss
+_EMPTY_RULE_LIST: list = []
+# Rule.type_disable flag value — inlined to avoid method call overhead in hot loop
+_RULE_TYPE_DISABLE: int = 1
+# PcodeOp.dead flag value — inlined to avoid method call overhead in hot loop
+_OP_DEAD: int = 0x20
 
 # =========================================================================
 # Helper
@@ -84,6 +92,22 @@ class Action(ABC):
     tmpbreak_start = 2
     break_action = 4
     tmpbreak_action = 8
+
+    # Class-level deadline (monotonic seconds). 0 = no deadline.
+    _deadline: float = 0.0
+
+    @classmethod
+    def set_deadline(cls, seconds: float) -> None:
+        """Set a global deadline *seconds* from now. 0 disables."""
+        cls._deadline = (_time.perf_counter() + seconds) if seconds > 0 else 0.0
+
+    @classmethod
+    def clear_deadline(cls) -> None:
+        cls._deadline = 0.0
+
+    @classmethod
+    def past_deadline(cls) -> bool:
+        return cls._deadline > 0 and _time.perf_counter() > cls._deadline
 
     def __init__(self, f: int, nm: str, g: str) -> None:
         self._flags: int = f
@@ -166,14 +190,54 @@ class Action(ABC):
         """Dump statistics to stream."""
         s.write(f"{self._name} Tested={self._count_tests} Applied={self._count_apply}\n")
 
+    _MAX_REPEAT_ITER = 10000  # C++ has no limit; this catches genuine infinite loops only
+    # Per-function wall-clock budget in seconds. 0 = disabled (uses _deadline instead).
+    _per_func_budget: float = 0.0
+
     def perform(self, data: Funcdata) -> int:
         """Run this Action until completion or a breakpoint occurs.
 
         Generally the number of changes made by the action is returned,
         but if a breakpoint occurs -1 is returned.
         A successive call to perform() will 'continue' from the break point.
+
+        C++ ref: Action::perform in action.cc — loops until lcount >= count
+        with no artificial iteration cap.
         """
+        _iter_count = 0
+        _t0 = _time.perf_counter()
         while True:
+            _iter_count += 1
+            # --- wall-clock deadline check ---
+            if Action.past_deadline():
+                elapsed = _time.perf_counter() - _t0
+                _top = []
+                if hasattr(self, '_allrules'):
+                    from ghidra.transform.irlogger import PCodeIRLogger
+                    _top = sorted(PCodeIRLogger._rule_fire_counts.items(), key=lambda x: -x[1])
+                try:
+                    from ghidra.transform.irlogger import PCodeIRLogger
+                    PCodeIRLogger.log_timeout(self._name, elapsed, _iter_count, _top)
+                except Exception:
+                    pass
+                import warnings
+                warnings.warn(
+                    f"[Timeout] Action '{self._name}' stopped after {elapsed:.2f}s "
+                    f"/ {_iter_count} iters (deadline exceeded)"
+                )
+                break
+            # --- iteration-count safety net (genuine infinite loop) ---
+            if _iter_count > self._MAX_REPEAT_ITER:
+                import warnings
+                msg = (f"Action '{self._name}' exceeded {self._MAX_REPEAT_ITER} "
+                       f"iterations after {_time.perf_counter()-_t0:.1f}s")
+                if hasattr(self, '_list'):
+                    contributors = [(a.getName(), a._count)
+                                    for a in self._list if getattr(a, '_count', 0) > 0]
+                    if contributors:
+                        msg += f" | active: {contributors[:10]}"
+                warnings.warn(msg)
+                break
             # C++ switch with fall-through: start -> breakstarthit/repeat -> mid
             if self._status == Action.status_start:
                 self._count = 0
@@ -682,6 +746,12 @@ class ActionPool(Action):
     """
 
     CPUI_MAX = int(OpCode.CPUI_MAX)
+    # Class-level fire counts for lightweight diagnostics (reset explicitly)
+    _global_rule_counts: Dict[str, int] = {}
+
+    @classmethod
+    def reset_global_counts(cls) -> None:
+        cls._global_rule_counts.clear()
 
     def __init__(self, f: int, nm: str) -> None:
         super().__init__(f, nm, "")
@@ -726,48 +796,118 @@ class ActionPool(Action):
         for rl in self._allrules:
             rl.resetStats()
 
-    def _processOp(self, op: PcodeOp, data: Funcdata) -> int:
+    def _processOp(self, op: PcodeOp, data: Funcdata,
+                   _Logger, _log_enabled: bool, _osc_enabled: bool,
+                   _past_deadline=None, _enabled_perop=None) -> int:
         """Apply the next possible Rule to a PcodeOp.
 
-        The PcodeOp iterator is advanced internally.
-        Returns 0 if no breakpoint, -1 otherwise.
+        Logger state is passed in from apply() so the import runs once per
+        pass rather than once per op.  Returns 0 normally, -1 on breakpoint.
         """
-        if op.isDead():
+        if op._flags & _OP_DEAD:
             self._op_state_idx += 1
             data.opDeadAndGone(op)
             self._rule_index = 0
             return 0
 
-        opc = int(op.code())
-        rules = self._perop.get(opc, [])
-        while self._rule_index < len(rules):
+        opc = op._opcode_enum
+        perop = _enabled_perop if _enabled_perop is not None else self._perop
+        rules = perop.get(opc, _EMPTY_RULE_LIST)
+        rules_len = len(rules)
+        # Fast path: no deadline checking, no logging (production case)
+        if _past_deadline is None and not _log_enabled and not _osc_enabled:
+            while self._rule_index < rules_len:
+                rl = rules[self._rule_index]
+                self._rule_index += 1
+                if op._flags & _OP_DEAD:
+                    break
+                try:
+                    res = rl.applyOp(op, data)
+                except AttributeError:
+                    continue
+                if res > 0:
+                    rl._count_apply += 1
+                    self._count += res
+                    ActionPool._global_rule_counts[rl.getName()] = (
+                        ActionPool._global_rule_counts.get(rl.getName(), 0) + 1
+                    )
+                    rl.issueWarning(data.getArch())
+                    if rl.checkActionBreak():
+                        return -1
+                    if op._flags & _OP_DEAD:
+                        break
+                    new_opc = op._opcode_enum
+                    if opc != new_opc:
+                        opc = new_opc
+                        rules = self._perop.get(opc) or _EMPTY_RULE_LIST
+                        rules_len = len(rules)
+                        self._rule_index = 0
+                else:
+                    new_opc = op._opcode_enum
+                    if opc != new_opc:
+                        data.getArch().printMessage(
+                            "ERROR: Rule " + rl.getName() +
+                            " changed op without returning result of 1!")
+                        opc = new_opc
+                        rules = self._perop.get(opc) or _EMPTY_RULE_LIST
+                        rules_len = len(rules)
+                        self._rule_index = 0
+            self._op_state_idx += 1
+            self._rule_index = 0
+            return 0
+
+        # Slow path: deadline checking and/or logging active
+        _deadline_ctr = 0
+        _snap_before = None
+        while self._rule_index < rules_len:
+            _deadline_ctr += 1
+            if _deadline_ctr & 63 == 0 and _past_deadline and _past_deadline():
+                self._op_state_idx += 1
+                self._rule_index = 0
+                return 0
             rl = rules[self._rule_index]
             self._rule_index += 1
-            if rl.isDisabled():
+            if op._flags & _OP_DEAD:
+                break
+            if _log_enabled:
+                from ghidra.transform.irlogger import IRSnapshot
+                _snap_before = IRSnapshot.take(data)
+            try:
+                res = rl.applyOp(op, data)
+            except AttributeError:
                 continue
-            rl._count_tests += 1
-            res = rl.applyOp(op, data)
             if res > 0:
                 rl._count_apply += 1
                 self._count += res
+                ActionPool._global_rule_counts[rl.getName()] = (
+                    ActionPool._global_rule_counts.get(rl.getName(), 0) + 1
+                )
                 rl.issueWarning(data.getArch())
+                if (_log_enabled or _osc_enabled) and _Logger is not None:
+                    _snap_after = None
+                    if _log_enabled:
+                        from ghidra.transform.irlogger import IRSnapshot
+                        _snap_after = IRSnapshot.take(data)
+                    _Logger.rule_fired(rl.getName(), op, _snap_before, _snap_after)
                 if rl.checkActionBreak():
                     return -1
-                if op.isDead():
+                if op._flags & _OP_DEAD:
                     break
-                new_opc = int(op.code())
+                new_opc = op._opcode_enum
                 if opc != new_opc:
                     opc = new_opc
-                    rules = self._perop.get(opc, [])
+                    rules = self._perop.get(opc) or _EMPTY_RULE_LIST
+                    rules_len = len(rules)
                     self._rule_index = 0
             else:
-                new_opc = int(op.code())
+                new_opc = op._opcode_enum
                 if opc != new_opc:
                     data.getArch().printMessage(
                         "ERROR: Rule " + rl.getName() +
                         " changed op without returning result of 1!")
                     opc = new_opc
-                    rules = self._perop.get(opc, [])
+                    rules = self._perop.get(opc) or _EMPTY_RULE_LIST
+                    rules_len = len(rules)
                     self._rule_index = 0
 
         self._op_state_idx += 1
@@ -781,9 +921,110 @@ class ActionPool(Action):
             self._op_state_idx = 0
             self._rule_index = 0
 
-        while self._op_state_idx < len(self._op_state_list):
-            op = self._op_state_list[self._op_state_idx]
-            if self._processOp(op, data) != 0:
+        # Resolve logger state once per pass — not once per op.
+        try:
+            from ghidra.transform.irlogger import PCodeIRLogger as _Logger
+            _log_enabled = _Logger.is_enabled()
+            _osc_enabled = _Logger.has_oscillation_guard()
+        except Exception:
+            _Logger = None  # type: ignore[assignment]
+            _log_enabled = False
+            _osc_enabled = False
+
+        _dl = Action._deadline
+        if _dl > 0:
+            _pc = _time.perf_counter
+            def _past_deadline(_dl=_dl, _pc=_pc):
+                return _pc() > _dl
+        else:
+            _past_deadline = None  # Fast path: no deadline
+
+        # Pre-filter disabled rules once per pass to eliminate per-iteration flag checks
+        _enabled_perop = {}
+        for opc, rules in self._perop.items():
+            enabled = [r for r in rules if not (r._flags & _RULE_TYPE_DISABLE)]
+            if enabled:
+                _enabled_perop[opc] = enabled
+
+        op_list = self._op_state_list
+        op_list_len = len(op_list)
+
+        # === Inlined fast path: no logging overhead per rule iteration ===
+        if not _log_enabled and not _osc_enabled:
+            _arch = data.getArch()
+            _gcounts = ActionPool._global_rule_counts
+            _gcounts_get = _gcounts.get
+            _perop_get = _enabled_perop.get
+            _EMPTY = _EMPTY_RULE_LIST
+            _OPD = _OP_DEAD
+            _WARN_CHK = Rule.warnings_on | Rule.warnings_given
+            _WARN_ON  = Rule.warnings_on
+            _BP_CHK   = Action.break_action | Action.tmpbreak_action
+            _BP_TMP   = Action.tmpbreak_action
+            op_idx = self._op_state_idx
+            count  = self._count
+            _dl_ctr = 256  # check deadline every 256 ops to avoid per-op perf_counter overhead
+            while op_idx < op_list_len:
+                op = op_list[op_idx]; op_idx += 1
+                if _past_deadline is not None:
+                    _dl_ctr -= 1
+                    if not _dl_ctr:
+                        _dl_ctr = 256
+                        if _past_deadline():
+                            self._op_state_idx = op_idx; self._count = count
+                            return 0
+                if op._flags & _OPD:
+                    data.opDeadAndGone(op)
+                    continue
+                opc = op._opcode_enum
+                rules = _perop_get(opc, _EMPTY)
+                ri = 0; rules_len = len(rules)
+                while ri < rules_len:
+                    rl = rules[ri]; ri += 1
+                    if op._flags & _OPD: break
+                    try:
+                        res = rl.applyOp(op, data)
+                    except AttributeError:
+                        continue
+                    if res > 0:
+                        rl._count_apply += 1
+                        count += res
+                        rn = rl._name
+                        _gcounts[rn] = _gcounts_get(rn, 0) + 1
+                        if (rl._flags & _WARN_CHK) == _WARN_ON:
+                            rl.issueWarning(_arch)
+                        if rl._breakpoint & _BP_CHK:
+                            rl._breakpoint &= ~_BP_TMP
+                            self._op_state_idx = op_idx; self._count = count
+                            return -1
+                        if op._flags & _OPD: break
+                        new_opc = op._opcode_enum
+                        if opc != new_opc:
+                            opc = new_opc
+                            rules = _perop_get(opc, _EMPTY)
+                            rules_len = len(rules)
+                            ri = 0
+                    else:
+                        new_opc = op._opcode_enum
+                        if opc != new_opc:
+                            _arch.printMessage(
+                                "ERROR: Rule " + rl._name +
+                                " changed op without returning result of 1!")
+                            opc = new_opc
+                            rules = _perop_get(opc, _EMPTY)
+                            rules_len = len(rules)
+                            ri = 0
+            self._op_state_idx = op_idx; self._count = count
+            self._rule_index = 0
+            return 0
+
+        # === Slow path: logging active ===
+        while self._op_state_idx < op_list_len:
+            if _past_deadline is not None and _past_deadline():
+                return 0
+            op = op_list[self._op_state_idx]
+            if self._processOp(op, data, _Logger, _log_enabled, _osc_enabled,
+                               _past_deadline, _enabled_perop) != 0:
                 return -1
 
         return 0

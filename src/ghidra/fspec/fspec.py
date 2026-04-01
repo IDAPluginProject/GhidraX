@@ -586,6 +586,8 @@ class ParamEntry:
     smallsize_sext = 8
     smallsize_inttype = 0x20
     smallsize_floatext = 0x40
+    extracheck_high = 0x80
+    extracheck_low = 0x100
     is_grouped = 0x200
     overlapping = 0x400
     first_storage = 0x800
@@ -639,6 +641,127 @@ class ParamEntry:
 
     def isFirstInClass(self) -> bool:
         return (self.flags & ParamEntry.first_storage) != 0
+
+    def isParamCheckHigh(self) -> bool:
+        return (self.flags & ParamEntry.extracheck_high) != 0
+
+    def isParamCheckLow(self) -> bool:
+        return (self.flags & ParamEntry.extracheck_low) != 0
+
+    @staticmethod
+    def findEntryByStorage(entryList: list, vn) -> Optional['ParamEntry']:
+        """Find a ParamEntry matching the given VarnodeData storage.
+
+        C++ ref: ParamEntry::findEntryByStorage in fspec.cc
+        """
+        for entry in reversed(entryList):
+            if (entry.spaceid is vn.space and entry.addressbase == vn.offset
+                    and entry.size == vn.size):
+                return entry
+        return None
+
+    def resolveFirst(self, curList: list) -> None:
+        """Set first_storage flag if this is the first entry of its storage class.
+
+        C++ ref: ParamEntry::resolveFirst in fspec.cc
+        """
+        if len(curList) <= 1:
+            self.flags |= ParamEntry.first_storage
+            return
+        prev = curList[-2]
+        if self.type != prev.type:
+            self.flags |= ParamEntry.first_storage
+
+    def resolveJoin(self, curList: list) -> None:
+        """Cache join record and adjust group based on overlapped entries.
+
+        C++ ref: ParamEntry::resolveJoin in fspec.cc
+        """
+        from ghidra.core.space import IPTR_JOIN
+        self.joinrec = None
+        if self.spaceid is None or self.spaceid.getType() != IPTR_JOIN:
+            return
+        mgr = self.spaceid.getManager() if hasattr(self.spaceid, 'getManager') else None
+        if mgr is None:
+            return
+        self.joinrec = mgr.findJoin(self.addressbase) if hasattr(mgr, 'findJoin') else None
+        if self.joinrec is None:
+            return
+        self.groupSet = []
+        npieces = self.joinrec.numPieces() if hasattr(self.joinrec, 'numPieces') else 0
+        for i in range(npieces):
+            piece = self.joinrec.getPiece(i)
+            entry = ParamEntry.findEntryByStorage(curList, piece)
+            if entry is not None:
+                self.groupSet.extend(entry.groupSet)
+                self.flags |= ParamEntry.extracheck_low if i == 0 else ParamEntry.extracheck_high
+        if not self.groupSet:
+            raise LowlevelError("<pentry> join must overlap at least one previous entry")
+        self.groupSet.sort()
+        self.flags |= ParamEntry.overlapping
+
+    def resolveOverlap(self, curList: list) -> None:
+        """Search for overlaps with previous entries and adjust groups.
+
+        C++ ref: ParamEntry::resolveOverlap in fspec.cc
+        """
+        if getattr(self, 'joinrec', None) is not None:
+            return
+        overlapSet = []
+        addr = Address(self.spaceid, self.addressbase)
+        for entry in curList[:-1]:
+            if not entry.intersects(addr, self.size):
+                continue
+            if self.contains(entry):
+                if entry.isOverlap():
+                    continue
+                overlapSet.extend(entry.groupSet)
+                if self.addressbase == entry.addressbase:
+                    self.flags |= ParamEntry.extracheck_low if self.spaceid.isBigEndian() else ParamEntry.extracheck_high
+                else:
+                    self.flags |= ParamEntry.extracheck_high if self.spaceid.isBigEndian() else ParamEntry.extracheck_low
+            else:
+                raise LowlevelError("Illegal overlap of <pentry> in compiler spec")
+        if not overlapSet:
+            return
+        overlapSet.sort()
+        self.groupSet = overlapSet
+        self.flags |= ParamEntry.overlapping
+
+    def subsumesDefinition(self, op2: 'ParamEntry') -> bool:
+        """Check if this entry subsumes the definition of another.
+
+        C++ ref: ParamEntry::subsumesDefinition in fspec.cc
+        """
+        if self.type != TYPECLASS_GENERAL and op2.type != self.type:
+            return False
+        if self.spaceid is not op2.spaceid:
+            return False
+        if op2.addressbase < self.addressbase:
+            return False
+        if (op2.addressbase + op2.size - 1) > (self.addressbase + self.size - 1):
+            return False
+        if self.alignment != op2.alignment:
+            return False
+        return True
+
+    def contains(self, op2: 'ParamEntry') -> bool:
+        """Check if this entry contains the given entry.
+
+        C++ ref: ParamEntry::contains in fspec.cc
+        """
+        if getattr(op2, 'joinrec', None) is not None:
+            return False
+        if getattr(self, 'joinrec', None) is None:
+            addr = Address(self.spaceid, self.addressbase)
+            return op2.containedBy(addr, self.size)
+        npieces = self.joinrec.numPieces() if hasattr(self.joinrec, 'numPieces') else 0
+        for i in range(npieces):
+            vdata = self.joinrec.getPiece(i)
+            addr = vdata.getAddr() if hasattr(vdata, 'getAddr') else Address(vdata.space, vdata.offset)
+            if op2.containedBy(addr, vdata.size):
+                return True
+        return False
 
     def getSpace(self) -> Optional[AddrSpace]:
         return self.spaceid
@@ -1550,13 +1673,15 @@ class ParamListStandard(ParamList):
     def calcDelay(self) -> None:
         """Calculate the maximum delay for this parameter list.
 
-        C++ ref: ``ParamListStandard::calcDelay``
+        C++ ref: ``ParamListStandard::calcDelay`` in fspec.cc:1153-1163
         """
         self.maxdelay = 0
         for e in self.entry:
-            d = e.getSlot(e.getBase(), 0)
-            if isinstance(d, int) and d > self.maxdelay:
-                self.maxdelay = d
+            spc = e.getSpace()
+            if spc is not None and hasattr(spc, 'getDelay'):
+                delay = spc.getDelay()
+                if delay > self.maxdelay:
+                    self.maxdelay = delay
 
     def populateResolver(self) -> None:
         """Enter all ParamEntry objects into an interval map.
@@ -1615,6 +1740,225 @@ class ParamListStandard(ParamList):
         self.calcDelay()
         self.populateResolver()
         self.pointermax = pointermax
+
+    def assignMap(self, proto, typefactory, res: list) -> None:
+        """Assign addresses to input parameters of a prototype.
+
+        C++ ref: ParamListStandard::assignMap in fspec.cc
+        """
+        from ghidra.fspec.modelrules import AssignAction
+        status = [0] * self.numgroup
+
+        if len(res) == 2:
+            dt = res[-1].type
+            if (res[-1].flags & ParameterPieces.hiddenretparm) != 0:
+                if self.assignAddressFallback(TYPECLASS_HIDDENRET, dt, False, status, res[-1]) == AssignAction.fail:
+                    raise LowlevelError("Cannot assign parameter address for " + (dt.getName() if dt else "unknown"))
+            else:
+                if self.assignAddress(dt, proto, 0, typefactory, status, res[-1]) == AssignAction.fail:
+                    raise LowlevelError("Cannot assign parameter address for " + (dt.getName() if dt else "unknown"))
+            res[-1].flags |= ParameterPieces.hiddenretparm
+        for i in range(len(proto.intypes)):
+            pp = ParameterPieces()
+            res.append(pp)
+            dt = proto.intypes[i]
+            responseCode = self.assignAddress(dt, proto, i, typefactory, status, res[-1])
+            if responseCode == AssignAction.fail or responseCode == AssignAction.no_assignment:
+                raise LowlevelError("Cannot assign parameter address for " + (dt.getName() if dt else "unknown"))
+
+    def addResolverRange(self, spc, first: int, last: int, paramEntry, position: int) -> None:
+        """Add a range to the resolver interval map.
+
+        C++ ref: ParamListStandard::addResolverRange in fspec.cc
+        """
+        if not hasattr(self, '_resolvers'):
+            self._resolvers = {}
+        idx = spc.getIndex()
+        if idx not in self._resolvers:
+            self._resolvers[idx] = []
+        self._resolvers[idx].append((first, last, paramEntry, position))
+
+
+class ParamListStandardOut(ParamListStandard):
+    """Standard output (return value) parameter list.
+
+    C++ ref: ParamListStandardOut in fspec.hh
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.useFillinFallback: bool = True
+
+    def getType(self) -> int:
+        return ParamListStandard.p_standard_out
+
+    def assignMap(self, proto, typefactory, res: list) -> None:
+        """Assign address for the return value of a prototype.
+
+        C++ ref: ParamListStandardOut::assignMap in fspec.cc
+        """
+        from ghidra.fspec.modelrules import AssignAction
+        from ghidra.types.datatype import TYPE_VOID
+        status = [0] * self.numgroup
+
+        pp = ParameterPieces()
+        res.append(pp)
+        if proto.outtype.getMetatype() == TYPE_VOID:
+            res[-1].type = proto.outtype
+            res[-1].flags = 0
+            return
+
+        responseCode = self.assignAddress(proto.outtype, proto, -1, typefactory, status, res[-1])
+        if responseCode == AssignAction.fail:
+            responseCode = AssignAction.hiddenret_ptrparam
+
+        if responseCode in (AssignAction.hiddenret_ptrparam, AssignAction.hiddenret_specialreg,
+                            AssignAction.hiddenret_specialreg_void):
+            spc = self.spacebase
+            if spc is None:
+                spc = typefactory.getArch().getDefaultDataSpace() if hasattr(typefactory, 'getArch') else None
+            if spc is None:
+                raise LowlevelError("Cannot assign return value as a pointer: no space")
+            pointersize = spc.getAddrSize()
+            wordsize = spc.getWordSize()
+            pointertp = typefactory.getTypePointer(pointersize, proto.outtype, wordsize)
+            if responseCode == AssignAction.hiddenret_specialreg_void:
+                res[-1].type = typefactory.getTypeVoid()
+            else:
+                res[-1].type = pointertp
+                if self.assignAddress(pointertp, proto, -1, typefactory, status, res[-1]) == AssignAction.fail:
+                    raise LowlevelError("Cannot assign return value as a pointer")
+            res[-1].flags = ParameterPieces.indirectstorage
+
+            pp2 = ParameterPieces()
+            res.append(pp2)
+            res[-1].type = pointertp
+            isSpecial = (responseCode == AssignAction.hiddenret_specialreg or
+                         responseCode == AssignAction.hiddenret_specialreg_void)
+            res[-1].flags = ParameterPieces.hiddenretparm if isSpecial else 0
+
+    def initialize(self) -> None:
+        """Initialize the output parameter list.
+
+        C++ ref: ParamListStandardOut::initialize in fspec.cc
+        """
+        self.useFillinFallback = True
+        for rule in self.modelRules:
+            if hasattr(rule, 'canAffectFillinOutput') and rule.canAffectFillinOutput():
+                self.useFillinFallback = False
+                break
+        if self.useFillinFallback:
+            self.autoKilledByCall = True
+
+    def fillinMap(self, active) -> None:
+        """Determine the return value from active output trials.
+
+        C++ ref: ParamListStandardOut::fillinMap in fspec.cc
+        """
+        if active.getNumTrials() == 0:
+            return
+        if self.useFillinFallback:
+            self.fillinMapFallback(active, False)
+            return
+        for rule in self.modelRules:
+            if hasattr(rule, 'fillinOutputMap') and rule.fillinOutputMap(active):
+                return
+
+    def fillinMapFallback(self, active, firstOnly: bool) -> None:
+        """Fallback method for determining return value from trials.
+
+        C++ ref: ParamListStandardOut::fillinMapFallback in fspec.cc
+        """
+        bestEntry = None
+        for i in range(active.getNumTrials()):
+            trial = active.getTrial(i)
+            if not trial.isActive():
+                continue
+            entry = self.findEntry(trial.getAddress(), trial.getSize(), True)
+            if entry is None:
+                continue
+            if bestEntry is None or entry.getGroup() < bestEntry.getGroup():
+                bestEntry = entry
+            if firstOnly:
+                break
+        if bestEntry is None:
+            return
+        for i in range(active.getNumTrials()):
+            trial = active.getTrial(i)
+            if not trial.isActive():
+                continue
+            entry = self.findEntry(trial.getAddress(), trial.getSize(), True)
+            if entry is bestEntry or (entry is not None and entry.getGroup() == bestEntry.getGroup()):
+                trial.markUsed()
+            else:
+                trial.markNoUse()
+
+
+class ParamListRegister(ParamListStandard):
+    """A parameter list using only registers (no stack).
+
+    C++ ref: ParamListRegister in fspec.hh
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def getType(self) -> int:
+        return ParamListStandard.p_register
+
+    def fillinMap(self, active) -> None:
+        """Given an unordered list of trials, mark active ones as used.
+
+        C++ ref: ParamListRegister::fillinMap in fspec.cc
+        """
+        if active.getNumTrials() == 0:
+            return
+        for i in range(active.getNumTrials()):
+            paramtrial = active.getTrial(i)
+            entrySlot = self.findEntry(paramtrial.getAddress(), paramtrial.getSize(), True)
+            if entrySlot is None:
+                paramtrial.markNoUse()
+            else:
+                paramtrial.setEntry(entrySlot, 0)
+                if paramtrial.isActive():
+                    paramtrial.markUsed()
+        active.sortTrials()
+
+
+class ParamListRegisterOut(ParamListStandardOut):
+    """Output parameter list using only registers.
+
+    C++ ref: ParamListRegisterOut in fspec.hh
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def getType(self) -> int:
+        return ParamListStandard.p_register_out
+
+
+class ParamListMerged(ParamListStandard):
+    """A merged parameter list from multiple calling conventions.
+
+    C++ ref: ParamListMerged in fspec.hh
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def foldIn(self, op2: ParamListStandard) -> None:
+        """Fold another parameter list into this one.
+
+        C++ ref: ParamListMerged::foldIn in fspec.cc
+        """
+        for e in op2.entry:
+            if e not in self.entry:
+                self.entry.append(e)
+        if op2.spacebase is not None:
+            self.spacebase = op2.spacebase
+        if op2.numgroup > self.numgroup:
+            self.numgroup = op2.numgroup
 
 
 # =========================================================================
@@ -1705,8 +2049,9 @@ class ProtoModel:
         Returns a string: 'unaffected', 'killedbycall', 'return_address', or 'unknown'.
         """
         # Unique space is always local to function
-        if hasattr(addr, 'getSpace') and addr.getSpace() is not None:
-            stype = addr.getSpace().getType()
+        a_spc = addr.getSpace()
+        if a_spc is not None:
+            stype = a_spc.getType()
             if stype == 3:  # IPTR_INTERNAL
                 return 'unaffected'
 
@@ -1721,19 +2066,18 @@ class ProtoModel:
         if not efflist:
             return 'unknown'
 
-        a_spc = addr.getSpace() if hasattr(addr, 'getSpace') else None
-        a_off = addr.getOffset() if hasattr(addr, 'getOffset') else 0
+        a_off = addr.getOffset()
 
         for eff in efflist:
             e_addr = eff.getAddress()
             e_size = eff.getSize()
-            e_spc = e_addr.getSpace() if hasattr(e_addr, 'getSpace') else None
+            e_spc = e_addr.getSpace()
             if e_spc is not a_spc:
                 continue
             # Size 0 means whole space is unaffected
             if e_size == 0:
                 return 'unaffected'
-            e_off = e_addr.getOffset() if hasattr(e_addr, 'getOffset') else 0
+            e_off = e_addr.getOffset()
             # Check containment: [a_off, a_off+size) ⊆ [e_off, e_off+e_size)
             if a_off >= e_off and (a_off + size) <= (e_off + e_size):
                 return _TYPE_TO_STR.get(eff.getType(), 'unknown')
@@ -1911,6 +2255,23 @@ class ProtoModel:
                 if hasattr(eff, 'getSize') and eff.getSize() >= size:
                     return eff.getType() if hasattr(eff, 'getType') else 4
         return 4  # unknown_effect
+
+    def deriveInputMap(self, active) -> None:
+        """Given input trials, derive the most likely input prototype.
+
+        Trials are sorted and marked as used or not.
+        C++ ref: ``ProtoModel::deriveInputMap`` (fspec.hh:791-792)
+        """
+        if self.input is not None:
+            self.input.fillinMap(active)
+
+    def deriveOutputMap(self, active) -> None:
+        """Given output trials, derive the most likely output prototype.
+
+        C++ ref: ``ProtoModel::deriveOutputMap`` (fspec.hh:798-799)
+        """
+        if self.output is not None:
+            self.output.fillinMap(active)
 
     def getInput(self) -> Optional[ParamListStandard]:
         return self.input
@@ -2595,6 +2956,35 @@ class FuncProto:
         if self.model is not None and hasattr(self.model, 'isAutoKilledByCall'):
             return self.model.isAutoKilledByCall()
         return (self.flags & FuncProto.auto_killedbycall) != 0
+
+    def resolveModel(self, active) -> None:
+        """Pick a specific model from a merged set based on active trials.
+
+        C++ ref: ``FuncProto::resolveModel`` (fspec.cc:3767-3776)
+        """
+        if self.model is None:
+            return
+        if not self.model.isMerged():
+            return
+        if hasattr(self.model, 'selectModel'):
+            newmodel = self.model.selectModel(active)
+            self.setModel(newmodel)
+
+    def deriveInputMap(self, active) -> None:
+        """Given input trials, derive the most likely inputs for this prototype.
+
+        C++ ref: ``FuncProto::deriveInputMap`` (fspec.hh:1494-1495)
+        """
+        if self.model is not None:
+            self.model.deriveInputMap(active)
+
+    def deriveOutputMap(self, active) -> None:
+        """Given output trials, derive the most likely return value.
+
+        C++ ref: ``FuncProto::deriveOutputMap`` (fspec.hh:1501-1502)
+        """
+        if self.model is not None:
+            self.model.deriveOutputMap(active)
 
     def getMaxInputDelay(self) -> int:
         return self.model.getMaxInputDelay() if self.model else 0
@@ -3507,7 +3897,7 @@ class FuncCallSpecs:
         self.name: str = ""
         self.proto: FuncProto = FuncProto()
         self.effective_extrapop: int = ProtoModel.extrapop_unknown
-        self.stackoffset: int = 0
+        self.stackoffset: int = FuncCallSpecs.offset_unknown
         self.paramshift: int = 0
         self.matchCallCount: int = 0
         self.isinputactive: bool = False
@@ -3709,12 +4099,25 @@ class FuncCallSpecs:
         if self.proto.outparam is not None and hasattr(self.proto.outparam, 'setTypeLock'):
             self.proto.outparam.setTypeLock(val)
 
-    def abortSpacebaseRelative(self, fd) -> None:
-        """Abort any spacebase-relative analysis for this call.
+    def abortSpacebaseRelative(self, data) -> None:
+        """Remove the spacebase placeholder input from this call.
 
-        C++ ref: ``FuncCallSpecs::abortSpacebaseRelative``
+        Does NOT reset stackoffset — it was already set by resolveSpacebaseRelative.
+
+        C++ ref: ``FuncCallSpecs::abortSpacebaseRelative`` in fspec.cc:4910-4921
         """
-        self.stackoffset = FuncCallSpecs.offset_unknown
+        if hasattr(self, '_stackPlaceholderSlot') and self._stackPlaceholderSlot >= 0:
+            vn = self.op.getIn(self._stackPlaceholderSlot)
+            if hasattr(data, 'opRemoveInput'):
+                data.opRemoveInput(self.op, self._stackPlaceholderSlot)
+            self.clearStackPlaceholderSlot()
+            # Remove the op producing the placeholder as well
+            from ghidra.core.space import IPTR_INTERNAL
+            if (vn is not None and vn.hasNoDescend()
+                    and vn.getSpace().getType() == IPTR_INTERNAL
+                    and vn.isWritten()):
+                if hasattr(data, 'opDestroy'):
+                    data.opDestroy(vn.getDef())
 
     def isAutoKilledByCall(self) -> bool:
         if self.proto.model is not None and hasattr(self.proto.model, 'isAutoKilledByCall'):
@@ -3722,11 +4125,18 @@ class FuncCallSpecs:
         return False
 
     def initActiveInput(self) -> None:
-        """Turn on analysis recovering input parameters."""
+        """Turn on analysis recovering input parameters.
+
+        C++ ref: ``FuncCallSpecs::initActiveInput`` in fspec.cc
+        """
         self.isinputactive = True
         if not hasattr(self, '_activeInput') or self._activeInput is None:
             from ghidra.fspec.paramactive import ParamActive
             self._activeInput = ParamActive(True)
+        maxdelay = self.proto.getMaxInputDelay() if self.proto is not None else 0
+        if maxdelay > 0:
+            maxdelay = 3
+        self._activeInput.setMaxPass(maxdelay)
 
     def clearActiveInput(self) -> None:
         """Turn off analysis recovering input parameters."""
@@ -3828,9 +4238,47 @@ class FuncCallSpecs:
                 loadval.setSpacebasePlaceholder()
 
     def resolveSpacebaseRelative(self, data, phvn) -> None:
-        """Resolve the spacebase-relative placeholder."""
-        if phvn is not None and hasattr(phvn, 'getOffset'):
-            self.stackoffset = phvn.getOffset()
+        """Resolve the spacebase-relative placeholder.
+
+        After RuleLoadVarnode converts LOAD→COPY, phvn is the COPY output.
+        We trace phvn->getDef()->getIn(0) to get the direct stack varnode,
+        then set stackoffset from its offset.
+
+        C++ ref: ``FuncCallSpecs::resolveSpacebaseRelative`` in fspec.cc
+        """
+        if phvn is None or not phvn.isWritten():
+            return
+        defop = phvn.getDef()
+        if defop is None or defop.numInput() < 1:
+            return
+        refvn = defop.getIn(0)
+        from ghidra.core.space import IPTR_SPACEBASE
+        spacebase = refvn.getSpace()
+        if spacebase.getType() != IPTR_SPACEBASE:
+            if hasattr(data, 'warningHeader'):
+                data.warningHeader("This function may have set the stack pointer")
+        self.stackoffset = refvn.getOffset()
+
+        # If the placeholder is still at its designated slot, abort (remove it)
+        if hasattr(self, '_stackPlaceholderSlot') and self._stackPlaceholderSlot >= 0:
+            if self.op.getIn(self._stackPlaceholderSlot) == phvn:
+                self.abortSpacebaseRelative(data)
+                return
+
+        if self.isInputLocked():
+            slot = self.op.getSlot(phvn) - 1
+            if slot >= self.numParams():
+                raise LowlevelError("Stack placeholder does not line up with locked parameter")
+            param = self.getParam(slot)
+            addr = param.getAddress()
+            if addr.getSpace() != spacebase:
+                if spacebase.getType() == IPTR_SPACEBASE:
+                    raise LowlevelError("Stack placeholder does not match locked space")
+            self.stackoffset -= addr.getOffset()
+            if hasattr(spacebase, 'wrapOffset'):
+                self.stackoffset = spacebase.wrapOffset(self.stackoffset)
+            return
+        raise LowlevelError("Unresolved stack placeholder")
 
     def finalInputCheck(self) -> None:
         """Perform final check on trials affected by conditional execution.
@@ -3850,6 +4298,30 @@ class FuncCallSpecs:
             if not trial.hasCondExeEffect():
                 continue
             trial.markNoUse()
+
+    def resolveModel(self, active) -> None:
+        """Pick a specific model from merged set based on active trials.
+
+        C++ ref: ``FuncCallSpecs::resolveModel`` (fspec.hh:1488)
+        """
+        if self.proto is not None:
+            self.proto.resolveModel(active)
+
+    def deriveInputMap(self, active) -> None:
+        """Given input trials, derive the most likely inputs for this prototype.
+
+        C++ ref: ``FuncCallSpecs::deriveInputMap`` (fspec.hh:1494-1495)
+        """
+        if self.proto is not None:
+            self.proto.deriveInputMap(active)
+
+    def deriveOutputMap(self, active) -> None:
+        """Given output trials, derive the most likely return value.
+
+        C++ ref: ``FuncCallSpecs::deriveOutputMap`` (fspec.hh:1501-1502)
+        """
+        if self.proto is not None:
+            self.proto.deriveOutputMap(active)
 
     def checkInputTrialUse(self, data, aliascheck=None) -> None:
         """Mark if input trials are being actively used.
@@ -4220,6 +4692,276 @@ class FuncCallSpecs:
 
     def setOverride(self, val: bool) -> None:
         self._isOverride = val
+
+    def getSpacebaseRelative(self):
+        """Get stack-pointer Varnode active at the point of this CALL.
+
+        C++ ref: FuncCallSpecs::getSpacebaseRelative in fspec.cc
+        """
+        slot = self.getStackPlaceholderSlot()
+        if slot < 0:
+            return None
+        tmpvn = self.op.getIn(slot)
+        if not hasattr(tmpvn, 'isSpacebasePlaceholder') or not tmpvn.isSpacebasePlaceholder():
+            return None
+        if not tmpvn.isWritten():
+            return None
+        loadop = tmpvn.getDef()
+        if loadop.code() != OpCode.CPUI_LOAD:
+            return None
+        return loadop.getIn(1)
+
+    def buildParam(self, data, vn, param, stackref):
+        """Build a Varnode representing a specific parameter.
+
+        If vn is None, build a spacebase-relative varnode.
+        If vn size doesn't match, create a SUBPIECE truncation.
+        C++ ref: FuncCallSpecs::buildParam in fspec.cc
+        """
+        if vn is None:
+            spc = param.getAddress().getSpace()
+            off = param.getAddress().getOffset()
+            sz = param.getSize()
+            vn = data.opStackLoad(spc, off, sz, self.op, stackref, False)
+            return vn
+        if vn.getSize() == param.getSize():
+            return vn
+        newop = data.newOp(2, self.op.getAddr())
+        data.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
+        newout = data.newUniqueOut(param.getSize(), newop)
+        if vn.isFree() and not vn.isConstant() and not vn.hasNoDescend():
+            vn = data.newVarnode(vn.getSize(), vn.getAddr())
+        data.opSetInput(newop, vn, 0)
+        data.opSetInput(newop, data.newConstant(4, 0), 1)
+        data.opInsertBefore(newop, self.op)
+        return newout
+
+    def transferLockedInputParam(self, param) -> int:
+        """Get the index of the CALL input Varnode matching the given parameter.
+
+        Returns slot# to reuse, -1 for stack parameter, 0 if can't be built.
+        C++ ref: FuncCallSpecs::transferLockedInputParam in fspec.cc
+        """
+        activeIn = self.getActiveInput()
+        if activeIn is None:
+            return 0
+        numtrials = activeIn.getNumTrials()
+        startaddr = param.getAddress()
+        sz = param.getSize()
+        lastaddr = startaddr + (sz - 1)
+        for i in range(numtrials):
+            curtrial = activeIn.getTrial(i)
+            if startaddr < curtrial.getAddress():
+                continue
+            trialend = curtrial.getAddress() + (curtrial.getSize() - 1)
+            if trialend < lastaddr:
+                continue
+            if curtrial.isDefinitelyNotUsed():
+                return 0
+            return curtrial.getSlot()
+        from ghidra.core.space import IPTR_SPACEBASE
+        if startaddr.getSpace().getType() == IPTR_SPACEBASE:
+            return -1
+        return 0
+
+    def transferLockedOutputParam(self, param, newoutput: list) -> None:
+        """Return any outputs of this CALL that overlap the given return value parameter.
+
+        C++ ref: FuncCallSpecs::transferLockedOutputParam in fspec.cc
+        """
+        vn = self.op.getOut() if self.op is not None else None
+        if vn is not None:
+            if param.getAddress().justifiedContain(param.getSize(), vn.getAddr(), vn.getSize(), False) >= 0:
+                newoutput.append(vn)
+            elif vn.getAddr().justifiedContain(vn.getSize(), param.getAddress(), param.getSize(), False) >= 0:
+                newoutput.append(vn)
+        indop = self.op.previousOp() if self.op is not None and hasattr(self.op, 'previousOp') else None
+        while indop is not None and indop.code() == OpCode.CPUI_INDIRECT:
+            if hasattr(indop, 'isIndirectCreation') and indop.isIndirectCreation():
+                vn = indop.getOut()
+                if param.getAddress().justifiedContain(param.getSize(), vn.getAddr(), vn.getSize(), False) >= 0:
+                    newoutput.append(vn)
+                elif vn.getAddr().justifiedContain(vn.getSize(), param.getAddress(), param.getSize(), False) >= 0:
+                    newoutput.append(vn)
+            indop = indop.previousOp() if hasattr(indop, 'previousOp') else None
+
+    def transferLockedInput(self, newinput: list, source) -> bool:
+        """List/create Varnodes for each input parameter matching a source prototype.
+
+        C++ ref: FuncCallSpecs::transferLockedInput in fspec.cc
+        """
+        newinput.append(self.op.getIn(0))  # Always keep the call destination address
+        numparams = source.numParams()
+        stackref = None
+        for i in range(numparams):
+            reuse = self.transferLockedInputParam(source.getParam(i))
+            if reuse == 0:
+                return False
+            if reuse > 0:
+                newinput.append(self.op.getIn(reuse))
+            else:
+                if stackref is None:
+                    stackref = self.getSpacebaseRelative()
+                if stackref is None:
+                    return False
+                newinput.append(None)
+        return True
+
+    def transferLockedOutput(self, newoutput: list, source) -> bool:
+        """Pass back the Varnode needed to match the output parameter of a source prototype.
+
+        C++ ref: FuncCallSpecs::transferLockedOutput in fspec.cc
+        """
+        param = source.getOutput()
+        from ghidra.types.datatype import TYPE_VOID
+        if param.getType().getMetatype() == TYPE_VOID:
+            return True
+        self.transferLockedOutputParam(param, newoutput)
+        return True
+
+    def commitNewInputs(self, data, newinput: list) -> None:
+        """Update input Varnodes to this CALL to reflect the formal input parameters.
+
+        C++ ref: FuncCallSpecs::commitNewInputs in fspec.cc
+        """
+        if not self.isInputLocked():
+            return
+        stackref = self.getSpacebaseRelative()
+        placeholder = None
+        slot = self.getStackPlaceholderSlot()
+        if slot >= 0:
+            placeholder = self.op.getIn(slot)
+        noplacehold = True
+
+        # Clear activeinput and old placeholder
+        self.clearStackPlaceholderSlot()
+        activeIn = self.getActiveInput()
+        numPasses = 0
+        if activeIn is not None:
+            numPasses = activeIn.getNumPasses() if hasattr(activeIn, 'getNumPasses') else 0
+            activeIn.clear()
+
+        from ghidra.core.space import IPTR_SPACEBASE
+        numparams = self.numParams()
+        for i in range(numparams):
+            param = self.getParam(i)
+            vn = self.buildParam(data, newinput[1 + i], param, stackref)
+            newinput[1 + i] = vn
+            if activeIn is not None:
+                activeIn.registerTrial(param.getAddress(), param.getSize())
+                activeIn.getTrial(i).markActive()
+            if noplacehold and param.getAddress().getSpace().getType() == IPTR_SPACEBASE:
+                if hasattr(vn, 'setSpacebasePlaceholder'):
+                    vn.setSpacebasePlaceholder()
+                noplacehold = False
+                placeholder = None
+        if placeholder is not None:
+            newinput.append(placeholder)
+            self.setStackPlaceholderSlot(len(newinput) - 1)
+        data.opSetAllInput(self.op, newinput)
+        if not self.proto.isDotdotdot():
+            self.clearActiveInput()
+        else:
+            if activeIn is not None and numPasses > 0:
+                if hasattr(activeIn, 'finishPass'):
+                    activeIn.finishPass()
+
+    def commitNewOutputs(self, data, newoutput: list) -> None:
+        """Update output Varnode to this CALL to reflect the formal return value.
+
+        C++ ref: FuncCallSpecs::commitNewOutputs in fspec.cc
+        """
+        if not self.isOutputLocked():
+            return
+        activeOut = self.getActiveOutput()
+        if activeOut is not None:
+            activeOut.clear()
+
+        if newoutput:
+            param = self.getOutput()
+            if activeOut is not None:
+                activeOut.registerTrial(param.getAddress(), param.getSize())
+            from ghidra.types.datatype import TYPE_BOOL
+            if (param.getSize() == 1 and param.getType().getMetatype() == TYPE_BOOL
+                    and hasattr(data, 'isTypeRecoveryOn') and data.isTypeRecoveryOn()):
+                if hasattr(data, 'opMarkCalculatedBool'):
+                    data.opMarkCalculatedBool(self.op)
+
+            # Find exact match
+            exactMatch = None
+            for i in range(len(newoutput)):
+                if newoutput[i].getSize() == param.getSize():
+                    exactMatch = newoutput[i]
+                    break
+
+            if exactMatch is not None:
+                indOp = exactMatch.getDef() if exactMatch.isWritten() else None
+                if indOp is not None and self.op is not indOp:
+                    data.opSetOutput(self.op, exactMatch)
+                    data.opUnlink(indOp)
+                realOut = exactMatch
+            else:
+                data.opUnsetOutput(self.op)
+                realOut = data.newVarnodeOut(param.getSize(), param.getAddress(), self.op)
+
+            for i in range(len(newoutput)):
+                oldOut = newoutput[i]
+                if oldOut is exactMatch:
+                    continue
+                indOp = oldOut.getDef() if oldOut.isWritten() else None
+                if indOp is self.op:
+                    indOp = None
+                if oldOut.getSize() < param.getSize():
+                    # Truncation: create SUBPIECE
+                    if indOp is not None:
+                        data.opUninsert(indOp)
+                        data.opSetOpcode(indOp, OpCode.CPUI_SUBPIECE)
+                    else:
+                        indOp = data.newOp(2, self.op.getAddr())
+                        data.opSetOpcode(indOp, OpCode.CPUI_SUBPIECE)
+                        data.opSetOutput(indOp, oldOut)
+                    overlap = oldOut.overlap(realOut.getAddr(), realOut.getSize()) if hasattr(oldOut, 'overlap') else 0
+                    data.opSetInput(indOp, realOut, 0)
+                    data.opSetInput(indOp, data.newConstant(4, overlap), 1)
+                    data.opInsertAfter(indOp, self.op)
+                elif param.getSize() < oldOut.getSize():
+                    # Extension: check for natural extension
+                    overlap_val = oldOut.getAddr().justifiedContain(
+                        oldOut.getSize(), param.getAddress(), param.getSize(), False) if hasattr(oldOut.getAddr(), 'justifiedContain') else 0
+                    opc = self.proto.assumedOutputExtension(param.getAddress(), param.getSize()) if hasattr(self.proto, 'assumedOutputExtension') else OpCode.CPUI_COPY
+                    if opc != OpCode.CPUI_COPY and overlap_val == 0:
+                        from ghidra.types.datatype import TYPE_INT
+                        if opc == OpCode.CPUI_PIECE:
+                            if param.getType().getMetatype() == TYPE_INT:
+                                opc = OpCode.CPUI_INT_SEXT
+                            else:
+                                opc = OpCode.CPUI_INT_ZEXT
+                        if indOp is not None:
+                            data.opUninsert(indOp)
+                            if indOp.numInput() > 1:
+                                data.opRemoveInput(indOp, 1)
+                            data.opSetOpcode(indOp, opc)
+                            data.opSetInput(indOp, realOut, 0)
+                            data.opInsertAfter(indOp, self.op)
+                        else:
+                            extop = data.newOp(1, self.op.getAddr())
+                            data.opSetOpcode(extop, opc)
+                            data.opSetOutput(extop, oldOut)
+                            data.opSetInput(extop, realOut, 0)
+                            data.opInsertAfter(extop, self.op)
+                    else:
+                        # Fallback: unlink and create indirect+PIECE chain
+                        if indOp is not None:
+                            data.opUnlink(indOp)
+                        # Simplified: just create a SUBPIECE for the overlap portion
+                        subOp = data.newOp(2, self.op.getAddr())
+                        data.opSetOpcode(subOp, OpCode.CPUI_SUBPIECE)
+                        data.opSetOutput(subOp, oldOut)
+                        data.opSetInput(subOp, realOut, 0)
+                        data.opSetInput(subOp, data.newConstant(4, 0), 1)
+                        data.opInsertAfter(subOp, self.op)
+
+        self.clearActiveOutput()
 
     def __repr__(self) -> str:
         return f"FuncCallSpecs({self.name!r} @ {self.entryaddress})"

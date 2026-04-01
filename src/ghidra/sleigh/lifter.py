@@ -42,11 +42,13 @@ class _StackSpace(AddrSpace):
       x86-64: RSP at register offset 0x20, size 8
     """
     def __init__(self, mgr, reg_space, idx: int, flags: int,
-                 sp_offset: int = 0x10, sp_size: int = 4):
+                 sp_offset: int = 0x10, sp_size: int = 4,
+                 contain_space=None):
         super().__init__(mgr, None, IPTR_SPACEBASE, "stack", False, sp_size, 1, idx,
                          flags, 1, 1)  # delay=1, deadcodedelay=1
         self._reg_space = reg_space
         self._spacebase = _SpacebasePoint(reg_space, sp_offset, sp_size)
+        self._contain = contain_space  # RAM space that the stack overlays
 
     def numSpacebase(self) -> int:
         return 1
@@ -55,6 +57,10 @@ class _StackSpace(AddrSpace):
         if i != 0:
             raise IndexError(f"Stack space has only 1 spacebase, got index {i}")
         return self._spacebase
+
+    def getContain(self):
+        """Return the address space that this spacebase overlays (RAM)."""
+        return self._contain
 
     def stackGrowsNegative(self) -> bool:
         return True
@@ -80,6 +86,7 @@ class Lifter:
 
         # Build address space manager from native register info
         self._spc_mgr = AddrSpaceManager()
+        self._spc_mgr._native = self._native  # expose for _TranslateShim
         self._spaces: Dict[str, AddrSpace] = {}
         self._setup_spaces()
 
@@ -159,7 +166,9 @@ class Lifter:
                 sp_off, sp_sz = 0x20, 8
             else:
                 sp_off, sp_sz = 0x10, 4
-            stack_spc = _StackSpace(self._spc_mgr, reg_space, idx, stack_flags, sp_off, sp_sz)
+            ram_space = self._spaces.get("ram")
+            stack_spc = _StackSpace(self._spc_mgr, reg_space, idx, stack_flags, sp_off, sp_sz,
+                                    contain_space=ram_space)
             self._spc_mgr._insertSpace(stack_spc)
             self._spc_mgr._stackSpace = stack_spc
             self._spaces["stack"] = stack_spc
@@ -667,8 +676,18 @@ class Lifter:
                     fd.opSetOutput(op, out_vn)
 
                 # Inputs — always fresh varnode (heritage connects via rename)
+                is_load_store = opc in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE)
                 for i, inp in enumerate(native_op.inputs):
                     in_vn = make_vn(inp.space, inp.offset, inp.size)
+                    # For LOAD/STORE input 0: tag the space constant with the
+                    # actual target space.  The native engine encodes the C++
+                    # AddrSpace* pointer as the offset of a const varnode; we
+                    # resolve it to the default data space (RAM) since that is
+                    # the only space x86 SLEIGH LOAD/STORE ops target.
+                    if is_load_store and i == 0 and inp.space == "const":
+                        data_spc = self._spc_mgr.getDefaultDataSpace()
+                        if data_spc is not None:
+                            in_vn.setSpaceFromConst(data_spc)
                     fd.opSetInput(op, in_vn, i)
 
                 fd.opInsertEnd(op, bb)

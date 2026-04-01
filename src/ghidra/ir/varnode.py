@@ -12,6 +12,10 @@ from typing import TYPE_CHECKING, Optional, List, Iterator, Set
 from ghidra.core.address import Address, calc_mask
 from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_JOIN, IPTR_FSPEC, IPTR_IOP, IPTR_INTERNAL, IPTR_PROCESSOR, IPTR_SPACEBASE
 from ghidra.core.pcoderaw import VarnodeData
+from ghidra.core.opcodes import OpCode as _OpCode
+_VN_WRITTEN  = 0x10   # Varnode.written flag bit
+_CPUI_COPY   = 1      # OpCode.CPUI_COPY integer value
+_ADDRSPACE_BIG_ENDIAN = 1  # AddrSpace.big_endian flag
 
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
@@ -77,6 +81,13 @@ class Varnode:
     stop_uppropagation = 0x800
     has_implied_field = 0x1000
 
+    __slots__ = (
+        '_flags', '_size', '_create_index', '_mergegroup', '_addlflags',
+        '_loc', '_def', '_high', '_mapentry', '_type', '_descend',
+        '_cover', '_temp_dataType', '_valueSet', '_consumed', '_nzm',
+        '_iop_ref', '_space_ref',  # set dynamically in funcdata.py
+    )
+
     def __init__(self, size: int, loc: Address, dt=None) -> None:
         self._flags: int = 0
         self._size: int = size
@@ -94,8 +105,10 @@ class Varnode:
         self._valueSet = None
         self._consumed: int = ~0 & 0xFFFFFFFFFFFFFFFF
         self._nzm: int = 0
+        self._iop_ref = None
+        self._space_ref = None
 
-        spc = loc.getSpace()
+        spc = loc.base  # cache the space directly
         if spc is None:
             self._flags = 0
             return
@@ -116,7 +129,7 @@ class Varnode:
         return self._loc
 
     def getSpace(self) -> Optional[AddrSpace]:
-        return self._loc.getSpace()
+        return self._loc.base
 
     def getOffset(self) -> int:
         return self._loc.getOffset()
@@ -146,14 +159,25 @@ class Varnode:
         return self._create_index
 
     def getCover(self) -> Optional[Cover]:
-        self.updateCover()
+        if self._flags & 0x1000000:  # Varnode.coverdirty
+            self.updateCover()
         return self._cover
 
     def getSpaceFromConst(self) -> Optional[AddrSpace]:
-        """Get AddrSpace from this encoded constant Varnode (LOAD/STORE)."""
-        # In C++ this casts the offset to an AddrSpace pointer; in Python we store the space ref.
-        # The caller must resolve this appropriately.
+        """Get AddrSpace from this encoded constant Varnode (LOAD/STORE).
+
+        In C++ the offset IS a cast AddrSpace* pointer; ``getSpaceFromConst``
+        casts it back.  In Python the lifter stores the actual target space
+        reference in ``_space_ref`` (set by ``setSpaceFromConst``).
+        """
+        ref = self._space_ref
+        if ref is not None:
+            return ref
         return self._loc.getSpace()
+
+    def setSpaceFromConst(self, spc: AddrSpace) -> None:
+        """Tag this constant Varnode with the space it encodes (for LOAD/STORE input 0)."""
+        self._space_ref = spc
 
     def getTypeDefFacing(self):
         """Return the data-type of this when it is written to."""
@@ -226,17 +250,15 @@ class Varnode:
     def setFlags(self, fl: int) -> None:
         self._flags |= fl
         if self._high is not None:
-            if hasattr(self._high, 'flagsDirty'):
-                self._high.flagsDirty()
-            if (fl & Varnode.coverdirty) != 0 and hasattr(self._high, 'coverDirty'):
+            self._high.flagsDirty()
+            if (fl & Varnode.coverdirty) != 0:
                 self._high.coverDirty()
 
     def clearFlags(self, fl: int) -> None:
         self._flags &= ~fl
         if self._high is not None:
-            if hasattr(self._high, 'flagsDirty'):
-                self._high.flagsDirty()
-            if (fl & Varnode.coverdirty) != 0 and hasattr(self._high, 'coverDirty'):
+            self._high.flagsDirty()
+            if (fl & Varnode.coverdirty) != 0:
                 self._high.coverDirty()
 
     def isAnnotation(self) -> bool:
@@ -508,13 +530,13 @@ class Varnode:
         self._flags &= ~Varnode.directwrite
 
     def setImplied(self) -> None:
-        self._flags |= Varnode.implied
+        self._flags = (self._flags | Varnode.implied) & ~Varnode.explict
 
     def clearImplied(self) -> None:
         self._flags &= ~Varnode.implied
 
     def setExplicit(self) -> None:
-        self._flags |= Varnode.explict
+        self._flags = (self._flags | Varnode.explict) & ~Varnode.implied
 
     def clearExplicit(self) -> None:
         self._flags &= ~Varnode.explict
@@ -873,7 +895,7 @@ class Varnode:
 
     def getUsePoint(self, fd: Funcdata) -> Address:
         """Get Address when this Varnode first comes into scope."""
-        if self.isWritten():
+        if self._flags & 0x10:
             return self._def.getAddr()
         addr = fd.getAddress()
         return addr + (-1)
@@ -884,20 +906,20 @@ class Varnode:
             return self._type
         ct = None
         if self._def is not None:
-            ct = self._def.outputTypeLocal() if hasattr(self._def, 'outputTypeLocal') else None
-            if ct is not None and hasattr(self._def, 'stopsTypePropagation') and self._def.stopsTypePropagation():
+            ct = self._def.outputTypeLocal()
+            if ct is not None and self._def.stopsTypePropagation():
                 if blockup_ref is not None:
                     blockup_ref[0] = True
                 return ct
         for op in self._descend:
             i = op.getSlot(self)
-            newct = op.inputTypeLocal(i) if hasattr(op, 'inputTypeLocal') else None
+            newct = op.inputTypeLocal(i)
             if newct is None:
                 continue
             if ct is None:
                 ct = newct
             else:
-                if hasattr(newct, 'typeOrder') and newct.typeOrder(ct) < 0:
+                if newct.typeOrder(ct) < 0:
                     ct = newct
         return ct
 
@@ -932,47 +954,48 @@ class Varnode:
 
     def copyShadow(self, op2: Varnode) -> bool:
         """Are this and op2 copied from the same source?"""
-        from ghidra.core.opcodes import OpCode
         if self is op2:
             return True
         vn = self
-        while vn.isWritten() and vn.getDef().code() == OpCode.CPUI_COPY:
-            vn = vn.getDef().getIn(0)
+        while vn is not None and (vn._flags & _VN_WRITTEN) and vn._def._opcode_enum == _CPUI_COPY:
+            vn = vn._def._inrefs[0]
             if vn is op2:
                 return True
-        while op2.isWritten() and op2.getDef().code() == OpCode.CPUI_COPY:
-            op2 = op2.getDef().getIn(0)
+        if vn is None:
+            return False
+        while op2 is not None and (op2._flags & _VN_WRITTEN) and op2._def._opcode_enum == _CPUI_COPY:
+            op2 = op2._def._inrefs[0]
             if vn is op2:
                 return True
         return False
 
     def findSubpieceShadow(self, leastByte: int, whole: Varnode, recurse: int) -> bool:
         """Try to find a SUBPIECE operation producing this from whole."""
-        from ghidra.core.opcodes import OpCode
+        OpCode = _OpCode
         vn = self
-        while vn.isWritten() and vn.getDef().code() == OpCode.CPUI_COPY:
-            vn = vn.getDef().getIn(0)
-        if not vn.isWritten():
-            if vn.isConstant():
+        while vn is not None and (vn._flags & _VN_WRITTEN) and vn._def._opcode_enum == _CPUI_COPY:
+            vn = vn._def._inrefs[0]
+        if vn is None or not (vn._flags & _VN_WRITTEN):
+            if vn is not None and vn.isConstant():
                 w = whole
-                while w.isWritten() and w.getDef().code() == OpCode.CPUI_COPY:
-                    w = w.getDef().getIn(0)
-                if not w.isConstant():
+                while w is not None and (w._flags & _VN_WRITTEN) and w._def._opcode_enum == _CPUI_COPY:
+                    w = w._def._inrefs[0]
+                if w is None or not w.isConstant():
                     return False
                 off = w.getOffset() >> (leastByte * 8)
                 off &= calc_mask(vn.getSize())
                 return off == vn.getOffset()
             return False
-        opc = vn.getDef().code()
+        opc = vn._def._opcode_enum
         if opc == OpCode.CPUI_SUBPIECE:
-            tmpvn = vn.getDef().getIn(0)
-            off = vn.getDef().getIn(1).getOffset()
-            if off != leastByte or tmpvn.getSize() != whole.getSize():
+            tmpvn = vn._def._inrefs[0]
+            off = vn._def._inrefs[1]._loc.offset
+            if off != leastByte or tmpvn._size != whole._size:
                 return False
             if tmpvn is whole:
                 return True
-            while tmpvn.isWritten() and tmpvn.getDef().code() == OpCode.CPUI_COPY:
-                tmpvn = tmpvn.getDef().getIn(0)
+            while tmpvn is not None and (tmpvn._flags & _VN_WRITTEN) and tmpvn._def._opcode_enum == _CPUI_COPY:
+                tmpvn = tmpvn._def._inrefs[0]
                 if tmpvn is whole:
                     return True
         elif opc == OpCode.CPUI_MULTIEQUAL:
@@ -980,44 +1003,48 @@ class Varnode:
             if recurse > 1:
                 return False
             w = whole
-            while w.isWritten() and w.getDef().code() == OpCode.CPUI_COPY:
-                w = w.getDef().getIn(0)
-            if not w.isWritten():
+            while w is not None and (w._flags & _VN_WRITTEN) and w._def._opcode_enum == _CPUI_COPY:
+                w = w._def._inrefs[0]
+            if w is None or not (w._flags & _VN_WRITTEN):
                 return False
-            bigOp = w.getDef()
+            bigOp = w._def
             if bigOp.code() != OpCode.CPUI_MULTIEQUAL:
                 return False
             smallOp = vn.getDef()
             if bigOp.getParent() is not smallOp.getParent():
                 return False
             for i in range(smallOp.numInput()):
-                if not smallOp.getIn(i).findSubpieceShadow(leastByte, bigOp.getIn(i), recurse):
+                inp_s = smallOp.getIn(i)
+                inp_b = bigOp.getIn(i)
+                if inp_s is None or inp_b is None:
+                    return False
+                if not inp_s.findSubpieceShadow(leastByte, inp_b, recurse):
                     return False
             return True
         return False
 
     def findPieceShadow(self, leastByte: int, piece: Varnode) -> bool:
         """Try to find a PIECE operation that produces this from a given piece."""
-        from ghidra.core.opcodes import OpCode
+        OpCode = _OpCode
         vn = self
-        while vn.isWritten() and vn.getDef().code() == OpCode.CPUI_COPY:
-            vn = vn.getDef().getIn(0)
-        if not vn.isWritten():
+        while vn is not None and (vn._flags & _VN_WRITTEN) and vn._def._opcode_enum == _CPUI_COPY:
+            vn = vn._def._inrefs[0]
+        if vn is None or not (vn._flags & _VN_WRITTEN):
             return False
-        opc = vn.getDef().code()
+        opc = vn._def._opcode_enum
         if opc == OpCode.CPUI_PIECE:
-            tmpvn = vn.getDef().getIn(1)  # Least significant part
-            if leastByte >= tmpvn.getSize():
-                leastByte -= tmpvn.getSize()
-                tmpvn = vn.getDef().getIn(0)
+            tmpvn = vn._def._inrefs[1]  # Least significant part
+            if leastByte >= tmpvn._size:
+                leastByte -= tmpvn._size
+                tmpvn = vn._def._inrefs[0]
             else:
-                if piece.getSize() + leastByte > tmpvn.getSize():
+                if piece._size + leastByte > tmpvn._size:
                     return False
-            if leastByte == 0 and tmpvn.getSize() == piece.getSize():
+            if leastByte == 0 and tmpvn._size == piece._size:
                 if tmpvn is piece:
                     return True
-                while tmpvn.isWritten() and tmpvn.getDef().code() == OpCode.CPUI_COPY:
-                    tmpvn = tmpvn.getDef().getIn(0)
+                while tmpvn is not None and (tmpvn._flags & _VN_WRITTEN) and tmpvn._def._opcode_enum == _CPUI_COPY:
+                    tmpvn = tmpvn._def._inrefs[0]
                     if tmpvn is piece:
                         return True
                 return False
@@ -1026,20 +1053,23 @@ class Varnode:
 
     def partialCopyShadow(self, op2: Varnode, relOff: int) -> bool:
         """Is one of this or op2 a partial copy of the other?"""
-        if self._size < op2._size:
+        s1 = self._size; s2 = op2._size
+        if s1 < s2:
             vn = self
-        elif self._size > op2._size:
+        elif s1 > s2:
             vn = op2
             op2 = self
             relOff = -relOff
+            s1, s2 = s2, s1
         else:
             return False
         if relOff < 0:
             return False
-        if relOff + vn.getSize() > op2.getSize():
+        if relOff + s1 > s2:
             return False
-        bigEndian = self.getSpace().isBigEndian() if self.getSpace() else False
-        leastByte = (op2.getSize() - vn.getSize()) - relOff if bigEndian else relOff
+        spc = self._loc.base
+        bigEndian = ((spc._flags & _ADDRSPACE_BIG_ENDIAN) != 0) if spc is not None else False
+        leastByte = (s2 - s1) - relOff if bigEndian else relOff
         if vn.findSubpieceShadow(leastByte, op2, 0):
             return True
         if op2.findPieceShadow(leastByte, vn):
@@ -1285,6 +1315,8 @@ class VarnodeBank:
         self._manage = manage  # AddrSpaceManager
         self._loc_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
         self._def_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
+        self._addr_idx: Dict[tuple, List] = {}   # (offset, size) -> [id(vn), ...]
+        self._space_varnodes: Dict[int, set] = {}  # id(space) -> {vn, ...}
         self._create_index: int = 0
         self._uniq_space = None
         self._uniqbase: int = 0
@@ -1301,6 +1333,8 @@ class VarnodeBank:
     def clear(self) -> None:
         self._loc_tree.clear()
         self._def_tree.clear()
+        self._addr_idx.clear()
+        self._space_varnodes.clear()
         self._create_index = 0
 
     def size(self) -> int:
@@ -1314,14 +1348,33 @@ class VarnodeBank:
         vn = Varnode(s, m, dt)
         vn._create_index = self._create_index
         self._create_index += 1
-        self._loc_tree[id(vn)] = vn
-        self._def_tree[id(vn)] = vn
+        vnid = id(vn)
+        self._loc_tree[vnid] = vn
+        self._def_tree[vnid] = vn
+        key = (m.offset, s)
+        bucket = self._addr_idx.get(key)
+        if bucket is None:
+            self._addr_idx[key] = [vnid]
+        else:
+            bucket.append(vnid)
+        spc_id = id(m.base)
+        sbucket = self._space_varnodes.get(spc_id)
+        if sbucket is None:
+            self._space_varnodes[spc_id] = {vn}
+        else:
+            sbucket.add(vn)
         return vn
 
     def createDef(self, s: int, m: Address, dt, op: PcodeOp) -> Varnode:
-        """Create a new Varnode with a defining PcodeOp."""
+        """Create a new Varnode with a defining PcodeOp.
+
+        C++ ref: ``VarnodeBank::createDef`` — calls xref() which sets
+        the ``insert`` flag.  This is required so that
+        ``isHeritageKnown()`` returns True.
+        """
         vn = self.create(s, m, dt)
         vn.setDef(op)
+        vn.setFlags(Varnode.insert)
         return vn
 
     def destroy(self, vn: Varnode) -> None:
@@ -1329,6 +1382,19 @@ class VarnodeBank:
         vnid = id(vn)
         self._loc_tree.pop(vnid, None)
         self._def_tree.pop(vnid, None)
+        key = (vn._loc.offset, vn._size)
+        bucket = self._addr_idx.get(key)
+        if bucket is not None:
+            try:
+                bucket.remove(vnid)
+            except ValueError:
+                pass
+            if not bucket:
+                del self._addr_idx[key]
+        spc_id = id(vn._loc.base)
+        sbucket = self._space_varnodes.get(spc_id)
+        if sbucket is not None:
+            sbucket.discard(vn)
 
     def clearDead(self) -> None:
         """Remove Varnodes that have no def and no descendants."""
@@ -1337,6 +1403,21 @@ class VarnodeBank:
                      or vn.isInput() or vn.isConstant()}
         self._loc_tree = {k: v for k, v in self._loc_tree.items() if k in alive_ids}
         self._def_tree = {k: v for k, v in self._def_tree.items() if k in alive_ids}
+        self._addr_idx.clear()
+        self._space_varnodes.clear()
+        for vnid, vn in self._loc_tree.items():
+            key = (vn._loc.offset, vn._size)
+            bucket = self._addr_idx.get(key)
+            if bucket is None:
+                self._addr_idx[key] = [vnid]
+            else:
+                bucket.append(vnid)
+            spc_id = id(vn._loc.base)
+            sbucket = self._space_varnodes.get(spc_id)
+            if sbucket is None:
+                self._space_varnodes[spc_id] = {vn}
+            else:
+                sbucket.add(vn)
 
     def getCreateIndex(self) -> int:
         return self._create_index
@@ -1349,13 +1430,20 @@ class VarnodeBank:
 
     def findLoc(self, addr: Address, size: int) -> List[Varnode]:
         """Find all Varnodes at the given location and size."""
-        return [vn for vn in self._loc_tree.values()
-                if vn.getAddr() == addr and vn.getSize() == size]
+        bucket = self._addr_idx.get((addr.offset, size))
+        if bucket is None:
+            return []
+        return [self._loc_tree[vnid] for vnid in bucket if vnid in self._loc_tree]
 
     def findInput(self, size: int, addr: Address) -> Optional[Varnode]:
         """Find an input Varnode of given size at given address."""
-        for vn in self._loc_tree.values():
-            if vn.getAddr() == addr and vn.getSize() == size and vn.isInput():
+        bucket = self._addr_idx.get((addr.offset, size))
+        if bucket is None:
+            return None
+        loc_tree = self._loc_tree
+        for vnid in bucket:
+            vn = loc_tree.get(vnid)
+            if vn is not None and vn.isInput():
                 return vn
         return None
 
@@ -1407,24 +1495,39 @@ class VarnodeBank:
 
     def xref(self, vn: Varnode) -> Varnode:
         """Insert a Varnode into the sorted lists, handling duplicates."""
-        # Check for existing match in loc_tree
-        for existing in self._loc_tree.values():
-            if (existing.getAddr() == vn.getAddr() and
-                    existing.getSize() == vn.getSize() and
-                    existing.getFlags() & (Varnode.input | Varnode.written) ==
-                    vn.getFlags() & (Varnode.input | Varnode.written)):
-                if vn.isWritten() and existing.isWritten():
-                    if existing.getDef() is not None and vn.getDef() is not None:
-                        if existing.getDef().getSeqNum() == vn.getDef().getSeqNum():
+        key = (vn._loc.offset, vn._size)
+        bucket = self._addr_idx.get(key)
+        _IP_WR = 0x18  # Varnode.input | Varnode.written
+        _WR    = 0x10  # Varnode.written
+        _FREE  = 0x18  # free = not(written|input) — same mask as _IP_WR
+        vn_flags = vn._flags
+        if bucket:
+            vn_iw = vn_flags & _IP_WR
+            loc_tree = self._loc_tree
+            for eid in bucket:
+                existing = loc_tree.get(eid)
+                if existing is None or existing is vn:
+                    continue
+                if existing._flags & _IP_WR != vn_iw:
+                    continue
+                if vn_flags & _WR:  # isWritten
+                    ex_def = existing._def
+                    vn_def = vn._def
+                    if ex_def is not None and vn_def is not None:
+                        if ex_def._start.uniq == vn_def._start.uniq:  # SeqNum eq inline
                             self.replace(vn, existing)
                             return existing
-                elif not vn.isWritten() and not vn.isFree():
+                elif not (vn_flags & _FREE):  # not isWritten and not isFree
                     self.replace(vn, existing)
                     return existing
-        vn.setFlags(Varnode.insert)
+        vn._flags = vn_flags | Varnode.insert  # setFlags(insert)
         vnid = id(vn)
         self._loc_tree[vnid] = vn
         self._def_tree[vnid] = vn
+        if bucket is None:
+            self._addr_idx[key] = [vnid]
+        else:
+            bucket.append(vnid)  # duplicate guard: xref only called after pop from trees
         return vn
 
     def setInput(self, vn: Varnode) -> Varnode:
@@ -1630,6 +1733,64 @@ def contiguous_test(vn1: Varnode, vn2: Varnode) -> bool:
         return False  # Must be least significant
     if op1.getIn(1).getOffset() != vn2.getSize():
         return False  # Must be contiguous
+    return True
+
+
+def functionalEquality(vn1: Varnode, vn2: Varnode) -> bool:
+    """Determine if two Varnodes hold the same value.
+
+    Only returns True if it can be immediately determined they are equivalent.
+    C++ ref: expression.cc — functionalEquality
+    """
+    from ghidra.core.opcodes import OpCode
+    if vn1 is vn2:
+        return True
+    if vn1.getSize() != vn2.getSize():
+        return False
+    if vn1.isConstant():
+        if vn2.isConstant():
+            return vn1.getOffset() == vn2.getOffset()
+        return False
+    if vn1.isFree() or vn2.isFree():
+        return False
+    # Both are written — compare their defining ops
+    if not (vn1._flags & 0x10) or not (vn2._flags & 0x10):
+        return False
+    op1 = vn1._def
+    op2 = vn2._def
+    opc = op1.code()
+    if opc != op2.code():
+        return False
+    num = op1.numInput()
+    if num != op2.numInput():
+        return False
+    if op1.isMarker():
+        return False
+    if op2.isCall():
+        return False
+    if opc == OpCode.CPUI_LOAD:
+        if op1.getAddr() != op2.getAddr():
+            return False
+    if num >= 3:
+        if opc != OpCode.CPUI_PTRADD:
+            return False
+        if op1.getIn(2).getOffset() != op2.getIn(2).getOffset():
+            return False
+        num = 2
+    for i in range(num):
+        in1 = op1.getIn(i)
+        in2 = op2.getIn(i)
+        if in1 is in2:
+            continue
+        if in1.getSize() != in2.getSize():
+            return False
+        if in1.isConstant():
+            if not in2.isConstant() or in1.getOffset() != in2.getOffset():
+                return False
+        elif in1.isFree() or in2.isFree():
+            return False
+        else:
+            return False
     return True
 
 

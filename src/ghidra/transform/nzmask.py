@@ -8,79 +8,95 @@ from ghidra.core.address import (
 )
 
 
+_BOOL_OPCS = frozenset((
+    OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL,
+    OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_SLESSEQUAL,
+    OpCode.CPUI_INT_LESS, OpCode.CPUI_INT_LESSEQUAL,
+    OpCode.CPUI_INT_CARRY, OpCode.CPUI_INT_SCARRY,
+    OpCode.CPUI_INT_SBORROW, OpCode.CPUI_BOOL_NEGATE,
+    OpCode.CPUI_BOOL_XOR, OpCode.CPUI_BOOL_AND, OpCode.CPUI_BOOL_OR,
+    OpCode.CPUI_FLOAT_EQUAL, OpCode.CPUI_FLOAT_NOTEQUAL,
+    OpCode.CPUI_FLOAT_LESS, OpCode.CPUI_FLOAT_LESSEQUAL,
+    OpCode.CPUI_FLOAT_NAN,
+))
+
+_VN_CONSTANT = 0x02  # Varnode.constant flag
+
+
 def getNZMaskLocal(op, cliploop=True):
-    out = op.getOut()
+    out = op._output
     if out is None: return 0
-    size = out.getSize()
+    size = out._size
     fm = calc_mask(size)
-    opc = op.code()
-    bools = (OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL,
-             OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_SLESSEQUAL,
-             OpCode.CPUI_INT_LESS, OpCode.CPUI_INT_LESSEQUAL,
-             OpCode.CPUI_INT_CARRY, OpCode.CPUI_INT_SCARRY,
-             OpCode.CPUI_INT_SBORROW, OpCode.CPUI_BOOL_NEGATE,
-             OpCode.CPUI_BOOL_XOR, OpCode.CPUI_BOOL_AND, OpCode.CPUI_BOOL_OR,
-             OpCode.CPUI_FLOAT_EQUAL, OpCode.CPUI_FLOAT_NOTEQUAL,
-             OpCode.CPUI_FLOAT_LESS, OpCode.CPUI_FLOAT_LESSEQUAL,
-             OpCode.CPUI_FLOAT_NAN)
-    if opc in bools:
+    opc = op._opcode_enum
+    ins = op._inrefs
+    # Guard: any None input → return full mask (conservative)
+    for vn in ins:
+        if vn is None:
+            return fm
+    if opc in _BOOL_OPCS:
         return 1
     if opc in (OpCode.CPUI_COPY, OpCode.CPUI_INT_ZEXT):
-        return op.getIn(0).getNZMask()
+        return ins[0]._nzm
     if opc == OpCode.CPUI_INT_SEXT:
-        return sign_extend_sized(op.getIn(0).getNZMask(), op.getIn(0).getSize(), size) & fm
+        i0 = ins[0]
+        return sign_extend_sized(i0._nzm, i0._size, size) & fm
     if opc in (OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_OR):
-        r = op.getIn(0).getNZMask()
-        return r | op.getIn(1).getNZMask() if r != fm else fm
+        r = ins[0]._nzm
+        return r | ins[1]._nzm if r != fm else fm
     if opc == OpCode.CPUI_INT_AND:
-        r = op.getIn(0).getNZMask()
-        return r & op.getIn(1).getNZMask() if r != 0 else 0
+        r = ins[0]._nzm
+        return r & ins[1]._nzm if r != 0 else 0
     if opc == OpCode.CPUI_INT_LEFT:
-        if not op.getIn(1).isConstant(): return fm
-        sa = int(op.getIn(1).getOffset())
-        return pcode_left(op.getIn(0).getNZMask(), sa) & fm
+        i1 = ins[1]
+        if not (i1._flags & _VN_CONSTANT): return fm
+        sa = int(i1._loc.offset)
+        return pcode_left(ins[0]._nzm, sa) & fm
     if opc == OpCode.CPUI_INT_RIGHT:
-        if not op.getIn(1).isConstant(): return fm
-        sa = int(op.getIn(1).getOffset())
-        return pcode_right(op.getIn(0).getNZMask(), sa)
+        i1 = ins[1]
+        if not (i1._flags & _VN_CONSTANT): return fm
+        sa = int(i1._loc.offset)
+        return pcode_right(ins[0]._nzm, sa)
     if opc == OpCode.CPUI_INT_SRIGHT:
-        if not op.getIn(1).isConstant() or size > 8: return fm
-        sa = int(op.getIn(1).getOffset())
-        r = op.getIn(0).getNZMask()
+        i1 = ins[1]
+        if not (i1._flags & _VN_CONSTANT) or size > 8: return fm
+        sa = int(i1._loc.offset)
+        r = ins[0]._nzm
         if (r & (fm ^ (fm >> 1))) == 0:
             return pcode_right(r, sa)
         return pcode_right(r, sa) | ((fm >> sa) ^ fm)
     if opc == OpCode.CPUI_INT_DIV:
-        val = op.getIn(0).getNZMask()
+        val = ins[0]._nzm
         r = coveringmask(val)
-        if op.getIn(1).isConstant():
-            sa = mostsigbit_set(op.getIn(1).getNZMask())
+        i1 = ins[1]
+        if i1._flags & _VN_CONSTANT:
+            sa = mostsigbit_set(i1._nzm)
             if sa != -1:
                 r >>= sa
         return r & fm
     if opc == OpCode.CPUI_INT_REM:
-        val = op.getIn(1).getNZMask() - 1
+        val = ins[1]._nzm - 1
         return coveringmask(val) & fm
     if opc == OpCode.CPUI_SUBPIECE:
-        r = op.getIn(0).getNZMask()
-        s = int(op.getIn(1).getOffset())
+        r = ins[0]._nzm
+        s = int(ins[1]._loc.offset)
         return (r >> (8 * s)) & fm if s < 8 else 0
     if opc == OpCode.CPUI_PIECE:
-        sa = op.getIn(1).getSize()
-        hi = op.getIn(0).getNZMask()
+        sa = ins[1]._size
+        hi = ins[0]._nzm
         r = (hi << (8 * sa)) if sa < 8 else 0
-        return (r | op.getIn(1).getNZMask()) & fm
+        return (r | ins[1]._nzm) & fm
     if opc == OpCode.CPUI_INT_ADD:
-        r = op.getIn(0).getNZMask()
+        r = ins[0]._nzm
         if r != fm:
-            r |= op.getIn(1).getNZMask()
+            r |= ins[1]._nzm
             r |= (r << 1)
             r &= fm
         return r
     if opc == OpCode.CPUI_INT_MULT:
         if size > 8: return fm
-        v1 = op.getIn(0).getNZMask()
-        v2 = op.getIn(1).getNZMask()
+        v1 = ins[0]._nzm
+        v2 = ins[1]._nzm
         s1 = mostsigbit_set(v1); s2 = mostsigbit_set(v2)
         if s1 == -1 or s2 == -1: return 0
         l1 = leastsigbit_set(v1); l2 = leastsigbit_set(v2)
@@ -94,39 +110,44 @@ def getNZMaskLocal(op, cliploop=True):
     if opc == OpCode.CPUI_INT_NEGATE:
         return fm
     if opc == OpCode.CPUI_MULTIEQUAL:
-        if op.numInput() == 0: return fm
+        n = len(ins)
+        if n == 0: return fm
         r = 0
-        for i in range(op.numInput()):
+        for i in range(n):
             if cliploop:
-                parent = op.getParent()
-                if parent is not None and hasattr(parent, 'isLoopIn') and (not hasattr(parent, 'sizeIn') or i < parent.sizeIn()) and parent.isLoopIn(i):
+                parent = op._parent
+                if parent is not None and i < parent.sizeIn() and parent.isLoopIn(i):
                     continue
-            r |= op.getIn(i).getNZMask()
+            r |= ins[i]._nzm
         return r
     if opc == OpCode.CPUI_INDIRECT:
         return fm
     if opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND, OpCode.CPUI_CPOOLREF):
-        return 1 if hasattr(op, 'isCalculatedBool') and op.isCalculatedBool() else fm
+        return 1 if (op._flags & 0x10000080) else fm  # PcodeOp.calculated_bool | booloutput
     if opc == OpCode.CPUI_POPCOUNT:
-        s = popcount(op.getIn(0).getNZMask())
+        s = popcount(ins[0]._nzm)
         return coveringmask(s) & fm
     if opc == OpCode.CPUI_LZCOUNT:
-        return coveringmask(op.getIn(0).getSize() * 8) & fm
+        return coveringmask(ins[0]._size * 8) & fm
     return fm
+
+
+_VN_WRITTEN2   = 0x10   # Varnode.written
+_VN_CONSTANT2  = 0x02   # Varnode.constant
 
 
 def calcNZMask(data):
     """Calculate non-zero mask for all Varnodes in the function."""
     for op in list(data._obank.beginAlive()):
-        for i in range(op.numInput()):
-            vn = op.getIn(i)
+        for vn in op._inrefs:
             if vn is None:
                 continue
-            if not vn.isWritten():
-                if vn.isConstant():
-                    vn._nzm = vn.getOffset()
+            vn_flags = vn._flags
+            if not (vn_flags & _VN_WRITTEN2):
+                if vn_flags & _VN_CONSTANT2:
+                    vn._nzm = vn._loc.offset
                 else:
-                    vn._nzm = calc_mask(vn.getSize())
-        out = op.getOut()
+                    vn._nzm = calc_mask(vn._size)
+        out = op._output
         if out is not None:
             out._nzm = getNZMaskLocal(op, True)

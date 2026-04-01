@@ -573,6 +573,8 @@ class MapState:
         self._maplist.append(newRange)
 
     def _addFixedType(self, start: int, ct, flags: int, types) -> None:
+        if ct is None:
+            return
         if ct.getMetatype() == 'partialstruct':
             parent = ct.getParent()
             if parent.getMetatype() == 'struct' and ct.getOffset() == 0:
@@ -712,7 +714,7 @@ class MapState:
         for i in range(len(addbase)):
             offset = alias[i]
             ct = addbase[i].base.getType()
-            if ct.getMetatype() == 'ptr':
+            if ct is not None and ct.getMetatype() == 'ptr':
                 ct = ct.getPtrTo()
                 while ct.getMetatype() == 'array':
                     ct = ct.getBase()
@@ -848,16 +850,18 @@ class ScopeLocal(ScopeInternal):
         self._space = decoder.readSpace(ATTRIB_MAIN)
 
     def buildVariableName(self, addr, pc, ct, index: int, flags: int) -> str:
-        if ((flags & 0x20) != 0 and (flags & 0x40) == 0  # addrtied but not persist
+        from ghidra.ir.varnode import Varnode as VN
+        if ((flags & (VN.addrtied | VN.persist)) == VN.addrtied
                 and addr.getSpace() == self._space):
             if self._fd.getFuncProto().getLocalRange().inRange(addr, 1):
                 start = AddrSpace.byteToAddress(addr.getOffset(), self._space.getWordSize())
                 start = AddrSpace.signExtend(start, addr.getAddrSize() * 8 - 1)
                 if self._stackGrowsNegative:
                     start = -start
-                s = ""
-                if ct is not None:
-                    s += ct.printNameBase()
+                buf = []
+                if ct is not None and hasattr(ct, 'printNameBase'):
+                    ct.printNameBase(buf)
+                s = "".join(buf)
                 spacename = addr.getSpace().getName()
                 spacename = spacename[0].upper() + spacename[1:]
                 s += spacename

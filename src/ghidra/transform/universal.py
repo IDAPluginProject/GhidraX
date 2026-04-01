@@ -11,19 +11,19 @@ from ghidra.transform.coreaction2 import *
 
 # Import all available rules
 from ghidra.transform.ruleaction import *
-from ghidra.transform.ruleaction_batch1a import *
-from ghidra.transform.ruleaction_batch1b import *
-from ghidra.transform.ruleaction_batch1c import *
-from ghidra.transform.ruleaction_batch1d import *
-from ghidra.transform.ruleaction_batch1e import *
-from ghidra.transform.ruleaction_batch1f import *
-from ghidra.transform.ruleaction_batch1g import *
-from ghidra.transform.ruleaction_batch1h import *
-from ghidra.transform.ruleaction_batch1i import *
-from ghidra.transform.ruleaction_batch2a import *
-from ghidra.transform.ruleaction_batch2b import *
-from ghidra.transform.ruleaction_batch2c import *
-from ghidra.transform.ruleaction_batch2d import *
+from ghidra.transform.rules_compare import *
+from ghidra.transform.rules_shift_compare import *
+from ghidra.transform.rules_bitcount import *
+from ghidra.transform.rules_zerocomp import *
+from ghidra.transform.rules_extension import *
+from ghidra.transform.rules_piece import *
+from ghidra.transform.rules_misc import *
+from ghidra.transform.rules_boollogic import *
+from ghidra.transform.rules_signmod import *
+from ghidra.transform.rules_phi_float import *
+from ghidra.transform.rules_divopt import *
+from ghidra.transform.rules_pointer import *
+from ghidra.transform.rules_subvar import *
 
 
 def universalAction(allacts: ActionDatabase, conf) -> None:

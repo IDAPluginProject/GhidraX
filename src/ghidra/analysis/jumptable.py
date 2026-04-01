@@ -86,57 +86,220 @@ class LoadTable:
                 i += 1
 
 
+class RootedOp:
+    """A PcodeOp paired with the index of the earliest common Varnode it uses as input.
+
+    C++ ref: RootedOp in jumptable.hh
+    """
+    __slots__ = ('op', 'rootVn')
+
+    def __init__(self, op=None, rootVn: int = 0) -> None:
+        self.op = op
+        self.rootVn = rootVn
+
+
 class PathMeld:
-    """All paths from a switch variable to the BRANCHIND."""
+    """All paths from a switch variable to the BRANCHIND.
+
+    C++ ref: PathMeld in jumptable.hh / jumptable.cc
+    """
 
     def __init__(self) -> None:
-        self._commonVn: list = []
-        self._opMeld: list = []
+        self.commonVn: list = []
+        self.opMeld: List[RootedOp] = []
 
     def clear(self) -> None:
-        self._commonVn.clear()
-        self._opMeld.clear()
+        self.commonVn.clear()
+        self.opMeld.clear()
 
     def empty(self) -> bool:
-        return len(self._commonVn) == 0
+        return len(self.commonVn) == 0
 
     def numCommonVarnode(self) -> int:
-        return len(self._commonVn)
+        return len(self.commonVn)
 
     def numOps(self) -> int:
-        return len(self._opMeld)
+        return len(self.opMeld)
 
     def getVarnode(self, i: int):
-        return self._commonVn[i]
+        return self.commonVn[i]
 
     def getOp(self, i: int):
-        return self._opMeld[i][0]
+        return self.opMeld[i].op
 
     def getOpParent(self, i: int):
-        rootIdx = self._opMeld[i][1]
-        return self._commonVn[rootIdx]
+        rootIdx = self.opMeld[i].rootVn
+        return self.commonVn[rootIdx]
+
+    def getEarliestOp(self, pos: int):
+        """Find the earliest PcodeOp using the Varnode at the given index.
+
+        C++ ref: PathMeld::getEarliestOp in jumptable.cc
+        """
+        for i in range(len(self.opMeld) - 1, -1, -1):
+            if self.opMeld[i].rootVn == pos:
+                return self.opMeld[i].op
+        return None
 
     def set(self, op_or_path, vn=None):
+        """Initialize this container from a single op+vn, a PathMeld, or a PcodeOpNode path.
+
+        C++ ref: PathMeld::set (3 overloads) in jumptable.cc
+        """
         self.clear()
         if vn is not None:
-            self._commonVn.append(vn)
-            self._opMeld.append((op_or_path, 0))
+            # set(PcodeOp*, Varnode*)
+            self.commonVn.append(vn)
+            self.opMeld.append(RootedOp(op_or_path, 0))
         elif isinstance(op_or_path, PathMeld):
-            self._commonVn = list(op_or_path._commonVn)
-            self._opMeld = list(op_or_path._opMeld)
+            # set(const PathMeld&)
+            self.commonVn = list(op_or_path.commonVn)
+            self.opMeld = list(op_or_path.opMeld)
         elif isinstance(op_or_path, list):
-            for item in op_or_path:
-                if hasattr(item, 'op'):
-                    self._opMeld.append((item.op, 0))
+            # set(const vector<PcodeOpNode>&)
+            for i, node in enumerate(op_or_path):
+                vn_item = node.op.getIn(node.slot)
+                self.opMeld.append(RootedOp(node.op, i))
+                self.commonVn.append(vn_item)
+
+    def append(self, op2: 'PathMeld') -> None:
+        """Append paths from another PathMeld to the beginning.
+
+        C++ ref: PathMeld::append in jumptable.cc
+        """
+        shift = len(op2.commonVn)
+        self.commonVn = op2.commonVn + self.commonVn
+        self.opMeld = list(op2.opMeld) + self.opMeld
+        for i in range(len(op2.opMeld), len(self.opMeld)):
+            self.opMeld[i].rootVn += shift
+
+    def internalIntersect(self, parentMap: list) -> None:
+        """Calculate intersection of a new path with the old path.
+
+        C++ ref: PathMeld::internalIntersect in jumptable.cc
+        """
+        newVn = []
+        for vn in self.commonVn:
+            if hasattr(vn, 'isMark') and vn.isMark():
+                parentMap.append(len(newVn))
+                newVn.append(vn)
+                vn.clearMark()
+            else:
+                parentMap.append(-1)
+        self.commonVn = newVn
+        lastIntersect = -1
+        for i in range(len(parentMap) - 1, -1, -1):
+            val = parentMap[i]
+            if val == -1:
+                parentMap[i] = lastIntersect
+            else:
+                lastIntersect = val
+
+    def meldOps(self, path: list, cutOff: int, parentMap: list) -> int:
+        """Meld in PcodeOps from a new path.
+
+        C++ ref: PathMeld::meldOps in jumptable.cc
+        """
+        for entry in self.opMeld:
+            pos = parentMap[entry.rootVn] if entry.rootVn < len(parentMap) else -1
+            if pos == -1:
+                entry.op = None
+            else:
+                entry.rootVn = pos
+
+        newMeld: List[RootedOp] = []
+        curRoot = -1
+        meldPos = 0
+        lastBlock = None
+        for i in range(cutOff):
+            op = path[i].op
+            curOp = None
+            while meldPos < len(self.opMeld):
+                trialOp = self.opMeld[meldPos].op
+                if trialOp is None:
+                    meldPos += 1
+                    continue
+                if trialOp.getParent() is not op.getParent():
+                    if op.getParent() is lastBlock:
+                        curOp = None
+                        break
+                    elif trialOp.getParent() is not lastBlock:
+                        res = self.opMeld[meldPos].rootVn
+                        self.opMeld = newMeld
+                        return res
+                elif trialOp.getSeqNum().getOrder() <= op.getSeqNum().getOrder():
+                    curOp = trialOp
+                    break
+                lastBlock = trialOp.getParent()
+                newMeld.append(self.opMeld[meldPos])
+                curRoot = self.opMeld[meldPos].rootVn
+                meldPos += 1
+            if curOp is op:
+                newMeld.append(self.opMeld[meldPos])
+                curRoot = self.opMeld[meldPos].rootVn
+                meldPos += 1
+            else:
+                newMeld.append(RootedOp(op, curRoot))
+            lastBlock = op.getParent()
+        self.opMeld = newMeld
+        return -1
+
+    def truncatePaths(self, cutPoint: int) -> None:
+        """Truncate all paths at the given cut point.
+
+        C++ ref: PathMeld::truncatePaths in jumptable.cc
+        """
+        while len(self.opMeld) > 1:
+            if self.opMeld[-1].rootVn < cutPoint:
+                break
+            self.opMeld.pop()
+        del self.commonVn[cutPoint:]
+
+    def meld(self, path: list) -> None:
+        """Add a new path, recalculating common Varnodes.
+
+        C++ ref: PathMeld::meld in jumptable.cc
+        """
+        parentMap: list = []
+
+        for node in path:
+            vn = node.op.getIn(node.slot)
+            if hasattr(vn, 'setMark'):
+                vn.setMark()
+        self.internalIntersect(parentMap)
+        cutOff = -1
+
+        for i, node in enumerate(path):
+            vn = node.op.getIn(node.slot)
+            if not (hasattr(vn, 'isMark') and vn.isMark()):
+                cutOff = i + 1
+            elif hasattr(vn, 'clearMark'):
+                vn.clearMark()
+        newCutoff = self.meldOps(path, cutOff, parentMap)
+        if newCutoff >= 0:
+            self.truncatePaths(newCutoff)
+        del path[cutOff:]
 
     def markPaths(self, val: bool, startVarnode: int = 0) -> None:
-        for i in range(len(self._opMeld)):
-            op = self._opMeld[i][0]
-            if hasattr(op, 'setMark') and hasattr(op, 'clearMark'):
-                if val:
-                    op.setMark()
-                else:
-                    op.clearMark()
+        """Mark or unmark all PcodeOps up to the given Varnode index.
+
+        C++ ref: PathMeld::markPaths in jumptable.cc
+        """
+        startOp = -1
+        for i in range(len(self.opMeld) - 1, -1, -1):
+            if self.opMeld[i].rootVn == startVarnode:
+                startOp = i
+                break
+        if startOp < 0:
+            return
+        if val:
+            for i in range(startOp + 1):
+                if hasattr(self.opMeld[i].op, 'setMark'):
+                    self.opMeld[i].op.setMark()
+        else:
+            for i in range(startOp + 1):
+                if hasattr(self.opMeld[i].op, 'clearMark'):
+                    self.opMeld[i].op.clearMark()
 
 
 class GuardRecord:
@@ -170,6 +333,140 @@ class GuardRecord:
 
     def clear(self) -> None:
         self.cbranch = None
+
+    @staticmethod
+    def oneOffMatch(op1, op2) -> int:
+        """Check if two PcodeOps produce the same value via simple duplicate calculation.
+
+        C++ ref: GuardRecord::oneOffMatch in jumptable.cc
+        """
+        if op1.code() != op2.code():
+            return 0
+        opc = op1.code()
+        from ghidra.core.opcodes import OpCode
+        if opc in (OpCode.CPUI_INT_AND, OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_XOR,
+                   OpCode.CPUI_INT_OR, OpCode.CPUI_INT_LEFT, OpCode.CPUI_INT_RIGHT,
+                   OpCode.CPUI_INT_SRIGHT, OpCode.CPUI_INT_MULT, OpCode.CPUI_SUBPIECE):
+            if op2.getIn(0) is not op1.getIn(0):
+                return 0
+            vn1 = op1.getIn(1)
+            vn2 = op2.getIn(1)
+            if vn1.isConstant() and vn2.isConstant() and vn1.getOffset() == vn2.getOffset():
+                return 1
+        return 0
+
+    @staticmethod
+    def quasiCopy(vn, bitsPreserved_out: list) -> 'Varnode':
+        """Compute the source of a quasi-COPY chain for the given Varnode.
+
+        C++ ref: GuardRecord::quasiCopy in jumptable.cc
+        Returns (baseVn, bitsPreserved) as a tuple when called with a list,
+        or just baseVn when bitsPreserved_out is provided as a mutable list.
+        """
+        from ghidra.core.address import mostsigbit_set
+        from ghidra.core.opcodes import OpCode
+        nzmask = vn.getNZMask() if hasattr(vn, 'getNZMask') else 0
+        bitsPreserved = mostsigbit_set(nzmask) + 1
+        if bitsPreserved == 0:
+            if isinstance(bitsPreserved_out, list):
+                bitsPreserved_out.clear()
+                bitsPreserved_out.append(0)
+            return vn
+        mask = (1 << bitsPreserved) - 1
+        op = vn.getDef() if vn.isWritten() else None
+        while op is not None:
+            opc = op.code()
+            if opc == OpCode.CPUI_COPY:
+                vn = op.getIn(0)
+                op = vn.getDef() if vn.isWritten() else None
+            elif opc == OpCode.CPUI_INT_AND:
+                constVn = op.getIn(1)
+                if constVn.isConstant() and constVn.getOffset() == mask:
+                    vn = op.getIn(0)
+                    op = vn.getDef() if vn.isWritten() else None
+                else:
+                    op = None
+            elif opc == OpCode.CPUI_INT_OR:
+                constVn = op.getIn(1)
+                if constVn.isConstant() and ((constVn.getOffset() | mask) == (constVn.getOffset() ^ mask)):
+                    vn = op.getIn(0)
+                    op = vn.getDef() if vn.isWritten() else None
+                else:
+                    op = None
+            elif opc in (OpCode.CPUI_INT_SEXT, OpCode.CPUI_INT_ZEXT):
+                if op.getIn(0).getSize() * 8 >= bitsPreserved:
+                    vn = op.getIn(0)
+                    op = vn.getDef() if vn.isWritten() else None
+                else:
+                    op = None
+            elif opc == OpCode.CPUI_PIECE:
+                if op.getIn(1).getSize() * 8 >= bitsPreserved:
+                    vn = op.getIn(1)
+                    op = vn.getDef() if vn.isWritten() else None
+                else:
+                    op = None
+            elif opc == OpCode.CPUI_SUBPIECE:
+                constVn = op.getIn(1)
+                if constVn.isConstant() and constVn.getOffset() == 0:
+                    vn = op.getIn(0)
+                    op = vn.getDef() if vn.isWritten() else None
+                else:
+                    op = None
+            else:
+                op = None
+        if isinstance(bitsPreserved_out, list):
+            bitsPreserved_out.clear()
+            bitsPreserved_out.append(bitsPreserved)
+        return vn
+
+    def valueMatch(self, vn2, baseVn2, bitsPreserved2: int) -> int:
+        """Determine if this guard applies to the given Varnode.
+
+        C++ ref: GuardRecord::valueMatch in jumptable.cc
+        Returns: 0=no match, 1=same value, 2=same value pending no writes
+        """
+        from ghidra.core.opcodes import OpCode
+        if self.vn is vn2:
+            return 1
+        if self.bitsPreserved == bitsPreserved2:
+            if self.baseVn is baseVn2:
+                return 1
+            loadOp = self.baseVn.getDef() if self.baseVn.isWritten() else None
+            loadOp2 = baseVn2.getDef() if baseVn2.isWritten() else None
+        else:
+            loadOp = self.vn.getDef() if self.vn.isWritten() else None
+            loadOp2 = vn2.getDef() if vn2.isWritten() else None
+        if loadOp is None or loadOp2 is None:
+            return 0
+        if GuardRecord.oneOffMatch(loadOp, loadOp2) == 1:
+            return 1
+        if loadOp.code() != OpCode.CPUI_LOAD or loadOp2.code() != OpCode.CPUI_LOAD:
+            return 0
+        if loadOp.getIn(0).getOffset() != loadOp2.getIn(0).getOffset():
+            return 0
+        ptr = loadOp.getIn(1)
+        ptr2 = loadOp2.getIn(1)
+        if ptr is ptr2:
+            return 2
+        if not ptr.isWritten() or not ptr2.isWritten():
+            return 0
+        addop = ptr.getDef()
+        if addop.code() != OpCode.CPUI_INT_ADD:
+            return 0
+        constvn = addop.getIn(1)
+        if not constvn.isConstant():
+            return 0
+        addop2 = ptr2.getDef()
+        if addop2.code() != OpCode.CPUI_INT_ADD:
+            return 0
+        constvn2 = addop2.getIn(1)
+        if not constvn2.isConstant():
+            return 0
+        if constvn.getOffset() != constvn2.getOffset():
+            return 0
+        if addop.getIn(0) is addop2.getIn(0):
+            return 2
+        return 0
 
 
 class JumpModel:
@@ -827,51 +1124,848 @@ class EmulateFunction:
 
 
 class JumpBasic(JumpModel):
-    """The basic jump-table model: a normalized switch variable with a linear map to addresses."""
+    """The basic jump-table model: a normalized switch variable with a linear map to addresses.
+
+    C++ ref: JumpBasic in jumptable.hh / jumptable.cc
+    """
 
     def __init__(self, jt=None) -> None:
         super().__init__(jt)
-        self._pathMeld = PathMeld()
-        self._jrange = None  # JumpValuesRange
-        self._varnodeIndex = None
-        self._normqvn = None
-        self._switchvn = None
+        self.pathMeld = PathMeld()
+        self.jrange: Optional[JumpValuesRange] = None
+        self.selectguards: List[GuardRecord] = []
+        self.varnodeIndex: int = 0
+        self.normalvn = None  # Varnode: the normalized switch variable
+        self.switchvn = None  # Varnode: the unnormalized switch variable
+
+    def getValueRange(self):
+        return self.jrange
 
     def isOverride(self) -> bool:
         return False
 
     def getTableSize(self) -> int:
-        if self._jrange is not None:
-            return self._jrange.getSize()
+        if self.jrange is not None:
+            return self.jrange.getSize()
         return 0
 
-    def recoverModel(self, fd, indop, matchsize=0, maxtablesize=1024) -> bool:
-        return False  # Full implementation requires emulation
+    # ------------------------------------------------------------------
+    # Static helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def isprune(vn) -> bool:
+        """Test if the search should be pruned at this Varnode.
 
-    def buildAddresses(self, fd, indop, addresstable, loadpoints=None, loadcounts=None):
-        pass
-
-    def findUnnormalized(self, maxaddsub=0, maxleftright=0, maxext=0):
-        pass
-
-    def buildLabels(self, fd, addresstable, label, orig=None):
-        for i in range(len(addresstable)):
-            label.append(i)
-
-    def foldInNormalization(self, fd, indop):
-        return None
-
-    def foldInGuards(self, fd, jump) -> bool:
+        C++ ref: JumpBasic::isprune in jumptable.cc
+        """
+        if not vn.isWritten():
+            return True
+        op = vn.getDef()
+        if op.isCall() or op.isMarker():
+            return True
+        if op.numInput() == 0:
+            return True
         return False
 
-    def sanityCheck(self, fd, indop, addresstable, loadpoints=None, loadcounts=None) -> bool:
+    @staticmethod
+    def ispoint(vn) -> bool:
+        """Test if Varnode could possibly be the switch variable.
+
+        C++ ref: JumpBasic::ispoint in jumptable.cc
+        """
+        if vn.isConstant():
+            return False
+        if hasattr(vn, 'isAnnotation') and vn.isAnnotation():
+            return False
+        if hasattr(vn, 'isReadOnly') and vn.isReadOnly():
+            return False
+        return True
+
+    @staticmethod
+    def getStride(vn) -> int:
+        """Calculate stride from known-zero least-significant bits.
+
+        C++ ref: JumpBasic::getStride in jumptable.cc
+        """
+        mask = vn.getNZMask() if hasattr(vn, 'getNZMask') else 0xFFFFFFFFFFFFFFFF
+        if (mask & 0x3f) == 0:
+            return 32
+        stride = 1
+        while (mask & 1) == 0:
+            mask >>= 1
+            stride <<= 1
+        return stride
+
+    @staticmethod
+    def getMaxValue(vn) -> int:
+        """Get maximum value from INT_AND masking, or 0 if unrestricted.
+
+        C++ ref: JumpBasic::getMaxValue in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.address import coveringmask, calc_mask
+        maxValue = 0
+        if not vn.isWritten():
+            return maxValue
+        op = vn.getDef()
+        if op.code() == OpCode.CPUI_INT_AND:
+            constvn = op.getIn(1)
+            if constvn.isConstant():
+                maxValue = coveringmask(constvn.getOffset())
+                maxValue = (maxValue + 1) & calc_mask(vn.getSize())
+        elif op.code() == OpCode.CPUI_MULTIEQUAL:
+            i = 0
+            for i in range(op.numInput()):
+                subvn = op.getIn(i)
+                if not subvn.isWritten():
+                    break
+                andOp = subvn.getDef()
+                if andOp.code() != OpCode.CPUI_INT_AND:
+                    break
+                cv = andOp.getIn(1)
+                if not cv.isConstant():
+                    break
+                if maxValue < cv.getOffset():
+                    maxValue = cv.getOffset()
+            else:
+                i = op.numInput()  # All inputs matched
+            if i == op.numInput():
+                maxValue = coveringmask(maxValue)
+                maxValue = (maxValue + 1) & calc_mask(vn.getSize())
+            else:
+                maxValue = 0
+        return maxValue
+
+    @staticmethod
+    def backup2Switch(fd, output: int, outvn, invn) -> int:
+        """Back up a constant value from output Varnode to input Varnode.
+
+        C++ ref: JumpBasic::backup2Switch in jumptable.cc
+        """
+        from ghidra.core.error import LowlevelError
+        curvn = outvn
+        while curvn is not invn:
+            op = curvn.getDef()
+            top = op.getOpcode()
+            # Find first non-constant input
+            slot = 0
+            for slot in range(op.numInput()):
+                if not op.getIn(slot).isConstant():
+                    break
+            evalType = op.getEvalType() if hasattr(op, 'getEvalType') else -1
+            if evalType == 2:  # PcodeOp::binary
+                otherslot = 1 - slot
+                otherAddr = op.getIn(otherslot).getAddr()
+                if not otherAddr.isConstant():
+                    otherval = 0  # Would need MemoryImage for readonly
+                else:
+                    otherval = otherAddr.getOffset()
+                if hasattr(top, 'recoverInputBinary'):
+                    output = top.recoverInputBinary(slot, op.getOut().getSize(), output,
+                                                    op.getIn(slot).getSize(), otherval)
+                curvn = op.getIn(slot)
+            elif evalType == 1:  # PcodeOp::unary
+                if hasattr(top, 'recoverInputUnary'):
+                    output = top.recoverInputUnary(op.getOut().getSize(), output,
+                                                   op.getIn(slot).getSize())
+                curvn = op.getIn(slot)
+            else:
+                raise LowlevelError("Bad switch normalization op")
+        return output
+
+    @staticmethod
+    def duplicateVarnodes(arr: list) -> bool:
+        """Check if all Varnodes in array are identical.
+
+        C++ ref: JumpBasic::duplicateVarnodes in jumptable.cc
+        """
+        if not arr:
+            return True
+        vn = arr[0]
+        for i in range(1, len(arr)):
+            if arr[i] is not vn:
+                return False
+        return True
+
+    # ------------------------------------------------------------------
+    # Path / guard analysis
+    # ------------------------------------------------------------------
+    def findDeterminingVarnodes(self, op, slot: int) -> None:
+        """Calculate the initial set of Varnodes that might be switch variables.
+
+        C++ ref: JumpBasic::findDeterminingVarnodes in jumptable.cc
+        """
+        from ghidra.core.expression import PcodeOpNode
+        path = [PcodeOpNode(op, slot)]
+        firstpoint = False
+
+        while True:
+            node = path[-1]
+            curvn = node.op.getIn(node.slot)
+            if JumpBasic.isprune(curvn):
+                if JumpBasic.ispoint(curvn):
+                    if not firstpoint:
+                        self.pathMeld.set(path)
+                        firstpoint = True
+                    else:
+                        self.pathMeld.meld(path)
+                path[-1].slot += 1
+                while path[-1].slot >= path[-1].op.numInput():
+                    path.pop()
+                    if not path:
+                        break
+                    path[-1].slot += 1
+            else:
+                path.append(PcodeOpNode(curvn.getDef(), 0))
+            if len(path) <= 1:
+                break
+
+        if self.pathMeld.empty():
+            self.pathMeld.set(op, op.getIn(slot))
+
+    def analyzeGuards(self, bl, pathout: int) -> None:
+        """Analyze CBRANCH guards leading to the switch block.
+
+        C++ ref: JumpBasic::analyzeGuards in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.analysis.rangeutil import CircleRange
+        maxbranch = 2
+        maxpullback = 2
+        usenzmask = not self.jumptable.isPartial() if self.jumptable is not None else True
+
+        self.selectguards.clear()
+
+        for i in range(maxbranch):
+            if pathout >= 0 and bl.sizeOut() == 2:
+                prevbl = bl
+                bl = prevbl.getOut(pathout)
+                indpath = pathout
+                pathout = -1
+            else:
+                pathout = -1
+                while True:
+                    if bl.sizeIn() != 1:
+                        if bl.sizeIn() > 1:
+                            self.checkUnrolledGuard(bl, maxpullback, usenzmask)
+                        return
+                    prevbl = bl.getIn(0)
+                    if prevbl.sizeOut() != 1:
+                        break
+                    bl = prevbl
+                indpath = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
+
+            cbranch = prevbl.lastOp() if hasattr(prevbl, 'lastOp') else None
+            if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
+                break
+            if i != 0:
+                otherbl = prevbl.getOut(1 - indpath)
+                otherop = otherbl.lastOp() if hasattr(otherbl, 'lastOp') else None
+                if otherop is not None and otherop.code() == OpCode.CPUI_BRANCHIND:
+                    if self.jumptable is not None and otherop is not self.jumptable.getIndirectOp():
+                        break
+
+            toswitchval = (indpath == 1)
+            if cbranch.isBooleanFlip():
+                toswitchval = not toswitchval
+            bl = prevbl
+            vn = cbranch.getIn(1)
+            rng = CircleRange(1 if toswitchval else 0, 1)
+
+            indpathstore = (1 - indpath) if (hasattr(prevbl, 'getFlipPath') and prevbl.getFlipPath()) else indpath
+            self.selectguards.append(GuardRecord(cbranch, cbranch, indpathstore, rng, vn))
+            for j in range(maxpullback):
+                if not vn.isWritten():
+                    break
+                readOp = vn.getDef()
+                result = rng.pullBack(readOp, usenzmask)
+                if result is None or result[0] is None:
+                    break
+                vn = result[0]
+                if rng.isEmpty():
+                    break
+                self.selectguards.append(GuardRecord(cbranch, readOp, indpathstore, rng, vn))
+
+    def calcRange(self, vn, rng_out) -> None:
+        """Calculate the range of values for the given Varnode reaching the switch.
+
+        C++ ref: JumpBasic::calcRange in jumptable.cc
+        rng_out is a mutable list [CircleRange] that will be replaced with result.
+        """
+        from ghidra.analysis.rangeutil import CircleRange
+        stride = 1
+        if vn.isConstant():
+            rng = CircleRange(vn.getOffset(), vn.getSize())
+        elif vn.isWritten() and hasattr(vn.getDef(), 'isBoolOutput') and vn.getDef().isBoolOutput():
+            rng = CircleRange(0, 2, 1, 1)
+        else:
+            maxValue = JumpBasic.getMaxValue(vn)
+            stride = JumpBasic.getStride(vn)
+            rng = CircleRange(0, maxValue, vn.getSize(), stride)
+
+        bitsPreserved_out = []
+        baseVn = GuardRecord.quasiCopy(vn, bitsPreserved_out)
+        bitsPreserved = bitsPreserved_out[0] if bitsPreserved_out else 0
+        for guard in self.selectguards:
+            matchval = guard.valueMatch(vn, baseVn, bitsPreserved)
+            if matchval == 0:
+                continue
+            rng.intersect(guard.getRange())
+
+        if rng.getSize() > 0x10000:
+            positive = CircleRange(0, (rng.getMask() >> 1) + 1, vn.getSize(), stride)
+            positive.intersect(rng)
+            if not positive.isEmpty():
+                rng = positive
+
+        rng_out.clear()
+        rng_out.append(rng)
+
+    def findSmallestNormal(self, matchsize: int) -> None:
+        """Find the Varnode with smallest range as the normalized switch variable.
+
+        C++ ref: JumpBasic::findSmallestNormal in jumptable.cc
+        """
+        rng_out = [None]
+        self.varnodeIndex = 0
+        self.calcRange(self.pathMeld.getVarnode(0), rng_out)
+        rng = rng_out[0]
+        self.jrange.setRange(rng)
+        self.jrange.setStartVn(self.pathMeld.getVarnode(0))
+        self.jrange.setStartOp(self.pathMeld.getOp(0))
+        maxsize = rng.getSize()
+        for i in range(1, self.pathMeld.numCommonVarnode()):
+            if maxsize == matchsize:
+                return
+            self.calcRange(self.pathMeld.getVarnode(i), rng_out)
+            rng = rng_out[0]
+            sz = rng.getSize()
+            if sz < maxsize:
+                if sz != 256 or self.pathMeld.getVarnode(i).getSize() != 1:
+                    self.varnodeIndex = i
+                    maxsize = sz
+                    self.jrange.setRange(rng)
+                    self.jrange.setStartVn(self.pathMeld.getVarnode(i))
+                    earlyOp = self.pathMeld.getEarliestOp(i) if hasattr(self.pathMeld, 'getEarliestOp') else self.pathMeld.getOp(i)
+                    self.jrange.setStartOp(earlyOp)
+
+    def findNormalized(self, fd, rootbl, pathout: int, matchsize: int, maxtablesize: int) -> None:
+        """Do all work to recover the normalized switch variable.
+
+        C++ ref: JumpBasic::findNormalized in jumptable.cc
+        """
+        self.analyzeGuards(rootbl, pathout)
+        self.findSmallestNormal(matchsize)
+        sz = self.jrange.getSize()
+        if sz > maxtablesize and self.pathMeld.numCommonVarnode() == 1:
+            vn = self.pathMeld.getVarnode(0)
+            if hasattr(vn, 'isReadOnly') and vn.isReadOnly():
+                from ghidra.analysis.rangeutil import CircleRange
+                # Would need MemoryImage to read value — simplified
+                self.varnodeIndex = 0
+
+    def markFoldableGuards(self) -> None:
+        """Mark the guard CBRANCHs that are truly part of the model.
+
+        C++ ref: JumpBasic::markFoldableGuards in jumptable.cc
+        """
+        vn = self.pathMeld.getVarnode(self.varnodeIndex)
+        bitsPreserved_out = []
+        baseVn = GuardRecord.quasiCopy(vn, bitsPreserved_out)
+        bitsPreserved = bitsPreserved_out[0] if bitsPreserved_out else 0
+        for guardRecord in self.selectguards:
+            if guardRecord.valueMatch(vn, baseVn, bitsPreserved) == 0 or guardRecord.isUnrolled():
+                guardRecord.clear()
+
+    def markModel(self, val: bool) -> None:
+        """Set or clear marks on model PcodeOps.
+
+        C++ ref: JumpBasic::markModel in jumptable.cc
+        """
+        self.pathMeld.markPaths(val, self.varnodeIndex)
+        for guard in self.selectguards:
+            op = guard.getBranch()
+            if op is None:
+                continue
+            readOp = guard.getReadOp()
+            if readOp is not None:
+                if val:
+                    if hasattr(readOp, 'setMark'):
+                        readOp.setMark()
+                else:
+                    if hasattr(readOp, 'clearMark'):
+                        readOp.clearMark()
+
+    def flowsOnlyToModel(self, vn, trailOp) -> bool:
+        """Check if vn only flows into the model (marked ops).
+
+        C++ ref: JumpBasic::flowsOnlyToModel in jumptable.cc
+        """
+        for op in vn.getDescend():
+            if op is trailOp:
+                continue
+            if not (hasattr(op, 'isMark') and op.isMark()):
+                return False
+        return True
+
+    def checkUnrolledGuard(self, bl, maxpullback: int, usenzmask: bool) -> None:
+        """Check for a guard unrolled across multiple blocks.
+
+        C++ ref: JumpBasic::checkUnrolledGuard in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.analysis.rangeutil import CircleRange
+        varArray = []
+        if not self.checkCommonCbranch(varArray, bl):
+            return
+        if JumpBasic.duplicateVarnodes(varArray):
+            vn = varArray[0]
+            rng = CircleRange(True)
+            indpathstore = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
+            cbranch = bl.getIn(0).lastOp() if hasattr(bl.getIn(0), 'lastOp') else None
+            if cbranch is not None:
+                self.selectguards.append(GuardRecord(cbranch, cbranch, indpathstore, rng, vn, True))
+                for j in range(maxpullback):
+                    if not vn.isWritten():
+                        break
+                    readOp = vn.getDef()
+                    result = rng.pullBack(readOp, usenzmask)
+                    if result is None or result[0] is None:
+                        break
+                    vn = result[0]
+                    if rng.isEmpty():
+                        break
+                    self.selectguards.append(GuardRecord(cbranch, readOp, indpathstore, rng, vn, True))
+
+    def checkCommonCbranch(self, varArray: list, bl) -> bool:
+        """Check for common CBRANCH flow across incoming blocks.
+
+        C++ ref: JumpBasic::checkCommonCbranch in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        curBlock = bl.getIn(0)
+        op = curBlock.lastOp() if hasattr(curBlock, 'lastOp') else None
+        if op is None or op.code() != OpCode.CPUI_CBRANCH:
+            return False
+        outslot = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
+        isOpFlip = op.isBooleanFlip()
+        varArray.append(op.getIn(1))
+        for i in range(1, bl.sizeIn()):
+            curBlock = bl.getIn(i)
+            op = curBlock.lastOp() if hasattr(curBlock, 'lastOp') else None
+            if op is None or op.code() != OpCode.CPUI_CBRANCH:
+                return False
+            if op.isBooleanFlip() != isOpFlip:
+                return False
+            revIdx = bl.getInRevIndex(i) if hasattr(bl, 'getInRevIndex') else i
+            if outslot != revIdx:
+                return False
+            varArray.append(op.getIn(1))
+        return True
+
+    # ------------------------------------------------------------------
+    # Core model methods
+    # ------------------------------------------------------------------
+    def recoverModel(self, fd, indop, matchsize: int = 0, maxtablesize: int = 1024) -> bool:
+        """Recover the jump-table model.
+
+        C++ ref: JumpBasic::recoverModel in jumptable.cc
+        """
+        self.jrange = JumpValuesRange()
+        self.findDeterminingVarnodes(indop, 0)
+        self.findNormalized(fd, indop.getParent(), -1, matchsize, maxtablesize)
+        if self.jrange.getSize() > maxtablesize:
+            return False
+        self.markFoldableGuards()
+        return True
+
+    def buildAddresses(self, fd, indop, addresstable: list,
+                       loadpoints=None, loadcounts=None) -> None:
+        """Build the address table by emulating the switch paths.
+
+        C++ ref: JumpBasic::buildAddresses in jumptable.cc
+        """
+        addresstable.clear()
+        emul = EmulateFunction(fd)
+        emul.setLoadCollect(loadpoints)
+
+        mask = 0xFFFFFFFFFFFFFFFF
+        glb = fd.getArch() if hasattr(fd, 'getArch') else None
+        bit = glb.funcptr_align if glb is not None and hasattr(glb, 'funcptr_align') else 0
+        if bit != 0:
+            mask = (mask >> bit) << bit
+        spc = indop.getAddr().getSpace()
+        notdone = self.jrange.initializeForReading()
+        while notdone:
+            val = self.jrange.getValue()
+            addr_offset = emul.emulatePath(val, self.pathMeld,
+                                           self.jrange.getStartOp(),
+                                           self.jrange.getStartVarnode())
+            wordsize = spc.getWordSize() if spc is not None and hasattr(spc, 'getWordSize') else 1
+            if wordsize > 1:
+                addr_offset = addr_offset * wordsize
+            addr_offset &= mask
+            addresstable.append(Address(spc, addr_offset))
+            if loadcounts is not None and loadpoints is not None:
+                loadcounts.append(len(loadpoints))
+            notdone = self.jrange.next()
+
+    def findUnnormalized(self, maxaddsub: int = 0, maxleftright: int = 0, maxext: int = 0) -> None:
+        """Find the unnormalized switch variable by walking back through normalization ops.
+
+        C++ ref: JumpBasic::findUnnormalized in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        i = self.varnodeIndex
+        self.normalvn = self.pathMeld.getVarnode(i)
+        i += 1
+        self.switchvn = self.normalvn
+        self.markModel(True)
+
+        countaddsub = 0
+        countext = 0
+        normop = None
+        while i < self.pathMeld.numCommonVarnode():
+            if not self.flowsOnlyToModel(self.switchvn, normop):
+                break
+            testvn = self.pathMeld.getVarnode(i)
+            if not self.switchvn.isWritten():
+                break
+            normop = self.switchvn.getDef()
+            found_j = -1
+            for j in range(normop.numInput()):
+                if normop.getIn(j) is testvn:
+                    found_j = j
+                    break
+            if found_j == -1:
+                break
+            opc = normop.code()
+            accepted = False
+            if opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB):
+                countaddsub += 1
+                if countaddsub <= maxaddsub:
+                    if normop.getIn(1 - found_j).isConstant():
+                        self.switchvn = testvn
+                        accepted = True
+            elif opc in (OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_SEXT):
+                countext += 1
+                if countext <= maxext:
+                    self.switchvn = testvn
+                    accepted = True
+            if not accepted:
+                break
+            i += 1
+        self.markModel(False)
+
+    def buildLabels(self, fd, addresstable: list, label: list, orig=None) -> None:
+        """Build case labels for the address table.
+
+        C++ ref: JumpBasic::buildLabels in jumptable.cc
+        """
+        origrange = orig.getValueRange() if orig is not None and hasattr(orig, 'getValueRange') else self.jrange
+        if origrange is None:
+            for i in range(len(addresstable)):
+                label.append(i)
+            return
+
+        notdone = origrange.initializeForReading()
+        while notdone:
+            val = origrange.getValue()
+            needswarning = 0
+            if origrange.isReversible():
+                if self.jrange is not None and not self.jrange.contains(val):
+                    needswarning = 1
+                try:
+                    switchval = JumpBasic.backup2Switch(fd, val, self.normalvn, self.switchvn)
+                except Exception:
+                    switchval = JumpValues.NO_LABEL
+                    needswarning = 2
+            else:
+                switchval = JumpValues.NO_LABEL
+            if needswarning == 1 and hasattr(fd, 'warning') and len(label) < len(addresstable):
+                fd.warning("This code block may not be properly labeled as switch case", addresstable[len(label)])
+            elif needswarning == 2 and hasattr(fd, 'warning') and len(label) < len(addresstable):
+                fd.warning("Calculation of case label failed", addresstable[len(label)])
+            label.append(switchval)
+            if len(label) >= len(addresstable):
+                break
+            notdone = origrange.next()
+
+        while len(label) < len(addresstable):
+            if hasattr(fd, 'warning'):
+                fd.warning("Bad switch case", addresstable[len(label)])
+            label.append(JumpValues.NO_LABEL)
+
+    def foldInNormalization(self, fd, indop):
+        """Set the BRANCHIND input to the unnormalized switch variable.
+
+        C++ ref: JumpBasic::foldInNormalization in jumptable.cc
+        """
+        if self.switchvn is not None and hasattr(fd, 'opSetInput'):
+            fd.opSetInput(indop, self.switchvn, 0)
+        return self.switchvn
+
+    def foldInOneGuard(self, fd, guard, jump) -> bool:
+        """Fold in a single guard CBRANCH.
+
+        C++ ref: JumpBasic::foldInOneGuard in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        cbranch = guard.getBranch()
+        cbranchblock = cbranch.getParent()
+        if cbranchblock.sizeOut() != 2:
+            return False
+        indpath = guard.getPath()
+        if hasattr(cbranchblock, 'getFlipPath') and cbranchblock.getFlipPath():
+            indpath = 1 - indpath
+        switchbl = jump.getIndirectOp().getParent()
+        if cbranchblock.getOut(indpath) is not switchbl:
+            return False
+        guardtarget = cbranchblock.getOut(1 - indpath)
+
+        pos = -1
+        for p in range(switchbl.sizeOut()):
+            if switchbl.getOut(p) is guardtarget:
+                pos = p
+                break
+        if pos == -1:
+            pos = switchbl.sizeOut()
+
+        if jump.hasFoldedDefault() and jump.getDefaultBlock() != pos:
+            return False
+
+        if hasattr(switchbl, 'noInterveningStatement') and not switchbl.noInterveningStatement():
+            return False
+
+        if pos == switchbl.sizeOut():
+            if hasattr(jump, 'addBlockToSwitch'):
+                jump.addBlockToSwitch(guardtarget, JumpValues.NO_LABEL)
+            jump.setLastAsDefault()
+            if hasattr(fd, 'pushBranch'):
+                fd.pushBranch(cbranchblock, 1 - indpath, switchbl)
+        else:
+            val = 0 if ((indpath == 0) != cbranch.isBooleanFlip()) else 1
+            if hasattr(fd, 'opSetInput') and hasattr(fd, 'newConstant'):
+                fd.opSetInput(cbranch, fd.newConstant(cbranch.getIn(0).getSize(), val), 1)
+            jump.setDefaultBlock(pos)
+        jump.setFoldedDefault()
+        guard.clear()
+        return True
+
+    def foldInGuards(self, fd, jump) -> bool:
+        """Fold in all guard CBRANCHs.
+
+        C++ ref: JumpBasic::foldInGuards in jumptable.cc
+        """
+        change = False
+        for guard in self.selectguards:
+            cbranch = guard.getBranch()
+            if cbranch is None:
+                continue
+            if hasattr(cbranch, 'isDead') and cbranch.isDead():
+                guard.clear()
+                continue
+            if self.foldInOneGuard(fd, guard, jump):
+                change = True
+        return change
+
+    def sanityCheck(self, fd, indop, addresstable: list,
+                    loadpoints=None, loadcounts=None) -> bool:
+        """Validate the address table, truncating at first unreasonable entry.
+
+        C++ ref: JumpBasic::sanityCheck in jumptable.cc
+        """
+        if not addresstable:
+            return True
+        addr = addresstable[0]
+        i = 0
+        if addr.getOffset() != 0:
+            for i in range(1, len(addresstable)):
+                if addresstable[i].getOffset() == 0:
+                    break
+                diff = abs(addr.getOffset() - addresstable[i].getOffset())
+                if diff > 0xffff:
+                    glb = fd.getArch() if hasattr(fd, 'getArch') else None
+                    loader = glb.loader if glb is not None and hasattr(glb, 'loader') else None
+                    dataavail = True
+                    if loader is not None and hasattr(loader, 'loadFill'):
+                        try:
+                            loader.loadFill(bytearray(4), 4, addresstable[i])
+                        except Exception:
+                            dataavail = False
+                    else:
+                        dataavail = False
+                    if not dataavail:
+                        break
+            else:
+                i = len(addresstable)
+        if i == 0:
+            return False
+        if i != len(addresstable):
+            del addresstable[i:]
+            if self.jrange is not None:
+                self.jrange.truncate(i)
+            if loadcounts is not None and loadpoints is not None:
+                del loadpoints[loadcounts[i - 1]:]
         return True
 
     def clone(self, jt):
-        return JumpBasic(jt)
+        """Clone this model for a new JumpTable.
+
+        C++ ref: JumpBasic::clone in jumptable.cc
+        """
+        res = JumpBasic(jt)
+        if self.jrange is not None:
+            res.jrange = self.jrange.clone()
+        return res
 
     def clear(self):
-        self._pathMeld.clear()
+        """Clear all model state.
+
+        C++ ref: JumpBasic::clear in jumptable.cc
+        """
+        self.jrange = None
+        self.pathMeld.clear()
+        self.selectguards.clear()
+        self.normalvn = None
+        self.switchvn = None
+
+
+class JumpBasic2(JumpBasic):
+    """A two-path jump-table model with a default constant path.
+
+    C++ ref: JumpBasic2 in jumptable.hh / jumptable.cc
+    """
+
+    def __init__(self, jt=None) -> None:
+        super().__init__(jt)
+        self.extravn = None  # Varnode at the join point
+        self.origPathMeld = PathMeld()
+
+    def initializeStart(self, pMeld: PathMeld) -> None:
+        """Initialize at the point where JumpBasic model failed.
+
+        C++ ref: JumpBasic2::initializeStart in jumptable.cc
+        """
+        if pMeld.empty():
+            self.extravn = None
+            return
+        self.extravn = pMeld.getVarnode(pMeld.numCommonVarnode() - 1)
+        self.origPathMeld.set(pMeld)
+
+    def recoverModel(self, fd, indop, matchsize: int = 0, maxtablesize: int = 1024) -> bool:
+        """Try to recover a two-path jump-table model.
+
+        C++ ref: JumpBasic2::recoverModel in jumptable.cc
+        """
+        from ghidra.core.opcodes import OpCode
+        joinvn = self.extravn
+        if joinvn is None:
+            return False
+        if not joinvn.isWritten():
+            return False
+        multiop = joinvn.getDef()
+        if multiop.code() != OpCode.CPUI_MULTIEQUAL:
+            return False
+        if multiop.numInput() != 2:
+            return False
+        # Search for a constant along one of the paths
+        path = -1
+        copyop = None
+        extravalue = 0
+        for p in range(2):
+            vn = multiop.getIn(p)
+            if not vn.isWritten():
+                continue
+            cop = vn.getDef()
+            if cop.code() != OpCode.CPUI_COPY:
+                continue
+            othervn = cop.getIn(0)
+            if othervn.isConstant():
+                extravalue = othervn.getOffset()
+                copyop = cop
+                path = p
+                break
+        if path == -1:
+            return False
+        rootbl = multiop.getParent().getIn(1 - path)
+        pathout = multiop.getParent().getInRevIndex(1 - path) if hasattr(multiop.getParent(), 'getInRevIndex') else 0
+        jdef = JumpValuesRangeDefault()
+        self.jrange = jdef
+        jdef.setExtraValue(extravalue)
+        jdef.setDefaultVn(joinvn)
+        jdef.setDefaultOp(self.origPathMeld.getOp(self.origPathMeld.numOps() - 1))
+
+        self.findDeterminingVarnodes(multiop, 1 - path)
+        self.findNormalized(fd, rootbl, pathout, matchsize, maxtablesize)
+        if self.jrange.getSize() > maxtablesize:
+            return False
+
+        self.pathMeld.append(self.origPathMeld)
+        self.varnodeIndex += self.origPathMeld.numCommonVarnode()
+        return True
+
+    def checkNormalDominance(self) -> bool:
+        """Check if the normalized switch variable's defining block dominates the switch block.
+
+        C++ ref: JumpBasic2::checkNormalDominance in jumptable.cc
+        """
+        if hasattr(self.normalvn, 'isInput') and self.normalvn.isInput():
+            return True
+        if not self.normalvn.isWritten():
+            return True
+        defblock = self.normalvn.getDef().getParent()
+        switchblock = self.pathMeld.getOp(0).getParent()
+        while switchblock is not None:
+            if switchblock is defblock:
+                return True
+            switchblock = switchblock.getImmedDom() if hasattr(switchblock, 'getImmedDom') else None
+        return False
+
+    def findUnnormalized(self, maxaddsub: int = 0, maxleftright: int = 0, maxext: int = 0) -> None:
+        """Find the unnormalized switch variable, handling backward normalization.
+
+        C++ ref: JumpBasic2::findUnnormalized in jumptable.cc
+        """
+        from ghidra.core.error import LowlevelError
+        self.normalvn = self.pathMeld.getVarnode(self.varnodeIndex)
+        if self.checkNormalDominance():
+            super().findUnnormalized(maxaddsub, maxleftright, maxext)
+            return
+        self.switchvn = self.extravn
+        multiop = self.extravn.getDef()
+        if multiop.getIn(0) is self.normalvn or multiop.getIn(1) is self.normalvn:
+            self.normalvn = self.switchvn
+        else:
+            raise LowlevelError("Backward normalization not implemented")
+
+    def foldInOneGuard(self, fd, guard, jump) -> bool:
+        """Fold in a guard for the two-path model.
+
+        C++ ref: JumpBasic2::foldInOneGuard in jumptable.cc
+        """
+        jump.setLastAsDefault()
+        guard.clear()
+        return True
+
+    def clone(self, jt):
+        """Clone this model.
+
+        C++ ref: JumpBasic2::clone in jumptable.cc
+        """
+        res = JumpBasic2(jt)
+        if self.jrange is not None:
+            res.jrange = self.jrange.clone()
+        return res
+
+    def clear(self):
+        """Clear all state.
+
+        C++ ref: JumpBasic2::clear in jumptable.cc
+        """
+        self.extravn = None
+        self.origPathMeld.clear()
+        super().clear()
 
 
 class JumpBasicOverride(JumpModel):

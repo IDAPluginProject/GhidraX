@@ -169,6 +169,19 @@ class CommentDatabaseInternal(CommentDatabase):
     def getComments(self, fad: Address) -> List[Comment]:
         return self._comments.get(self._key(fad), [])
 
+    def deleteComment(self, com: Comment) -> None:
+        """Delete a specific comment from the database.
+
+        C++ ref: CommentDatabaseInternal::deleteComment
+        """
+        key = self._key(com.getFuncAddr())
+        lst = self._comments.get(key)
+        if lst is not None:
+            try:
+                lst.remove(com)
+            except ValueError:
+                pass
+
     def encode(self, encoder) -> None:
         """Encode the entire comment database.
 
@@ -218,11 +231,78 @@ class CommentSorter:
         self._opstop_idx: int = 0
         self._displayUnplaced: bool = False
 
+    def findPosition(self, subsort: list, comm: Comment, fd) -> bool:
+        """Figure out position of given Comment and initialize its key.
+
+        C++ ref: CommentSorter::findPosition
+        subsort is a mutable [index, order] list.
+        Returns True if the Comment could be positioned.
+        """
+        if comm.getType() == 0:
+            return False
+        fad = fd.getAddress()
+        ctype = comm.getType()
+        if (ctype & (Comment.CommentType.header | Comment.CommentType.warningheader)) != 0 and comm.getAddr() == fad:
+            subsort[0] = -1
+            subsort[1] = CommentSorter.header_basic
+            return True
+
+        # Try to find block containing comment via op tree
+        backupOp = None
+        op = None
+        block = None
+        if hasattr(fd, 'beginOp') and hasattr(fd, 'endOpAll'):
+            opiter = fd.beginOp(comm.getAddr())
+            if opiter is not None:
+                op = opiter
+                block = op.getParent() if hasattr(op, 'getParent') else None
+                if block is not None and hasattr(block, 'contains') and block.contains(comm.getAddr()):
+                    subsort[0] = block.getIndex()
+                    subsort[1] = op.getSeqNum().getOrder()
+                    return True
+                if comm.getAddr() == op.getAddr():
+                    backupOp = op
+
+        # Try previous op
+        if hasattr(fd, 'getBasicBlocks'):
+            bblocks = fd.getBasicBlocks()
+            if bblocks is not None:
+                nblocks = bblocks.getSize() if hasattr(bblocks, 'getSize') else 0
+                for i in range(nblocks):
+                    bl = bblocks.getBlock(i)
+                    if hasattr(bl, 'contains') and bl.contains(comm.getAddr()):
+                        subsort[0] = bl.getIndex()
+                        subsort[1] = 0xFFFFFFFF
+                        return True
+
+        if backupOp is not None:
+            parent = backupOp.getParent() if hasattr(backupOp, 'getParent') else None
+            if parent is not None:
+                subsort[0] = parent.getIndex()
+                subsort[1] = backupOp.getSeqNum().getOrder()
+                return True
+
+        if hasattr(fd, 'beginOpAll') and hasattr(fd, 'endOpAll'):
+            if fd.beginOpAll() == fd.endOpAll():
+                subsort[0] = 0
+                subsort[1] = 0
+                return True
+
+        if self._displayUnplaced:
+            subsort[0] = -1
+            subsort[1] = CommentSorter.header_unplaced
+            return True
+
+        return False
+
     def setupFunctionList(self, tp: int, fd, db, displayUnplaced: bool = False) -> None:
-        """Collect all comments for a function and sort by block position."""
+        """Collect all comments for a function and sort by block position.
+
+        C++ ref: CommentSorter::setupFunctionList
+        """
         self._commmap.clear()
         self._displayUnplaced = displayUnplaced
-        if fd is None or db is None:
+        if fd is None or db is None or tp == 0:
             self._sorted_keys = []
             return
         funcaddr = fd.getAddress() if hasattr(fd, 'getAddress') else None
@@ -230,42 +310,16 @@ class CommentSorter:
             self._sorted_keys = []
             return
         comments = db.getComments(funcaddr)
+        subsort = [0, 0]
         pos = 0
         for comm in comments:
             if (comm.getType() & tp) == 0:
                 continue
-            comm.setEmitted(False)
-            blockidx = -1
-            order = 0
-            caddr = comm.getAddr()
-            # Try to find the basic block containing this address
-            if hasattr(fd, 'getBasicBlocks'):
-                bblocks = fd.getBasicBlocks()
-                if hasattr(bblocks, 'getSize'):
-                    for i in range(bblocks.getSize()):
-                        bl = bblocks.getBlock(i)
-                        if hasattr(bl, 'getStart') and hasattr(bl, 'getStop'):
-                            start = bl.getStart()
-                            stop = bl.getStop()
-                            if not caddr.isInvalid() and not start.isInvalid():
-                                if start <= caddr and (stop.isInvalid() or caddr <= stop):
-                                    blockidx = i
-                                    order = caddr.getOffset() - start.getOffset()
-                                    break
-            if blockidx < 0:
-                # Header or unplaced
-                ctype = comm.getType()
-                if ctype & (Comment.CommentType.header | Comment.CommentType.warningheader):
-                    blockidx = -1
-                    order = CommentSorter.header_basic
-                elif displayUnplaced:
-                    blockidx = -1
-                    order = CommentSorter.header_unplaced
-                else:
-                    continue
-            key = (blockidx, order, pos)
-            self._commmap[key] = comm
-            pos += 1
+            if self.findPosition(subsort, comm, fd):
+                comm.setEmitted(False)
+                key = (subsort[0], subsort[1], pos)
+                self._commmap[key] = comm
+                pos += 1
         self._sorted_keys = sorted(self._commmap.keys())
         self._start_idx = 0
         self._stop_idx = len(self._sorted_keys)

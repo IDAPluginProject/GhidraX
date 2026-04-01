@@ -113,6 +113,7 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
     model.output = out_list
     # Build input parameter list from cspec
     in_list = ParamListStandard()
+    stack_space = getattr(spc_mgr, '_stackSpace', None)
     if reg_space is not None:
         if is_64:
             # x86-64 Windows __fastcall input params (from x86-64-win.cspec)
@@ -146,12 +147,24 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
                     e.type = TypeClass.TYPECLASS_FLOAT
                 in_list.addEntry(e)
         else:
-            # x86-32: no register input params for cdecl (all stack)
-            pass
+            # x86-32 cdecl: all params are on the stack (from x86win.cspec / x86gcc.cspec)
+            #   <pentry minsize="1" maxsize="500" align="4">
+            #     <addr offset="4" space="stack"/>
+            #   </pentry>
+            if stack_space is not None:
+                e = ParamEntry(0)
+                e.spaceid = stack_space
+                e.addressbase = 4  # after return address
+                e.size = 500
+                e.minsize = 1
+                e.alignment = 4
+                e.numslots = 500 // 4
+                e.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+                in_list.addEntry(e)
     model.input = in_list
-    stack_space = getattr(spc_mgr, '_stackSpace', None)
     if stack_space is not None:
         model.input.spacebase = stack_space
+    model.input.calcDelay()
 
     # Build effect list from cspec
     if reg_space is not None:
@@ -211,6 +224,22 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
     return model
 
 
+class _TranslateShim:
+    """Minimal Translate-like shim that delegates getRegisterName to native SLEIGH."""
+
+    def __init__(self, spc_mgr) -> None:
+        self._native = getattr(spc_mgr, '_native', None)
+
+    def getRegisterName(self, base, off: int, size: int) -> str:
+        if self._native is None:
+            return ""
+        spc_name = base.getName() if hasattr(base, 'getName') else str(base) if base else "register"
+        try:
+            return self._native.get_register_name(spc_name, off, size)
+        except Exception:
+            return ""
+
+
 class ArchitectureStandalone:
     """Minimal Architecture-like object for Heritage and Action pipeline.
 
@@ -230,6 +259,11 @@ class ArchitectureStandalone:
         self._unique_base: int = 0x10000000
         self._errors: List[str] = []
         self.trim_recurse_max = 5
+        self.translate = _TranslateShim(spc_mgr)
+        # Create a symbol database with a global scope
+        from ghidra.database.database import Database
+        self.symboltab = Database(self)
+        self.symboltab.createGlobalScope("global")
         # Build a minimal default prototype model with return register info
         self.defaultfp = _build_default_proto_model(spc_mgr, self)
         self.evalfp_current = None
@@ -272,6 +306,33 @@ class ArchitectureStandalone:
     def getStackSpace(self):
         """Return the stack space (may be None for raw binaries)."""
         return getattr(self._spc_mgr, '_stackSpace', None)
+
+    def getSpaceBySpacebase(self, loc, size: int):
+        """Find the address space associated with a spacebase register.
+
+        Given the Address of a register (e.g. ESP at register:0x10),
+        find the spacebase space (e.g. stack) that uses it as its base.
+
+        C++ ref: ``Architecture::getSpaceBySpacebase``
+        """
+        from ghidra.core.space import IPTR_SPACEBASE
+        for i in range(self.numSpaces()):
+            spc = self.getSpace(i)
+            if spc is None:
+                continue
+            if spc.getType() != IPTR_SPACEBASE:
+                continue
+            numbase = spc.numSpacebase() if hasattr(spc, 'numSpacebase') else 0
+            for j in range(numbase):
+                point = spc.getSpacebase(j)
+                if point is None:
+                    continue
+                p_space = point.space if hasattr(point, 'space') else None
+                p_offset = point.offset if hasattr(point, 'offset') else 0
+                p_size = point.size if hasattr(point, 'size') else 0
+                if p_space is loc.getSpace() and p_offset == loc.getOffset() and p_size == size:
+                    return spc
+        return None
 
     def printMessage(self, msg: str) -> None:
         """Collect messages from the action pipeline."""

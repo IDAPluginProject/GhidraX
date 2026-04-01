@@ -644,5 +644,10 @@ class TransformManager:
         for rop in self.newOps:
             op = rop.replacement
             for i, rvn in enumerate(rop.input):
-                self.fd.opSetInput(op, rvn.replacement, i)
+                if rvn is None:
+                    continue
+                if rvn.replacement is None:
+                    rvn.createReplacement(self.fd)
+                if rvn.replacement is not None:
+                    self.fd.opSetInput(op, rvn.replacement, i)
             self._specialHandling(rop)

@@ -9,6 +9,8 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, Dict, List
 
+from ghidra.core.opcodes import OpCode
+
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
     from ghidra.ir.varnode import Varnode
@@ -57,6 +59,16 @@ class PcodeOpSet(ABC):
         """Secondary test: does the given PcodeOp affect the Varnode?"""
         ...
 
+    @staticmethod
+    def compareByBlock(a: PcodeOp, b: PcodeOp) -> bool:
+        """Compare two PcodeOps first by block index, then by SeqNum order.
+
+        C++ ref: PcodeOpSet::compareByBlock
+        """
+        if a.getParent() != b.getParent():
+            return a.getParent().getIndex() < b.getParent().getIndex()
+        return a.getSeqNum().getOrder() < b.getSeqNum().getOrder()
+
     def clear(self) -> None:
         self._is_pop = False
         self._opList.clear()
@@ -73,22 +85,35 @@ class CoverBlock:
       - start=sentinel, stop=sentinel  =>  whole block covered
     """
 
-    # Sentinel value representing "whole block" endpoint
+    # Sentinel value representing "whole block" endpoint  (C++ (PcodeOp*)1)
     _WHOLE_BLOCK_SENTINEL = object()
+    # Sentinel: "begin-only, not yet extended"  (C++ (PcodeOp*)2)
+    _BEGIN_ONLY_SENTINEL = object()
 
-    __slots__ = ('start', 'stop')
+    __slots__ = ('start', 'stop', 'ustart', 'ustop')
 
     def __init__(self) -> None:
         self.start: object = None  # PcodeOp or None or sentinel
         self.stop: object = None   # PcodeOp or None or sentinel
+        self.ustart: int = 0       # cached getUIndex(start)
+        self.ustop: int = 0        # cached getUIndex(stop)
 
     @staticmethod
     def getUIndex(op) -> int:
-        """Get the comparison index for a PcodeOp."""
+        """Get the comparison index for a PcodeOp.
+
+        C++ ref: CoverBlock::getUIndex
+        Sentinel mapping:
+          None                  -> 0           (C++ (PcodeOp*)0)
+          _WHOLE_BLOCK_SENTINEL -> 0xFFFFFFFF   (C++ (PcodeOp*)1)
+          _BEGIN_ONLY_SENTINEL  -> 0xFFFFFFFE   (C++ (PcodeOp*)2)
+        """
         if op is None:
             return 0
         if op is CoverBlock._WHOLE_BLOCK_SENTINEL:
             return 0xFFFFFFFF
+        if op is CoverBlock._BEGIN_ONLY_SENTINEL:
+            return 0xFFFFFFFE
         return op.getSeqNum().getOrder()
 
     def getStart(self):
@@ -98,23 +123,31 @@ class CoverBlock:
         return self.stop
 
     def clear(self) -> None:
-        self.start = None
-        self.stop = None
+        self.start = None; self.stop = None
+        self.ustart = 0; self.ustop = 0
 
     def setAll(self) -> None:
         """Mark whole block as covered."""
-        self.start = None
-        self.stop = CoverBlock._WHOLE_BLOCK_SENTINEL
+        self.start = None; self.stop = CoverBlock._WHOLE_BLOCK_SENTINEL
+        self.ustart = 0; self.ustop = 0xFFFFFFFF
 
     def setBegin(self, begin) -> None:
-        """Reset start of range."""
+        """Reset start of range.
+
+        C++ ref: CoverBlock::setBegin
+        If stop was previously None, set it to _BEGIN_ONLY_SENTINEL
+        (C++ (PcodeOp*)2) meaning 'defined but not yet extended'.
+        """
         self.start = begin
+        self.ustart = CoverBlock.getUIndex(begin)
         if self.stop is None:
-            self.stop = CoverBlock._WHOLE_BLOCK_SENTINEL
+            self.stop = CoverBlock._BEGIN_ONLY_SENTINEL
+            self.ustop = 0xFFFFFFFE
 
     def setEnd(self, end) -> None:
         """Reset end of range."""
         self.stop = end
+        self.ustop = CoverBlock.getUIndex(end)
 
     def empty(self) -> bool:
         """Return True if this is empty/uncovered."""
@@ -161,12 +194,13 @@ class CoverBlock:
           1 = boundary intersection only
           2 = interval intersection
         """
-        if self.empty() or op2.empty():
-            return 0
-        ustart = CoverBlock.getUIndex(self.start)
-        ustop = CoverBlock.getUIndex(self.stop)
-        u2start = CoverBlock.getUIndex(op2.start)
-        u2stop = CoverBlock.getUIndex(op2.stop)
+        if self.start is None and self.stop is None: return 0
+        if op2.start is None and op2.stop is None: return 0
+        # Use cached integer values — no getUIndex() calls needed
+        ustart = self.ustart
+        ustop = self.ustop
+        u2start = op2.ustart
+        u2stop = op2.ustop
         if ustart <= ustop:
             if u2start <= u2stop:
                 if ustop <= u2start or u2stop <= ustart:
@@ -188,25 +222,49 @@ class CoverBlock:
 
     def merge(self, op2: CoverBlock) -> None:
         """Merge another CoverBlock into this."""
-        if op2.empty():
+        if op2.start is None and op2.stop is None:
             return
-        if self.empty():
-            self.start = op2.start
-            self.stop = op2.stop
+        if self.start is None and self.stop is None:
+            self.start = op2.start; self.stop = op2.stop
+            self.ustart = op2.ustart; self.ustop = op2.ustop
             return
-        # Take the union
-        s1 = CoverBlock.getUIndex(self.start) if self.start is not None else 0
-        e1 = CoverBlock.getUIndex(self.stop) if (self.stop is not None and self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-        s2 = CoverBlock.getUIndex(op2.start) if op2.start is not None else 0
-        e2 = CoverBlock.getUIndex(op2.stop) if (op2.stop is not None and op2.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
+        # Take the union — use cached values
+        s1 = self.ustart if self.start is not None else 0
+        e1 = self.ustop if (self.stop is not None and self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
+        s2 = op2.ustart if op2.start is not None else 0
+        e2 = op2.ustop if (op2.stop is not None and op2.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
         if self.stop is None:
             e1 = s1
         if op2.stop is None:
             e2 = s2
         if s2 < s1:
-            self.start = op2.start
+            self.start = op2.start; self.ustart = op2.ustart
         if e2 > e1:
-            self.stop = op2.stop
+            self.stop = op2.stop; self.ustop = op2.ustop
+
+    def print(self, s) -> None:
+        """Print a description of the covered range.
+
+        C++ ref: CoverBlock::print
+        """
+        if self.empty():
+            s.write("empty")
+            return
+        ustart = CoverBlock.getUIndex(self.start)
+        ustop = CoverBlock.getUIndex(self.stop)
+        if ustart == 0:
+            s.write("begin")
+        elif ustart >= 0xFFFFFFFE:
+            s.write("end")
+        else:
+            s.write(str(self.start.getSeqNum()))
+        s.write('-')
+        if ustop == 0:
+            s.write("begin")
+        elif ustop >= 0xFFFFFFFE:
+            s.write("end")
+        else:
+            s.write(str(self.stop.getSeqNum()))
 
     def __repr__(self) -> str:
         if self.empty():
@@ -221,6 +279,8 @@ class Cover:
     """
 
     _emptyBlock: CoverBlock = CoverBlock()
+
+    __slots__ = ('_cover',)
 
     def __init__(self) -> None:
         self._cover: Dict[int, CoverBlock] = {}
@@ -313,24 +373,79 @@ class Cover:
             self._cover[blk] = CoverBlock()
         self._cover[blk].setBegin(defop)
 
-    def addRefPoint(self, ref, vn) -> None:
-        """Add a variable read to this Cover."""
-        parent = ref.getParent()
-        if parent is None:
-            return
-        blk = parent.getIndex()
-        if blk not in self._cover:
-            self._cover[blk] = CoverBlock()
-        cb = self._cover[blk]
-        if cb.empty():
-            cb.setAll()
+    def addRefRecurse(self, bl) -> None:
+        """Add cover recursively backward from block bottom.
+
+        C++ ref: Cover::addRefRecurse
+        """
+        blk_idx = bl.getIndex()
+        if blk_idx not in self._cover:
+            self._cover[blk_idx] = CoverBlock()
+        block = self._cover[blk_idx]
+
+        if block.empty():
+            block.setAll()
+            for j in range(bl.sizeIn()):
+                self.addRefRecurse(bl.getIn(j))
         else:
-            uind = CoverBlock.getUIndex(ref)
-            stop_ind = CoverBlock.getUIndex(cb.stop) if (cb.stop is not None and cb.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-            if cb.stop is None:
-                stop_ind = CoverBlock.getUIndex(cb.start) if cb.start is not None else 0
-            if uind > stop_ind:
-                cb.setEnd(ref)
+            op = block.getStop()
+            ustart = CoverBlock.getUIndex(block.getStart())
+            ustop = CoverBlock.getUIndex(op)
+            if ustop != 0xFFFFFFFF and ustop >= ustart:
+                block.setEnd(CoverBlock._WHOLE_BLOCK_SENTINEL)
+
+            if ustop == 0 and block.getStart() is None:
+                if (op is not None and
+                        op is not CoverBlock._BEGIN_ONLY_SENTINEL and
+                        op is not CoverBlock._WHOLE_BLOCK_SENTINEL and
+                        op.code() == OpCode.CPUI_MULTIEQUAL):
+                    for j in range(bl.sizeIn()):
+                        self.addRefRecurse(bl.getIn(j))
+
+    def addRefPoint(self, ref, vn) -> None:
+        """Add a variable read and recursively fill backward.
+
+        C++ ref: Cover::addRefPoint
+        """
+        bl = ref.getParent()
+        if bl is None:
+            return
+        blk_idx = bl.getIndex()
+        if blk_idx not in self._cover:
+            self._cover[blk_idx] = CoverBlock()
+        block = self._cover[blk_idx]
+
+        if block.empty():
+            block.setEnd(ref)
+        else:
+            if block.contain(ref):
+                if ref.code() != OpCode.CPUI_MULTIEQUAL:
+                    return
+                # Even if MULTIEQUAL ref is contained, we may be adding
+                # new cover because we are looking at a different branch
+            else:
+                op = block.getStop()
+                startop = block.getStart()
+                block.setEnd(ref)
+                ustop = CoverBlock.getUIndex(block.getStop())
+                if ustop >= CoverBlock.getUIndex(startop):
+                    if (op is not None and
+                            op is not CoverBlock._BEGIN_ONLY_SENTINEL and
+                            op is not CoverBlock._WHOLE_BLOCK_SENTINEL and
+                            hasattr(op, 'code') and
+                            op.code() == OpCode.CPUI_MULTIEQUAL and
+                            startop is None):
+                        for j in range(bl.sizeIn()):
+                            self.addRefRecurse(bl.getIn(j))
+                    return
+
+        if ref.code() == OpCode.CPUI_MULTIEQUAL:
+            for j in range(ref.numInput()):
+                if ref.getIn(j) == vn:
+                    self.addRefRecurse(bl.getIn(j))
+        else:
+            for j in range(bl.sizeIn()):
+                self.addRefRecurse(bl.getIn(j))
 
     def containVarnodeDef(self, vn) -> int:
         """Check the definition of a Varnode for containment.
@@ -376,21 +491,11 @@ class Cover:
             list of intersecting block indices
         """
         listout: List[int] = []
-        keys1 = sorted(self._cover.keys())
-        keys2 = sorted(op2._cover.keys())
-        i = 0
-        j = 0
-        while i < len(keys1) and j < len(keys2):
-            if keys1[i] < keys2[j]:
-                i += 1
-            elif keys1[i] > keys2[j]:
-                j += 1
-            else:
-                val = self._cover[keys1[i]].intersect(op2._cover[keys2[j]])
-                if val >= level:
-                    listout.append(keys1[i])
-                i += 1
-                j += 1
+        c2 = op2._cover
+        for blk, cb1 in self._cover.items():
+            cb2 = c2.get(blk)
+            if cb2 is not None and cb1.intersect(cb2) >= level:
+                listout.append(blk)
         return listout
 
     def print(self, s) -> None:

@@ -52,17 +52,80 @@ class InjectedUserOp(UserPcodeOp):
         self.injectid = injid
     def getInjectId(self): return self.injectid
 
+    def decode(self, decoder) -> None:
+        """Decode a <callotherfixup> element.
 
-class VolatileReadOp(UserPcodeOp):
-    def __init__(self, nm="read_volatile", glb=None):
+        C++ ref: ``InjectedUserOp::decode``
+        """
+        if self.glb is None or not hasattr(self.glb, 'pcodeinjectlib'):
+            raise Exception("InjectedUserOp.decode requires Architecture with pcodeinjectlib")
+        self.injectid = self.glb.pcodeinjectlib.decodeInject(
+            "userop", "", 1, decoder)  # CALLOTHERFIXUP_TYPE=1
+        self.name = self.glb.pcodeinjectlib.getCallOtherTarget(self.injectid)
+        base = self.glb.userops.getOp(self.name)
+        if base is None:
+            raise Exception("Unknown userop name in <callotherfixup>: " + self.name)
+        if not isinstance(base, UnspecializedPcodeOp):
+            raise Exception("<callotherfixup> overloads userop with another purpose: " + self.name)
+        self.useropindex = base.getIndex()
+
+
+class VolatileOp(UserPcodeOp):
+    """Base for volatile read/write ops."""
+
+    @staticmethod
+    def appendSize(base: str, size: int) -> str:
+        """Append a size suffix to a base name.
+
+        C++ ref: ``VolatileOp::appendSize``
+        """
+        return f"{base}_{size}"
+
+
+class VolatileReadOp(VolatileOp):
+    def __init__(self, nm="read_volatile", glb=None, functional: bool = False):
         super().__init__(nm, glb, UserPcodeOp.volatile_read, UserPcodeOp.BUILTIN_VOLATILE_READ)
-        self.flags = UserPcodeOp.no_operator
+        if functional:
+            self.flags = 0
+        else:
+            self.flags = UserPcodeOp.no_operator
+
+    def getOperatorName(self, op=None) -> str:
+        """C++ ref: ``VolatileReadOp::getOperatorName``"""
+        if op is None:
+            return self.name
+        out = op.getOut() if hasattr(op, 'getOut') else None
+        if out is None:
+            return self.name
+        return self.appendSize(self.name, out.getSize())
+
+    def extractAnnotationSize(self, vn, op) -> int:
+        """C++ ref: ``VolatileReadOp::extractAnnotationSize``"""
+        outvn = op.getOut() if hasattr(op, 'getOut') else None
+        if outvn is not None:
+            return outvn.getSize()
+        return 1
 
 
-class VolatileWriteOp(UserPcodeOp):
-    def __init__(self, nm="write_volatile", glb=None):
+class VolatileWriteOp(VolatileOp):
+    def __init__(self, nm="write_volatile", glb=None, functional: bool = False):
         super().__init__(nm, glb, UserPcodeOp.volatile_write, UserPcodeOp.BUILTIN_VOLATILE_WRITE)
-        self.flags = UserPcodeOp.annotation_assignment
+        if functional:
+            self.flags = 0
+        else:
+            self.flags = UserPcodeOp.annotation_assignment
+
+    def getOperatorName(self, op=None) -> str:
+        """C++ ref: ``VolatileWriteOp::getOperatorName``"""
+        if op is None:
+            return self.name
+        if not hasattr(op, 'numInput') or op.numInput() < 3:
+            return self.name
+        return self.appendSize(self.name, op.getIn(2).getSize())
+
+    def extractAnnotationSize(self, vn, op) -> int:
+        """C++ ref: ``VolatileWriteOp::extractAnnotationSize``"""
+        return op.getIn(2).getSize()
 
 
 class UserOpManage:
@@ -304,6 +367,42 @@ class SegmentOp(UserPcodeOp):
 
     def getNumVariableTerms(self) -> int:
         return 0
+
+    def unify(self, data, op, bindlist: list) -> bool:
+        """Match a CALLOTHER op to this segment operation.
+
+        C++ ref: ``SegmentOp::unify``
+        """
+        from ghidra.core.opcodes import OpCode
+        if op.code() != OpCode.CPUI_CALLOTHER:
+            return False
+        if op.getIn(0).getOffset() != self.useropindex:
+            return False
+        if op.numInput() != 3:
+            return False
+        innervn = op.getIn(1)
+        if self.baseinsize != 0:
+            basevn = op.getIn(1)
+            innervn = op.getIn(2)
+            if basevn.isConstant():
+                basevn = data.newConstant(self.baseinsize, basevn.getOffset())
+            bindlist[0] = basevn
+        else:
+            bindlist[0] = None
+        if innervn.isConstant():
+            innervn = data.newConstant(self.innerinsize, innervn.getOffset())
+        bindlist[1] = innervn
+        return True
+
+    def execute(self, inputs: list) -> int:
+        """Execute the segment operation via p-code script.
+
+        C++ ref: ``SegmentOp::execute``
+        """
+        if self.glb is None or not hasattr(self.glb, 'pcodeinjectlib'):
+            raise Exception("SegmentOp.execute requires Architecture with pcodeinjectlib")
+        pcodeScript = self.glb.pcodeinjectlib.getPayload(self.injectId)
+        return pcodeScript.evaluate(inputs)
 
 
 class JumpAssistOp(UserPcodeOp):

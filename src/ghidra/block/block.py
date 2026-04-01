@@ -494,6 +494,32 @@ class FlowBlock:
                 return True
         return False
 
+    def checkEdges(self) -> None:
+        """Verify consistency of edge references.
+
+        C++ ref: FlowBlock::checkEdges (debug method)
+        """
+        for i, edge in enumerate(self._intothis):
+            rev = edge.reverse_index
+            bl = edge.point
+            if len(bl._outofthis) <= rev:
+                raise Exception("Not enough outofthis blocks")
+            edger = bl._outofthis[rev]
+            if edger.point is not self:
+                raise Exception("Intothis edge mismatch")
+            if edger.reverse_index != i:
+                raise Exception("Intothis index mismatch")
+        for i, edge in enumerate(self._outofthis):
+            rev = edge.reverse_index
+            bl = edge.point
+            if len(bl._intothis) <= rev:
+                raise Exception("Not enough intothis blocks")
+            edger = bl._intothis[rev]
+            if edger.point is not self:
+                raise Exception("Outofthis edge mismatch")
+            if edger.reverse_index != i:
+                raise Exception("Outofthis index mismatch")
+
     def getInIndex(self, bl) -> int:
         for i in range(len(self._intothis)):
             if self._intothis[i].point is bl:
@@ -1308,6 +1334,8 @@ class BlockBasic(FlowBlock):
 
     def negateCondition(self, toporbottom: bool) -> bool:
         from ghidra.ir.op import PcodeOp as PcodeOpCls
+        if not self._op:
+            return False
         self._op[-1].flipFlag(PcodeOpCls.boolean_flip)
         self._op[-1].flipFlag(PcodeOpCls.fallthru_true)
         FlowBlock.negateCondition(self, True); return True

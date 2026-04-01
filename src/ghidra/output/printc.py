@@ -673,7 +673,7 @@ class PrintC(PrintLanguage):
         if spc is not None and spc.getName() == "register":
             off = addr.getOffset()
             sz = vn.getSize() if vn is not None else 4
-            name = self._getRegisterName(off, sz)
+            name = self._getRegisterName(spc, off, sz)
             self.pushAtom(Atom(name, vartoken, SyntaxHighlight.var_color, op, vn))
         elif spc is not None and spc.getName() == "unique":
             name = f"tmp_{addr.getOffset():x}"
@@ -683,18 +683,26 @@ class PrintC(PrintLanguage):
             name = f"{sn}{addr.getOffset():x}"
             self.pushAtom(Atom(name, vartoken, SyntaxHighlight.var_color, op, vn))
 
-    def _getRegisterName(self, off, sz):
-        """Get x86 register name from offset and size."""
+    def _getRegisterName(self, spc, off, sz):
+        """Get register name from space, offset and size via translate."""
         if self._glb is not None and hasattr(self._glb, 'translate') and self._glb.translate is not None:
-            nm = self._glb.translate.getRegisterName(None, off, sz) if hasattr(self._glb.translate, 'getRegisterName') else ""
-            if nm:
-                return nm
+            tr = self._glb.translate
+            if hasattr(tr, 'getRegisterName'):
+                try:
+                    nm = tr.getRegisterName(spc, off, sz)
+                    if nm:
+                        return nm
+                except Exception:
+                    pass
+        # Hardcoded x86 fallback when translate lookup fails
         _x86_regs = {
             (0x0,4): "EAX", (0x4,4): "ECX", (0x8,4): "EDX", (0xC,4): "EBX",
             (0x10,4): "ESP", (0x14,4): "EBP", (0x18,4): "ESI", (0x1C,4): "EDI",
             (0x0,1): "AL", (0x1,1): "AH", (0x4,1): "CL", (0x8,1): "DL",
             (0x0,2): "AX", (0x4,2): "CX", (0x8,2): "DX", (0xC,2): "BX",
-            (0x200,1): "CF", (0x206,1): "ZF", (0x207,1): "SF", (0x20B,1): "OF",
+            (0x200,1): "CF", (0x202,1): "PF", (0x206,1): "ZF",
+            (0x207,1): "SF", (0x20B,1): "OF", (0x208,1): "DF",
+            (0x284,4): "EIP",
         }
         return _x86_regs.get((off, sz), f"reg_{off:x}")
 
@@ -796,9 +804,8 @@ class PrintC(PrintLanguage):
     def genericFunctionName(self, addr):
         if addr is None:
             return "func_unknown"
-        if hasattr(addr, 'printRaw'):
-            return f"func_{addr.printRaw()}"
-        return f"func_{addr.getOffset():x}"
+        off = addr.getOffset() if hasattr(addr, 'getOffset') else 0
+        return f"FUN_{off:08x}"
 
     def genericTypeName(self, ct):
         from ghidra.types.datatype import TYPE_INT, TYPE_UINT, TYPE_UNKNOWN, TYPE_SPACEBASE, TYPE_FLOAT
@@ -1778,7 +1785,7 @@ class PrintC(PrintLanguage):
         for inst in ops:
             if inst.notPrinted():
                 continue
-            if inst.code() == OpCode.CPUI_MULTIEQUAL:
+            if inst.code() in (OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INDIRECT):
                 continue
             if hasattr(inst, 'isBranch') and inst.isBranch():
                 if self.isSet(PrintLanguage.no_branch):

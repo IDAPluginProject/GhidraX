@@ -9,86 +9,313 @@ from ghidra.core.address import calc_mask, mostsigbit_set
 
 
 class RuleDivOpt(Rule):
-    """Collapse multiply-high division pattern: (x * c) >> n => x / d."""
+    """Convert INT_MULT and shift forms into INT_DIV or INT_SDIV.
+
+    C++ ref: ruleaction.cc — RuleDivOpt
+    """
     def __init__(self, g): super().__init__(g, 0, "divopt")
     def clone(self, gl):
         return RuleDivOpt(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT]
-    def applyOp(self, op, data):
-        if not op.getIn(1).isConstant(): return 0
-        n = int(op.getIn(1).getOffset())
-        invn = op.getIn(0)
-        if not invn.isWritten(): return 0
-        # Look for SUBPIECE(MULT(ZEXT/SEXT(x), const))
-        subop = invn.getDef()
-        if subop.code() == OpCode.CPUI_SUBPIECE:
-            multvn = subop.getIn(0)
-            if not multvn.isWritten(): return 0
-            multop = multvn.getDef()
-            if multop.code() != OpCode.CPUI_INT_MULT: return 0
-            if not multop.getIn(1).isConstant(): return 0
-            c = int(subop.getIn(1).getOffset())
-            n += c * 8
-            extvn = multop.getIn(0)
-            if not extvn.isWritten(): return 0
-            extop = extvn.getDef()
-            if extop.code() not in (OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_SEXT): return 0
-            x = extop.getIn(0)
-            if x.isFree(): return 0
-            xsize = x.getSize() * 8
-            multconst = multop.getIn(1).getOffset()
-            from ghidra.core.int128 import calcDivisor
-            divisor = calcDivisor(n, multconst, xsize)
-            if divisor == 0: return 0
-            outsize = op.getOut().getSize()
-            if extop.code() == OpCode.CPUI_INT_ZEXT:
-                data.opSetInput(op, x, 0)
-                data.opSetInput(op, data.newConstant(outsize, divisor), 1)
-                data.opSetOpcode(op, OpCode.CPUI_INT_DIV)
+    def getOpList(self):
+        return [OpCode.CPUI_SUBPIECE, OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT]
+
+    @staticmethod
+    def findForm(op):
+        """Find the multiply-high division form rooted at the given op.
+
+        C++ ref: RuleDivOpt::findForm
+        Returns (resVn, n, y, xsize, extopc) or None if not found.
+        """
+        curOp = op
+        shiftopc = curOp.code()
+        if shiftopc in (OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT):
+            vn = curOp.getIn(0)
+            if not vn.isWritten(): return None
+            cvn = curOp.getIn(1)
+            if not cvn.isConstant(): return None
+            n = int(cvn.getOffset())
+            curOp = vn.getDef()
+        else:
+            n = 0
+            if shiftopc != OpCode.CPUI_SUBPIECE: return None
+            shiftopc = OpCode.CPUI_MAX
+
+        if curOp.code() == OpCode.CPUI_SUBPIECE:
+            c = int(curOp.getIn(1).getOffset())
+            inVn = curOp.getIn(0)
+            if not inVn.isWritten(): return None
+            if curOp.getOut().getSize() + c != inVn.getSize():
+                return None
+            n += 8 * c
+            curOp = inVn.getDef()
+
+        if curOp.code() != OpCode.CPUI_INT_MULT: return None
+        inVn = curOp.getIn(0)
+        y = None
+        if not inVn.isWritten(): return None
+        if hasattr(inVn, 'isConstantExtended'):
+            y = inVn.isConstantExtended()
+        if y is not None:
+            inVn = curOp.getIn(1)
+            if not inVn.isWritten(): return None
+        else:
+            vn1 = curOp.getIn(1)
+            if hasattr(vn1, 'isConstantExtended'):
+                y = vn1.isConstantExtended()
+            if y is None:
+                if vn1.isConstant():
+                    y = int(vn1.getOffset())
+                else:
+                    return None
+
+        extOp = inVn.getDef()
+        extopc = extOp.code()
+        if extopc != OpCode.CPUI_INT_SEXT:
+            if extopc == OpCode.CPUI_INT_ZEXT:
+                nzMask = extOp.getIn(0).getNZMask()
             else:
-                data.opSetInput(op, x, 0)
-                data.opSetInput(op, data.newConstant(outsize, divisor), 1)
-                data.opSetOpcode(op, OpCode.CPUI_INT_SDIV)
-            return 1
-        return 0
+                nzMask = inVn.getNZMask()
+            if nzMask == 0: return None
+            xsize = nzMask.bit_length()
+            if xsize > 4 * inVn.getSize(): return None
+        else:
+            xsize = extOp.getIn(0).getSize() * 8
+
+        if extopc in (OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_SEXT):
+            extVn = extOp.getIn(0)
+            if extVn.isFree(): return None
+            if inVn.getSize() == op.getOut().getSize():
+                resVn = inVn
+            else:
+                resVn = extVn
+        else:
+            extopc = OpCode.CPUI_INT_ZEXT
+            resVn = inVn
+
+        if ((extopc == OpCode.CPUI_INT_ZEXT and shiftopc == OpCode.CPUI_INT_SRIGHT) or
+                (extopc == OpCode.CPUI_INT_SEXT and shiftopc == OpCode.CPUI_INT_RIGHT)):
+            if 8 * op.getOut().getSize() - n != xsize:
+                return None
+        return (resVn, n, y, xsize, extopc)
+
+    @staticmethod
+    def moveSignBitExtraction(firstVn, replaceVn, data) -> None:
+        """Replace sign-bit extractions from firstVn with replaceVn.
+
+        C++ ref: RuleDivOpt::moveSignBitExtraction
+        """
+        testList = [firstVn]
+        if firstVn.isWritten():
+            defOp = firstVn.getDef()
+            if defOp.code() == OpCode.CPUI_INT_SRIGHT:
+                testList.append(defOp.getIn(0))
+        i = 0
+        while i < len(testList):
+            vn = testList[i]
+            i += 1
+            for op in list(vn.getDescend()):
+                opc = op.code()
+                if opc in (OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT):
+                    constVn = op.getIn(1)
+                    if constVn.isWritten():
+                        constOp = constVn.getDef()
+                        if constOp.code() == OpCode.CPUI_COPY:
+                            constVn = constOp.getIn(0)
+                        elif constOp.code() == OpCode.CPUI_INT_AND:
+                            constVn = constOp.getIn(0)
+                            otherVn = constOp.getIn(1)
+                            if not otherVn.isConstant(): continue
+                            if constVn.getOffset() != (constVn.getOffset() & otherVn.getOffset()):
+                                continue
+                    if constVn.isConstant():
+                        sa = firstVn.getSize() * 8 - 1
+                        if sa == int(constVn.getOffset()):
+                            data.opSetInput(op, replaceVn, 0)
+                elif opc == OpCode.CPUI_COPY:
+                    testList.append(op.getOut())
+
+    @staticmethod
+    def checkFormOverlap(op) -> bool:
+        """Check if SUBPIECE form is contained in a superseding INT_SRIGHT form.
+
+        C++ ref: RuleDivOpt::checkFormOverlap
+        """
+        if op.code() != OpCode.CPUI_SUBPIECE: return False
+        vn = op.getOut()
+        for superOp in list(vn.getDescend()):
+            opc = superOp.code()
+            if opc != OpCode.CPUI_INT_RIGHT and opc != OpCode.CPUI_INT_SRIGHT:
+                continue
+            cvn = superOp.getIn(1)
+            if not cvn.isConstant():
+                return True
+            result = RuleDivOpt.findForm(superOp)
+            if result is not None:
+                return True
+        return False
+
+    def applyOp(self, op, data):
+        from ghidra.core.int128 import calcDivisor
+        result = self.findForm(op)
+        if result is None: return 0
+        inVn, n, y, xsize, extOpc = result
+        if self.checkFormOverlap(op): return 0
+        if extOpc == OpCode.CPUI_INT_SEXT:
+            xsize -= 1
+        divisor = calcDivisor(n, y, xsize)
+        if divisor == 0: return 0
+        outSize = op.getOut().getSize()
+
+        if inVn.getSize() < outSize:
+            inExt = data.newOp(1, op.getAddr())
+            data.opSetOpcode(inExt, extOpc)
+            extOut = data.newUniqueOut(outSize, inExt)
+            data.opSetInput(inExt, inVn, 0)
+            inVn = extOut
+            data.opInsertBefore(inExt, op)
+        elif inVn.getSize() > outSize:
+            newop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(newop, OpCode.CPUI_INT_ADD)
+            resVn = data.newUniqueOut(inVn.getSize(), newop)
+            data.opInsertBefore(newop, op)
+            data.opSetOpcode(op, OpCode.CPUI_SUBPIECE)
+            data.opSetInput(op, resVn, 0)
+            data.opSetInput(op, data.newConstant(4, 0), 1)
+            op = newop
+            outSize = inVn.getSize()
+
+        if extOpc == OpCode.CPUI_INT_ZEXT:
+            data.opSetInput(op, inVn, 0)
+            data.opSetInput(op, data.newConstant(outSize, divisor), 1)
+            data.opSetOpcode(op, OpCode.CPUI_INT_DIV)
+        else:
+            self.moveSignBitExtraction(op.getOut(), inVn, data)
+            divop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(divop, OpCode.CPUI_INT_SDIV)
+            newout = data.newUniqueOut(outSize, divop)
+            data.opSetInput(divop, inVn, 0)
+            data.opSetInput(divop, data.newConstant(outSize, divisor), 1)
+            data.opInsertBefore(divop, op)
+            sgnop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(sgnop, OpCode.CPUI_INT_SRIGHT)
+            sgnvn = data.newUniqueOut(outSize, sgnop)
+            data.opSetInput(sgnop, inVn, 0)
+            data.opSetInput(sgnop, data.newConstant(outSize, outSize * 8 - 1), 1)
+            data.opInsertBefore(sgnop, op)
+            data.opSetInput(op, newout, 0)
+            data.opSetInput(op, sgnvn, 1)
+            data.opSetOpcode(op, OpCode.CPUI_INT_ADD)
+        return 1
 
 
 class RuleDivTermAdd(Rule):
-    """Simplify division term: sub(ext(x)*c, n) + x => sub(ext(x)*(c+2^n), n)."""
+    """Simplify division term: sub(ext(x)*c, n) + x => sub(ext(x)*(c+2^n), n).
+
+    C++ ref: ruleaction.cc — RuleDivTermAdd
+    """
     def __init__(self, g): super().__init__(g, 0, "divtermadd")
     def clone(self, gl):
         return RuleDivTermAdd(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT]
+
+    @staticmethod
+    def findSubshift(op):
+        """Find the SUBPIECE + optional shift pattern.
+
+        C++ ref: RuleDivTermAdd::findSubshift
+        Returns (subop, n, shiftopc) or None if not found.
+        """
+        shiftopc = op.code()
+        if shiftopc != OpCode.CPUI_SUBPIECE:
+            vn = op.getIn(0)
+            if not vn.isWritten():
+                return None
+            subop = vn.getDef()
+            if subop.code() != OpCode.CPUI_SUBPIECE:
+                return None
+            if not op.getIn(1).isConstant():
+                return None
+            n = int(op.getIn(1).getOffset())
+        else:
+            shiftopc = OpCode.CPUI_MAX
+            subop = op
+            n = 0
+        c = int(subop.getIn(1).getOffset())
+        if subop.getOut().getSize() + c != subop.getIn(0).getSize():
+            return None
+        n += 8 * c
+        return (subop, n, shiftopc)
+
     def applyOp(self, op, data):
-        # Pattern: (sub(ext(x)*c) >> n) + x => sub(ext(x)*(c+2^n)) >> n
-        # This collapses the extra add into the multiply constant
-        if not op.getIn(1).isConstant():
+        """C++ ref: RuleDivTermAdd::applyOp in ruleaction.cc"""
+        from ghidra.core.int128 import set_u128, leftshift128, add128
+
+        result = self.findSubshift(op)
+        if result is None:
             return 0
-        n = int(op.getIn(1).getOffset())
+        subop, n, shiftopc = result
         if n > 127:
             return 0
-        invn = op.getIn(0)
-        if not invn.isWritten():
-            return 0
-        subop = invn.getDef()
-        if subop.code() != OpCode.CPUI_SUBPIECE:
-            return 0
+
         multvn = subop.getIn(0)
         if not multvn.isWritten():
             return 0
         multop = multvn.getDef()
         if multop.code() != OpCode.CPUI_INT_MULT:
             return 0
-        if not multop.getIn(1).isConstant():
+        multConst_vn = multop.getIn(1)
+        if not multConst_vn.isConstant():
             return 0
-        # Check for extension
+        multConst = int(multConst_vn.getOffset())
+
         extvn = multop.getIn(0)
         if not extvn.isWritten():
             return 0
         extop = extvn.getDef()
-        if extop.code() not in (OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_SEXT):
+        opc = extop.code()
+        if opc == OpCode.CPUI_INT_ZEXT:
+            if op.code() == OpCode.CPUI_INT_SRIGHT:
+                return 0
+        elif opc == OpCode.CPUI_INT_SEXT:
+            if op.code() == OpCode.CPUI_INT_RIGHT:
+                return 0
+        else:
             return 0
-        # Would need 128-bit constant arithmetic to complete the transform
+
+        power = leftshift128(set_u128(1), n)
+        newMultConst = add128(multConst, power)
+        x = extop.getIn(0)
+
+        for addop in list(op.getOut().getDescend()):
+            if addop.code() != OpCode.CPUI_INT_ADD:
+                continue
+            if addop.getIn(0) is not x and addop.getIn(1) is not x:
+                continue
+
+            # Construct the new constant
+            newConstVn = data.newConstant(extvn.getSize(), newMultConst & calc_mask(extvn.getSize()))
+
+            # Construct the new multiply
+            newmultop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(newmultop, OpCode.CPUI_INT_MULT)
+            newmultvn = data.newUniqueOut(extvn.getSize(), newmultop)
+            data.opSetInput(newmultop, extvn, 0)
+            data.opSetInput(newmultop, newConstVn, 1)
+            data.opInsertBefore(newmultop, op)
+
+            if shiftopc == OpCode.CPUI_MAX:
+                shiftopc = OpCode.CPUI_INT_RIGHT
+            newshiftop = data.newOp(2, op.getAddr())
+            data.opSetOpcode(newshiftop, shiftopc)
+            newshiftvn = data.newUniqueOut(extvn.getSize(), newshiftop)
+            data.opSetInput(newshiftop, newmultvn, 0)
+            data.opSetInput(newshiftop, data.newConstant(4, n), 1)
+            data.opInsertBefore(newshiftop, op)
+
+            data.opSetOpcode(addop, OpCode.CPUI_SUBPIECE)
+            data.opSetInput(addop, newshiftvn, 0)
+            data.opSetInput(addop, data.newConstant(4, 0), 1)
+            return 1
         return 0
 
 
@@ -750,7 +977,7 @@ class RuleExtensionPush(Rule):
         if addcount > 0:
             if op.getIn(0).loneDescend() is not None:
                 return 0
-        from ghidra.transform.ruleaction_batch2c import RulePushPtr
+        from ghidra.transform.rules_pointer import RulePushPtr
         RulePushPtr.duplicateNeed(op, data)
         return 1
 
@@ -1196,39 +1423,344 @@ class RuleTransformCpool(Rule):
 
 
 class RulePiecePathology(Rule):
-    """Fix PIECE where high part is sign/zero extension of low part."""
+    """Search for concatenations with unlikely things to inform return/parameter consumption.
+
+    C++ ref: ruleaction.cc — RulePiecePathology
+    """
     def __init__(self, g): super().__init__(g, 0, "piecepathology")
     def clone(self, gl):
         return RulePiecePathology(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [OpCode.CPUI_PIECE]
+
+    @staticmethod
+    def isPathology(vn, data) -> bool:
+        """Determine if the given Varnode is part of a pathological concatenation.
+
+        C++ ref: RulePiecePathology::isPathology
+        """
+        from ghidra.core.space import IPTR_IOP
+        worklist = []
+        pos = 0
+        slot = 0
+        res = False
+        while True:
+            if vn.isInput() and not vn.isPersist():
+                res = True
+                break
+            op = vn.getDef() if vn.isWritten() else None
+            while not res and op is not None:
+                opc = op.code()
+                if opc == OpCode.CPUI_COPY:
+                    vn = op.getIn(0)
+                    op = vn.getDef() if vn.isWritten() else None
+                elif opc == OpCode.CPUI_MULTIEQUAL:
+                    if not op.isMark():
+                        op.setMark()
+                        worklist.append(op)
+                    op = None
+                elif opc == OpCode.CPUI_INDIRECT:
+                    if op.getIn(1).getSpace().getType() == IPTR_IOP:
+                        callOp = op.getIn(1).getDef() if hasattr(op.getIn(1), 'getDef') else None
+                        if callOp is None:
+                            # Try to get the op from const addr
+                            pass
+                        if callOp is not None and callOp.isCall():
+                            fspec = data.getCallSpecs(callOp) if hasattr(data, 'getCallSpecs') else None
+                            if fspec is not None and not fspec.isOutputActive():
+                                res = True
+                    op = None
+                elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                    fspec = data.getCallSpecs(op) if hasattr(data, 'getCallSpecs') else None
+                    if fspec is not None and not fspec.isOutputActive():
+                        res = True
+                    op = None
+                else:
+                    op = None
+            if res:
+                break
+            if pos >= len(worklist):
+                break
+            op = worklist[pos]
+            if slot < op.numInput():
+                vn = op.getIn(slot)
+                slot += 1
+            else:
+                pos += 1
+                if pos >= len(worklist):
+                    break
+                vn = worklist[pos].getIn(0)
+                slot = 1
+        for w in worklist:
+            w.clearMark()
+        return res
+
+    @staticmethod
+    def tracePathologyForward(op, data) -> int:
+        """Trace a pathological concatenation forward to CALLs and RETURNs.
+
+        C++ ref: RulePiecePathology::tracePathologyForward
+        """
+        count = 0
+        worklist = []
+        pos = 0
+        op.setMark()
+        worklist.append(op)
+        while pos < len(worklist):
+            curOp = worklist[pos]
+            pos += 1
+            outVn = curOp.getOut()
+            for descOp in list(outVn.getDescend()):
+                opc = descOp.code()
+                if opc in (OpCode.CPUI_COPY, OpCode.CPUI_INDIRECT, OpCode.CPUI_MULTIEQUAL):
+                    if not descOp.isMark():
+                        descOp.setMark()
+                        worklist.append(descOp)
+                elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                    fProto = data.getCallSpecs(descOp) if hasattr(data, 'getCallSpecs') else None
+                    if fProto is not None and not fProto.isInputActive() and not fProto.isInputLocked():
+                        bytesConsumed = op.getIn(1).getSize()
+                        for i in range(1, descOp.numInput()):
+                            if descOp.getIn(i) is outVn:
+                                if hasattr(fProto, 'setInputBytesConsumed'):
+                                    if fProto.setInputBytesConsumed(i, bytesConsumed):
+                                        count += 1
+                elif opc == OpCode.CPUI_RETURN:
+                    if hasattr(data, 'getFuncProto'):
+                        fp = data.getFuncProto()
+                        if not fp.isOutputLocked():
+                            if hasattr(fp, 'setReturnBytesConsumed'):
+                                if fp.setReturnBytesConsumed(descOp.getIn(1).getSize()):
+                                    count += 1
+        for w in worklist:
+            w.clearMark()
+        return count
+
     def applyOp(self, op, data):
-        hivn = op.getIn(0)  # High part
-        lovn = op.getIn(1)  # Low part
-        # Check if high part is all zeros (zero extension of low)
-        if hivn.isConstant() and hivn.getOffset() == 0:
-            data.opSetOpcode(op, OpCode.CPUI_INT_ZEXT)
-            data.opSetInput(op, lovn, 0)
-            data.opRemoveInput(op, 1)
-            return 1
-        return 0
+        from ghidra.ir.op import PcodeOp as PcodeOpClass
+        vn = op.getIn(0)
+        if not vn.isWritten():
+            return 0
+        subOp = vn.getDef()
+        opc = subOp.code()
+        if opc == OpCode.CPUI_SUBPIECE:
+            if int(subOp.getIn(1).getOffset()) == 0:
+                return 0
+            if not self.isPathology(subOp.getIn(0), data):
+                return 0
+        elif opc == OpCode.CPUI_INDIRECT:
+            if not subOp.isIndirectCreation():
+                return 0
+            lsbVn = op.getIn(1)
+            if not lsbVn.isWritten():
+                return 0
+            lsbOp = lsbVn.getDef()
+            evalType = getattr(lsbOp, '_evaltype', 0)
+            binary_flag = getattr(PcodeOpClass, 'binary', 2)
+            unary_flag = getattr(PcodeOpClass, 'unary', 1)
+            if (evalType & (binary_flag | unary_flag)) == 0:
+                if not lsbOp.isCall():
+                    return 0
+                fc = data.getCallSpecs(lsbOp) if hasattr(data, 'getCallSpecs') else None
+                if fc is None or not fc.isOutputLocked():
+                    return 0
+            addr = lsbVn.getAddr()
+            spc = addr.getSpace()
+            if spc.isBigEndian():
+                from ghidra.core.address import Address
+                addr = Address(spc, addr.getOffset() - vn.getSize())
+            else:
+                from ghidra.core.address import Address
+                addr = Address(spc, addr.getOffset() + lsbVn.getSize())
+            if addr != vn.getAddr():
+                return 0
+        else:
+            return 0
+        return self.tracePathologyForward(op, data)
 
 
 class RulePieceStructure(Rule):
-    """Detect PIECE ops that form structure fields and convert to structured access."""
+    """Concatenating structure pieces gets printed as explicit write statements.
+
+    C++ ref: ruleaction.cc — RulePieceStructure
+    """
     def __init__(self, g): super().__init__(g, 0, "piecestructure")
     def clone(self, gl):
         return RulePieceStructure(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_PIECE]
+    def getOpList(self): return [OpCode.CPUI_PIECE, OpCode.CPUI_INT_ZEXT]
+
+    @staticmethod
+    def determineDatatype(vn):
+        """Determine structured data-type and base offset for a Varnode.
+
+        C++ ref: RulePieceStructure::determineDatatype
+        Returns (datatype, baseOffset) or (None, 0).
+        """
+        ct = vn.getStructuredType() if hasattr(vn, 'getStructuredType') else None
+        if ct is None:
+            return (None, 0)
+        if ct.getSize() != vn.getSize():
+            entry = vn.getSymbolEntry() if hasattr(vn, 'getSymbolEntry') else None
+            if entry is None:
+                return (None, 0)
+            baseOffset = vn.getAddr().overlap(0, entry.getAddr(), ct.getSize()) if hasattr(vn.getAddr(), 'overlap') else -1
+            if baseOffset < 0:
+                return (None, 0)
+            baseOffset += entry.getOffset() if hasattr(entry, 'getOffset') else 0
+            subType = ct
+            subOffset = baseOffset
+            while subType is not None and subType.getSize() > vn.getSize():
+                result = subType.getSubType(subOffset)
+                if result is None:
+                    subType = None
+                    break
+                if isinstance(result, tuple):
+                    subType, subOffset = result
+                else:
+                    subType = result
+                    subOffset = 0
+            if subType is not None and subType.getSize() == vn.getSize() and subOffset == 0:
+                if not (hasattr(subType, 'isPieceStructured') and subType.isPieceStructured()):
+                    return (None, 0)
+        else:
+            baseOffset = 0
+        return (ct, baseOffset)
+
+    @staticmethod
+    def spanningRange(ct, offset: int, size: int) -> bool:
+        """Determine if the given range spans multiple elements of a structured data-type.
+
+        C++ ref: RulePieceStructure::spanningRange
+        """
+        if offset + size > ct.getSize():
+            return False
+        newOff = offset
+        while True:
+            result = ct.getSubType(newOff) if hasattr(ct, 'getSubType') else None
+            if result is None:
+                return True
+            if isinstance(result, tuple):
+                ct, newOff = result
+            else:
+                ct = result
+                newOff = 0
+            if newOff + size > ct.getSize():
+                return True
+            if not (hasattr(ct, 'isPieceStructured') and ct.isPieceStructured()):
+                break
+        return False
+
+    @staticmethod
+    def convertZextToPiece(zext, ct, offset: int, data) -> bool:
+        """Convert an INT_ZEXT to PIECE with a zero constant as the first parameter.
+
+        C++ ref: RulePieceStructure::convertZextToPiece
+        """
+        outvn = zext.getOut()
+        invn = zext.getIn(0)
+        if invn.isConstant():
+            return False
+        sz = outvn.getSize() - invn.getSize()
+        if sz > 8:
+            return False
+        spc = outvn.getSpace() if hasattr(outvn, 'getSpace') else None
+        isBig = spc.isBigEndian() if spc is not None and hasattr(spc, 'isBigEndian') else False
+        offset += 0 if isBig else invn.getSize()
+        newOff = offset
+        while ct is not None and ct.getSize() > sz:
+            result = ct.getSubType(newOff) if hasattr(ct, 'getSubType') else None
+            if result is None:
+                ct = None
+                break
+            if isinstance(result, tuple):
+                ct, newOff = result
+            else:
+                ct = result
+                newOff = 0
+        zerovn = data.newConstant(sz, 0)
+        if ct is not None and ct.getSize() == sz:
+            if hasattr(zerovn, 'updateType'):
+                zerovn.updateType(ct)
+        data.opSetOpcode(zext, OpCode.CPUI_PIECE)
+        data.opInsertInput(zext, zerovn, 0)
+        if hasattr(invn, 'getType') and hasattr(invn.getType(), 'needsResolution'):
+            if invn.getType().needsResolution():
+                if hasattr(data, 'inheritResolution'):
+                    data.inheritResolution(invn.getType(), zext, 1, zext, 0)
+        return True
+
+    @staticmethod
+    def findReplaceZext(stack, structuredType, data) -> bool:
+        """Search for leaves defined by INT_ZEXT and convert them to PIECE.
+
+        C++ ref: RulePieceStructure::findReplaceZext
+        """
+        change = False
+        for node in stack:
+            if not node.get('isLeaf', False):
+                continue
+            vn = node.get('vn')
+            if vn is None or not vn.isWritten():
+                continue
+            op = vn.getDef()
+            if op.code() != OpCode.CPUI_INT_ZEXT:
+                continue
+            typeOff = node.get('typeOffset', 0)
+            if not RulePieceStructure.spanningRange(structuredType, typeOff, vn.getSize()):
+                continue
+            if RulePieceStructure.convertZextToPiece(op, structuredType, typeOff, data):
+                change = True
+        return change
+
+    @staticmethod
+    def separateSymbol(root, leaf) -> bool:
+        """Return True if root and leaf should be part of different symbols.
+
+        C++ ref: RulePieceStructure::separateSymbol
+        """
+        rootEntry = root.getSymbolEntry() if hasattr(root, 'getSymbolEntry') else None
+        leafEntry = leaf.getSymbolEntry() if hasattr(leaf, 'getSymbolEntry') else None
+        if rootEntry is not leafEntry:
+            return True
+        if root.isAddrTied():
+            return False
+        if not leaf.isWritten():
+            return True
+        if hasattr(leaf, 'isProtoPartial') and leaf.isProtoPartial():
+            return True
+        op = leaf.getDef()
+        if op.isMarker():
+            return True
+        if op.code() != OpCode.CPUI_PIECE:
+            return False
+        if hasattr(leaf, 'getType') and hasattr(leaf.getType(), 'isPieceStructured'):
+            if leaf.getType().isPieceStructured():
+                return True
+        return False
+
     def applyOp(self, op, data):
-        # Would detect when PIECE inputs come from adjacent fields of the same structure
-        # and convert to a direct structure access
+        if hasattr(op, 'isPartialRoot') and op.isPartialRoot():
+            return 0
         outvn = op.getOut()
-        if outvn is None: return 0
-        # Need to check if output has a structured type
-        dt = outvn.getType() if hasattr(outvn, 'getType') and outvn.getType() is not None else None
-        if dt is None: return 0
-        from ghidra.types.datatype import TYPE_STRUCT
-        if dt.getMetatype() == TYPE_STRUCT:
-            # Would check if inputs match adjacent fields
-            pass
+        ct, baseOffset = self.determineDatatype(outvn)
+        if ct is None:
+            return 0
+        if op.code() == OpCode.CPUI_INT_ZEXT:
+            outType = outvn.getType() if hasattr(outvn, 'getType') else None
+            if outType is not None and self.convertZextToPiece(op, outType, 0, data):
+                return 1
+            return 0
+        # Check if outvn is really the root of the tree
+        zext = outvn.loneDescend()
+        if zext is not None:
+            if zext.code() == OpCode.CPUI_PIECE:
+                return 0
+            if zext.code() == OpCode.CPUI_INT_ZEXT:
+                zextOut = zext.getOut()
+                zextType = zextOut.getType() if hasattr(zextOut, 'getType') else None
+                if zextType is not None and self.convertZextToPiece(zext, zextType, 0, data):
+                    return 1
+                return 0
+        # Mark this op as a partial root
+        if hasattr(op, 'setPartialRoot'):
+            op.setPartialRoot()
         return 0

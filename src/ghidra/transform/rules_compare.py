@@ -290,7 +290,10 @@ class RuleAndDistribute(Rule):
         return [int(OpCode.CPUI_INT_AND)]
 
     def applyOp(self, op, data) -> int:
-        size = op.getOut().getSize()
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        size = outvn.getSize()
         if size > 8:
             return 0
         fullmask = calc_mask(size)

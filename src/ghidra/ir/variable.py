@@ -13,6 +13,38 @@ from ghidra.ir.cover import Cover
 if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
 
+# ---------------------------------------------------------------------------
+# Pre-cached Varnode flag constants — avoids repeated sys.modules lookup
+# inside every hot flag-checking method (called millions of times per run).
+# ---------------------------------------------------------------------------
+_VN_MARK            = 0x01
+_VN_CONSTANT        = 0x02
+_VN_INPUT           = 0x08
+_VN_IMPLIED         = 0x40
+_VN_TYPELOCK        = 0x100
+_VN_NAMELOCK        = 0x200
+_VN_PERSIST         = 0x4000
+_VN_ADDRTIED        = 0x8000
+_VN_UNAFFECTED      = 0x10000
+_VN_SPACEBASE       = 0x20000
+_VN_INDIRECT_CREATE = 0x400000
+_VN_MAPPED          = 0x200000
+_VN_PROTO_PARTIAL   = 0x80000000
+_HV_FLAGSDIRTY      = 1    # HighVariable.flagsdirty
+_HV_COVERDIRTY      = 8    # HighVariable.coverdirty
+_HV_SYMBOLDIRTY     = 0x10 # HighVariable.symboldirty
+_HV_TYPEDIRTY       = 4    # HighVariable.typedirty
+_HV_COVER_MASK      = 0x408  # coverdirty | extendcoverdirty (for isCoverDirty)
+_VN_WRITTEN         = 0x10   # Varnode.written flag (def op assigned)
+_CPUI_COPY          = 1      # OpCode.CPUI_COPY integer value
+_ADDRSPACE_BIG_ENDIAN = 1    # AddrSpace.big_endian flag bit
+# Mask of flags that block speculative merging when set on a HighVariable.
+# If (flags & _SPEC_OK_BLOCKERS)==0 AND _symbol is None → _spec_ok=True.
+_SPEC_OK_BLOCKERS   = (0x08 | 0x4000 | 0x8000 |   # INPUT|PERSIST|ADDRTIED
+                       0x400000 |                  # INDIRECT_CREATE
+                       0x80000000 |                # PROTO_PARTIAL
+                       0x200)                      # NAMELOCK
+
 
 class VariableGroup:
     """A collection of HighVariable objects that overlap.
@@ -204,12 +236,19 @@ class HighVariable:
     intersectdirty   = 0x200
     extendcoverdirty = 0x400
 
+    __slots__ = (
+        '_inst', '_numMergeClasses', '_highflags', '_flags', '_spec_ok',
+        '_type', '_nameRepresentative', '_internalCover', '_piece',
+        '_symbol', '_symboloffset',
+    )
+
     def __init__(self, vn: Varnode) -> None:
         self._inst: List[Varnode] = [vn]
         self._numMergeClasses: int = 1
         self._highflags: int = (HighVariable.flagsdirty | HighVariable.namerepdirty |
                                 HighVariable.typedirty | HighVariable.coverdirty)
         self._flags: int = 0
+        self._spec_ok: bool = False  # True when no speculative-merge blockers are set
         self._type = None  # Datatype
         self._nameRepresentative: Optional[Varnode] = None
         self._internalCover: Cover = Cover()
@@ -224,17 +263,20 @@ class HighVariable:
     # --- Accessors ---
 
     def getType(self):
-        self._updateType()
+        if self._highflags & _HV_TYPEDIRTY:
+            self._updateType()
         return self._type
 
     def getCover(self) -> Cover:
-        self._updateCover()
+        if self._highflags & _HV_COVERDIRTY:
+            self._updateCover()
         if self._piece is not None:
             return self._piece.getCover()
         return self._internalCover
 
     def getSymbol(self):
-        self._updateSymbol()
+        if self._highflags & _HV_SYMBOLDIRTY:
+            self._updateSymbol()
         return self._symbol
 
     def getSymbolOffset(self) -> int:
@@ -252,76 +294,61 @@ class HighVariable:
     # --- Flag queries ---
 
     def isMapped(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.mapped) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_MAPPED)
 
     def isPersist(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.persist) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_PERSIST)
 
     def isAddrTied(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.addrtied) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_ADDRTIED)
 
     def isInput(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.input) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_INPUT)
 
     def isUnaffected(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.unaffected) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_UNAFFECTED)
 
     def isConstant(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.constant) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_CONSTANT)
 
     def isTypeLock(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.typelock) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_TYPELOCK)
 
     def isNameLock(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.namelock) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_NAMELOCK)
 
     def isImplied(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.implied) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_IMPLIED)
 
     def isSpacebase(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.spacebase) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_SPACEBASE)
 
     def isExtraOut(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & (VN.indirect_creation | VN.addrtied)) == VN.indirect_creation
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return (self._flags & (_VN_INDIRECT_CREATE | _VN_ADDRTIED)) == _VN_INDIRECT_CREATE
 
     def isProtoPartial(self) -> bool:
-        self._updateFlags()
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.proto_partial) != 0
+        if self._highflags & _HV_FLAGSDIRTY: self._updateFlags()
+        return bool(self._flags & _VN_PROTO_PARTIAL)
 
     def setMark(self) -> None:
-        from ghidra.ir.varnode import Varnode as VN
-        self._flags |= VN.mark
+        self._flags |= _VN_MARK
 
     def clearMark(self) -> None:
-        from ghidra.ir.varnode import Varnode as VN
-        self._flags &= ~VN.mark
+        self._flags &= ~_VN_MARK
 
     def isMark(self) -> bool:
-        from ghidra.ir.varnode import Varnode as VN
-        return (self._flags & VN.mark) != 0
+        return bool(self._flags & _VN_MARK)
 
     def isUnmerged(self) -> bool:
         return (self._highflags & HighVariable.unmerged) != 0
@@ -378,6 +405,90 @@ class HighVariable:
     def isCoverDirty(self) -> bool:
         return (self._highflags & (HighVariable.coverdirty | HighVariable.extendcoverdirty)) != 0
 
+    # --- Representative / naming methods ---
+
+    def getNameRepresentative(self) -> 'Varnode':
+        """Return the Varnode best suited to provide a name.
+
+        C++ ref: ``HighVariable::getNameRepresentative`` in variable.cc
+        """
+        if (self._highflags & HighVariable.namerepdirty) == 0:
+            if self._nameRepresentative is not None:
+                return self._nameRepresentative
+        self._highflags &= ~HighVariable.namerepdirty
+        if not self._inst:
+            return self._nameRepresentative
+        rep = self._inst[0]
+        for vn in self._inst[1:]:
+            if HighVariable.compareName(rep, vn):
+                rep = vn
+        self._nameRepresentative = rep
+        return rep
+
+    def getTypeRepresentative(self) -> 'Varnode':
+        """Return the Varnode best suited to determine the data-type.
+
+        C++ ref: ``HighVariable::getTypeRepresentative`` in variable.cc
+        """
+        if not self._inst:
+            return None
+        rep = self._inst[0]
+        for vn in self._inst[1:]:
+            if rep.isTypeLock() != vn.isTypeLock():
+                if vn.isTypeLock():
+                    rep = vn
+            else:
+                rtype = rep.getType()
+                vtype = vn.getType()
+                if rtype is not None and vtype is not None and hasattr(vtype, 'typeOrderBool'):
+                    if vtype.typeOrderBool(rtype) < 0:
+                        rep = vn
+        return rep
+
+    def getInputVarnode(self) -> 'Varnode':
+        """Return the input Varnode member (must exist).
+
+        C++ ref: ``HighVariable::getInputVarnode`` in variable.cc
+        """
+        for vn in self._inst:
+            if vn.isInput():
+                return vn
+        raise RuntimeError("HighVariable has no input member")
+
+    def hasName(self) -> bool:
+        """Determine if this variable can have a name.
+
+        Returns False for implied varnodes, non-coverable varnodes,
+        and certain unaffected inputs like the stack pointer.
+
+        C++ ref: ``HighVariable::hasName`` in variable.cc
+        """
+        indirectonly = True
+        for vn in self._inst:
+            if not vn.hasCover():
+                if len(self._inst) > 1:
+                    raise RuntimeError("Non-coverable varnode has been merged")
+                return False
+            if vn.isImplied():
+                if len(self._inst) > 1:
+                    raise RuntimeError("Implied varnode has been merged")
+                return False
+            if not (hasattr(vn, 'isIndirectOnly') and vn.isIndirectOnly()):
+                indirectonly = False
+        if self.isUnaffected():
+            if not self.isInput():
+                return False
+            if indirectonly:
+                return False
+            try:
+                vn = self.getInputVarnode()
+            except RuntimeError:
+                return False
+            if not (hasattr(vn, 'isIllegalInput') and vn.isIllegalInput()):
+                if vn.isSpacebase():
+                    return False
+        return True
+
     # --- Internal update methods ---
 
     def updateFlags(self) -> None:
@@ -394,6 +505,7 @@ class HighVariable:
         self._flags &= (VN.mark | VN.typelock)
         self._flags |= fl & ~(VN.mark | VN.directwrite | VN.typelock)
         self._highflags &= ~HighVariable.flagsdirty
+        self._spec_ok = (self._flags & _SPEC_OK_BLOCKERS) == 0 and self._symbol is None
 
     def _updateType(self) -> None:
         if (self._highflags & HighVariable.typedirty) == 0:
@@ -473,6 +585,7 @@ class HighVariable:
 
     def setSymbol(self, vn: Varnode) -> None:
         """Update Symbol information for this from the given member Varnode."""
+        self._spec_ok = False  # symbol assigned → disable fast-path
         entry = vn.getSymbolEntry()
         if entry is None:
             return
@@ -487,16 +600,18 @@ class HighVariable:
         elif hasattr(entry, 'isDynamic') and entry.isDynamic():
             self._symboloffset = -1
         elif (self._symbol is not None and hasattr(self._symbol, 'getType') and
+              self._symbol.getType() is not None and
               hasattr(entry, 'getAddr') and
               self._symbol.getType().getSize() == vn.getSize() and
               entry.getAddr() == vn.getAddr() and
               not (hasattr(entry, 'isPiece') and entry.isPiece())):
             self._symboloffset = -1
         else:
+            symtype = self._symbol.getType() if (self._symbol and hasattr(self._symbol, 'getType')) else None
+            symsize = symtype.getSize() if symtype is not None else 0
             if hasattr(vn, 'getAddr') and hasattr(entry, 'getAddr') and hasattr(entry, 'getOffset'):
                 self._symboloffset = vn.getAddr().overlapJoin(
-                    0, entry.getAddr(),
-                    self._symbol.getType().getSize() if (self._symbol and hasattr(self._symbol, 'getType')) else 0
+                    0, entry.getAddr(), symsize
                 ) + entry.getOffset()
             else:
                 self._symboloffset = -1
@@ -509,6 +624,8 @@ class HighVariable:
         self._symbol = sym
         self._symboloffset = off
         self._highflags &= ~HighVariable.symboldirty
+        if sym is not None:
+            self._spec_ok = False
 
     def merge(self, tv2: HighVariable, testCache=None, isspeculative: bool = False) -> None:
         """Merge with another HighVariable taking into account groups."""
@@ -742,73 +859,12 @@ class HighVariable:
 
     # --- Query helpers ---
 
-    def hasName(self) -> bool:
-        """Check if this HighVariable can be named."""
-        indirectonly = True
-        for vn in self._inst:
-            if not vn.hasCover():
-                if len(self._inst) > 1:
-                    raise RuntimeError("Non-coverable varnode has been merged")
-                return False
-            if vn.isImplied():
-                if len(self._inst) > 1:
-                    raise RuntimeError("Implied varnode has been merged")
-                return False
-            if not vn.isIndirectOnly():
-                indirectonly = False
-        if self.isUnaffected():
-            if not self.isInput():
-                return False
-            if indirectonly:
-                return False
-            vn = self.getInputVarnode()
-            if vn is not None and not vn.isIllegalInput():
-                if vn.isSpacebase():
-                    return False
-        return True
-
     def getTiedVarnode(self) -> Optional[Varnode]:
         """Find the first address-tied member Varnode."""
         for vn in self._inst:
             if vn.isAddrTied():
                 return vn
         raise RuntimeError("Could not find address-tied varnode")
-
-    def getInputVarnode(self) -> Optional[Varnode]:
-        """Find (the) input member Varnode."""
-        for vn in self._inst:
-            if vn.isInput():
-                return vn
-        raise RuntimeError("Could not find input varnode")
-
-    def getTypeRepresentative(self) -> Optional[Varnode]:
-        """Get a member Varnode with the strongest data-type."""
-        if not self._inst:
-            return None
-        rep = self._inst[0]
-        for i in range(1, len(self._inst)):
-            vn = self._inst[i]
-            if rep.isTypeLock() != vn.isTypeLock():
-                if vn.isTypeLock():
-                    rep = vn
-            elif (hasattr(vn.getType(), 'typeOrderBool') and
-                  0 > vn.getType().typeOrderBool(rep.getType())):
-                rep = vn
-        return rep
-
-    def getNameRepresentative(self) -> Optional[Varnode]:
-        """Get a member Varnode that dictates the naming."""
-        if (self._highflags & HighVariable.namerepdirty) == 0:
-            return self._nameRepresentative
-        self._highflags &= ~HighVariable.namerepdirty
-        if not self._inst:
-            return self._nameRepresentative
-        self._nameRepresentative = self._inst[0]
-        for i in range(1, len(self._inst)):
-            vn = self._inst[i]
-            if HighVariable.compareName(self._nameRepresentative, vn):
-                self._nameRepresentative = vn
-        return self._nameRepresentative
 
     def groupWith(self, off: int, hi2: HighVariable) -> None:
         """Put this and another HighVariable in the same intersection group."""
@@ -927,57 +983,79 @@ class HighIntersectTest:
 
     def __init__(self, affectingOps=None) -> None:
         self._affectingOps = affectingOps
-        self._highedgemap: dict = {}  # HighEdge -> bool
+        # Per-HighVariable adjacency: _adj[id(a)][id(b)] = bool (intersection result)
+        # _id_to_high maps id(h) -> HighVariable object for moveIntersectTests
+        self._adj: dict = {}  # id(high) -> {id(neighbor): bool}
+        self._id_to_high: dict = {}  # id(high) -> HighVariable
+        self._blist: list = []  # reused scratch buffer for _blockIntersection
 
     @staticmethod
-    def _gatherBlockVarnodes(a: HighVariable, blk: int, cover, res: list) -> None:
-        """Gather Varnode instances that intersect a cover on a specific block."""
-        for i in range(a.numInstances()):
-            vn = a.getInstance(i)
-            c = vn.getCover()
-            if c is not None and hasattr(c, 'intersectByBlock'):
-                if 1 < c.intersectByBlock(blk, cover):
+    def _gatherBlockVarnodes(a: HighVariable, blk: int, cb_outer, res: list) -> None:
+        """Gather Varnode instances whose cover at blk intersects cb_outer > 1."""
+        for vn in a._inst:
+            c = vn._cover
+            if c is not None:
+                cb1 = c._cover.get(blk)
+                if cb1 is not None and 1 < cb1.intersect(cb_outer):
                     res.append(vn)
 
     @staticmethod
-    def _testBlockIntersection(a: HighVariable, blk: int, cover, relOff: int, blist: list) -> bool:
-        """Test instances for intersection on a specific block with copy shadow check."""
-        for i in range(a.numInstances()):
-            vn = a.getInstance(i)
-            c = vn.getCover()
-            if c is None or not hasattr(c, 'intersectByBlock'):
+    def _testBlockIntersection(a: HighVariable, blk: int, cb_outer, relOff: int, blist: list) -> bool:
+        """Test instances for intersection; blist contains plain Varnode objects."""
+        for vn in a._inst:
+            c = vn._cover
+            if c is None:
                 continue
-            if 2 > c.intersectByBlock(blk, cover):
+            cb1 = c._cover.get(blk)
+            if cb1 is None or 2 > cb1.intersect(cb_outer):
                 continue
+            sz = vn._size
             for vn2 in blist:
-                c2 = vn2.getCover()
-                if c2 is not None and hasattr(c2, 'intersectByBlock'):
-                    if 1 < c2.intersectByBlock(blk, c):
-                        if vn.getSize() == vn2.getSize():
-                            if not vn.copyShadow(vn2):
-                                return True
+                c2 = vn2._cover
+                if c2 is not None:
+                    cb_vn = c2._cover.get(blk)
+                    if cb_vn is not None and 1 < cb_vn.intersect(cb1):
+                        if sz == vn2._size:
+                            # Inline copyShadow(vn, vn2) — return True if no shadow (real intersection)
+                            _cs = vn; _cs2 = vn2
+                            if _cs is not _cs2:
+                                while _cs is not None and (_cs._flags & _VN_WRITTEN) and _cs._def._opcode_enum == _CPUI_COPY:
+                                    _cs = _cs._def._inrefs[0]
+                                    if _cs is _cs2: break
+                                else:
+                                    if _cs is None:
+                                        return True
+                                    while _cs2 is not None and (_cs2._flags & _VN_WRITTEN) and _cs2._def._opcode_enum == _CPUI_COPY:
+                                        _cs2 = _cs2._def._inrefs[0]
+                                        if _cs is _cs2: break
+                                    else:
+                                        return True
                         else:
-                            if hasattr(vn, 'partialCopyShadow'):
-                                if not vn.partialCopyShadow(vn2, relOff):
-                                    return True
-                            else:
+                            if not vn.partialCopyShadow(vn2, relOff):
                                 return True
         return False
 
-    def _blockIntersection(self, a: HighVariable, b: HighVariable, blk: int) -> bool:
+    def _blockIntersection(self, a: HighVariable, b: HighVariable, blk: int,
+                            aCover=None, bCover=None) -> bool:
         """Test if two HighVariables intersect on a given block."""
         blist = []
-        aCover = a.getCover()
-        bCover = b.getCover()
-        self._gatherBlockVarnodes(b, blk, aCover, blist)
-        if self._testBlockIntersection(a, blk, bCover, 0, blist):
+        if aCover is None:
+            aCover = a.getCover()
+        if bCover is None:
+            bCover = b.getCover()
+        cb_a = aCover._cover.get(blk)
+        cb_b = bCover._cover.get(blk)
+        if cb_a is None or cb_b is None:
+            return False
+        self._gatherBlockVarnodes(b, blk, cb_a, blist)
+        if self._testBlockIntersection(a, blk, cb_b, 0, blist):
             return True
         if a._piece is not None:
             baseOff = a._piece.getOffset()
             for i in range(a._piece.numIntersection()):
                 interPiece = a._piece.getIntersection(i)
                 off = interPiece.getOffset() - baseOff
-                if self._testBlockIntersection(interPiece.getHigh(), blk, bCover, off, blist):
+                if self._testBlockIntersection(interPiece.getHigh(), blk, cb_b, off, blist):
                     return True
         if b._piece is not None:
             bBaseOff = b._piece.getOffset()
@@ -985,8 +1063,8 @@ class HighIntersectTest:
                 blist2 = []
                 bPiece = b._piece.getIntersection(i)
                 bOff = bPiece.getOffset() - bBaseOff
-                self._gatherBlockVarnodes(bPiece.getHigh(), blk, aCover, blist2)
-                if self._testBlockIntersection(a, blk, bCover, -bOff, blist2):
+                self._gatherBlockVarnodes(bPiece.getHigh(), blk, cb_a, blist2)
+                if self._testBlockIntersection(a, blk, cb_b, -bOff, blist2):
                     return True
                 if a._piece is not None:
                     aBaseOff = a._piece.getOffset()
@@ -997,23 +1075,23 @@ class HighIntersectTest:
                             continue
                         if aOff < 0 and -aOff >= aInterPiece.getSize():
                             continue
-                        if self._testBlockIntersection(aInterPiece.getHigh(), blk, bCover, aOff, blist2):
+                        if self._testBlockIntersection(aInterPiece.getHigh(), blk, cb_b, aOff, blist2):
                             return True
         return False
 
     def _purgeHigh(self, high: HighVariable) -> None:
         """Remove cached intersection tests for a given HighVariable."""
         hid = id(high)
-        to_remove = []
-        reverse_remove = []
-        for edge_key, val in self._highedgemap.items():
-            if edge_key.a is high:
-                to_remove.append(edge_key)
-                reverse_remove.append(HighEdge(edge_key.b, edge_key.a))
-        for rk in reverse_remove:
-            self._highedgemap.pop(rk, None)
-        for k in to_remove:
-            self._highedgemap.pop(k, None)
+        neighbors = self._adj.pop(hid, None)
+        if neighbors is None:
+            return
+        # Remove reverse edges for each neighbor O(degree)
+        for nbid in neighbors:
+            nb_map = self._adj.get(nbid)
+            if nb_map is not None:
+                nb_map.pop(hid, None)
+                if not nb_map:
+                    del self._adj[nbid]
 
     def _testUntiedCallIntersection(self, tied: HighVariable, untied: HighVariable) -> bool:
         """Test if untied HighVariable intersects an address-tied one during a call."""
@@ -1035,82 +1113,194 @@ class HighIntersectTest:
 
     def updateHigh(self, a: HighVariable) -> bool:
         """Make sure given HighVariable's Cover is up-to-date."""
-        if not hasattr(a, 'isCoverDirty') or not a.isCoverDirty():
+        if not (a._highflags & _HV_COVER_MASK):
             return True
-        if hasattr(a, 'updateCover'):
-            a.updateCover()
+        a.updateCover()
         self._purgeHigh(a)
         return False
 
     def intersection(self, a: HighVariable, b: HighVariable) -> bool:
-        """Test the intersection of two HighVariables and cache the result."""
+        """Test the intersection of two HighVariables."""
         if a is b:
             return False
-        ares = self.updateHigh(a)
-        bres = self.updateHigh(b)
-        if ares and bres:
-            edge = HighEdge(a, b)
-            cached = self._highedgemap.get(edge)
-            if cached is not None:
-                return cached
-        res = False
-        aCover = a.getCover() if hasattr(a, 'getCover') else None
-        bCover = b.getCover() if hasattr(b, 'getCover') else None
-        if aCover is not None and bCover is not None:
-            if hasattr(aCover, 'intersectList') and hasattr(a, 'numInstances'):
-                blockisect = aCover.intersectList(bCover, 2)
-                for blk in blockisect:
-                    if self._blockIntersection(a, b, blk):
-                        res = True
-                        break
+        # Inline updateHigh: ensure covers are up-to-date
+        if a._highflags & _HV_COVER_MASK:
+            a.updateCover()
+            self._purgeHigh(a)
+        if b._highflags & _HV_COVER_MASK:
+            b.updateCover()
+            self._purgeHigh(b)
+        a_piece = a._piece; b_piece = b._piece
+        aCover = a_piece._cover if a_piece is not None else a._internalCover
+        bCover = b_piece._cover if b_piece is not None else b._internalCover
+        if aCover is None or bCover is None:
+            return False
+        # Inline intersectList + common no-piece _blockIntersection path
+        ac = aCover._cover
+        c2 = bCover._cover
+        no_piece = a_piece is None and b_piece is None
+        a_inst = a._inst; b_inst = b._inst
+        if no_piece and len(a_inst) == 1 and len(b_inst) == 1:
+            # ---- Dominant fast path: single-instance no-piece ----
+            # All 3 inner intersect checks already guaranteed by outer cb1.intersect(cb2)>=2.
+            vn_a = a_inst[0]; vn_b = b_inst[0]
+            if vn_a._size == vn_b._size:
+                # Same-size subpath: inline copyShadow, no per-block branch
+                if vn_a is not vn_b:
+                    if len(ac) > len(c2): ac, c2 = c2, ac  # iterate smaller dict
+                    for blk, cb1 in ac.items():
+                        cb2 = c2.get(blk)
+                        if cb2 is None:
+                            continue
+                        # Inline CoverBlock.intersect >= 2 (saves 4.95M fn-call overheads)
+                        _us1 = cb1.ustart; _ue1 = cb1.ustop
+                        _us2 = cb2.ustart; _ue2 = cb2.ustop
+                        if _us1 <= _ue1:
+                            if _us2 <= _ue2:
+                                if _ue1 <= _us2 or _ue2 <= _us1: continue
+                            else:
+                                if _us1 >= _ue2 and _ue1 <= _us2: continue
+                        else:
+                            if _us2 <= _ue2:
+                                if _us2 >= _ue1 and _ue2 <= _us1: continue
+                        _va = vn_a
+                        while (_va is not None) and (_va._flags & _VN_WRITTEN) and _va._def._opcode_enum == _CPUI_COPY:
+                            _va = _va._def._inrefs[0]
+                            if _va is vn_b: break
+                        else:
+                            _vb = vn_b
+                            while (_vb is not None) and (_vb._flags & _VN_WRITTEN) and _vb._def._opcode_enum == _CPUI_COPY:
+                                _vb = _vb._def._inrefs[0]
+                                if _va is _vb: break
+                            else:
+                                return True
             else:
-                # Fallback for objects without full HighVariable API
-                val = aCover.intersect(bCover) if hasattr(aCover, 'intersect') else 0
-                res = (val == 2)
-        if not res and hasattr(a, 'isAddrTied') and hasattr(b, 'isAddrTied'):
-            aTied = a.isAddrTied()
-            bTied = b.isAddrTied()
-            if aTied != bTied:
-                if aTied:
-                    res = self._testUntiedCallIntersection(a, b)
+                # Different-size subpath: inline partialCopyShadow, hoist setup outside loop
+                # relOff=0 guaranteed; sizes differ guaranteed; so s1 < s2 after reorder
+                _ps1 = vn_a._size; _ps2 = vn_b._size
+                if _ps1 < _ps2:
+                    _psv = vn_a; _pop2 = vn_b
                 else:
-                    res = self._testUntiedCallIntersection(b, a)
-        self._highedgemap[HighEdge(a, b)] = res
-        self._highedgemap[HighEdge(b, a)] = res
-        return res
+                    _psv = vn_b; _pop2 = vn_a; _ps1, _ps2 = _ps2, _ps1
+                _pspc = _psv._loc.base
+                _plb = (_ps2 - _ps1) if (_pspc is not None and (_pspc._flags & _ADDRSPACE_BIG_ENDIAN)) else 0
+                if len(ac) > len(c2): ac, c2 = c2, ac  # iterate smaller dict
+                for blk, cb1 in ac.items():
+                    cb2 = c2.get(blk)
+                    if cb2 is None:
+                        continue
+                    _us1 = cb1.ustart; _ue1 = cb1.ustop
+                    _us2 = cb2.ustart; _ue2 = cb2.ustop
+                    if _us1 <= _ue1:
+                        if _us2 <= _ue2:
+                            if _ue1 <= _us2 or _ue2 <= _us1: continue
+                        else:
+                            if _us1 >= _ue2 and _ue1 <= _us2: continue
+                    else:
+                        if _us2 <= _ue2:
+                            if _us2 >= _ue1 and _ue2 <= _us1: continue
+                    if not _psv.findSubpieceShadow(_plb, _pop2, 0):
+                        if not _pop2.findPieceShadow(_plb, _psv):
+                            return True
+        elif no_piece:
+            # Multi-instance no-piece path — all CoverBlock.intersect calls inlined
+            for blk, cb1 in ac.items():
+                cb2 = c2.get(blk)
+                if cb2 is None:
+                    continue
+                # Inline cb1.intersect(cb2) < 2
+                _u1s = cb1.ustart; _u1e = cb1.ustop
+                _u2s = cb2.ustart; _u2e = cb2.ustop
+                if _u1s <= _u1e:
+                    if _u2s <= _u2e:
+                        if _u1e <= _u2s or _u2e <= _u1s: continue
+                    else:
+                        if _u1s >= _u2e and _u1e <= _u2s: continue
+                else:
+                    if _u2s <= _u2e:
+                        if _u2s >= _u1e and _u2e <= _u1s: continue
+                for vn_a in a_inst:
+                    ca = vn_a._cover
+                    if ca is None:
+                        continue
+                    ca_blk = ca._cover.get(blk)
+                    if ca_blk is None:
+                        continue
+                    # Inline ca_blk.intersect(cb2) < 2
+                    _cas = ca_blk.ustart; _cae = ca_blk.ustop
+                    if _cas <= _cae:
+                        if _u2s <= _u2e:
+                            if _cae <= _u2s or _u2e <= _cas: continue
+                        else:
+                            if _cas >= _u2e and _cae <= _u2s: continue
+                    else:
+                        if _u2s <= _u2e:
+                            if _u2s >= _cae and _u2e <= _cas: continue
+                    sz_a = vn_a._size
+                    for vn_b in b_inst:
+                        cb = vn_b._cover
+                        if cb is None:
+                            continue
+                        cb_blk = cb._cover.get(blk)
+                        if cb_blk is None:
+                            continue
+                        # Inline cb_blk.intersect(cb1) < 2
+                        _cbs = cb_blk.ustart; _cbe = cb_blk.ustop
+                        if _cbs <= _cbe:
+                            if _u1s <= _u1e:
+                                if _cbe <= _u1s or _u1e <= _cbs: continue
+                            else:
+                                if _cbs >= _u1e and _cbe <= _u1s: continue
+                        else:
+                            if _u1s <= _u1e:
+                                if _u1s >= _cbe and _u1e <= _cbs: continue
+                        # Inline cb_blk.intersect(ca_blk) < 2
+                        if _cbs <= _cbe:
+                            if _cas <= _cae:
+                                if _cbe <= _cas or _cae <= _cbs: continue
+                            else:
+                                if _cbs >= _cae and _cbe <= _cas: continue
+                        else:
+                            if _cas <= _cae:
+                                if _cas >= _cbe and _cae <= _cbs: continue
+                        sz_b = vn_b._size
+                        if sz_a == sz_b:
+                            if not vn_a.copyShadow(vn_b):
+                                return True
+                        else:
+                            # Inline partialCopyShadow(vn_a, vn_b, 0) — relOff=0, sizes differ
+                            _pcs_spc = vn_a._loc.base
+                            _pcs_big = (_pcs_spc._flags & _ADDRSPACE_BIG_ENDIAN) if _pcs_spc is not None else 0
+                            if sz_a < sz_b:
+                                _plb = (sz_b - sz_a) if _pcs_big else 0
+                                if not vn_a.findSubpieceShadow(_plb, vn_b, 0):
+                                    if not vn_b.findPieceShadow(_plb, vn_a):
+                                        return True
+                            else:
+                                _plb = (sz_a - sz_b) if _pcs_big else 0
+                                if not vn_b.findSubpieceShadow(_plb, vn_a, 0):
+                                    if not vn_a.findPieceShadow(_plb, vn_b):
+                                        return True
+        else:
+            # Has-piece path
+            for blk, cb1 in aCover._cover.items():
+                cb2 = c2.get(blk)
+                if cb2 is None or cb1.intersect(cb2) < 2:
+                    continue
+                if self._blockIntersection(a, b, blk, aCover, bCover):
+                    return True
+        aTied = a.isAddrTied()
+        if aTied != b.isAddrTied():
+            if aTied:
+                return self._testUntiedCallIntersection(a, b)
+            return self._testUntiedCallIntersection(b, a)
+        return False
 
     def moveIntersectTests(self, high1: HighVariable, high2: HighVariable) -> None:
-        """Translate intersection tests for high2 into tests for high1."""
-        yesinter = []
-        nointer = []
-        for edge_key, val in list(self._highedgemap.items()):
-            if edge_key.a is high2:
-                b = edge_key.b
-                if b is high1:
-                    continue
-                if val:
-                    yesinter.append(b)
-                else:
-                    nointer.append(b)
-                    b.setMark()
-        # Purge all high2 tests
-        self._purgeHigh(high2)
-        # Remove high1 false tests if high2 also had no test with that variable
-        to_remove = []
-        for edge_key, val in self._highedgemap.items():
-            if edge_key.a is high1:
-                if not val:
-                    if not edge_key.b.isMark():
-                        to_remove.append(edge_key)
-        for k in to_remove:
-            del self._highedgemap[k]
-        for h in nointer:
-            h.clearMark()
-        # Reinsert high2's intersection==true tests for high1
-        for h in yesinter:
-            self._highedgemap[HighEdge(high1, h)] = True
-            self._highedgemap[HighEdge(h, high1)] = True
+        """No-op: cache removed, intersections are always recomputed."""
+        pass
 
     def clear(self) -> None:
         """Clear any cached tests."""
-        self._highedgemap.clear()
+        self._adj.clear()
+        self._id_to_high.clear()

@@ -378,6 +378,8 @@ class PrintLanguage(ABC):
         Decides how the Varnode should be emitted (symbol, constant, etc.)
         and pushes the resulting leaf Atom.
         """
+        if vn is None:
+            return
         if hasattr(vn, 'isAnnotation') and vn.isAnnotation():
             self.pushAnnotation(vn, op)
             return

@@ -128,6 +128,9 @@ class DecompilerPython:
             arch = ArchitectureStandalone(lifter._spc_mgr)
             fd.setArch(arch)
 
+            # 3b. Create FuncCallSpecs for CALL/CALLIND ops
+            self._safe(lambda: _setup_call_specs(fd, lifter=lifter), "CallSpecs")
+
             # 4. Analysis / optimisation
             ran_full = False
             if self.use_python_full_actions:

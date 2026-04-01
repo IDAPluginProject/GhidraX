@@ -142,6 +142,46 @@ class FloatFormat:
         x |= (code & mask) << self.exp_pos
         return x
 
+    # --- Public API matching C++ method names ---
+
+    def calcPrecision(self) -> None:
+        """C++ ref: FloatFormat::calcPrecision"""
+        self._calcPrecision()
+
+    @staticmethod
+    def createFloat(sign: bool, signif: int, exp: int) -> float:
+        """C++ ref: FloatFormat::createFloat"""
+        return FloatFormat._createFloat(sign, signif, exp)
+
+    @staticmethod
+    def extractExpSig(x: float) -> tuple[FloatClass, bool, int, int]:
+        """C++ ref: FloatFormat::extractExpSig"""
+        return FloatFormat._extractExpSig(x)
+
+    def setFractionalCode(self, x: int, code: int) -> int:
+        """C++ ref: FloatFormat::setFractionalCode"""
+        return self._setFractionalCode(x, code)
+
+    def setSign(self, x: int, sign: bool) -> int:
+        """C++ ref: FloatFormat::setSign"""
+        return self._setSign(x, sign)
+
+    def setExponentCode(self, x: int, code: int) -> int:
+        """C++ ref: FloatFormat::setExponentCode"""
+        return self._setExponentCode(x, code)
+
+    def getZeroEncoding(self, sgn: bool) -> int:
+        """C++ ref: FloatFormat::getZeroEncoding"""
+        return self._getZeroEncoding(sgn)
+
+    def getInfinityEncoding(self, sgn: bool) -> int:
+        """C++ ref: FloatFormat::getInfinityEncoding"""
+        return self._getInfinityEncoding(sgn)
+
+    def getNaNEncoding(self, sgn: bool) -> int:
+        """C++ ref: FloatFormat::getNaNEncoding"""
+        return self._getNaNEncoding(sgn)
+
     # --- Conversion to/from host float ---
 
     @staticmethod

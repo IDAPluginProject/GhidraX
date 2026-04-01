@@ -229,6 +229,8 @@ class RuleDoubleIn(Rule):
     @staticmethod
     def _attemptMarking(vn, subpieceOp) -> int:
         """Mark hi/lo pieces if the SUBPIECE extracts exactly half of an arithmetic whole."""
+        if subpieceOp.numInput() < 2:
+            return 0
         whole = subpieceOp.getIn(0)
         if hasattr(whole, 'isTypeLock') and whole.isTypeLock():
             tp = whole.getType() if hasattr(whole, 'getType') else None
@@ -644,6 +646,7 @@ class RuleSplitFlow(Rule):
         splitflow = SplitFlow(data, invn, lowSize)
         if not splitflow.doTrace():
             return 0
+        splitflow.apply()
         return 1
 
 

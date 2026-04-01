@@ -763,6 +763,13 @@ class Scope(ABC):
     def addMapEntry(self, sym: Symbol, entry: SymbolEntry) -> SymbolEntry:
         ...
 
+    def restrictScope(self, fd) -> None:
+        """Associate this scope with a specific function.
+
+        C++ ref: ``Scope::restrictScope``
+        """
+        self.fd = fd
+
     def isGlobal(self) -> bool:
         return self.parent is None or self.fd is None
 
@@ -820,11 +827,12 @@ class Scope(ABC):
             return self.parent.queryCodeLabel(addr)
         return None
 
-    def queryProperties(self, addr: Address, size: int, usepoint, flags_ref) -> None:
+    def queryProperties(self, addr: Address, size: int, usepoint, flags_ref):
         """Query boolean properties of a memory range (base Scope implementation).
 
         C++ ref: ``Scope::queryProperties`` in database.cc
         Delegates to findClosestFit/findAddr, then falls back to scope-based flags.
+        Returns the SymbolEntry if found, else None.
         """
         from ghidra.ir.varnode import Varnode
         up = usepoint if usepoint else Address()
@@ -844,6 +852,7 @@ class Scope(ABC):
                     flags |= db.getProperty(addr)
         if isinstance(flags_ref, list) and flags_ref:
             flags_ref[0] = flags
+        return entry
 
     # --- Symbol creation methods ---
 
@@ -1242,6 +1251,10 @@ class Scope(ABC):
     def isNameUsed(self, name: str, scope: Optional['Scope'] = None) -> bool:
         return self.findByName(name) is not None
 
+    def _findFirstByName(self, name: str) -> Optional[Symbol]:
+        """Check if a symbol with the given name exists. Returns it or None."""
+        return self.findByName(name)
+
     def isReadOnly(self) -> bool:
         return False
 
@@ -1255,14 +1268,125 @@ class Scope(ABC):
                 return candidate
             i += 1
 
-    def buildDefaultName(self, sym: Symbol, base: int, addr: Address) -> str:
-        return f"DAT_{addr.getOffset():08x}"
+    def buildDefaultName(self, sym, base: int, vn=None) -> str:
+        """Create a default name for the given Symbol.
+
+        C++ ref: ``Scope::buildDefaultName`` in database.cc
+        """
+        from ghidra.ir.varnode import Varnode as VN
+        if vn is not None and not vn.isConstant():
+            usepoint = Address()
+            if not (hasattr(vn, 'isAddrTied') and vn.isAddrTied()) and self.fd is not None:
+                usepoint = vn.getUsePoint(self.fd) if hasattr(vn, 'getUsePoint') else Address()
+            high = vn.getHigh() if hasattr(vn, 'getHigh') else None
+            if sym.getCategory() == Symbol.function_parameter or (high is not None and high.isInput()):
+                index = -1
+                if sym.getCategory() == Symbol.function_parameter:
+                    index = sym.getCategoryIndex() + 1
+                return self.buildVariableName(vn.getAddr(), usepoint, sym.getType(), index, vn.getFlags() | VN.input)
+            return self.buildVariableName(vn.getAddr(), usepoint, sym.getType(), base, vn.getFlags())
+        if hasattr(sym, 'mapentry') and sym.mapentry:
+            entry = sym.mapentry[0]
+            addr = entry.getAddr()
+            usepoint = entry.getFirstUseAddress() if hasattr(entry, 'getFirstUseAddress') else Address()
+            is_invalid = usepoint.isInvalid() if hasattr(usepoint, 'isInvalid') else True
+            flags = VN.addrtied if is_invalid else 0
+            if sym.getCategory() == Symbol.function_parameter:
+                flags |= VN.input
+                index = sym.getCategoryIndex() + 1
+                return self.buildVariableName(addr, usepoint, sym.getType(), index, flags)
+            return self.buildVariableName(addr, usepoint, sym.getType(), base, flags)
+        return self.buildVariableName(Address(), Address(), sym.getType(), base, 0)
 
     def buildUndefinedName(self) -> str:
         return "$$undef"
 
     def buildVariableName(self, addr: Address, pc: Address, ct, index: int, flags: int) -> str:
-        return f"local_{addr.getOffset():x}"
+        """Build a variable name from address and flags.
+
+        C++ ref: ``ScopeInternal::buildVariableName`` in database.cc
+        """
+        from ghidra.ir.varnode import Varnode as VN
+        from ghidra.core.address import AddrSpace
+        sz = 1 if ct is None else ct.getSize()
+
+        def _regname() -> str:
+            if self.glb is not None and hasattr(self.glb, 'translate') and self.glb.translate is not None:
+                nm = self.glb.translate.getRegisterName(
+                    addr.getSpace(), addr.getOffset(), sz
+                ) if hasattr(self.glb.translate, 'getRegisterName') else ""
+                return nm if nm else ""
+            return ""
+
+        if (flags & VN.unaffected) != 0:
+            if (flags & VN.return_address) != 0:
+                return self.makeNameUnique("unaff_retaddr")
+            rn = _regname()
+            if rn:
+                return self.makeNameUnique(f"unaff_{rn}")
+            return self.makeNameUnique(f"unaff_{addr.getOffset():08x}")
+
+        if (flags & VN.persist) != 0:
+            rn = _regname()
+            if rn:
+                return self.makeNameUnique(rn)
+            s = ""
+            if ct is not None and hasattr(ct, 'printNameBase'):
+                s += ct.printNameBase()
+            spacename = addr.getSpace().getName() if addr.getSpace() is not None else "mem"
+            spacename = spacename[0].upper() + spacename[1:]
+            s += spacename
+            addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
+            wordSize = addr.getSpace().getWordSize() if addr.getSpace() is not None and hasattr(addr.getSpace(), 'getWordSize') else 1
+            off = AddrSpace.byteToAddress(addr.getOffset(), wordSize)
+            s += f"{off:0{2*addrSize}x}"
+            return self.makeNameUnique(s)
+
+        if (flags & VN.input) != 0 and index < 0:
+            rn = _regname()
+            if rn:
+                return self.makeNameUnique(f"in_{rn}")
+            sn = addr.getSpace().getName() if addr.getSpace() is not None else "mem"
+            return self.makeNameUnique(f"in_{sn}_{addr.getOffset():08x}")
+
+        if (flags & VN.input) != 0:
+            return self.makeNameUnique(f"param_{index}")
+
+        if (flags & VN.addrtied) != 0:
+            s = ""
+            if ct is not None and hasattr(ct, 'printNameBase'):
+                s += ct.printNameBase()
+            spacename = addr.getSpace().getName() if addr.getSpace() is not None else "mem"
+            spacename = spacename[0].upper() + spacename[1:]
+            s += spacename
+            addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
+            wordSize = addr.getSpace().getWordSize() if addr.getSpace() is not None and hasattr(addr.getSpace(), 'getWordSize') else 1
+            off = AddrSpace.byteToAddress(addr.getOffset(), wordSize)
+            s += f"{off:0{2*addrSize}x}"
+            return self.makeNameUnique(s)
+
+        if (flags & VN.indirect_creation) != 0:
+            rn = _regname()
+            if rn:
+                return self.makeNameUnique(f"extraout_{rn}")
+            return self.makeNameUnique("extraout_var")
+
+        # Local variable — printNameBase(list) appends a prefix character
+        def _namebase(ct):
+            buf = []
+            if ct is not None and hasattr(ct, 'printNameBase'):
+                ct.printNameBase(buf)
+            return "".join(buf)
+
+        s = _namebase(ct) + f"Var{index}"
+        index += 1
+        if self._findFirstByName(s) is not None:
+            for _ in range(10):
+                s2 = _namebase(ct) + f"Var{index}"
+                index += 1
+                if self._findFirstByName(s2) is None:
+                    return s2
+        return self.makeNameUnique(s)
 
     def printBounds(self, s) -> None:
         s.write(f"Scope {self.name}")
@@ -1304,9 +1428,37 @@ class ScopeInternal(Scope):
             sym.symbolId = self._nextSymId
             self._nextSymId += 1
 
-    def addSymbol(self, sym: Symbol) -> None:
+    def addSymbol(self, sym_or_name, ct=None, addr=None, usepoint=None):
+        """Add a Symbol to this scope.
+
+        Two calling conventions:
+          addSymbol(sym: Symbol) -> None              -- add pre-built Symbol
+          addSymbol(name, ct, addr, usepoint) -> SymbolEntry  -- create Symbol + entry
+
+        C++ ref: ``ScopeInternal::addSymbol`` / ``ScopeInternal::addMapSym``
+        """
+        if isinstance(sym_or_name, str):
+            # 4-arg form: create a new Symbol + SymbolEntry
+            name = sym_or_name
+            sz = ct.getSize() if ct is not None and hasattr(ct, 'getSize') else (addr.getSpace().getAddrSize() if addr is not None and addr.getSpace() is not None else 4)
+            sym = Symbol(self, name, ct)
+            self._addSymbolDirect(sym)
+            entry = SymbolEntry(sym, addr, sz)
+            return self.addMapEntry(sym, entry)
+        # Single-arg form: add pre-built Symbol
+        sym = sym_or_name
+        self._addSymbolDirect(sym)
+
+    def _addSymbolDirect(self, sym: Symbol) -> None:
+        """Internal: register a Symbol in all index structures.
+
+        C++ ref: ``ScopeInternal::addSymbolInternal``
+        """
         self._assignSymbolId(sym)
         sym.scope = self
+        if not sym.name:
+            sym.name = self.buildUndefinedName()
+            sym.displayName = sym.name
         self._symbolsById[sym.symbolId] = sym
         if sym.name not in self._symbolsByName:
             self._symbolsByName[sym.name] = []
@@ -1365,16 +1517,19 @@ class ScopeInternal(Scope):
         """
         bestentry = None
         oldsize = -1
-        end = addr.getOffset() + size - 1
+        target_spc = addr.base
+        target_off = addr.offset
+        end = target_off + size - 1
         for entries_list in self._entriesByAddr.values():
             for entry in entries_list:
-                if entry.addr.getSpace() is not addr.getSpace():
+                if entry.addr.base is not target_spc:
                     continue
-                if entry.getFirst() > addr.getOffset():
+                e_off = entry.addr.offset
+                esz = entry.size
+                if e_off > target_off:
                     continue
-                if entry.getLast() < end:
+                if e_off + esz - 1 < end:
                     continue
-                esz = entry.getSize()
                 if esz < oldsize or oldsize == -1:
                     if entry.inUse(usepoint):
                         bestentry = entry
@@ -1468,10 +1623,11 @@ class ScopeInternal(Scope):
             return entry.getSymbol()
         return None
 
-    def queryProperties(self, addr: Address, size: int, usepoint, flags_ref) -> None:
+    def queryProperties(self, addr: Address, size: int, usepoint, flags_ref):
         """Query boolean properties of the given address range.
 
         C++ ref: ``Scope::queryProperties`` in database.cc
+        Returns the SymbolEntry if found, else None.
         """
         from ghidra.ir.varnode import Varnode
         up = usepoint if usepoint else Address()
@@ -1494,9 +1650,26 @@ class ScopeInternal(Scope):
                     flags |= db.getProperty(addr)
         if isinstance(flags_ref, list) and flags_ref:
             flags_ref[0] = flags
+        return entry
+
+    def assignDefaultNames(self, base: int) -> int:
+        """Assign default names to all unnamed symbols.
+
+        C++ ref: ``ScopeInternal::assignDefaultNames`` in database.cc
+        """
+        for sym in list(self._symbolsById.values()):
+            if not sym.isNameUndefined():
+                continue
+            nm = self.buildDefaultName(sym, base, None)
+            self.renameSymbol(sym, nm)
+            base += 1
+        return base
 
     def renameSymbol(self, sym: Symbol, newname: str) -> None:
-        """Rename a symbol."""
+        """Rename a symbol.
+
+        C++ ref: ``ScopeInternal::renameSymbol``
+        """
         oldname = sym.name
         lst = self._symbolsByName.get(oldname)
         if lst:
@@ -1504,7 +1677,8 @@ class ScopeInternal(Scope):
                 lst.remove(sym)
             except ValueError:
                 pass
-        sym.setName(newname)
+        sym.name = newname
+        sym.displayName = newname
         if newname not in self._symbolsByName:
             self._symbolsByName[newname] = []
         self._symbolsByName[newname].append(sym)

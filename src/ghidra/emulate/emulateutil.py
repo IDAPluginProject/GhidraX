@@ -374,6 +374,13 @@ class EmulateSnippet:
         """Retrieve a temporary register value directly."""
         return self.tempValues.get(offset, 0)
 
+    def getLoadImageValue(self, spc: 'AddrSpace', offset: int, sz: int) -> int:
+        """Pull a value from the load image.
+
+        C++ ref: EmulateSnippet::getLoadImageValue
+        """
+        return _load_image_value(self.glb.loader, spc, offset, sz)
+
     # -- legality check ----------------------------------------------------
 
     def checkForLegalCode(self) -> bool:

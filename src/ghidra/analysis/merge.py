@@ -11,6 +11,22 @@ from bisect import bisect_left
 from ghidra.ir.cover import Cover, PcodeOpSet
 from ghidra.core.opcodes import OpCode
 
+# Pre-cached Varnode flag constants for hot merge test paths
+_VN_INPUT           = 0x08
+_VN_TYPELOCK        = 0x100
+_VN_NAMELOCK        = 0x200
+_VN_PERSIST         = 0x4000
+_VN_ADDRTIED        = 0x8000
+_VN_INDIRECT_CREATE = 0x400000
+_VN_PROTO_PARTIAL   = 0x80000000
+_HV_FLAGSDIRTY      = 1
+_HV_SYMBOLDIRTY     = 0x10
+_HV_TYPEDIRTY       = 4
+# Combined mask for speculative exclusions
+_SPEC_EXCL = _VN_INPUT | _VN_PERSIST | _VN_ADDRTIED
+# isExtraOut = (flags & (indirect_creation | addrtied)) == indirect_creation
+_EXTRAOUT_MASK = _VN_INDIRECT_CREATE | _VN_ADDRTIED
+
 if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
     from ghidra.ir.variable import HighVariable
@@ -151,8 +167,8 @@ class Merge:
             if high_in.getType() is not high_out.getType():
                 return False
         if high_out.isAddrTied() and high_in.isAddrTied():
-            t1 = high_out.getTiedVarnode() if hasattr(high_out, 'getTiedVarnode') else None
-            t2 = high_in.getTiedVarnode() if hasattr(high_in, 'getTiedVarnode') else None
+            t1 = high_out.getTiedVarnode()
+            t2 = high_in.getTiedVarnode()
             if t1 is not None and t2 is not None and t1.getAddr() != t2.getAddr():
                 return False
         if high_in.isInput():
@@ -160,17 +176,17 @@ class Merge:
                 return False
             if high_out.isAddrTied() and not high_in.isAddrTied():
                 return False
-        elif hasattr(high_in, 'isExtraOut') and high_in.isExtraOut():
+        elif high_in.isExtraOut():
             return False
         if high_out.isInput():
             if high_in.isPersist():
                 return False
             if high_in.isAddrTied() and not high_out.isAddrTied():
                 return False
-        elif hasattr(high_out, 'isExtraOut') and high_out.isExtraOut():
+        elif high_out.isExtraOut():
             return False
-        if hasattr(high_in, 'isProtoPartial') and high_in.isProtoPartial():
-            if hasattr(high_out, 'isProtoPartial') and high_out.isProtoPartial():
+        if high_in.isProtoPartial():
+            if high_out.isProtoPartial():
                 return False
             if high_out.isInput():
                 return False
@@ -178,21 +194,20 @@ class Merge:
                 return False
             if high_out.isPersist():
                 return False
-        if hasattr(high_out, 'isProtoPartial') and high_out.isProtoPartial():
+        if high_out.isProtoPartial():
             if high_in.isInput():
                 return False
             if high_in.isAddrTied():
                 return False
             if high_in.isPersist():
                 return False
-        s_in = high_in.getSymbol() if hasattr(high_in, 'getSymbol') else None
-        s_out = high_out.getSymbol() if hasattr(high_out, 'getSymbol') else None
+        s_in = high_in.getSymbol()
+        s_out = high_out.getSymbol()
         if s_in is not None and s_out is not None:
             if s_in is not s_out:
                 return False
-            if hasattr(high_in, 'getSymbolOffset') and hasattr(high_out, 'getSymbolOffset'):
-                if high_in.getSymbolOffset() != high_out.getSymbolOffset():
-                    return False
+            if high_in.getSymbolOffset() != high_out.getSymbolOffset():
+                return False
         return True
 
     @staticmethod
@@ -205,31 +220,74 @@ class Merge:
         if high_out.getType() is not high_in.getType():
             return False
         if high_out.isInput():
-            vn = high_out.getInputVarnode() if hasattr(high_out, 'getInputVarnode') else None
+            vn = high_out.getInputVarnode()
             if vn is not None and vn.isIllegalInput() and not vn.isIndirectOnly():
                 return False
         if high_in.isInput():
-            vn = high_in.getInputVarnode() if hasattr(high_in, 'getInputVarnode') else None
+            vn = high_in.getInputVarnode()
             if vn is not None and vn.isIllegalInput() and not vn.isIndirectOnly():
                 return False
-        sym = high_in.getSymbol() if hasattr(high_in, 'getSymbol') else None
-        if sym is not None and hasattr(sym, 'isIsolated') and sym.isIsolated():
+        sym = high_in.getSymbol()
+        if sym is not None and sym.isIsolated():
             return False
-        sym = high_out.getSymbol() if hasattr(high_out, 'getSymbol') else None
-        if sym is not None and hasattr(sym, 'isIsolated') and sym.isIsolated():
+        sym = high_out.getSymbol()
+        if sym is not None and sym.isIsolated():
             return False
         return True
 
     @staticmethod
-    def mergeTestSpeculative(high_out: HighVariable, high_in: HighVariable) -> bool:
-        """Speculative tests for merging HighVariables."""
-        if not Merge.mergeTestAdjacent(high_out, high_in):
+    def mergeTestSpeculative(hi: HighVariable, ho: HighVariable) -> bool:
+        """Speculative tests — inlines required+adjacent+speculative using direct flag bits."""
+        if hi is ho:
+            return True
+        # Ensure flags are up to date (inline dirty check)
+        if hi._highflags & _HV_FLAGSDIRTY:
+            hi._updateFlags()
+        if ho._highflags & _HV_FLAGSDIRTY:
+            ho._updateFlags()
+        fi = hi._flags
+        fo = ho._flags
+        # --- speculative: neither can be input, persist, or addr-tied ---
+        if fi & _SPEC_EXCL or fo & _SPEC_EXCL:
             return False
-        if high_out.isPersist() or high_in.isPersist():
+        # --- required: typeLock type equality ---
+        if fi & _VN_TYPELOCK and fo & _VN_TYPELOCK:
+            if hi._highflags & _HV_TYPEDIRTY: hi._updateType()
+            if ho._highflags & _HV_TYPEDIRTY: ho._updateType()
+            if hi._type is not ho._type:
+                return False
+        # isAddrTied excluded above → skip tied-varnode check
+        # isInput excluded above → isExtraOut branch runs for both
+        if (fi & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
             return False
-        if high_out.isInput() or high_in.isInput():
+        if (fo & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
             return False
-        if high_out.isAddrTied() or high_in.isAddrTied():
+        # proto_partial: if both partial → no merge
+        if fi & _VN_PROTO_PARTIAL and fo & _VN_PROTO_PARTIAL:
+            return False
+        # (proto_partial other subconditions excluded by isInput/isAddrTied/isPersist above)
+        # --- symbol check ---
+        if hi._highflags & _HV_SYMBOLDIRTY: hi._updateSymbol()
+        if ho._highflags & _HV_SYMBOLDIRTY: ho._updateSymbol()
+        s_in = hi._symbol
+        s_out = ho._symbol
+        if s_in is not None and s_out is not None:
+            if s_in is not s_out:
+                return False
+            if hi._symboloffset != ho._symboloffset:
+                return False
+        # --- adjacent: namelock both ---
+        if fi & _VN_NAMELOCK and fo & _VN_NAMELOCK:
+            return False
+        # --- adjacent: type equality ---
+        if hi._highflags & _HV_TYPEDIRTY: hi._updateType()
+        if ho._highflags & _HV_TYPEDIRTY: ho._updateType()
+        if hi._type is not ho._type:
+            return False
+        # isInput excluded → skip getInputVarnode illegalInput check
+        if s_in is not None and s_in.isIsolated():
+            return False
+        if s_out is not None and s_out.isIsolated():
             return False
         return True
 
@@ -279,7 +337,10 @@ class Merge:
             op = vn.getDef()
             if op.code() != OpCode.CPUI_COPY:
                 continue
-            if op.getIn(0).getHigh() is high:
+            in0 = op.getIn(0)
+            if in0 is None:
+                continue
+            if in0.getHigh() is high:
                 continue
             singlelist.append(vn)
 
@@ -346,7 +407,10 @@ class Merge:
             op = vn.getDef()
             if op.code() != OpCode.CPUI_COPY:
                 continue
-            if op.getIn(0).getHigh() is high:
+            _in0 = op.getIn(0)
+            if _in0 is None:
+                continue
+            if _in0.getHigh() is high:
                 continue
             if filterTemps and op.getOut().getSpace() is not None:
                 if op.getOut().getSpace().getType() != IPTR_INTERNAL:
@@ -365,12 +429,55 @@ class Merge:
         """
         if high1 is high2:
             return True
+        if isspeculative:
+            if high1._highflags & _HV_FLAGSDIRTY:
+                high1._updateFlags()
+            if high2._highflags & _HV_FLAGSDIRTY:
+                high2._updateFlags()
+            # Fast path: both highs are "clean" (no exclusion flags, no symbol)
+            if high1._spec_ok and high2._spec_ok:
+                if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
+                if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
+                if high1._type is not high2._type:
+                    return False
+            else:
+                # Full speculative test
+                fi = high1._flags; fo = high2._flags
+                if fi & _SPEC_EXCL or fo & _SPEC_EXCL:
+                    return False
+                if (fi & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
+                    return False
+                if (fo & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
+                    return False
+                if fi & _VN_PROTO_PARTIAL and fo & _VN_PROTO_PARTIAL:
+                    return False
+                if fi & _VN_TYPELOCK and fo & _VN_TYPELOCK:
+                    if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
+                    if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
+                    if high1._type is not high2._type:
+                        return False
+                if high1._highflags & _HV_SYMBOLDIRTY: high1._updateSymbol()
+                if high2._highflags & _HV_SYMBOLDIRTY: high2._updateSymbol()
+                s1 = high1._symbol; s2 = high2._symbol
+                if s1 is not None and s2 is not None:
+                    if s1 is not s2:
+                        return False
+                    if high1._symboloffset != high2._symboloffset:
+                        return False
+                if fi & _VN_NAMELOCK and fo & _VN_NAMELOCK:
+                    return False
+                if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
+                if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
+                if high1._type is not high2._type:
+                    return False
+                if s1 is not None and s1.isIsolated():
+                    return False
+                if s2 is not None and s2.isIsolated():
+                    return False
         if self._testCache.intersection(high1, high2):
             return False
-        if hasattr(high1, 'merge'):
-            high1.merge(high2, self._testCache, isspeculative)
-        if hasattr(high1, 'updateCover'):
-            high1.updateCover()
+        high1.merge(high2, self._testCache, isspeculative)
+        high1.updateCover()
         return True
 
     def inflateTest(self, a: Varnode, high: HighVariable) -> bool:
@@ -675,10 +782,9 @@ class Merge:
         for high in highvec:
             merged = False
             for out in highstack:
-                if self.mergeTestSpeculative(out, high):
-                    if self.merge(out, high, True):
-                        merged = True
-                        break
+                if self.merge(out, high, True):
+                    merged = True
+                    break
             if not merged:
                 highstack.append(high)
 
@@ -1012,7 +1118,8 @@ class Merge:
             if op.code() == OpCode.CPUI_COPY:
                 v1 = op.getOut()
                 h1 = v1.getHigh() if v1 is not None else None
-                if h1 is not None and h1 is op.getIn(0).getHigh():
+                _in0c = op.getIn(0)
+                if h1 is not None and _in0c is not None and h1 is _in0c.getHigh():
                     if hasattr(self._data, 'opMarkNonPrinting'):
                         self._data.opMarkNonPrinting(op)
 
