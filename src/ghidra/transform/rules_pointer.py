@@ -3,9 +3,47 @@ Remaining rules batch 2c: Pointer/type-dependent rules + LOAD/STORE rules.
 These are the final 10 rules needed for 136/136 coverage.
 """
 from __future__ import annotations
+import os
 from ghidra.transform.action import Rule
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import calc_mask
+
+
+def _ptrarith_debug_should_log(op) -> bool:
+    spec = os.getenv("PYGHIDRA_PTRARITH_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _ptrarith_debug_log(op, message: str) -> None:
+    if not _ptrarith_debug_should_log(op):
+        return
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    path = os.getenv("PYGHIDRA_PTRARITH_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_rule_debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(f"[ptrarith] addr={addr} {message}\n")
+    except Exception:
+        return
 
 
 class RulePushPtr(Rule):
@@ -687,27 +725,59 @@ class RulePtrArith(Rule):
         return res
 
     def applyOp(self, op, data):
-        # Check if one input is a pointer type and the other is a scaled index
-        for slot in range(2):
-            basevn = op.getIn(slot)
-            dt = basevn.getType() if hasattr(basevn, 'getType') and basevn.getType() is not None else None
-            if dt is None: continue
-            from ghidra.types.datatype import TYPE_PTR
-            if dt.getMetatype() != TYPE_PTR: continue
-            idxvn = op.getIn(1 - slot)
-            if idxvn.isWritten():
-                defop = idxvn.getDef()
-                if defop.code() == OpCode.CPUI_INT_MULT and defop.getIn(1).isConstant():
-                    elemsize = int(defop.getIn(1).getOffset())
-                    ptrto = dt.getPtrTo()
-                    if ptrto is not None and ptrto.getSize() == elemsize:
-                        # Convert to PTRADD
-                        data.opSetOpcode(op, OpCode.CPUI_PTRADD)
-                        if slot == 1:
-                            data.opSwapInput(op, 0, 1)
-                        data.opSetInput(op, defop.getIn(0), 1)
-                        data.opInsertInput(op, data.newConstant(4, elemsize), 2)
-                        return 1
+        if not hasattr(data, 'hasTypeRecoveryStarted') or not data.hasTypeRecoveryStarted():
+            _ptrarith_debug_log(op, "skip=no_type_recovery")
+            return 0
+
+        from ghidra.types.datatype import TYPE_PTR
+
+        slot = -1
+        for i in range(op.numInput()):
+            ct = op.getIn(i).getTypeReadFacing(op) if hasattr(op.getIn(i), 'getTypeReadFacing') else None
+            _ptrarith_debug_log(
+                op,
+                f"input[{i}] metatype={ct.getMetatype() if ct is not None and hasattr(ct, 'getMetatype') else None}"
+            )
+            if ct is not None and ct.getMetatype() == TYPE_PTR:
+                slot = i
+                break
+        if slot < 0:
+            _ptrarith_debug_log(op, "skip=no_pointer_input")
+            return 0
+
+        eval_res = RulePtrArith.evaluatePointerExpression(op, slot)
+        _ptrarith_debug_log(op, f"slot={slot} evaluatePointerExpression={eval_res}")
+        if eval_res != 2:
+            return 0
+        preferred = RulePtrArith.verifyPreferredPointer(op, slot)
+        _ptrarith_debug_log(op, f"verifyPreferredPointer={preferred}")
+        if not preferred:
+            return 0
+
+        state = AddTreeState(data, op, slot)
+        applied = state.apply()
+        _ptrarith_debug_log(
+            op,
+            "state.apply="
+            f"{applied} valid={state.valid} size={state.size} offset={state.offset:#x} "
+            f"multsum={state.multsum:#x} nonmultsum={state.nonmultsum:#x} "
+            f"isSubtype={state.isSubtype} mult_terms={len(state.multiple)} nonmult_terms={len(state.nonmult)}"
+        )
+        if applied:
+            return 1
+        alt = state.initAlternateForm()
+        _ptrarith_debug_log(op, f"initAlternateForm={alt}")
+        if alt:
+            applied = state.apply()
+            _ptrarith_debug_log(
+                op,
+                "alternate.apply="
+                f"{applied} valid={state.valid} size={state.size} offset={state.offset:#x} "
+                f"multsum={state.multsum:#x} nonmultsum={state.nonmultsum:#x} "
+                f"isSubtype={state.isSubtype} mult_terms={len(state.multiple)} nonmult_terms={len(state.nonmult)}"
+            )
+            if applied:
+                return 1
         return 0
 
 
@@ -727,10 +797,20 @@ class RulePtrFlow(Rule):
     def clone(self, gl):
         return RulePtrFlow(self._basegroup, self.glb) if gl.contains(self._basegroup) else None
     def getOpList(self):
-        return [OpCode.CPUI_STORE, OpCode.CPUI_LOAD, OpCode.CPUI_CALLIND,
-                OpCode.CPUI_BRANCHIND, OpCode.CPUI_NEW, OpCode.CPUI_INDIRECT,
-                OpCode.CPUI_COPY, OpCode.CPUI_PTRSUB, OpCode.CPUI_PTRADD,
-                OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INT_ADD]
+        if not self.hasTruncations:
+            return []
+        return [
+            OpCode.CPUI_STORE,
+            OpCode.CPUI_LOAD,
+            OpCode.CPUI_COPY,
+            OpCode.CPUI_MULTIEQUAL,
+            OpCode.CPUI_INDIRECT,
+            OpCode.CPUI_INT_ADD,
+            OpCode.CPUI_CALLIND,
+            OpCode.CPUI_BRANCHIND,
+            OpCode.CPUI_PTRSUB,
+            OpCode.CPUI_PTRADD,
+        ]
 
     @staticmethod
     def trialSetPtrFlow(op) -> bool:

@@ -70,12 +70,12 @@ def _split_basic_blocks(fd, lifter=None) -> None:
                 # Jump table resolved — keep BRANCHIND, don't convert
                 continue
             # Convert BRANCHIND → CALLIND
-            op.setOpcodeEnum(OpCode.CPUI_CALLIND)
+            fd.opSetOpcode(op, OpCode.CPUI_CALLIND)
             # Create synthetic RETURN op after the CALLIND
             # Matches C++ FlowInfo::artificialHalt which calls
             # newVarnodeIop → newConstant(sizeof(op), op->getTime())
             ret_op = fd.newOp(1, op.getSeqNum().getAddr())
-            ret_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+            fd.opSetOpcode(ret_op, OpCode.CPUI_RETURN)
             # Create const varnode matching C++ newVarnodeIop behavior
             uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
             ret_in = fd.newConstant(4, uniq)
@@ -97,7 +97,7 @@ def _split_basic_blocks(fd, lifter=None) -> None:
             next_off = last_off + 1  # default: 1 byte past last op
             next_addr = Address(last_addr.getSpace(), next_off)
             ret_op = fd.newOp(1, next_addr)
-            ret_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+            fd.opSetOpcode(ret_op, OpCode.CPUI_RETURN)
             uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
             ret_in = fd.newConstant(4, uniq)
             fd.opSetInput(ret_op, ret_in, 0)
@@ -139,7 +139,7 @@ def _split_basic_blocks(fd, lifter=None) -> None:
             continue
         # Only convert if target is an already-decoded instruction start
         if tgt_off in decoded_addrs:
-            op.setOpcodeEnum(OpCode.CPUI_BRANCH)
+            fd.opSetOpcode(op, OpCode.CPUI_BRANCH)
 
     # --- Step 0e: fillinBranchStubs — stub blocks for out-of-range targets ---
     # C++ FlowInfo::fillinBranchStubs creates artificial halt (RETURN) ops at
@@ -158,7 +158,7 @@ def _split_basic_blocks(fd, lifter=None) -> None:
             if code_spc is not None:
                 stub_addr = Address(code_spc, uaddr)
                 stub_op = fd.newOp(1, stub_addr)
-                stub_op.setOpcodeEnum(OpCode.CPUI_RETURN)
+                fd.opSetOpcode(stub_op, OpCode.CPUI_RETURN)
                 uniq = stub_op.getSeqNum().getTime() if hasattr(stub_op.getSeqNum(), 'getTime') else 0
                 stub_in = fd.newConstant(4, uniq)
                 fd.opSetInput(stub_op, stub_in, 0)
@@ -536,13 +536,10 @@ def _setup_call_specs(fd, lifter=None) -> None:
 
     C++ ref: flow.cc  FlowInfo::setupCallSpecs / setupCallindSpecs
     """
+    from ghidra.core.address import Address
     from ghidra.fspec.fspec import FuncCallSpecs
 
-    # Get default model from architecture (already has effect list)
-    default_model = None
-    arch = fd.getArch() if hasattr(fd, 'getArch') else None
-    if arch is not None and hasattr(arch, 'defaultfp'):
-        default_model = arch.defaultfp
+    override = fd.getOverride() if hasattr(fd, 'getOverride') else None
 
     bblocks = fd.getBasicBlocks()
     for bi in range(bblocks.getSize()):
@@ -556,12 +553,20 @@ def _setup_call_specs(fd, lifter=None) -> None:
                     tgt = op.getIn(0).getAddr()
                     if tgt is not None and not tgt.isConstant():
                         fc.setAddress(tgt)
-                # Attach default prototype model so hasEffect works properly.
-                # setModel propagates extrapop from the model (e.g. 8 for
-                # x86-64, 4 for x86-32), so ActionExtraPopSetup creates
-                # INT_ADD ops for stack-pointer adjustment, matching C++.
-                if default_model is not None and hasattr(fc, 'proto'):
-                    fc.proto.setModel(default_model)
+                    if hasattr(fd, 'newVarnodeCallSpecs'):
+                        fd.opSetInput(op, fd.newVarnodeCallSpecs(fc), 0)
+                    if override is not None and hasattr(override, 'applyPrototype'):
+                        override.applyPrototype(fd, fc)
+                else:
+                    if override is not None and hasattr(override, 'applyIndirect'):
+                        override.applyIndirect(fd, fc)
+                    if override is not None and hasattr(override, 'applyPrototype'):
+                        override.applyPrototype(fd, fc)
+                    if hasattr(fc, 'getEntryAddress') and not fc.getEntryAddress().isInvalid():
+                        if hasattr(fd, 'opSetOpcode'):
+                            fd.opSetOpcode(op, OpCode.CPUI_CALL)
+                        if hasattr(fd, 'newVarnodeCallSpecs'):
+                            fd.opSetInput(op, fd.newVarnodeCallSpecs(fc), 0)
                 fd.addCallSpecs(fc)
 
 

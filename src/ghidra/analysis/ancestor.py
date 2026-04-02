@@ -9,15 +9,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Optional
 
+from ghidra.core.space import IPTR_INTERNAL, IPTR_SPACEBASE
 from ghidra.ir.op import OpCode
 
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
     from ghidra.ir.varnode import Varnode
     from ghidra.fspec.fspec import ParamTrial
-
-IPTR_INTERNAL = 3
-IPTR_SPACEBASE = 4
 
 
 # ---------------------------------------------------------------------------
@@ -43,10 +41,30 @@ class TraverseNode:
 
     @staticmethod
     def isAlternatePathValid(vn: 'Varnode', flags: int) -> bool:
-        """Return True if an alternate path through *vn* with *flags* is valid."""
-        if (flags & (TraverseNode.actionalt | TraverseNode.indirectalt)) != 0:
+        """Return True if the alternate path looks more valid than the main path.
+
+        C++ ref: ``expression.cc::TraverseNode::isAlternatePathValid``.
+        """
+        if (flags & (TraverseNode.indirect | TraverseNode.indirectalt)) == TraverseNode.indirect:
             return True
-        return False
+        if (flags & (TraverseNode.indirect | TraverseNode.indirectalt)) == TraverseNode.indirectalt:
+            return False
+        if (flags & TraverseNode.actionalt) != 0:
+            return True
+        if vn.loneDescend() is None:
+            return False
+        op = vn.getDef()
+        if op is None:
+            return True
+        while (hasattr(op, 'isIncidentalCopy') and op.isIncidentalCopy()
+               and op.code() == OpCode.CPUI_COPY):
+            vn = op.getIn(0)
+            if vn.loneDescend() is None:
+                return False
+            op = vn.getDef()
+            if op is None:
+                return True
+        return not op.isMarker()
 
 
 # ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ The framework for applying transformations on function data-flow.
 from __future__ import annotations
 
 import io
+import os
 import time as _time
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, List, Dict, Set, Tuple
@@ -26,6 +27,46 @@ _EMPTY_RULE_LIST: list = []
 _RULE_TYPE_DISABLE: int = 1
 # PcodeOp.dead flag value — inlined to avoid method call overhead in hot loop
 _OP_DEAD: int = 0x20
+
+
+def _action_debug_should_log(action_name: str, op) -> bool:
+    spec = os.getenv("PYGHIDRA_ACTION_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    action_filter = os.getenv("PYGHIDRA_ACTION_DEBUG_NAME", "").strip()
+    if action_filter and action_filter != action_name:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _action_debug_log(action_name: str, op, message: str) -> None:
+    if not _action_debug_should_log(action_name, op):
+        return
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    path = os.getenv("PYGHIDRA_ACTION_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_rule_debug.log")
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(f"[action:{action_name}] addr={addr} {message}\n")
+    except Exception:
+        return
 
 # =========================================================================
 # Helper
@@ -55,6 +96,17 @@ class ActionGroupList:
     def contains(self, nm: str) -> bool:
         """Check if this ActionGroupList contains a given group."""
         return nm in self.list
+
+
+class ActionTraceRecorder:
+    """Optional observer for capturing IR after an Action completes.
+
+    This is intended for debugging / tracing only. Implementations should not
+    raise into the core decompiler pipeline.
+    """
+
+    def on_action_complete(self, action: "Action", data: "Funcdata", change_count: int) -> None:
+        raise NotImplementedError
 
 
 # =========================================================================
@@ -95,6 +147,7 @@ class Action(ABC):
 
     # Class-level deadline (monotonic seconds). 0 = no deadline.
     _deadline: float = 0.0
+    _trace_recorder: Optional[ActionTraceRecorder] = None
 
     @classmethod
     def set_deadline(cls, seconds: float) -> None:
@@ -108,6 +161,25 @@ class Action(ABC):
     @classmethod
     def past_deadline(cls) -> bool:
         return cls._deadline > 0 and _time.perf_counter() > cls._deadline
+
+    @classmethod
+    def set_trace_recorder(cls, recorder: Optional[ActionTraceRecorder]) -> None:
+        cls._trace_recorder = recorder
+
+    @classmethod
+    def clear_trace_recorder(cls) -> None:
+        cls._trace_recorder = None
+
+    @classmethod
+    def notify_trace_recorder(cls, action: "Action", data: "Funcdata", change_count: int) -> None:
+        recorder = cls._trace_recorder
+        if recorder is None:
+            return
+        try:
+            recorder.on_action_complete(action, data, change_count)
+        except Exception:
+            # Debug tracing must never interfere with the core pipeline.
+            return
 
     def __init__(self, f: int, nm: str, g: str) -> None:
         self._flags: int = f
@@ -446,6 +518,8 @@ class ActionGroup(Action):
         while self._state_idx < len(self._list):
             ac = self._list[self._state_idx]
             res = ac.perform(data)
+            if res >= 0:
+                Action.notify_trace_recorder(ac, data, res)
             if res > 0:
                 self._count += res
                 if self.checkActionBreak():
@@ -757,9 +831,10 @@ class ActionPool(Action):
         super().__init__(f, nm, "")
         self._allrules: List[Rule] = []
         self._perop: Dict[int, List[Rule]] = {}
-        self._op_state_iter = None  # Iterator state for apply
+        self._op_state_iter = None
         self._op_state_list: Optional[list] = None
         self._op_state_idx: int = 0
+        self._op_state_cur: Optional[PcodeOp] = None
         self._rule_index: int = 0
 
     def addRule(self, rl: Rule) -> None:
@@ -796,6 +871,22 @@ class ActionPool(Action):
         for rl in self._allrules:
             rl.resetStats()
 
+    @staticmethod
+    def _firstTrackedOp(data: Funcdata) -> Optional[PcodeOp]:
+        for op in data.beginOpAll():
+            return op
+        return None
+
+    @staticmethod
+    def _nextTrackedOp(data: Funcdata, seq) -> Optional[PcodeOp]:
+        for op in data.beginOpAll():
+            try:
+                if op.getSeqNum() > seq:
+                    return op
+            except Exception:
+                continue
+        return None
+
     def _processOp(self, op: PcodeOp, data: Funcdata,
                    _Logger, _log_enabled: bool, _osc_enabled: bool,
                    _past_deadline=None, _enabled_perop=None) -> int:
@@ -804,15 +895,17 @@ class ActionPool(Action):
         Logger state is passed in from apply() so the import runs once per
         pass rather than once per op.  Returns 0 normally, -1 on breakpoint.
         """
+        self._op_state_cur = op
         if op._flags & _OP_DEAD:
-            self._op_state_idx += 1
             data.opDeadAndGone(op)
+            self._op_state_cur = self._nextTrackedOp(data, op.getSeqNum())
             self._rule_index = 0
             return 0
 
         opc = op._opcode_enum
         perop = _enabled_perop if _enabled_perop is not None else self._perop
         rules = perop.get(opc, _EMPTY_RULE_LIST)
+        _action_debug_log(self._name, op, f"opc={opc} rules={[r._name for r in rules]}")
         rules_len = len(rules)
         # Fast path: no deadline checking, no logging (production case)
         if _past_deadline is None and not _log_enabled and not _osc_enabled:
@@ -821,6 +914,7 @@ class ActionPool(Action):
                 self._rule_index += 1
                 if op._flags & _OP_DEAD:
                     break
+                rl._count_tests += 1
                 try:
                     res = rl.applyOp(op, data)
                 except AttributeError:
@@ -852,7 +946,7 @@ class ActionPool(Action):
                         rules = self._perop.get(opc) or _EMPTY_RULE_LIST
                         rules_len = len(rules)
                         self._rule_index = 0
-            self._op_state_idx += 1
+            self._op_state_cur = self._nextTrackedOp(data, op.getSeqNum())
             self._rule_index = 0
             return 0
 
@@ -862,20 +956,40 @@ class ActionPool(Action):
         while self._rule_index < rules_len:
             _deadline_ctr += 1
             if _deadline_ctr & 63 == 0 and _past_deadline and _past_deadline():
-                self._op_state_idx += 1
+                self._op_state_cur = self._nextTrackedOp(data, op.getSeqNum())
                 self._rule_index = 0
                 return 0
             rl = rules[self._rule_index]
             self._rule_index += 1
+            _action_debug_log(self._name, op, f"try_rule={rl._name}")
             if op._flags & _OP_DEAD:
                 break
+            rl._count_tests += 1
             if _log_enabled:
                 from ghidra.transform.irlogger import IRSnapshot
                 _snap_before = IRSnapshot.take(data)
             try:
+                _orig_order = op.getSeqNum().getOrder()
+            except Exception:
+                _orig_order = None
+            _orig_opc = opc
+            try:
                 res = rl.applyOp(op, data)
             except AttributeError:
                 continue
+            if _orig_order is None:
+                _action_debug_log(
+                    self._name,
+                    op,
+                    f"rule={rl._name} res={res} opc={_orig_opc} new_opc={op._opcode_enum}",
+                )
+            else:
+                _action_debug_log(
+                    self._name,
+                    op,
+                    f"seq={op.getAddr().getOffset():#x}:{_orig_order:x} "
+                    f"rule={rl._name} res={res} opc={_orig_opc} new_opc={op._opcode_enum}",
+                )
             if res > 0:
                 rl._count_apply += 1
                 self._count += res
@@ -903,22 +1017,24 @@ class ActionPool(Action):
                 new_opc = op._opcode_enum
                 if opc != new_opc:
                     data.getArch().printMessage(
-                        "ERROR: Rule " + rl.getName() +
-                        " changed op without returning result of 1!")
+                            "ERROR: Rule " + rl.getName() +
+                            " changed op without returning result of 1!")
                     opc = new_opc
                     rules = self._perop.get(opc) or _EMPTY_RULE_LIST
                     rules_len = len(rules)
                     self._rule_index = 0
 
-        self._op_state_idx += 1
+        self._op_state_cur = self._nextTrackedOp(data, op.getSeqNum())
         self._rule_index = 0
         return 0
 
     def apply(self, data: Funcdata) -> int:
         """Apply all rules to all PcodeOps in the function."""
         if self._status != Action.status_mid:
-            self._op_state_list = list(data.beginOpAll())
+            self._op_state_iter = None
+            self._op_state_list = None
             self._op_state_idx = 0
+            self._op_state_cur = self._firstTrackedOp(data)
             self._rule_index = 0
 
         # Resolve logger state once per pass — not once per op.
@@ -946,9 +1062,6 @@ class ActionPool(Action):
             if enabled:
                 _enabled_perop[opc] = enabled
 
-        op_list = self._op_state_list
-        op_list_len = len(op_list)
-
         # === Inlined fast path: no logging overhead per rule iteration ===
         if not _log_enabled and not _osc_enabled:
             _arch = data.getArch()
@@ -961,31 +1074,54 @@ class ActionPool(Action):
             _WARN_ON  = Rule.warnings_on
             _BP_CHK   = Action.break_action | Action.tmpbreak_action
             _BP_TMP   = Action.tmpbreak_action
-            op_idx = self._op_state_idx
             count  = self._count
             _dl_ctr = 256  # check deadline every 256 ops to avoid per-op perf_counter overhead
-            while op_idx < op_list_len:
-                op = op_list[op_idx]; op_idx += 1
+            op = self._op_state_cur
+            while op is not None:
+                self._op_state_cur = op
                 if _past_deadline is not None:
                     _dl_ctr -= 1
                     if not _dl_ctr:
                         _dl_ctr = 256
                         if _past_deadline():
-                            self._op_state_idx = op_idx; self._count = count
+                            self._count = count
                             return 0
                 if op._flags & _OPD:
                     data.opDeadAndGone(op)
+                    op = self._nextTrackedOp(data, op.getSeqNum())
                     continue
                 opc = op._opcode_enum
                 rules = _perop_get(opc, _EMPTY)
-                ri = 0; rules_len = len(rules)
+                _action_debug_log(self._name, op, f"opc={opc} rules={[r._name for r in rules]}")
+                ri = self._rule_index
+                rules_len = len(rules)
                 while ri < rules_len:
                     rl = rules[ri]; ri += 1
+                    _action_debug_log(self._name, op, f"try_rule={rl._name}")
                     if op._flags & _OPD: break
+                    rl._count_tests += 1
+                    try:
+                        _orig_order = op.getSeqNum().getOrder()
+                    except Exception:
+                        _orig_order = None
+                    _orig_opc = opc
                     try:
                         res = rl.applyOp(op, data)
                     except AttributeError:
                         continue
+                    if _orig_order is None:
+                        _action_debug_log(
+                            self._name,
+                            op,
+                            f"rule={rl._name} res={res} opc={_orig_opc} new_opc={op._opcode_enum}",
+                        )
+                    else:
+                        _action_debug_log(
+                            self._name,
+                            op,
+                            f"seq={op.getAddr().getOffset():#x}:{_orig_order:x} "
+                            f"rule={rl._name} res={res} opc={_orig_opc} new_opc={op._opcode_enum}",
+                        )
                     if res > 0:
                         rl._count_apply += 1
                         count += res
@@ -995,7 +1131,9 @@ class ActionPool(Action):
                             rl.issueWarning(_arch)
                         if rl._breakpoint & _BP_CHK:
                             rl._breakpoint &= ~_BP_TMP
-                            self._op_state_idx = op_idx; self._count = count
+                            self._op_state_cur = op
+                            self._rule_index = ri
+                            self._count = count
                             return -1
                         if op._flags & _OPD: break
                         new_opc = op._opcode_enum
@@ -1014,15 +1152,18 @@ class ActionPool(Action):
                             rules = _perop_get(opc, _EMPTY)
                             rules_len = len(rules)
                             ri = 0
-            self._op_state_idx = op_idx; self._count = count
+                self._rule_index = 0
+                op = self._nextTrackedOp(data, op.getSeqNum())
+            self._op_state_cur = None
+            self._count = count
             self._rule_index = 0
             return 0
 
         # === Slow path: logging active ===
-        while self._op_state_idx < op_list_len:
+        while self._op_state_cur is not None:
             if _past_deadline is not None and _past_deadline():
                 return 0
-            op = op_list[self._op_state_idx]
+            op = self._op_state_cur
             if self._processOp(op, data, _Logger, _log_enabled, _osc_enabled,
                                _past_deadline, _enabled_perop) != 0:
                 return -1
@@ -1046,9 +1187,8 @@ class ActionPool(Action):
     def printState(self, s: io.StringIO) -> None:
         super().printState(s)
         if self._status == Action.status_mid:
-            if self._op_state_list and 0 <= self._op_state_idx - 1 < len(self._op_state_list):
-                op = self._op_state_list[self._op_state_idx - 1]
-                s.write(f" {op.getSeqNum()}")
+            if self._op_state_cur is not None:
+                s.write(f" {self._op_state_cur.getSeqNum()}")
 
     def getSubRule(self, specify: str) -> Optional[Rule]:
         token, remain = next_specifyterm(specify)

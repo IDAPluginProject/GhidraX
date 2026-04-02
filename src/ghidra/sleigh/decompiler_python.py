@@ -18,7 +18,7 @@ import os
 import traceback
 
 from ghidra.sleigh.lifter import Lifter
-from ghidra.sleigh.arch_map import add_sla_search_dir
+from ghidra.sleigh.arch_map import add_sla_search_dir, default_context_for_target
 from ghidra.arch.archshim import ArchitectureStandalone
 from ghidra.analysis.flowlifter import (
     _split_basic_blocks,
@@ -40,6 +40,187 @@ from ghidra.output.emit_helpers import (
 
 # Backward-compatible alias used by tests and scripts
 _ArchitectureShim = ArchitectureStandalone
+
+
+def _context_from_target(target: str) -> dict:
+    return default_context_for_target(target)
+
+
+def _reset_lifter_analysis_state(lifter: Lifter) -> None:
+    for attr in ("_jumptables", "_insn_fall_throughs"):
+        value = getattr(lifter, attr, None)
+        if hasattr(value, "clear"):
+            value.clear()
+    pending = getattr(lifter, "_unprocessed", None)
+    if hasattr(pending, "clear"):
+        pending.clear()
+
+
+def _install_tracked_context(arch: ArchitectureStandalone, target: str, entry: int) -> None:
+    parts = target.split(":")
+    if len(parts) < 3:
+        return
+    if parts[0].lower() != "x86":
+        return
+    try:
+        bitness = int(parts[2])
+    except ValueError:
+        return
+    if bitness not in (32, 64):
+        return
+
+    from ghidra.core.address import Address
+    from ghidra.core.globalcontext import ContextInternal, TrackedContext
+
+    code_space = arch.getDefaultCodeSpace() if hasattr(arch, "getDefaultCodeSpace") else None
+    reg_space = arch.getSpaceByName("register") if hasattr(arch, "getSpaceByName") else None
+    if code_space is None or reg_space is None:
+        return
+
+    ctx = ContextInternal()
+    tracked_set = ctx.createSet(Address(code_space, entry), Address(code_space, entry))
+    tracked = TrackedContext()
+    tracked.loc.space = reg_space
+    tracked.loc.offset = 0x20A
+    tracked.loc.size = 1
+    tracked.val = 0
+    tracked_set.append(tracked)
+    arch.context = ctx
+
+
+def _bind_blocks_to_funcdata(fd) -> None:
+    bblocks = fd.getBasicBlocks() if hasattr(fd, "getBasicBlocks") else None
+    if bblocks is None:
+        return
+    for bi in range(bblocks.getSize()):
+        bb = bblocks.getBlock(bi)
+        if hasattr(bb, "_data"):
+            bb._data = fd
+
+
+def _rebind_existing_opcodes(fd) -> None:
+    if not hasattr(fd, "beginOpAll"):
+        return
+    for op in list(fd.beginOpAll()):
+        fd.opSetOpcode(op, op.code())
+
+
+def _build_full_action_ready_funcdata(
+    lifter: Lifter,
+    arch: ArchitectureStandalone,
+    func_name: str,
+    target: str,
+    entry: int,
+    func_size: int,
+):
+    _reset_lifter_analysis_state(lifter)
+    fd = lifter.lift_function(func_name, entry, func_size)
+    fd.setArch(arch)
+    _rebind_existing_opcodes(fd)
+    _split_basic_blocks(fd, lifter=lifter)
+    _setup_call_specs(fd, lifter=lifter)
+    _bind_blocks_to_funcdata(fd)
+    return fd
+
+
+def _restore_rebuilt_funcdata(target_fd, rebuilt_fd) -> None:
+    preserved_override = None
+    if hasattr(target_fd, "getOverride"):
+        try:
+            preserved_override = target_fd.getOverride()
+        except Exception:
+            preserved_override = getattr(target_fd, "_localoverride", None) or getattr(target_fd, "_override", None)
+    if preserved_override is None:
+        preserved_override = getattr(target_fd, "_localoverride", None) or getattr(target_fd, "_override", None)
+    preserved_localmap = getattr(target_fd, "_localmap", None)
+    preserved_function_symbol = getattr(target_fd, "_functionSymbol", None)
+    preserved_heritage = getattr(target_fd, "_heritage", None)
+    preserved_covermerge = getattr(target_fd, "_covermerge", None)
+
+    target_fd.__dict__.clear()
+    target_fd.__dict__.update(rebuilt_fd.__dict__)
+
+    if preserved_function_symbol is not None:
+        target_fd._functionSymbol = preserved_function_symbol
+    if preserved_override is not None:
+        target_fd._localoverride = preserved_override
+        target_fd._override = preserved_override
+    if preserved_heritage is not None and hasattr(preserved_heritage, "clear"):
+        preserved_heritage.clear()
+        target_fd._heritage = preserved_heritage
+    if preserved_covermerge is not None and hasattr(preserved_covermerge, "clear"):
+        preserved_covermerge.clear()
+        target_fd._covermerge = preserved_covermerge
+
+    if preserved_localmap is not None:
+        target_fd._localmap = preserved_localmap
+        if hasattr(preserved_localmap, "_fd"):
+            preserved_localmap._fd = target_fd
+        if hasattr(preserved_localmap, "_name"):
+            preserved_localmap._name = target_fd.getName()
+        if hasattr(preserved_localmap, "clearUnlocked"):
+            preserved_localmap.clearUnlocked()
+        if hasattr(preserved_localmap, "resetLocalWindow"):
+            preserved_localmap.resetLocalWindow()
+    elif getattr(target_fd, "_localmap", None) is not None and hasattr(target_fd._localmap, "_fd"):
+        target_fd._localmap._fd = target_fd
+
+    if hasattr(target_fd, "clearActiveOutput"):
+        target_fd.clearActiveOutput()
+    _bind_blocks_to_funcdata(target_fd)
+
+    target_fd._qlst_map = {}
+    for fc in getattr(target_fd, "_qlst", []):
+        op = fc.getOp() if hasattr(fc, "getOp") else None
+        if op is not None:
+            target_fd._qlst_map[id(op)] = fc
+
+
+def _install_full_action_restart_rebuilder(
+    fd,
+    arch: ArchitectureStandalone,
+    lifter: Lifter,
+    target: str,
+    func_size: int,
+) -> None:
+    def _rebuild(target_fd) -> None:
+        rebuilt_fd = _build_full_action_ready_funcdata(
+            lifter=lifter,
+            arch=arch,
+            func_name=target_fd.getName(),
+            target=target,
+            entry=target_fd.getAddress().getOffset(),
+            func_size=func_size,
+        )
+        _restore_rebuilt_funcdata(target_fd, rebuilt_fd)
+
+    if hasattr(arch, "setRestartRebuilder"):
+        arch.setRestartRebuilder(_rebuild)
+
+
+def _prepare_funcdata_for_full_actions(
+    sla_path: str,
+    target: str,
+    image: bytes,
+    base_addr: int,
+    entry: int,
+    func_size: int = 0,
+):
+    context = _context_from_target(target)
+    lifter = Lifter(sla_path, context)
+    lifter.set_image(base_addr, image)
+    arch = ArchitectureStandalone(lifter._spc_mgr, target=target)
+    _install_tracked_context(arch, target, entry)
+    fd = _build_full_action_ready_funcdata(
+        lifter=lifter,
+        arch=arch,
+        func_name=f"func_{entry:x}",
+        target=target,
+        entry=entry,
+        func_size=func_size,
+    )
+    _install_full_action_restart_rebuilder(fd, arch, lifter, target, func_size)
+    return lifter, arch, fd
 
 
 class DecompilerPython:
@@ -114,27 +295,36 @@ class DecompilerPython:
             if not self._initialized:
                 self.initialize()
 
-            # 1. Lift binary → Python IR (Funcdata)
-            context = self._context_from_target(target)
-            lifter = Lifter(sla_path, context)
-            lifter.set_image(base_addr, image)
-            fd = lifter.lift_function(f"func_{entry:x}", entry, func_size)
+            if self.use_python_full_actions:
+                _, arch, fd = _prepare_funcdata_for_full_actions(
+                    sla_path=sla_path,
+                    target=target,
+                    image=image,
+                    base_addr=base_addr,
+                    entry=entry,
+                    func_size=func_size,
+                )
+            else:
+                # 1. Lift binary → Python IR (Funcdata)
+                context = self._context_from_target(target)
+                lifter = Lifter(sla_path, context)
+                lifter.set_image(base_addr, image)
+                fd = lifter.lift_function(f"func_{entry:x}", entry, func_size)
 
-            # 2. Build CFG (basic blocks, edges)
-            if self.use_python_flow:
-                self._safe(lambda: _split_basic_blocks(fd, lifter=lifter), "FlowInfo")
+                # 2. Build CFG (basic blocks, edges)
+                if self.use_python_flow:
+                    self._safe(lambda: _split_basic_blocks(fd, lifter=lifter), "FlowInfo")
 
-            # 3. Attach architecture shim
-            arch = ArchitectureStandalone(lifter._spc_mgr)
-            fd.setArch(arch)
+                # 3. Attach architecture shim
+                arch = ArchitectureStandalone(lifter._spc_mgr)
+                fd.setArch(arch)
 
-            # 3b. Create FuncCallSpecs for CALL/CALLIND ops
-            self._safe(lambda: _setup_call_specs(fd, lifter=lifter), "CallSpecs")
+                # 3b. Create FuncCallSpecs for CALL/CALLIND ops
+                self._safe(lambda: _setup_call_specs(fd, lifter=lifter), "CallSpecs")
 
             # 4. Analysis / optimisation
             ran_full = False
             if self.use_python_full_actions:
-                _seed_default_return_output(fd, target)
                 ran_full = self._safe(lambda: _run_full_decompile_action(fd),
                                       "FullActions") is not False
 
@@ -164,12 +354,7 @@ class DecompilerPython:
     # -----------------------------------------------------------------
     @staticmethod
     def _context_from_target(target: str) -> dict:
-        parts = target.split(":")
-        if len(parts) >= 3:
-            bitness = int(parts[2])
-            if bitness == 32 and "x86" in parts[0].lower():
-                return {"addrsize": 1, "opsize": 1}
-        return {}
+        return _context_from_target(target)
 
     def _safe(self, fn, label: str):
         """Run *fn*; on exception append to errors and return ``False``."""

@@ -185,7 +185,7 @@ def universalAction(allacts: ActionDatabase, conf) -> None:
     actprop.addRule(RuleSubvarAnd("subvar"))
     actprop.addRule(RuleSubvarSubpiece("subvar"))
     actprop.addRule(RuleSplitFlow("subvar"))
-    actprop.addRule(RulePtrFlow("subvar"))
+    actprop.addRule(RulePtrFlow("subvar", conf))
     actprop.addRule(RuleSubvarCompZero("subvar"))
     actprop.addRule(RuleSubvarShift("subvar"))
     actprop.addRule(RuleSubvarZext("subvar"))

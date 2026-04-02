@@ -7,7 +7,7 @@ Classes for tracking local variables and reconstructing stack layout.
 from __future__ import annotations
 import bisect
 from typing import List
-from ghidra.core.address import Address, AddrSpace, calc_mask
+from ghidra.core.address import Address, AddrSpace, calc_mask, sign_extend
 from ghidra.core.opcodes import OpCode
 from ghidra.core.marshal import AttributeId, ElementId
 from ghidra.database.database import ScopeInternal
@@ -567,7 +567,7 @@ class MapState:
         if not self._range.inRange(Address(self._spaceid, st), sz):
             return
         sst = AddrSpace.byteToAddress(st, self._spaceid.getWordSize())
-        sst = AddrSpace.signExtend(sst, self._spaceid.getAddrSize() * 8 - 1)
+        sst = sign_extend(sst, self._spaceid.getAddrSize() * 8 - 1)
         sst = AddrSpace.addressToByte(sst, self._spaceid.getWordSize())
         newRange = RangeHint(st, sz, sst, ct, fl, rt, hi)
         self._maplist.append(newRange)
@@ -629,7 +629,7 @@ class MapState:
             return False
         high = self._spaceid.wrapOffset(lastrange.getLast() + 1)
         sst = AddrSpace.byteToAddress(high, self._spaceid.getWordSize())
-        sst = AddrSpace.signExtend(sst, self._spaceid.getAddrSize() * 8 - 1)
+        sst = sign_extend(sst, self._spaceid.getAddrSize() * 8 - 1)
         sst = AddrSpace.addressToByte(sst, self._spaceid.getWordSize())
         termRange = RangeHint(high, 1, sst, self._defaultType, 0, RangeHint.endpoint, -2)
         self._maplist.append(termRange)
@@ -855,7 +855,7 @@ class ScopeLocal(ScopeInternal):
                 and addr.getSpace() == self._space):
             if self._fd.getFuncProto().getLocalRange().inRange(addr, 1):
                 start = AddrSpace.byteToAddress(addr.getOffset(), self._space.getWordSize())
-                start = AddrSpace.signExtend(start, addr.getAddrSize() * 8 - 1)
+                start = sign_extend(start, addr.getAddrSize() * 8 - 1)
                 if self._stackGrowsNegative:
                     start = -start
                 buf = []
@@ -885,12 +885,15 @@ class ScopeLocal(ScopeInternal):
             return
         localRange = self._fd.getFuncProto().getLocalRange()
         paramrange = self._fd.getFuncProto().getParamRange()
-        newrange_items = []
+        from ghidra.core.address import RangeList
+        newrange = RangeList()
         for r in localRange:
-            newrange_items.append((r.getSpace(), r.getFirst(), r.getLast()))
+            newrange.insertRange(r.getSpace(), r.getFirst(), r.getLast())
         for r in paramrange:
-            newrange_items.append((r.getSpace(), r.getFirst(), r.getLast()))
-        # In full implementation: glb.symboltab.setRange(self, newrange)
+            newrange.insertRange(r.getSpace(), r.getFirst(), r.getLast())
+        symboltab = getattr(self.glb, 'symboltab', None)
+        if symboltab is not None and hasattr(symboltab, 'setRange'):
+            symboltab.setRange(self, newrange)
 
     def restructureVarnode(self, aliasyes: bool) -> None:
         self.clearUnlockedCategory(-1)
@@ -1029,9 +1032,18 @@ class ScopeLocal(ScopeInternal):
         self.markNotMapped(self._space, vn.getOffset(), vn.getSize(), False)
 
     def _markUnaliased(self, alias: List[int]) -> None:
+        from ghidra.ir.varnode import Varnode
+        from ghidra.types.datatype import TYPE_ARRAY, TYPE_STRUCT
+
         rangemap = self._getMapTable(self._space)
         if rangemap is None:
             return
+        ranges = []
+        try:
+            ranges = list(self.getRangeTree())
+        except Exception:
+            ranges = []
+        range_index = 0
         alias_block_level = self.glb.alias_block_level
         aliason = False
         curalias = 0
@@ -1042,19 +1054,31 @@ class ScopeLocal(ScopeInternal):
                 aliason = True
                 curalias = alias[i]
                 i += 1
+            # Aliases should not propagate across unmapped local ranges.
+            while range_index < len(ranges):
+                rng = ranges[range_index]
+                if rng.getSpace() == self._space:
+                    if rng.getFirst() > curalias and curoff >= rng.getFirst():
+                        aliason = False
+                    if rng.getLast() >= curoff:
+                        break
+                    if rng.getLast() > curalias:
+                        aliason = False
+                range_index += 1
             symbol = entry.getSymbol()
             if aliason and (curoff - curalias > 0xffff):
                 aliason = False
             if not aliason:
-                symbol.getScope().setAttribute(symbol, 0x100)  # Varnode.nolocalalias
+                symbol.getScope().setAttribute(symbol, Varnode.nolocalalias)
             if symbol.isTypeLocked() and alias_block_level != 0:
                 if alias_block_level == 3:
                     aliason = False
                 else:
-                    meta = symbol.getType().getMetatype()
-                    if meta == 'struct':
+                    symbol_type = symbol.getType()
+                    meta = symbol_type.getMetatype() if symbol_type is not None else None
+                    if meta == TYPE_STRUCT:
                         aliason = False
-                    elif meta == 'array' and alias_block_level > 1:
+                    elif meta == TYPE_ARRAY and alias_block_level > 1:
                         aliason = False
 
     def _fakeInputSymbols(self) -> None:

@@ -5,6 +5,8 @@ Corresponds to fspec.hh / fspec.cc.
 from __future__ import annotations
 from typing import List, Optional
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
+from ghidra.core.space import IPTR_SPACEBASE
 
 
 class ParamTrial:
@@ -144,12 +146,16 @@ class ParamTrial:
 
     def splitHi(self, sz: int):
         """Create a trial representing the first part of this."""
-        return ParamTrial(self._addr, sz, self._slot)
+        res = ParamTrial(self._addr, sz, self._slot)
+        res._flags = self._flags
+        return res
 
     def splitLo(self, sz: int):
         """Create a trial representing the last part of this."""
         newaddr = Address(self._addr.getSpace(), self._addr.getOffset() + (self._size - sz))
-        return ParamTrial(newaddr, sz, self._slot)
+        res = ParamTrial(newaddr, sz, self._slot + 1)
+        res._flags = self._flags
+        return res
 
     def setFixedPosition(self, pos: int) -> None:
         self._fixedPosition = pos
@@ -168,9 +174,25 @@ class ParamTrial:
         return True
 
     def __lt__(self, other: ParamTrial) -> bool:
-        if self._slot != other._slot:
-            return self._slot < other._slot
-        return self._addr.getOffset() < other._addr.getOffset()
+        self_entry = self.getEntry()
+        other_entry = other.getEntry()
+        if self_entry is None:
+            return False
+        if other_entry is None:
+            return True
+        self_group = self_entry.getGroup()
+        other_group = other_entry.getGroup()
+        if self_group != other_group:
+            return self_group < other_group
+        if self_entry is not other_entry:
+            return id(self_entry) < id(other_entry)
+        if self_entry.isExclusion():
+            return self.getOffset() < other.getOffset()
+        if self._addr != other._addr:
+            if self_entry.isReverseStack():
+                return other._addr < self._addr
+            return self._addr < other._addr
+        return self._size < other._size
 
     @staticmethod
     def fixedPositionCompare(a: ParamTrial, b: ParamTrial) -> bool:
@@ -199,12 +221,14 @@ class ParamActive:
         self._stackplaceholder = -1
         self._numpasses = 0
         self._isfullychecked = False
-        self._needsfinalcheck = False
+        self._joinReverse = False
 
     def registerTrial(self, addr: Address, sz: int) -> None:
-        slot = self._slotbase
+        trial = ParamTrial(addr, sz, self._slotbase)
+        if addr.getSpace().getType() != IPTR_SPACEBASE:
+            trial.markKilledByCall()
+        self._trial.append(trial)
         self._slotbase += 1
-        self._trial.append(ParamTrial(addr, sz, slot))
 
     def getNumTrials(self) -> int:
         return len(self._trial)
@@ -214,7 +238,12 @@ class ParamActive:
 
     def whichTrial(self, addr: Address, sz: int) -> int:
         for i, t in enumerate(self._trial):
-            if t.getAddress() == addr and t.getSize() == sz:
+            if addr.overlap(0, t.getAddress(), t.getSize()) >= 0:
+                return i
+            if sz <= 1:
+                return -1
+            endaddr = addr + (sz - 1)
+            if endaddr.overlap(0, t.getAddress(), t.getSize()) >= 0:
                 return i
         return -1
 
@@ -271,20 +300,44 @@ class ParamActive:
         self._trial.sort()
 
     def deleteUnusedTrials(self) -> None:
-        self._trial = [t for t in self._trial if t.isUsed()]
+        newtrials = []
+        slot = 1
+        for trial in self._trial:
+            if not trial.isUsed():
+                continue
+            trial.setSlot(slot)
+            slot += 1
+            newtrials.append(trial)
+        self._trial = newtrials
 
     def splitTrial(self, i: int, sz: int) -> None:
-        t = self._trial[i]
-        addr1 = t.getAddress()
-        sz1 = sz
-        addr2 = Address(addr1.getSpace(), addr1.getOffset() + sz)
-        sz2 = t.getSize() - sz
-        t.setAddress(addr1, sz1)
-        newtrial = ParamTrial(addr2, sz2, t.getSlot())
-        self._trial.insert(i + 1, newtrial)
+        if self._stackplaceholder >= 0:
+            raise LowlevelError("Cannot split parameter when the placeholder has not been recovered")
+        trial = self._trial[i]
+        slot = trial.getSlot()
+        newtrials = []
+        for prev in self._trial[:i]:
+            newtrials.append(prev)
+            oldslot = newtrials[-1].getSlot()
+            if oldslot > slot:
+                newtrials[-1].setSlot(oldslot + 1)
+        newtrials.append(trial.splitHi(sz))
+        newtrials.append(trial.splitLo(trial.getSize() - sz))
+        for nxt in self._trial[i + 1:]:
+            newtrials.append(nxt)
+            oldslot = newtrials[-1].getSlot()
+            if oldslot > slot:
+                newtrials[-1].setSlot(oldslot + 1)
+        self._slotbase += 1
+        self._trial = newtrials
 
     def getNumUsed(self) -> int:
-        return sum(1 for t in self._trial if t.isUsed())
+        count = 0
+        for trial in self._trial:
+            if not trial.isUsed():
+                break
+            count += 1
+        return count
 
     def getTrialForInputVarnode(self, slot: int) -> ParamTrial:
         """Get trial corresponding to the given input Varnode slot."""
@@ -296,13 +349,29 @@ class ParamActive:
 
     def joinTrial(self, slot: int, addr: Address, sz: int) -> None:
         """Join adjacent parameter trials."""
-        for i, t in enumerate(self._trial):
-            if t.getSlot() == slot:
-                t.setAddress(addr, sz)
-                # Remove the next trial if it exists
-                if i + 1 < len(self._trial):
-                    del self._trial[i + 1]
-                break
+        if self._stackplaceholder >= 0:
+            raise LowlevelError("Cannot join parameters when the placeholder has not been removed")
+        newtrials = []
+        sizecheck = 0
+        for curtrial in self._trial:
+            curslot = curtrial.getSlot()
+            if curslot < slot:
+                newtrials.append(curtrial)
+            elif curslot == slot:
+                sizecheck += curtrial.getSize()
+                merged = ParamTrial(addr, sz, slot)
+                merged.markUsed()
+                merged.markActive()
+                newtrials.append(merged)
+            elif curslot == slot + 1:
+                sizecheck += curtrial.getSize()
+            else:
+                curtrial.setSlot(curslot - 1)
+                newtrials.append(curtrial)
+        if sizecheck != sz:
+            raise LowlevelError("Size mismatch when joining parameters")
+        self._slotbase -= 1
+        self._trial = newtrials
 
     def sortFixedPosition(self) -> None:
         """Sort trials by fixed position then by normal ordering."""

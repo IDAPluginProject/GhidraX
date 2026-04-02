@@ -235,6 +235,10 @@ class Varnode:
     def getDescendants(self) -> List[PcodeOp]:
         return list(self._descend)
 
+    def getDescend(self) -> List[PcodeOp]:
+        """C++-style descendant accessor used by many rule ports."""
+        return list(self._descend)
+
     def beginDescend(self) -> Iterator[PcodeOp]:
         return iter(self._descend)
 

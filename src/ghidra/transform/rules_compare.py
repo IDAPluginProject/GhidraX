@@ -120,23 +120,7 @@ class RuleIntLessEqual(Rule):
         return [int(OpCode.CPUI_INT_LESSEQUAL), int(OpCode.CPUI_INT_SLESSEQUAL)]
 
     def applyOp(self, op, data) -> int:
-        constvn = op.getIn(1)
-        if not constvn.isConstant():
-            return 0
-        val = constvn.getOffset()
-        size = constvn.getSize()
-        mask = calc_mask(size)
-        if op.code() == OpCode.CPUI_INT_LESSEQUAL:
-            if val == mask:
-                return 0
-            data.opSetOpcode(op, OpCode.CPUI_INT_LESS)
-        else:
-            smax = mask >> 1
-            if val == smax:
-                return 0
-            data.opSetOpcode(op, OpCode.CPUI_INT_SLESS)
-        data.opSetInput(op, data.newConstant(size, (val + 1) & mask), 1)
-        return 1
+        return 1 if data.replaceLessequal(op) else 0
 
 
 # =========================================================================

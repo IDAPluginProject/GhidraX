@@ -65,7 +65,7 @@ class RuleLessEqual(Rule):
             return 0
         eq0 = op_equal.getIn(0)
         eq1 = op_equal.getIn(1)
-        match = (compvn1 is eq0 and compvn2 is eq1) or (compvn1 is eq1 and compvn2 is eq0)
+        match = (compvn1 == eq0 and compvn2 == eq1) or (compvn1 == eq1 and compvn2 == eq0)
         if not match:
             return 0
         if equalopc == OpCode.CPUI_INT_NOTEQUAL:
@@ -125,7 +125,7 @@ class RuleLessNotEqual(Rule):
             return 0
         eq0 = op_equal.getIn(0)
         eq1 = op_equal.getIn(1)
-        match = (compvn1 is eq0 and compvn2 is eq1) or (compvn1 is eq1 and compvn2 is eq0)
+        match = (compvn1 == eq0 and compvn2 == eq1) or (compvn1 == eq1 and compvn2 == eq0)
         if not match:
             return 0
         data.opSetInput(op, compvn1, 0)
@@ -185,9 +185,9 @@ class RuleFloatRange(Rule):
         if nvn1.isFree():
             return 0
         cvn1 = cmp1.getIn(1 - slot1)
-        if nvn1 is not cmp2.getIn(0):
+        if nvn1 != cmp2.getIn(0):
             slot2 = 1
-            if nvn1 is not cmp2.getIn(1):
+            if nvn1 != cmp2.getIn(1):
                 return 0
         else:
             slot2 = 0
@@ -197,7 +197,7 @@ class RuleFloatRange(Rule):
                 return 0
             if matchvn.getOffset() != cvn1.getOffset():
                 return 0
-        elif cvn1 is not matchvn:
+        elif cvn1 != matchvn:
             return 0
         elif cvn1.isFree():
             return 0

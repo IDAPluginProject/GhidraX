@@ -353,6 +353,8 @@ class RulePullsubIndirect(Rule):
         if not RulePullsubMulti.acceptableSize(newSize):
             return 0
         outvn = op.getOut()
+        if outvn is None:
+            return 0
         if hasattr(outvn, 'isPrecisLo') and (outvn.isPrecisLo() or outvn.isPrecisHi()):
             return 0
 
@@ -531,7 +533,7 @@ class RuleCollectTerms(Rule):
 
     C++ ref: ruleaction.cc — RuleCollectTerms
     """
-    def __init__(self, g): super().__init__(g, 0, "collectterms")
+    def __init__(self, g): super().__init__(g, 0, "collect_terms")
     def clone(self, gl):
         return RuleCollectTerms(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [OpCode.CPUI_INT_ADD]
@@ -543,24 +545,81 @@ class RuleCollectTerms(Rule):
         C++ ref: RuleCollectTerms::getMultCoeff
         Returns (underlying_vn, coefficient).
         """
-        if not (vn._flags & 0x10):
+        if not vn.isWritten():
             return (vn, 1)
-        testop = vn._def
-        ins = testop._inrefs
-        if testop._opcode_enum != 32 or len(ins) < 2 or not (ins[1]._flags & 0x2):
+        testop = vn.getDef()
+        if testop.code() != OpCode.CPUI_INT_MULT or not testop.getIn(1).isConstant():
             return (vn, 1)
-        return (ins[0], int(ins[1]._loc.offset))
+        return (testop.getIn(0), int(testop.getIn(1).getOffset()))
 
     def applyOp(self, op, data):
-        ins = op._inrefs
-        in0 = ins[0] if ins else None
-        in1 = ins[1] if len(ins) > 1 else None
-        if in0 is in1:
-            # x + x => x * 2
-            data.opSetOpcode(op, OpCode.CPUI_INT_MULT)
-            data.opSetInput(op, data.newConstant(in0.getSize(), 2), 1)
-            return 1
-        return 0
+        from ghidra.core.expression import TermOrder
+
+        outvn = op.getOut()
+        if outvn is None:
+            return 0
+        nextop = outvn.loneDescend()
+        if nextop is not None and nextop.code() == OpCode.CPUI_INT_ADD:
+            return 0
+
+        termorder = TermOrder(op)
+        termorder.collect()
+        termorder.sortTerms()
+        order = termorder.getSort()
+        if not order:
+            return 0
+
+        i = 0
+        if not order[0].getVarnode().isConstant():
+            for i in range(1, len(order)):
+                vn1 = order[i - 1].getVarnode()
+                vn2 = order[i].getVarnode()
+                if vn2.isConstant():
+                    break
+                vn1, coef1 = self.getMultCoeff(vn1)
+                vn2, coef2 = self.getMultCoeff(vn2)
+                if vn1 is vn2:
+                    if order[i - 1].getMultiplier() is not None:
+                        return 1 if data.distributeIntMultAdd(order[i - 1].getMultiplier()) else 0
+                    if order[i].getMultiplier() is not None:
+                        return 1 if data.distributeIntMultAdd(order[i].getMultiplier()) else 0
+                    coef1 = (coef1 + coef2) & calc_mask(vn1.getSize())
+                    newcoeff = data.newConstant(vn1.getSize(), coef1)
+                    zerocoeff = data.newConstant(vn1.getSize(), 0)
+                    data.opSetInput(order[i - 1].getOp(), zerocoeff, order[i - 1].getSlot())
+                    if coef1 == 0:
+                        data.opSetInput(order[i].getOp(), newcoeff, order[i].getSlot())
+                    else:
+                        nextop = data.newOp(2, order[i].getOp().getAddr())
+                        vn2 = data.newUniqueOut(vn1.getSize(), nextop)
+                        data.opSetOpcode(nextop, OpCode.CPUI_INT_MULT)
+                        data.opSetInput(nextop, vn1, 0)
+                        data.opSetInput(nextop, newcoeff, 1)
+                        data.opInsertBefore(nextop, order[i].getOp())
+                        data.opSetInput(order[i].getOp(), vn2, order[i].getSlot())
+                    return 1
+
+        coef1 = 0
+        nonzerocount = 0
+        lastconst = 0
+        for j in range(len(order) - 1, i - 1, -1):
+            if order[j].getMultiplier() is not None:
+                continue
+            vn1 = order[j].getVarnode()
+            val = vn1.getOffset()
+            if val != 0:
+                nonzerocount += 1
+                coef1 += val
+                lastconst = j
+        if nonzerocount <= 1:
+            return 0
+        vn1 = order[lastconst].getVarnode()
+        coef1 &= calc_mask(vn1.getSize())
+        for j in range(lastconst + 1, len(order)):
+            if order[j].getMultiplier() is None:
+                data.opSetInput(order[j].getOp(), data.newConstant(vn1.getSize(), 0), order[j].getSlot())
+        data.opSetInput(order[lastconst].getOp(), data.newConstant(vn1.getSize(), coef1), order[lastconst].getSlot())
+        return 1
 
 
 class RuleSubCommute(Rule):

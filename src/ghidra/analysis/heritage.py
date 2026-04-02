@@ -7,6 +7,8 @@ Core classes: LocationMap, MemRange, TaskList, PriorityQueue, HeritageInfo, Load
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
@@ -21,6 +23,79 @@ if TYPE_CHECKING:
     from ghidra.block.block import FlowBlock, BlockBasic, BlockGraph
     from ghidra.analysis.funcdata import Funcdata
     from ghidra.fspec.fspec import FuncCallSpecs
+
+
+_HERITAGE_DEBUG = os.environ.get("PYGHIDRA_DEBUG_HERITAGE_ORDER", "")
+
+
+def _heritage_debug_enabled() -> bool:
+    return bool(_HERITAGE_DEBUG)
+
+
+def _debug_heritage(msg: str) -> None:
+    if _HERITAGE_DEBUG:
+        print(msg, file=sys.stderr)
+
+
+def _format_vn_debug(vn: "Varnode") -> str:
+    space = vn.getSpace()
+    space_name = space.getName() if space is not None else "none"
+    state = "written" if vn.isWritten() else ("input" if vn.isInput() else "free")
+    return f"{space_name}[{vn.getOffset():#x}:{vn.getSize()}:{state}]"
+
+
+def _sort_space_key(space: Optional[AddrSpace]) -> int:
+    """Mirror C++ Address ordering by using address-space index."""
+    if space is None:
+        return -1
+    return space.getIndex()
+
+
+def _sort_address_key(addr: Address) -> tuple[int, int]:
+    """Build a stable Address sort key matching ``Address::__lt__`` semantics."""
+    return (_sort_space_key(addr.getSpace()), addr.getOffset())
+
+
+def _sort_varnode_loc_def_key(vn: "Varnode") -> tuple[int, ...]:
+    """Build the C++ ``VarnodeCompareLocDef`` ordering as a Python sort key."""
+    input_or_written = vn.getFlags() & 0x18  # Varnode.input | Varnode.written
+    key = [
+        *_sort_address_key(vn.getAddr()),
+        vn.getSize(),
+        ((input_or_written - 1) & 0xFFFFFFFF),
+    ]
+    if input_or_written == 0x10:  # Varnode.written
+        seq = vn.getDef().getSeqNum()
+        key.extend((*_sort_address_key(seq.getAddr()), seq.getTime()))
+    elif input_or_written == 0:
+        key.append(vn.getCreateIndex())
+    else:
+        key.append(0)
+    return tuple(key)
+
+
+def _heritage_space_sort_key(space: Optional[AddrSpace]) -> tuple[int, int]:
+    """Approximate the native heritage space iteration order.
+
+    Native x64 traces show ``unique`` ranges being heritaged before
+    ``register`` ranges.  Our Python lifter currently assigns the register
+    space a lower index than unique, so raw ``arch.getSpace(i)`` iteration
+    produces the wrong disjoint/task chronology.  Keep the adjustment local
+    to heritage iteration, preferring internal temporaries before processor
+    and stack-backed spaces.
+    """
+    if space is None:
+        return (99, 99)
+    spc_type = space.getType()
+    if spc_type == IPTR_INTERNAL:
+        bucket = 0
+    elif spc_type == IPTR_PROCESSOR:
+        bucket = 1
+    elif spc_type == IPTR_SPACEBASE:
+        bucket = 2
+    else:
+        bucket = 3
+    return (bucket, space.getIndex())
 
 
 # =========================================================================
@@ -45,8 +120,9 @@ class LocationMap:
         self._map: Dict[Address, LocationMap.SizePass] = {}
         self._by_base: dict = {}  # base → {addr: SizePass} for fast same-space lookup
 
-    def add(self, addr: Address, size: int, pass_: int, intersect_ref: list = None) -> Address:
-        """Mark new address as heritaged. Returns the key of the containing entry.
+    def add(self, addr: Address, size: int, pass_: int,
+            intersect_ref: list = None) -> tuple[Address, "LocationMap.SizePass"]:
+        """Mark new address as heritaged and return the containing entry.
 
         intersect_ref[0] is set to:
           0 if only intersection is with range from the same pass
@@ -58,62 +134,77 @@ class LocationMap:
         intersect_ref[0] = 0
 
         addr_base = addr.base
-        addr_off = addr.offset
-        highest = addr_base._highest
-
-        # Only iterate same-base entries via _by_base index (avoids O(N) base-check filter)
         base_bucket = self._by_base.get(addr_base)
-        if base_bucket:
-            to_delete = None  # Deferred deletions — avoids list(items()) copy
-            for existing_addr, sp in base_bucket.items():
-                ex_off = existing_addr.offset
-                dist = addr_off - ex_off
-                if dist < 0 or dist > highest:
-                    dist = -1
-                if dist == -1 or dist >= sp.size:
-                    dist2 = ex_off - addr_off
-                    if dist2 < 0 or dist2 > highest or dist2 >= size:
-                        continue
-                    end1 = addr_off + size
-                    end2 = ex_off + sp.size
-                    new_end = end1 if end1 > end2 else end2
-                    size = new_end - addr_off
-                    if sp.pass_ < pass_:
-                        intersect_ref[0] = 1
-                        pass_ = sp.pass_
-                    if to_delete is None:
-                        to_delete = [existing_addr]
-                    else:
-                        to_delete.append(existing_addr)
-                    continue
-
-                if dist + size <= sp.size:
-                    intersect_ref[0] = 2 if sp.pass_ < pass_ else 0
-                    return existing_addr
-
-                new_size = dist + size
-                if sp.pass_ < pass_:
-                    intersect_ref[0] = 1
-                    pass_ = sp.pass_
-                addr = existing_addr
-                addr_off = ex_off
-                size = new_size
-                if to_delete is None:
-                    to_delete = [existing_addr]
-                else:
-                    to_delete.append(existing_addr)
-            if to_delete:
-                for ea in to_delete:
-                    del base_bucket[ea]
-                    del self._map[ea]
-
-        sp = LocationMap.SizePass(size, pass_)
-        self._map[addr] = sp
         if base_bucket is None:
             base_bucket = {}
             self._by_base[addr_base] = base_bucket
+            sorted_addrs: list[Address] = []
+        else:
+            sorted_addrs = sorted(base_bucket)
+
+        idx = bisect_left(sorted_addrs, addr)
+        if idx != 0:
+            idx -= 1
+        if idx < len(sorted_addrs):
+            start_addr = sorted_addrs[idx]
+            start_sp = base_bucket[start_addr]
+            if addr.overlap(0, start_addr, start_sp.size) == -1:
+                idx += 1
+
+        to_delete: list[Address] = []
+        if idx < len(sorted_addrs):
+            existing_addr = sorted_addrs[idx]
+            sp = base_bucket[existing_addr]
+            where = addr.overlap(0, existing_addr, sp.size)
+            if where != -1:
+                if where + size <= sp.size:
+                    intersect_ref[0] = 2 if sp.pass_ < pass_ else 0
+                    return existing_addr, sp
+                addr = existing_addr
+                size = where + size
+                if sp.pass_ < pass_:
+                    intersect_ref[0] = 1
+                    pass_ = sp.pass_
+                to_delete.append(existing_addr)
+                idx += 1
+
+        while idx < len(sorted_addrs):
+            existing_addr = sorted_addrs[idx]
+            sp = base_bucket[existing_addr]
+            where = existing_addr.overlap(0, addr, size)
+            if where == -1:
+                break
+            if where + sp.size > size:
+                size = where + sp.size
+            if sp.pass_ < pass_:
+                intersect_ref[0] = 1
+                pass_ = sp.pass_
+            to_delete.append(existing_addr)
+            idx += 1
+
+        for existing_addr in to_delete:
+            del base_bucket[existing_addr]
+            del self._map[existing_addr]
+
+        sp = LocationMap.SizePass(size, pass_)
+        self._map[addr] = sp
         base_bucket[addr] = sp
-        return addr
+        return addr, sp
+
+    def find(self, addr: Address) -> Optional[tuple[Address, "LocationMap.SizePass"]]:
+        """Look up the entry containing *addr* using C++ ``upper_bound`` semantics."""
+        base_bucket = self._by_base.get(addr.base)
+        if not base_bucket:
+            return None
+        sorted_addrs = sorted(base_bucket)
+        idx = bisect_right(sorted_addrs, addr)
+        if idx == 0:
+            return None
+        key = sorted_addrs[idx - 1]
+        sp = base_bucket[key]
+        if addr.overlap(0, key, sp.size) == -1:
+            return None
+        return key, sp
 
 
     def findPass(self, addr: Address) -> int:
@@ -135,13 +226,13 @@ class LocationMap:
         self._by_base.clear()
 
     def begin(self):
-        return iter(self._map.items())
+        return iter(sorted(self._map.items(), key=lambda item: item[0]))
 
     def end(self):
         return None
 
     def __iter__(self):
-        return iter(self._map.items())
+        return self.begin()
 
 
 # =========================================================================
@@ -182,30 +273,14 @@ class TaskList:
         self._list: List[MemRange] = []
 
     def add(self, addr: Address, size: int, fl: int) -> None:
-        """Add a range to the list (merging if overlapping with any existing entry).
-
-        C++ LocationMap is a sorted map that naturally deduplicates.
-        We search the entire list to find an existing entry that overlaps
-        the new range and merge into it rather than creating a duplicate.
-        """
-        spc = addr.getSpace()
-        off = addr.getOffset()
-        for entry in self._list:
-            if entry.addr.getSpace() is not spc:
-                continue
-            e_off = entry.addr.getOffset()
-            e_end = e_off + entry.size
-            # Check overlap: [off, off+size) intersects [e_off, e_end)
-            if off < e_end and (off + size) > e_off:
-                # Merge: extend entry to cover both ranges
-                new_off = min(off, e_off)
-                new_end = max(off + size, e_end)
-                entry.addr = Address(spc, new_off)
-                entry.size = new_end - new_off
-                entry.flags |= fl
-                return
-            # Also merge if ranges are identical
-            if off == e_off and size == entry.size:
+        """Add a range to the end of the list, merging only with the tail."""
+        if self._list:
+            entry = self._list[-1]
+            over = addr.overlap(0, entry.addr, entry.size)
+            if over >= 0:
+                relsize = size + over
+                if relsize > entry.size:
+                    entry.size = relsize
                 entry.flags |= fl
                 return
         self._list.append(MemRange(addr, size, fl))
@@ -230,7 +305,7 @@ class TaskList:
 
     def sort(self) -> None:
         """Sort ranges by address to match C++ sorted map iteration order."""
-        self._list.sort(key=lambda m: (id(m.addr.getSpace()), m.addr.getOffset()))
+        self._list.sort(key=lambda m: (_sort_address_key(m.addr), m.size))
 
     def __iter__(self):
         return iter(self._list)
@@ -700,10 +775,27 @@ class Heritage:
             if not descs:
                 continue
             if vn.getSize() < size:
+                if _heritage_debug_enabled():
+                    _debug_heritage(
+                        "guard.read "
+                        f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
+                        f"vn={_format_vn_debug(vn)} "
+                        f"follow=@{descs[0].getAddr().getOffset():#x} "
+                        f"opc={descs[0].code()}"
+                    )
                 read[i] = vn = self.normalizeReadSize(vn, descs[0], addr, size)
             vn.setActiveHeritage()
         for i, vn in enumerate(write):
             if vn.getSize() < size:
+                if _heritage_debug_enabled():
+                    op = vn.getDef()
+                    _debug_heritage(
+                        "guard.write "
+                        f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
+                        f"vn={_format_vn_debug(vn)} "
+                        f"def=@{op.getAddr().getOffset():#x} "
+                        f"opc={op.code()}"
+                    )
                 write[i] = vn = self.normalizeWriteSize(vn, addr, size)
             vn.setActiveHeritage()
         if guardPerformed:
@@ -864,11 +956,13 @@ class Heritage:
 
     def guardStores(self, addr: Address, size: int, write: list) -> None:
         """Guard STORE ops in preparation for the renaming algorithm."""
+        from ghidra.ir.op import PcodeOp
         if self._fd is None:
             return
         if not hasattr(self._fd, 'beginOp'):
             return
         spc = addr.getSpace()
+        container = spc.getContain() if hasattr(spc, 'getContain') else None
         for op in list(self._fd.beginOp(OpCode.CPUI_STORE)):
             if hasattr(op, 'isDead') and op.isDead():
                 continue
@@ -878,9 +972,10 @@ class Heritage:
             if not in0.isConstant():
                 continue
             storeSpc = in0.getSpaceFromConst() if hasattr(in0, 'getSpaceFromConst') else None
-            if storeSpc is spc or (hasattr(spc, 'getContain') and spc.getContain() is storeSpc):
+            if ((container is storeSpc and hasattr(op, 'usesSpacebasePtr') and op.usesSpacebasePtr())
+                    or (spc is storeSpc)):
                 if hasattr(self._fd, 'newIndirectOp'):
-                    indop = self._fd.newIndirectOp(op, addr, size, 0)
+                    indop = self._fd.newIndirectOp(op, addr, size, PcodeOp.indirect_store)
                     if indop is not None:
                         indop.getIn(0).setActiveHeritage()
                         indop.getOut().setActiveHeritage()
@@ -1242,7 +1337,8 @@ class Heritage:
                 lo = bisect_left(sorted_offsets, range_off - 128)
                 lo = max(0, lo)
                 for i in range(lo, hi):
-                    vn_off, vn_sz, vn = sorted_vns[i]
+                    vn_off, _, vn = sorted_vns[i]
+                    vn_sz = vn._size
                     if vn_off + vn_sz <= range_off:
                         continue  # Doesn't reach range start
                     if vn._addlflags & _WM:
@@ -1307,6 +1403,14 @@ class Heritage:
         self._fd.opSetOutput(newop, vn)
         if hasattr(newop.getOut(), 'setWriteMask'):
             newop.getOut().setWriteMask()
+        if _heritage_debug_enabled():
+            _debug_heritage(
+                "normalizeReadSize "
+                f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
+                f"read={_format_vn_debug(vn)} "
+                f"follow=@{op.getAddr().getOffset():#x} "
+                f"newin={_format_vn_debug(vn1)}"
+            )
         self._fd.opInsertBefore(newop, op)
         return vn1
 
@@ -1353,6 +1457,14 @@ class Heritage:
                 self._fd.opSetInput(newop, big, 0)
                 addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
                 self._fd.opSetInput(newop, self._fd.newConstant(addrSize, overlap + vn.getSize()), 1)
+                if _heritage_debug_enabled():
+                    _debug_heritage(
+                        "normalizeWriteSize.most "
+                        f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
+                        f"write={_format_vn_debug(vn)} "
+                        f"piece={_format_vn_debug(mostvn)} "
+                        f"follow=@{op.getAddr().getOffset():#x}"
+                    )
                 self._fd.opInsertBefore(newop, op)
 
         # Create least significant piece if needed
@@ -1375,6 +1487,14 @@ class Heritage:
                 self._fd.opSetInput(newop, big, 0)
                 addrSize2 = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
                 self._fd.opSetInput(newop, self._fd.newConstant(addrSize2, 0), 1)
+                if _heritage_debug_enabled():
+                    _debug_heritage(
+                        "normalizeWriteSize.least "
+                        f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
+                        f"write={_format_vn_debug(vn)} "
+                        f"piece={_format_vn_debug(leastvn)} "
+                        f"follow=@{op.getAddr().getOffset():#x}"
+                    )
                 self._fd.opInsertBefore(newop, op)
 
         # Concatenate least significant piece with vn
@@ -1637,9 +1757,9 @@ class Heritage:
         giter = self._globaldisjoint.find(addr) if hasattr(self._globaldisjoint, 'find') else None
         curPass = 0
         if giter is not None:
-            curPass = giter.get('pass', 0) if isinstance(giter, dict) else 0
+            curPass = giter[1].pass_
             if hasattr(self._globaldisjoint, 'erase'):
-                self._globaldisjoint.erase(giter)
+                self._globaldisjoint.erase(giter[0])
         cut = 0
         sz = refine[cut]
         curaddr = addr
@@ -2543,9 +2663,6 @@ class Heritage:
 
     def placeMultiequals(self) -> None:
         """Perform phi-node placement for the current set of address ranges."""
-        # Sort ranges by address to match C++ sorted-map iteration order.
-        # This ensures INDIRECTs at call sites are created in address order.
-        self._disjoint.sort()
         readvars: list = []
         writevars: list = []
         inputvars: list = []
@@ -2556,7 +2673,7 @@ class Heritage:
         if self._fd is not None:
             vbank = self._fd._vbank
             for spc_id, vn_set in vbank._space_varnodes.items():
-                entries = [(vn._loc.offset, vn._size, vn) for vn in vn_set]
+                entries = [(vn._loc.offset, _sort_varnode_loc_def_key(vn), vn) for vn in vn_set]
                 if entries:
                     entries.sort(key=lambda x: (x[0], x[1]))
                     sorted_offsets = [e[0] for e in entries]
@@ -2565,6 +2682,12 @@ class Heritage:
         idx = 0
         while idx < len(self._disjoint):
             memrange = self._disjoint[idx]
+            if _heritage_debug_enabled():
+                _debug_heritage(
+                    "placeMultiequals "
+                    f"idx={idx} range={memrange.addr.getSpace().getName()}[{memrange.addr.getOffset():#x}:{memrange.size}] "
+                    f"flags={memrange.flags}"
+                )
             maxsize = self.collect(memrange, readvars, writevars, inputvars, removevars, _sorted_idx)
             size = memrange.size
             # C++ refinement: split large ranges into sub-ranges (heritage.cc placeMultiequals)
@@ -2724,8 +2847,11 @@ class Heritage:
         stackSpace = None
         freeStores: list = []
 
-        # For each heritaged address space
-        for info in self._infolist:
+        # Iterate spaces in the observed native heritage order.  The Python
+        # lifter's current space indices do not fully match the native
+        # decompiler on x64, so using the raw list order can perturb
+        # disjoint/task chronology and downstream op insertion order.
+        for info in sorted(self._infolist, key=lambda info: _heritage_space_sort_key(info.space)):
             if not info.isHeritaged():
                 continue
             if self._pass < info.delay:
@@ -2744,16 +2870,18 @@ class Heritage:
             _vbank = self._fd._vbank
             _spc_bucket = _vbank._space_varnodes.get(id(info.space), ())
             _VN_WR = 0x10; _VN_IP = 0x08; _VN_UNAFF = 0x10000
-            for vn in list(_spc_bucket):
+            for vn in sorted(_spc_bucket, key=_sort_varnode_loc_def_key):
                 if not (vn._flags & _VN_WR) and vn.hasNoDescend() and not vn.isUnaffected() and not vn.isInput():
                     continue
                 if vn.isWriteMask():
                     continue
                 intersect_ref = [0]
-                self._globaldisjoint.add(vn.getAddr(), vn.getSize(), self._pass, intersect_ref)
+                canon_addr, canon_sizepass = self._globaldisjoint.add(
+                    vn.getAddr(), vn.getSize(), self._pass, intersect_ref
+                )
                 prev = intersect_ref[0]
                 if prev == 0:
-                    self._disjoint.add(vn.getAddr(), vn.getSize(), MemRange.new_addresses)
+                    self._disjoint.add(canon_addr, canon_sizepass.size, MemRange.new_addresses)
                 elif prev == 2:
                     if vn.isHeritageKnown():
                         continue
@@ -2765,7 +2893,7 @@ class Heritage:
                             needwarning = True
                             self.bumpDeadcodeDelay(vn.getSpace())
                             warnvn = vn
-                    self._disjoint.add(vn.getAddr(), vn.getSize(), MemRange.old_addresses)
+                    self._disjoint.add(canon_addr, canon_sizepass.size, MemRange.old_addresses)
                 else:
                     if not needwarning and info.deadremoved > 0:
                         isJumpRecov = hasattr(self._fd, 'isJumptableRecoveryOn') and self._fd.isJumptableRecoveryOn()
@@ -2775,7 +2903,7 @@ class Heritage:
                             needwarning = True
                             self.bumpDeadcodeDelay(vn.getSpace())
                             warnvn = vn
-                    self._disjoint.add(vn.getAddr(), vn.getSize(),
+                    self._disjoint.add(canon_addr, canon_sizepass.size,
                                        MemRange.old_addresses | MemRange.new_addresses)
 
             if needwarning and not info.warningissued:

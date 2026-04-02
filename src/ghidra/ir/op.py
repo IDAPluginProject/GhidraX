@@ -7,7 +7,6 @@ The PcodeOp and PcodeOpBank classes.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
-
 from ghidra.core.address import Address, SeqNum
 from ghidra.core.error import LowlevelError
 from ghidra.core.opcodes import OpCode
@@ -15,6 +14,35 @@ from ghidra.core.opcodes import OpCode
 if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
     from ghidra.core.marshal import Encoder, Decoder
+
+
+_IOP_REF_LOOKUP: Dict[int, "PcodeOp"] = {}
+_TYPEOP_FLAG_CACHE: Optional[Dict[int, int]] = None
+
+
+def _get_typeop_flags_for_opcode(opc: OpCode) -> int:
+    """Mirror native PcodeOp::setOpcode(TypeOp*) for enum-only opcode updates.
+
+    Python frequently mutates ops via ``setOpcodeEnum()`` without a live TypeOp
+    instance attached. Native still preserves the opcode's behavioral flags
+    (booloutput, branch, call, commutative, etc.) because ``setOpcode`` always
+    receives a TypeOp. Cache the canonical TypeOp flags once and reuse them so
+    enum-only updates don't silently drop rule-visible properties.
+    """
+    global _TYPEOP_FLAG_CACHE
+    cache = _TYPEOP_FLAG_CACHE
+    if cache is None:
+        from ghidra.ir.typeop import registerTypeOps
+        from ghidra.types.datatype import TypeFactory
+
+        typeops = registerTypeOps(TypeFactory(), None)
+        cache = {}
+        for typeop in typeops:
+            if typeop is None:
+                continue
+            cache[int(typeop.getOpcode())] = int(typeop.getFlags())
+        _TYPEOP_FLAG_CACHE = cache
+    return cache.get(int(opc), 0)
 
 
 class PcodeOp:
@@ -71,6 +99,13 @@ class PcodeOp:
     concat_root          = 0x100
     no_indirect_collapse = 0x200
     store_unmapped       = 0x400
+
+    # Flags sourced from TypeOp::getFlags() in C++ PcodeOp::setOpcode.
+    _TYPEOP_FLAG_MASK = (
+        branch | call | coderef | commutative | returns | nocollapse |
+        marker | booloutput | unary | binary | ternary | special |
+        has_callspec | return_copy
+    )
 
     __slots__ = ('_opcode', '_opcode_enum', '_flags', '_addlflags',
                  '_start', '_parent', '_output', '_inrefs')
@@ -278,12 +313,20 @@ class PcodeOp:
     # --- Structural mutators (Funcdata-level) ---
 
     def setOpcode(self, t_op) -> None:
+        self._flags &= ~PcodeOp._TYPEOP_FLAG_MASK
         self._opcode = t_op
-        if t_op is not None:
-            self._opcode_enum = t_op.getOpcode()
+        if t_op is None:
+            self._opcode_enum = OpCode.CPUI_BLANK
+            return
+        self._opcode_enum = t_op.getOpcode()
+        if hasattr(t_op, "getFlags"):
+            self._flags |= int(t_op.getFlags())
 
     def setOpcodeEnum(self, opc: OpCode) -> None:
+        self._flags &= ~PcodeOp._TYPEOP_FLAG_MASK
+        self._opcode = None
         self._opcode_enum = opc
+        self._flags |= _get_typeop_flags_for_opcode(opc)
 
     def setOutput(self, vn: Optional[Varnode]) -> None:
         self._output = vn
@@ -377,9 +420,15 @@ class PcodeOp:
         return 0
 
     @staticmethod
-    def getOpFromConst(addr: Address) -> int:
-        """Retrieve the PcodeOp encoded as the address offset."""
-        return addr.getOffset()
+    def registerOpRef(op: "PcodeOp") -> None:
+        _IOP_REF_LOOKUP[id(op)] = op
+
+    @staticmethod
+    def getOpFromConst(addr: Address):
+        """Retrieve the PcodeOp encoded in an IOP-space address."""
+        if addr is None:
+            return None
+        return _IOP_REF_LOOKUP.get(addr.getOffset())
 
     def printRaw(self) -> str:
         """Print raw info about this op."""
@@ -445,6 +494,13 @@ class PcodeOp:
             return False
         if self._output is None:
             return False
+        if len(self._inrefs) == 0:
+            return False
+        for inv in self._inrefs:
+            if inv is None or not inv.isConstant():
+                return False
+        if self._output.getSize() > 8:
+            return False
         return True
 
     def isMoveable(self, point) -> bool:
@@ -460,22 +516,55 @@ class PcodeOp:
         return -1
 
     def getCseHash(self) -> int:
-        if self._output is None:
+        eval_type = self.getEvalType()
+        if (eval_type & (PcodeOp.unary | PcodeOp.binary)) == 0:
             return 0
-        h = int(self._opcode_enum) * 0x9e3779b9
-        for inp in self._inrefs:
-            if inp is not None and inp.isConstant():
-                h ^= inp.getOffset() * 0x517cc1b7
-        return h & 0xFFFFFFFF
+        if self._opcode_enum == OpCode.CPUI_COPY:
+            return 0
+        outvn = self._output
+        if outvn is None:
+            return 0
+        mask = 0xFFFFFFFFFFFFFFFF
+        h = ((outvn.getSize() << 8) | int(self._opcode_enum)) & mask
+        for vn in self._inrefs:
+            h = ((h << 8) | (h >> 56)) & mask
+            if vn is None:
+                continue
+            if vn.isConstant():
+                h ^= vn.getOffset() & mask
+            else:
+                h ^= vn.getCreateIndex() & mask
+        return h
 
     def isCseMatch(self, other) -> bool:
+        if (self.getEvalType() & (PcodeOp.unary | PcodeOp.binary)) == 0:
+            return False
+        if (other.getEvalType() & (PcodeOp.unary | PcodeOp.binary)) == 0:
+            return False
+        if self._output is None or other._output is None:
+            return False
+        if self._output.getSize() != other._output.getSize():
+            return False
         if self._opcode_enum != other._opcode_enum:
+            return False
+        if self._opcode_enum == OpCode.CPUI_COPY:
             return False
         if len(self._inrefs) != len(other._inrefs):
             return False
         for i in range(len(self._inrefs)):
-            if self._inrefs[i] is not other._inrefs[i]:
-                return False
+            vn1 = self._inrefs[i]
+            vn2 = other._inrefs[i]
+            if vn1 is vn2:
+                continue
+            if (
+                vn1 is not None
+                and vn2 is not None
+                and vn1.isConstant()
+                and vn2.isConstant()
+                and vn1.getOffset() == vn2.getOffset()
+            ):
+                continue
+            return False
         return True
 
     def getBasicIter(self):
@@ -707,6 +796,16 @@ class PcodeOpBank:
         self._opcode_idx: dict = {}  # opcode_int -> {id(op): op} for O(1) beginByOpcode
         self._uniqid: int = 0
 
+    @staticmethod
+    def _opcode_key(value) -> Optional[int]:
+        if value is None:
+            return None
+        if hasattr(value, "_opcode_enum"):
+            return int(value._opcode_enum)
+        if hasattr(value, "getOpcode"):
+            return int(value.getOpcode())
+        return int(value)
+
     def clear(self) -> None:
         self._optree.clear()
         self._deadlist.clear()
@@ -755,13 +854,16 @@ class PcodeOpBank:
 
     def destroy(self, op: PcodeOp) -> None:
         """Destroy/retire the given PcodeOp."""
+        if not op.isDead():
+            raise LowlevelError("Deleting integrated op")
         sq = op.getSeqNum()
         self._optree.pop(sq, None)
         oid = id(op)
         self._deadlist.pop(oid, None)   # O(1)
         if self._alivelist.pop(oid, None) is not None:
-            if op._opcode is not None:
-                bucket = self._opcode_idx.get(int(op._opcode))
+            opc_int = self._opcode_key(op)
+            if opc_int is not None:
+                bucket = self._opcode_idx.get(opc_int)
                 if bucket is not None:
                     bucket.pop(oid, None)
         self._removeFromCodeList(op)
@@ -779,8 +881,8 @@ class PcodeOpBank:
         if oid not in self._alivelist:  # O(1)
             self._alivelist[oid] = op
             self._addToCodeList(op)
-            if op._opcode is not None:
-                opc_int = int(op._opcode)
+            opc_int = self._opcode_key(op)
+            if opc_int is not None:
                 bucket = self._opcode_idx.get(opc_int)
                 if bucket is None:
                     self._opcode_idx[opc_int] = {oid: op}
@@ -792,8 +894,9 @@ class PcodeOpBank:
         op.setFlag(PcodeOp.dead)
         oid = id(op)
         if self._alivelist.pop(oid, None) is not None:
-            if op._opcode is not None:
-                bucket = self._opcode_idx.get(int(op._opcode))
+            opc_int = self._opcode_key(op)
+            if opc_int is not None:
+                bucket = self._opcode_idx.get(opc_int)
                 if bucket is not None:
                     bucket.pop(oid, None)
         self._deadlist[oid] = op        # O(1)
@@ -886,15 +989,18 @@ class PcodeOpBank:
         """Change the op-code for the given PcodeOp."""
         oid = id(op)
         if oid in self._alivelist:
-            if op._opcode is not None:
-                bucket = self._opcode_idx.get(int(op._opcode))
+            old_opc_int = self._opcode_key(op)
+            if old_opc_int is not None:
+                bucket = self._opcode_idx.get(old_opc_int)
                 if bucket is not None:
                     bucket.pop(oid, None)
         self._removeFromCodeList(op)
         op.setOpcode(newopc)
         self._addToCodeList(op)
-        if oid in self._alivelist and newopc is not None:
-            opc_int = int(newopc)
+        if oid in self._alivelist:
+            opc_int = self._opcode_key(newopc if newopc is not None else op)
+            if opc_int is None:
+                return
             bucket = self._opcode_idx.get(opc_int)
             if bucket is None:
                 self._opcode_idx[opc_int] = {oid: op}

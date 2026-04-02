@@ -11,10 +11,13 @@ C++ ref: architecture.hh / architecture.cc (subset)
 
 from __future__ import annotations
 
-from typing import List
+from typing import Callable, List, Optional
 
 from ghidra.core.address import Address
+from ghidra.arch.userop import UserOpManage
+from ghidra.ir.typeop import registerTypeOps
 from ghidra.types.datatype import TypeFactory
+from ghidra.transform.action import ActionDatabase
 
 
 def _build_shim_type_factory(spc_mgr) -> TypeFactory:
@@ -28,7 +31,7 @@ def _build_shim_type_factory(spc_mgr) -> TypeFactory:
     return tf
 
 
-def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
+def _build_default_proto_model(spc_mgr, glb, target: str | None = None) -> 'ProtoModel':
     """Build a minimal default ProtoModel with return register and effect list.
 
     For x86-32: EAX (register offset 0, size 4) as return register.
@@ -43,7 +46,7 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
     C++ ref: ``ProtoModel::hasEffect`` → ``lookupEffect``
     """
     from ghidra.fspec.fspec import ProtoModel, ParamListStandard, ParamEntry, EffectRecord
-    model = ProtoModel("__cdecl", glb)
+    model_name = "__fastcall"
     # Determine register space and pointer size
     reg_space = None
     ptr_size = 4
@@ -56,6 +59,10 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
         ptr_size = code_space.getAddrSize()
     ret_size = 8 if ptr_size == 8 else 4
     is_64 = (ptr_size == 8)
+    if not is_64:
+        # Match x86win.cspec default_proto for the current PE-based workflow.
+        model_name = "__stdcall"
+    model = ProtoModel(model_name, glb)
 
     # Build output parameter list
     out_list = ParamListStandard()
@@ -81,7 +88,7 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
             entry_rax.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
             out_list.addEntry(entry_rax)
         else:
-            # x86-32 cdecl (from x86win.cspec / x86gcc.cspec):
+            # x86-32 Windows default proto (from x86win.cspec):
             #   <pentry minsize="4" maxsize="10" metatype="float"><register name="ST0"/></pentry>
             #   <pentry minsize="1" maxsize="4"><register name="EAX"/></pentry>
             #   <pentry minsize="5" maxsize="8"><addr space="join" piece1="EDX" piece2="EAX"/></pentry>
@@ -111,6 +118,13 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
             entry_edx.flags = ParamEntry.force_left_justify
             out_list.addEntry(entry_edx)
     model.output = out_list
+    if model.output.entry:
+        maxgroup = max(
+            (entry.getAllGroups()[-1] if entry.getAllGroups() else entry.getGroup())
+            for entry in model.output.entry
+        ) + 1
+        model.output.numgroup = maxgroup
+        model.output.resourceStart = [maxgroup]
     # Build input parameter list from cspec
     in_list = ParamListStandard()
     stack_space = getattr(spc_mgr, '_stackSpace', None)
@@ -146,8 +160,18 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
                     from ghidra.types.datatype import TypeClass
                     e.type = TypeClass.TYPECLASS_FLOAT
                 in_list.addEntry(e)
+            if stack_space is not None:
+                e = ParamEntry(4)
+                e.spaceid = stack_space
+                e.addressbase = 40
+                e.size = 500
+                e.minsize = 1
+                e.alignment = 8
+                e.numslots = 500 // 8
+                e.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
+                in_list.addEntry(e)
         else:
-            # x86-32 cdecl: all params are on the stack (from x86win.cspec / x86gcc.cspec)
+            # x86-32 Windows default proto: all params are on the stack.
             #   <pentry minsize="1" maxsize="500" align="4">
             #     <addr offset="4" space="stack"/>
             #   </pentry>
@@ -162,9 +186,25 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
                 e.flags = ParamEntry.first_storage | ParamEntry.force_left_justify
                 in_list.addEntry(e)
     model.input = in_list
+    if model.input.entry:
+        maxgroup = max(
+            (entry.getAllGroups()[-1] if entry.getAllGroups() else entry.getGroup())
+            for entry in model.input.entry
+        ) + 1
+        model.input.numgroup = maxgroup
+        model.input.resourceStart = [maxgroup]
     if stack_space is not None:
         model.input.spacebase = stack_space
     model.input.calcDelay()
+    if stack_space is not None:
+        model._stackgrowsnegative = stack_space.stackGrowsNegative()
+        model.input.getRangeList(stack_space, model.defaultParamRange)
+        model._defaultLocalRange()
+        if model.defaultParamRange.empty():
+            model._defaultParamRange()
+        model.stackshift = 8 if is_64 else 4
+    if not is_64:
+        model.setExtraPop(ProtoModel.extrapop_unknown)
 
     # Build effect list from cspec
     if reg_space is not None:
@@ -216,11 +256,21 @@ def _build_default_proto_model(spc_mgr, glb) -> 'ProtoModel':
             # EAX=0x0 is killedbycall via autoKilledByCall (output killedbycall="true" in cspec)
             for off, sz in ((0x00, 4), (0x04, 4), (0x08, 4), (0x1100, 10), (0x1110, 10)):
                 effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
-        # Sort by offset for lookupEffect binary search
+        if stack_space is not None:
+            # Match the x86 compiler specs, which model the caller return
+            # address as living at stack[0] on function entry.
+            effects.append(EffectRecord(Address(stack_space, 0), ret_size, EffectRecord.return_address))
+        # Sort by offset for lookupEffect binary search. Keep both attribute
+        # names in sync because different ports still read either
+        # ``effectlist`` or ``_effectlist``.
         effects.sort(key=lambda e: e.getAddress().getOffset())
+        model.effectlist = effects
         model._effectlist = effects
 
-    model.extrapop = 8 if is_64 else 4
+    if is_64:
+        model.extrapop = 8
+    else:
+        model.extrapop = ProtoModel.extrapop_unknown
     return model
 
 
@@ -249,25 +299,44 @@ class ArchitectureStandalone:
     This shim wraps the Lifter's AddrSpaceManager.
     """
 
-    def __init__(self, spc_mgr) -> None:
+    def __init__(self, spc_mgr, target: str | None = None) -> None:
         self._spc_mgr = spc_mgr
         self.context = None  # No tracked context by default
         self.types = _build_shim_type_factory(spc_mgr)
+        self.types.glb = self
         self.analyze_for_loops = False
         self.nan_ignore_all = False
+        self.nan_ignore_compare = True
         self.cpool = None
         self._unique_base: int = 0x10000000
         self._errors: List[str] = []
         self.trim_recurse_max = 5
+        self.max_instructions = 100000
+        self.flowoptions = 0x10
+        self.extra_pop = 0
+        self.commentdb = None
+        self.loader = None
+        self.pcodeinjectlib = None
+        self.inst = []
+        self.lanerecords = []
+        self.allacts = ActionDatabase()
+        self.userops = UserOpManage()
         self.translate = _TranslateShim(spc_mgr)
+        self._restart_rebuilder: Optional[Callable] = None
+        self.inst = registerTypeOps(self.types, self.translate)
         # Create a symbol database with a global scope
         from ghidra.database.database import Database
         self.symboltab = Database(self)
         self.symboltab.createGlobalScope("global")
+        global_scope = self.symboltab.getGlobalScope()
+        default_data = self.getDefaultDataSpace()
+        if global_scope is not None and default_data is not None:
+            self.symboltab.addRange(global_scope, default_data, 0, default_data.getHighest())
         # Build a minimal default prototype model with return register info
-        self.defaultfp = _build_default_proto_model(spc_mgr, self)
+        self.defaultfp = _build_default_proto_model(spc_mgr, self, target)
         self.evalfp_current = None
         self.evalfp_called = None
+        self.userops.initialize(self)
 
     def numSpaces(self) -> int:
         return self._spc_mgr.numSpaces()
@@ -303,9 +372,24 @@ class ArchitectureStandalone:
     def getIopSpace(self):
         return getattr(self._spc_mgr, '_iopSpace', None)
 
+    def getFspecSpace(self):
+        return getattr(self._spc_mgr, '_fspecSpace', None)
+
     def getStackSpace(self):
         """Return the stack space (may be None for raw binaries)."""
         return getattr(self._spc_mgr, '_stackSpace', None)
+
+    def getLanedRegister(self, loc: Address, size: int):
+        for record in self.lanerecords:
+            if hasattr(record, "getWholeSize") and record.getWholeSize() == size:
+                return record
+        return None
+
+    def getMinimumLanedRegisterSize(self) -> int:
+        if not self.lanerecords:
+            return -1
+        first = self.lanerecords[0]
+        return first.getWholeSize() if hasattr(first, "getWholeSize") else -1
 
     def getSpaceBySpacebase(self, loc, size: int):
         """Find the address space associated with a spacebase register.
@@ -346,6 +430,16 @@ class ArchitectureStandalone:
         self._errors.clear()
         return msgs
 
+    def setRestartRebuilder(self, rebuilder: Optional[Callable]) -> None:
+        self._restart_rebuilder = rebuilder
+
     def clearAnalysis(self, data) -> None:
         """Called by ActionRestartGroup between restart iterations."""
-        pass
+        rebuilder = self._restart_rebuilder
+        if rebuilder is not None and data is not None:
+            rebuilder(data)
+        elif data is not None and hasattr(data, "clear"):
+            data.clear()
+        commentdb = getattr(self, "commentdb", None)
+        if commentdb is not None and hasattr(commentdb, "clearType") and data is not None and hasattr(data, "getAddress"):
+            commentdb.clearType(data.getAddress(), 0x6)

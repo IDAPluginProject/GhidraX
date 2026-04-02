@@ -765,12 +765,9 @@ class BridgeValidator:
         from ghidra.sleigh.lifter import Lifter
         from ghidra.sleigh.decompiler_python import _split_basic_blocks, _ArchitectureShim
 
-        parts = target.split(":")
-        context = {}
-        if len(parts) >= 3:
-            bitness = int(parts[2])
-            if bitness == 32 and "x86" in parts[0].lower():
-                context = {"addrsize": 1, "opsize": 1}
+        from ghidra.sleigh.arch_map import default_context_for_target
+
+        context = default_context_for_target(target)
 
         lifter = Lifter(sla_path, context)
         lifter.set_image(base_addr, image)

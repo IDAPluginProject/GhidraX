@@ -10,10 +10,12 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, List, Dict
+from weakref import WeakValueDictionary
 
 from ghidra.core.address import Address, Range, RangeList
 from ghidra.core.pcoderaw import VarnodeData
 from ghidra.core.error import LowlevelError
+from ghidra.core.space import IPTR_SPACEBASE
 from ghidra.ir.op import OpCode
 from ghidra.types.datatype import (
     Datatype, TypeFactory, MetaType, TypeClass,
@@ -43,6 +45,9 @@ from ghidra.core.marshal import (
 if TYPE_CHECKING:
     from ghidra.core.space import AddrSpace
     from ghidra.core.marshal import Encoder, Decoder
+
+
+_FSPEC_REF_LOOKUP: "WeakValueDictionary[int, FuncCallSpecs]" = WeakValueDictionary()
 
 
 class ParamUnassignedError(LowlevelError):
@@ -834,24 +839,55 @@ class ParamEntry:
             return self.alignment - res
         return int(startaddr % self.alignment) if self.alignment else 0
 
+    def getAddrBySlotInfo(self, slot: int, sz: int, align: int = 1,
+                          justifyRight: bool = False) -> tuple[Address, int]:
+        """Get an address for a parameter and the updated slot count.
+
+        C++ ref: ``ParamEntry::getAddrBySlot``
+        """
+        res = Address()
+        if self.spaceid is None:
+            return res, slot
+        if sz < self.minsize:
+            return res, slot
+
+        if self.alignment == 0:
+            if slot != 0:
+                return res, slot
+            if sz > self.size:
+                return res, slot
+            res = Address(self.spaceid, self.addressbase)
+            spaceused = self.size
+        else:
+            if align > self.alignment:
+                tmp = (slot * self.alignment) % align
+                if tmp != 0:
+                    slot += (align - tmp) // self.alignment
+            slotsused = sz // self.alignment
+            if (sz % self.alignment) != 0:
+                slotsused += 1
+            if slot + slotsused > self.numslots:
+                return res, slot
+            spaceused = slotsused * self.alignment
+            if self.isReverseStack():
+                index = self.numslots - slot - slotsused
+            else:
+                index = slot
+            res = Address(self.spaceid, self.addressbase + index * self.alignment)
+            slot += slotsused
+
+        if justifyRight:
+            res = res + (spaceused - sz)
+        return res, slot
+
     def getAddrBySlot(self, slot: int, sz: int, align: int = 1,
                       justifyRight: bool = False) -> Address:
         """Get an address for a parameter given current slot consumption.
 
         C++ ref: ``ParamEntry::getAddrBySlot``
         """
-        if self.spaceid is None:
-            return Address()
-        if self.alignment == 0:
-            # Exclusion entry (register)
-            return Address(self.spaceid, self.addressbase)
-        # Stack-like entry: slot tracks consumed bytes
-        off = self.addressbase + slot
-        if align > 1:
-            rem = off % align
-            if rem != 0:
-                off += (align - rem)
-        return Address(self.spaceid, off)
+        res, _ = self.getAddrBySlotInfo(slot, sz, align, justifyRight)
+        return res
 
     def getSlot(self, addr: Address, skip: int) -> int:
         """Calculate the slot occupied by a specific address.
@@ -1097,10 +1133,7 @@ class ParamListStandard(ParamList):
         return self.pointermax
 
     def possibleParam(self, loc, size: int) -> bool:
-        for e in self.entry:
-            if e.containedBy(loc, size):
-                return True
-        return False
+        return self.findEntry(loc, size, True) is not None
 
     p_standard = 1
     p_standard_out = 2
@@ -1171,26 +1204,27 @@ class ParamListStandard(ParamList):
                     res.addr = Address(e.getSpace(), e.getBase())
                     res.type = dt
                     res.flags = 0
-                    status[grp] = -1
+                    for group_id in e.getAllGroups():
+                        status[group_id] = -1
                     return AssignAction.success
             else:
-                addr = e.getAddrBySlot(status[grp], dt.getSize(), dt.getAlignment())
+                addr, next_status = e.getAddrBySlotInfo(status[grp], dt.getSize(), dt.getAlignment())
                 if not addr.isInvalid():
                     res.addr = addr
                     res.type = dt
                     res.flags = 0
-                    status[grp] = status[grp] + dt.getSize()
+                    status[grp] = next_status
                     return AssignAction.success
         if not noFallback:
             se = self.getStackEntry()
             if se is not None:
                 grp = se.getGroup()
-                addr = se.getAddrBySlot(status[grp], dt.getSize(), dt.getAlignment())
+                addr, next_status = se.getAddrBySlotInfo(status[grp], dt.getSize(), dt.getAlignment())
                 if not addr.isInvalid():
                     res.addr = addr
                     res.type = dt
                     res.flags = 0
-                    status[grp] = status[grp] + dt.getSize()
+                    status[grp] = next_status
                     return AssignAction.success
         return AssignAction.fail
 
@@ -1199,14 +1233,27 @@ class ParamListStandard(ParamList):
 
         C++ ref: ``ParamListStandard::findEntry``
         """
+        if hasattr(loc, "getSpace") and loc.getSpace() is not None and hasattr(loc.getSpace(), "getIndex"):
+            resolvers = getattr(self, "_resolvers", None)
+            if resolvers is not None:
+                matches = resolvers.get(loc.getSpace().getIndex())
+                if matches is not None:
+                    off = loc.getOffset()
+                    for first, last, testEntry, _position in matches:
+                        if off < first or off > last:
+                            continue
+                        if testEntry.getMinSize() > size:
+                            continue
+                        if not just or testEntry.justifiedContain(loc, size) == 0:
+                            return testEntry
+                    return None
         for e in self.entry:
             if e.getSpace() is not loc.getSpace():
                 continue
             if e.getMinSize() > size:
                 continue
             if not just or e.justifiedContain(loc, size) == 0:
-                if e.containedBy(loc, size) or e.justifiedContain(loc, size) >= 0:
-                    return e
+                return e
         return None
 
     def selectUnreferenceEntry(self, grp: int, prefType):
@@ -1266,12 +1313,41 @@ class ParamListStandard(ParamList):
                     continue
                 sz = curentry.getSize() if curentry.isExclusion() else curentry.getAlign()
                 nextslot = 0
-                addr = curentry.getAddrBySlot(nextslot, sz, 1)
+                addr, _ = curentry.getAddrBySlotInfo(nextslot, sz, 1)
                 trialpos = active.getNumTrials()
                 active.registerTrial(addr, sz)
                 paramtrial = active.getTrial(trialpos)
                 paramtrial.markUnref()
                 paramtrial.setEntry(curentry, 0)
+            elif not curentry.isExclusion():
+                # For non-exclusion groups, synthesize unreferenced trials for any
+                # alignment slots that are skipped between active trials.
+                slotlist = []
+                for j in range(active.getNumTrials()):
+                    paramtrial = active.getTrial(j)
+                    if paramtrial.getEntry() is not curentry:
+                        continue
+                    slot = curentry.getSlot(paramtrial.getAddress(), 0) - curentry.getGroup()
+                    endslot = curentry.getSlot(
+                        paramtrial.getAddress(), paramtrial.getSize() - 1
+                    ) - curentry.getGroup()
+                    if endslot < slot:
+                        slot, endslot = endslot, slot
+                    while len(slotlist) <= endslot:
+                        slotlist.append(0)
+                    while slot <= endslot:
+                        slotlist[slot] = 1
+                        slot += 1
+                for j, present in enumerate(slotlist):
+                    if present != 0:
+                        continue
+                    nextslot = j
+                    addr, _ = curentry.getAddrBySlotInfo(nextslot, curentry.getAlign(), 1)
+                    trialpos = active.getNumTrials()
+                    active.registerTrial(addr, curentry.getAlign())
+                    paramtrial = active.getTrial(trialpos)
+                    paramtrial.markUnref()
+                    paramtrial.setEntry(curentry, 0)
         active.sortTrials()
 
     def separateSections(self, active, trialStart: list) -> None:
@@ -1422,6 +1498,11 @@ class ParamListStandard(ParamList):
             if trial.isDefinitelyNotUsed():
                 continue
             if not trial.isActive():
+                if trial.isUnref() and active.isRecoverSubcall():
+                    addr = trial.getAddress()
+                    spc = addr.getSpace() if hasattr(addr, "getSpace") else None
+                    if spc is not None and hasattr(spc, "getType") and spc.getType() == IPTR_SPACEBASE:
+                        seenchain = True
                 sg = trial.slotGroup() if hasattr(trial, 'slotGroup') else 0
                 if i == start:
                     chainlength += (sg - groupstart + 1)
@@ -1688,7 +1769,27 @@ class ParamListStandard(ParamList):
 
         C++ ref: ``ParamListStandard::populateResolver``
         """
-        pass
+        self._resolvers = {}
+        position = 0
+        for paramEntry in self.entry:
+            spc = paramEntry.getSpace()
+            if spc is None:
+                continue
+            joinrec = getattr(paramEntry, "joinrec", None)
+            if joinrec is not None and hasattr(joinrec, "numPieces"):
+                for i in range(joinrec.numPieces()):
+                    vdata = joinrec.getPiece(i)
+                    first = vdata.offset
+                    last = first + (vdata.size - 1)
+                    self.addResolverRange(vdata.space, first, last, paramEntry, position)
+                    position += 1
+            else:
+                first = paramEntry.getBase()
+                last = first + (paramEntry.getSize() - 1)
+                self.addResolverRange(spc, first, last, paramEntry, position)
+                position += 1
+        for idx, ranges in self._resolvers.items():
+            self._resolvers[idx] = sorted(ranges, key=lambda item: item[3])
 
     def decode(self, decoder, effectlist: list, normalstack: bool = True) -> None:
         """Decode this parameter list from an <input> or <output> element.
@@ -1791,6 +1892,12 @@ class ParamListStandardOut(ParamListStandard):
 
     def getType(self) -> int:
         return ParamListStandard.p_standard_out
+
+    def possibleParam(self, loc, size: int) -> bool:
+        for e in self.entry:
+            if e.justifiedContain(loc, size) >= 0:
+                return True
+        return False
 
     def assignMap(self, proto, typefactory, res: list) -> None:
         """Assign address for the return value of a prototype.
@@ -2838,9 +2945,34 @@ class FuncProto:
         return self.model.characterizeAsOutput(addr, size) if self.model else 0
 
     def possibleInputParam(self, addr, size: int) -> bool:
+        if not self.isDotdotdot():
+            if (self.flags & FuncProto.voidinputlock) != 0:
+                return False
+            num = self.numParams()
+            if num > 0:
+                locktest = False
+                for i in range(num):
+                    param = self.getParam(i)
+                    if not param.isTypeLocked():
+                        continue
+                    locktest = True
+                    iaddr = param.getAddress()
+                    if iaddr.justifiedContain(param.getSize(), addr, size, False) == 0:
+                        return True
+                if locktest:
+                    return False
         return self.model.possibleInputParam(addr, size) if self.model else False
 
     def possibleOutputParam(self, addr, size: int) -> bool:
+        if self.isOutputLocked():
+            outparam = self.getOutput()
+            if outparam is None:
+                return False
+            outtype = outparam.getType()
+            if outtype is None or outtype.getMetatype() == TYPE_VOID:
+                return False
+            iaddr = outparam.getAddress()
+            return iaddr.justifiedContain(outparam.getSize(), addr, size, False) == 0
         return self.model.possibleOutputParam(addr, size) if self.model else False
 
     def getBiggestContainedInputParam(self, loc, size: int, res) -> bool:
@@ -2856,6 +2988,14 @@ class FuncProto:
         effectlist is empty.  Returns a string for consistency with
         ``guardCalls`` which uses string comparisons.
         """
+        effectlist = getattr(self, 'effectlist', [])
+        if effectlist:
+            effect = ProtoModel.lookupEffect(effectlist, addr, size)
+            return {
+                EffectRecord.unaffected: 'unaffected',
+                EffectRecord.killedbycall: 'killedbycall',
+                EffectRecord.return_address: 'return_address',
+            }.get(effect, 'unknown')
         if self.model is not None:
             return self.model.hasEffect(addr, size)
         return 'unknown'
@@ -3772,9 +3912,10 @@ class FuncProto:
 
     def setInternal(self, m, vt) -> None:
         """Set internal backing storage for this."""
-        self.model = m
+        if self.model is None:
+            self.setModel(m)
         if vt is not None:
-            self.outparam = ProtoParameter(vt)
+            self.outparam = ProtoParameter("", vt, Address(), vt.getSize() if hasattr(vt, 'getSize') else 0)
 
     def setInputLock(self, val: bool) -> None:
         """Toggle the data-type lock on input parameters."""
@@ -3811,13 +3952,21 @@ class FuncProto:
 
     def effectBegin(self):
         """Get iterator to front of EffectRecord list."""
+        effectlist = getattr(self, 'effectlist', [])
+        if effectlist:
+            return iter(effectlist)
         if self.model is not None and hasattr(self.model, 'effectlist'):
             return iter(self.model.effectlist)
         return iter([])
 
     def effectEnd(self):
         """Get iterator end sentinel (use effectBegin as iterator)."""
-        return None
+        effectlist = getattr(self, 'effectlist', [])
+        if effectlist:
+            return len(effectlist)
+        if self.model is not None and hasattr(self.model, 'effectlist'):
+            return len(self.model.effectlist)
+        return 0
 
     def trashBegin(self):
         """Get iterator to front of likelytrash list."""
@@ -3984,6 +4133,9 @@ class FuncCallSpecs:
     def getExtraPop(self):
         return self.proto.getExtraPop()
 
+    def getModelExtraPop(self):
+        return self.proto.getModelExtraPop() if self.proto is not None else 0
+
     def setEffectiveExtraPop(self, val):
         self.effective_extrapop = val
 
@@ -4086,9 +4238,7 @@ class FuncCallSpecs:
 
     def setInternal(self, model, rettype) -> None:
         """Set internal calling convention."""
-        self.proto.model = model
-        if rettype is not None:
-            self.proto.outparam = ProtoParameter(rettype)
+        self.proto.setInternal(model, rettype)
 
     def setInputLock(self, val: bool) -> None:
         if val:
@@ -4107,6 +4257,9 @@ class FuncCallSpecs:
         C++ ref: ``FuncCallSpecs::abortSpacebaseRelative`` in fspec.cc:4910-4921
         """
         if hasattr(self, '_stackPlaceholderSlot') and self._stackPlaceholderSlot >= 0:
+            if self.op is None or not hasattr(self.op, 'numInput') or self._stackPlaceholderSlot >= self.op.numInput():
+                self.clearStackPlaceholderSlot()
+                return
             vn = self.op.getIn(self._stackPlaceholderSlot)
             if hasattr(data, 'opRemoveInput'):
                 data.opRemoveInput(self.op, self._stackPlaceholderSlot)
@@ -4261,7 +4414,9 @@ class FuncCallSpecs:
 
         # If the placeholder is still at its designated slot, abort (remove it)
         if hasattr(self, '_stackPlaceholderSlot') and self._stackPlaceholderSlot >= 0:
-            if self.op.getIn(self._stackPlaceholderSlot) == phvn:
+            if self.op is None or not hasattr(self.op, 'numInput') or self._stackPlaceholderSlot >= self.op.numInput():
+                self.clearStackPlaceholderSlot()
+            elif self.op.getIn(self._stackPlaceholderSlot) == phvn:
                 self.abortSpacebaseRelative(data)
                 return
 
@@ -4339,25 +4494,74 @@ class FuncCallSpecs:
         activeIn = self.getActiveInput()
         if activeIn is None:
             return
+        from ghidra.analysis.ancestor import AncestorRealistic
+        from ghidra.core.space import IPTR_SPACEBASE
+
+        maxancestor = data.getArch().trim_recurse_max if hasattr(data, 'getArch') and data.getArch() is not None else 0
+        callee_pop = False
+        expop = 0
+        if self.hasModel():
+            callee_pop = (self.getModelExtraPop() == ProtoModel.extrapop_unknown)
+            if callee_pop:
+                expop = self.getExtraPop()
+                if expop == ProtoModel.extrapop_unknown or expop <= 4:
+                    callee_pop = False
+
+        if aliascheck is None:
+            try:
+                from ghidra.database.varmap import AliasChecker
+                aliascheck = AliasChecker()
+                stack_space = data.getArch().getStackSpace() if hasattr(data, 'getArch') and data.getArch() is not None else None
+                if stack_space is not None:
+                    aliascheck.gather(data, stack_space, True)
+            except Exception:
+                aliascheck = None
+
+        ancestorReal = AncestorRealistic()
+        local_range = data.getFuncProto().getLocalRange() if hasattr(data, 'getFuncProto') else None
 
         for i in range(activeIn.getNumTrials()):
             trial = activeIn.getTrial(i)
             if trial.isChecked():
                 continue
             slot = trial.getSlot()
-            if self.op is not None and hasattr(self.op, 'getIn'):
-                vn = self.op.getIn(slot)
-                if vn is not None:
-                    if hasattr(vn, 'hasNoDescend') and not vn.hasNoDescend():
+            if self.op is None or not hasattr(self.op, 'getIn') or slot >= self.op.numInput():
+                continue
+            vn = self.op.getIn(slot)
+            if vn is None:
+                continue
+            spc = vn.getSpace() if hasattr(vn, 'getSpace') else None
+            if spc is not None and hasattr(spc, 'getType') and spc.getType() == IPTR_SPACEBASE:
+                if aliascheck is not None and hasattr(aliascheck, 'hasLocalAlias') and aliascheck.hasLocalAlias(vn):
+                    trial.markNoUse()
+                elif local_range is not None and hasattr(local_range, 'inRange') and not local_range.inRange(vn.getAddr(), 1):
+                    trial.markNoUse()
+                elif callee_pop:
+                    if int(trial.getAddress().getOffset() + (trial.getSize() - 1)) < expop:
                         trial.markActive()
-                    elif hasattr(vn, 'isInput') and vn.isInput():
-                        trial.markInactive()
                     else:
                         trial.markNoUse()
-                    if trial.isDefinitelyNotUsed() and hasattr(data, 'opSetInput'):
-                        data.opSetInput(self.op, data.newConstant(vn.getSize(), 0), slot)
-                    continue
-            trial.markActive()
+                elif ancestorReal.execute(self.op, slot, trial, False):
+                    if data.ancestorOpUse(maxancestor, vn, self.op, trial, 0, 0):
+                        trial.markActive()
+                    else:
+                        trial.markInactive()
+                else:
+                    trial.markNoUse()
+            else:
+                if ancestorReal.execute(self.op, slot, trial, True):
+                    if data.ancestorOpUse(maxancestor, vn, self.op, trial, 0, 0):
+                        trial.markActive()
+                        if hasattr(trial, 'hasCondExeEffect') and trial.hasCondExeEffect():
+                            activeIn.markNeedsFinalCheck()
+                    else:
+                        trial.markInactive()
+                elif vn.isInput() if hasattr(vn, 'isInput') else False:
+                    trial.markInactive()
+                else:
+                    trial.markNoUse()
+            if trial.isDefinitelyNotUsed() and hasattr(data, 'opSetInput'):
+                data.opSetInput(self.op, data.newConstant(vn.getSize(), 0), slot)
 
     def checkOutputTrialUse(self, data, trialvn: list = None) -> None:
         """Mark if output trials are being actively used.
@@ -4628,7 +4832,16 @@ class FuncCallSpecs:
     @staticmethod
     def getFspecFromConst(addr):
         """Retrieve the FuncCallSpecs from an encoded constant address."""
-        return None
+        if addr is None:
+            return None
+        return _FSPEC_REF_LOOKUP.get(addr.getOffset())
+
+    @staticmethod
+    def registerFspecRef(fc) -> None:
+        """Register a live FuncCallSpecs object for FSPEC-space lookups."""
+        if fc is None:
+            return
+        _FSPEC_REF_LOOKUP[id(fc)] = fc
 
     def getProtoModel(self):
         return self.proto.getModel()

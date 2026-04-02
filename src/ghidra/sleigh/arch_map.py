@@ -50,6 +50,37 @@ ARCH_TABLE = [
 _SLA_SEARCH_DIRS: list = []
 
 
+def default_context_for_target(target: str) -> Dict[str, int]:
+    """Return language-default SLEIGH context bits for a target string.
+
+    These defaults mirror the language ``.pspec`` files that native Ghidra
+    loads automatically. The pure-Python lifter only receives an ``.sla`` path,
+    so we must seed required x86 mode bits ourselves before decoding.
+    """
+    parts = target.split(":")
+    if len(parts) < 3:
+        return {}
+    proc = parts[0].lower()
+    try:
+        bitness = int(parts[2])
+    except ValueError:
+        return {}
+    if "x86" not in proc:
+        return {}
+    if bitness == 32:
+        return {"addrsize": 1, "opsize": 1}
+    if bitness == 64:
+        # Matches specs/Processors/x86/data/languages/x86-64.pspec
+        return {
+            "addrsize": 2,
+            "bit64": 1,
+            "opsize": 1,
+            "rexprefix": 0,
+            "longMode": 1,
+        }
+    return {}
+
+
 def add_sla_search_dir(path: str) -> None:
     """Add a directory to the SLA search path."""
     if path and path not in _SLA_SEARCH_DIRS:
@@ -130,7 +161,10 @@ def resolve_arch(procname: str, bitness: int, is_be: bool) -> Dict:
             return {
                 "sla_path": sla_path,
                 "target": entry.get("target", ""),
-                "context": dict(entry["context"]),
+                "context": {
+                    **default_context_for_target(entry.get("target", "")),
+                    **dict(entry["context"]),
+                },
             }
 
     raise ValueError(

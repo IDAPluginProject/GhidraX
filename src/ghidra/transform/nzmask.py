@@ -1,6 +1,7 @@
 """
 Non-zero mask calculation. Corresponds to PcodeOp::getNZMaskLocal() in op.cc.
 """
+from ghidra.core.expression import PcodeOpNode
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import (
     calc_mask, pcode_left, pcode_right, sign_extend_sized,
@@ -137,17 +138,77 @@ _VN_CONSTANT2  = 0x02   # Varnode.constant
 
 
 def calcNZMask(data):
-    """Calculate non-zero mask for all Varnodes in the function."""
-    for op in list(data._obank.beginAlive()):
-        for vn in op._inrefs:
+    """Calculate non-zero masks using the native DFS + loop worklist algorithm.
+
+    The C++ decompiler does not sweep alive ops linearly. It recursively walks
+    each op's defining subgraph first, then propagates around MULTIEQUAL loop
+    edges with a worklist. The linear Python port delayed mask precision by one
+    or more action rounds, which in turn delayed early ``oppool1`` folds such
+    as ``subzext -> andmask``.
+    """
+    alive_ops = list(data._obank.beginAlive())
+    opstack: list[PcodeOpNode] = []
+
+    for op in alive_ops:
+        if op is None or op.isMark():
+            continue
+        opstack.append(PcodeOpNode(op, 0))
+        op.setMark()
+
+        while opstack:
+            node = opstack[-1]
+            cur_op = node.op
+            if cur_op is None:
+                opstack.pop()
+                continue
+
+            if node.slot >= cur_op.numInput():
+                outvn = cur_op.getOut()
+                if outvn is not None:
+                    outvn._nzm = cur_op.getNZMaskLocal(True)
+                opstack.pop()
+                continue
+
+            oldslot = node.slot
+            node.slot += 1
+
+            if cur_op.code() == OpCode.CPUI_MULTIEQUAL:
+                parent = cur_op.getParent()
+                if parent is not None and parent.isLoopIn(oldslot):
+                    continue
+
+            vn = cur_op.getIn(oldslot)
             if vn is None:
                 continue
-            vn_flags = vn._flags
-            if not (vn_flags & _VN_WRITTEN2):
-                if vn_flags & _VN_CONSTANT2:
-                    vn._nzm = vn._loc.offset
+
+            if not vn.isWritten():
+                if vn.isConstant():
+                    vn._nzm = vn.getOffset()
                 else:
-                    vn._nzm = calc_mask(vn._size)
-        out = op._output
-        if out is not None:
-            out._nzm = getNZMaskLocal(op, True)
+                    vn._nzm = calc_mask(vn.getSize())
+                    if vn.isSpacebase():
+                        vn._nzm &= (~0xFF) & 0xFFFFFFFFFFFFFFFF
+            else:
+                defop = vn.getDef()
+                if defop is not None and not defop.isMark():
+                    opstack.append(PcodeOpNode(defop, 0))
+                    defop.setMark()
+
+    worklist = []
+    for op in alive_ops:
+        if op is None:
+            continue
+        op.clearMark()
+        if op.code() == OpCode.CPUI_MULTIEQUAL:
+            worklist.append(op)
+
+    while worklist:
+        op = worklist.pop()
+        outvn = op.getOut()
+        if outvn is None:
+            continue
+        nzmask = op.getNZMaskLocal(False)
+        if nzmask != outvn._nzm:
+            outvn._nzm = nzmask
+            for descend in op.getOut().getDescend():
+                worklist.append(descend)

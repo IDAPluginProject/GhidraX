@@ -667,7 +667,7 @@ class Lifter:
                 opc = OpCode(native_op.opcode)
                 num_in = len(native_op.inputs)
                 op = fd.newOp(num_in, Address(code_spc, insn.addr))
-                op.setOpcodeEnum(opc)
+                fd.opSetOpcode(op, opc)
 
                 # Output — always fresh varnode
                 if native_op.has_output:
@@ -677,7 +677,14 @@ class Lifter:
 
                 # Inputs — always fresh varnode (heritage connects via rename)
                 is_load_store = opc in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE)
-                for i, inp in enumerate(native_op.inputs):
+                start_idx = 0
+                if op.isCodeRef() and native_op.inputs:
+                    coderef_in = native_op.inputs[0]
+                    coderef_addr = Address(self._get_space(coderef_in.space), coderef_in.offset)
+                    fd.opSetInput(op, fd.newCodeRef(coderef_addr), 0)
+                    start_idx = 1
+
+                for i, inp in enumerate(native_op.inputs[start_idx:], start=start_idx):
                     in_vn = make_vn(inp.space, inp.offset, inp.size)
                     # For LOAD/STORE input 0: tag the space constant with the
                     # actual target space.  The native engine encodes the C++

@@ -1027,7 +1027,7 @@ class RuleThreeWayCompare(Rule):
         b1 = lessop.getIn(1)
         b2 = lessequalop.getIn(1)
         res = 0
-        if a1 is not a2:
+        if a1 != a2:
             if not a1.isConstant() or not a2.isConstant():
                 return -1
             if a1.getOffset() != a2.getOffset() and twoLessThan:
@@ -1038,7 +1038,7 @@ class RuleThreeWayCompare(Rule):
                     res = 1
                 else:
                     return -1
-        if b1 is not b2:
+        if b1 != b2:
             if not b1.isConstant() or not b2.isConstant():
                 return -1
             if b1.getOffset() != b2.getOffset() and twoLessThan:
@@ -1334,7 +1334,7 @@ class RuleRangeMeld(Rule):
                     markup[0] = cm
             if A1 is None or A2 is None:
                 return 0
-            if A1 is not A2:
+            if A1 != A2:
                 return 0
         if not A1.isHeritageKnown():
             return 0

@@ -356,6 +356,22 @@ class ActionDeadCode(Action):
                 res = True
         return res
 
+    @staticmethod
+    def _preserveDirectWriteMarker(vn) -> bool:
+        if vn is None or not (vn._flags & _VN_DIRECTWRITE):
+            return False
+        op = vn._def
+        if op is None or op._opcode_enum != _OPC_INDIRECT or not op.isMarker():
+            return False
+        if op.isIndirectStore():
+            return False
+        if len(op._inrefs) < 1:
+            return False
+        invn = op._inrefs[0]
+        if invn is None or not invn.isInput():
+            return False
+        return invn.getAddr() == vn.getAddr()
+
     # ------------------------------------------------------------------
     # apply  (C++ ActionDeadCode::apply)
     # ------------------------------------------------------------------
@@ -474,6 +490,8 @@ class ActionDeadCode(Action):
                     vn._addlflags = vn_addlfl & ~_cf2  # clearConsumeList + clearConsumeVacuous
                     if not vacflag:
                         op = vn._def
+                        if self._preserveDirectWriteMarker(vn):
+                            continue
                         changecount += 1
                         if op._flags & _op_call:  # isCall
                             data.opUnsetOutput(op)
@@ -495,6 +513,8 @@ class ActionDeadCode(Action):
                 vn._addlflags = vn_afl & ~_cf3  # clearConsumeList + clearConsumeVacuous
                 if not vacflag:
                     op = vn._def
+                    if self._preserveDirectWriteMarker(vn):
+                        continue
                     if op._flags & _oc:  # isCall
                         data.opUnsetOutput(op)
                     else:

@@ -42,10 +42,8 @@ class PcodeOpSet(ABC):
         for i, op in enumerate(self._opList):
             parent = op.getParent()
             blk = parent.getIndex() if parent else -1
-            while len(self._blockStart) <= blk:
-                self._blockStart.append(-1)
             if blk != last_block:
-                self._blockStart[blk] = i
+                self._blockStart.append(i)
                 last_block = blk
         self._is_pop = True
 
@@ -87,7 +85,7 @@ class CoverBlock:
 
     # Sentinel value representing "whole block" endpoint  (C++ (PcodeOp*)1)
     _WHOLE_BLOCK_SENTINEL = object()
-    # Sentinel: "begin-only, not yet extended"  (C++ (PcodeOp*)2)
+    # Sentinel representing the synthetic input definition point (C++ (PcodeOp*)2)
     _BEGIN_ONLY_SENTINEL = object()
 
     __slots__ = ('start', 'stop', 'ustart', 'ustop')
@@ -104,16 +102,24 @@ class CoverBlock:
 
         C++ ref: CoverBlock::getUIndex
         Sentinel mapping:
-          None                  -> 0           (C++ (PcodeOp*)0)
+          None                  -> 0            (C++ (PcodeOp*)0)
           _WHOLE_BLOCK_SENTINEL -> 0xFFFFFFFF   (C++ (PcodeOp*)1)
-          _BEGIN_ONLY_SENTINEL  -> 0xFFFFFFFE   (C++ (PcodeOp*)2)
+          _BEGIN_ONLY_SENTINEL  -> 0            (C++ (PcodeOp*)2)
         """
         if op is None:
             return 0
         if op is CoverBlock._WHOLE_BLOCK_SENTINEL:
             return 0xFFFFFFFF
         if op is CoverBlock._BEGIN_ONLY_SENTINEL:
-            return 0xFFFFFFFE
+            return 0
+        if hasattr(op, "isMarker") and op.isMarker():
+            if op.code() == OpCode.CPUI_MULTIEQUAL:
+                return 0
+            if op.code() == OpCode.CPUI_INDIRECT:
+                from ghidra.ir.op import PcodeOp
+                refop = PcodeOp.getOpFromConst(op.getIn(1).getAddr())
+                if refop is not None:
+                    return refop.getSeqNum().getOrder()
         return op.getSeqNum().getOrder()
 
     def getStart(self):
@@ -135,14 +141,12 @@ class CoverBlock:
         """Reset start of range.
 
         C++ ref: CoverBlock::setBegin
-        If stop was previously None, set it to _BEGIN_ONLY_SENTINEL
-        (C++ (PcodeOp*)2) meaning 'defined but not yet extended'.
         """
         self.start = begin
         self.ustart = CoverBlock.getUIndex(begin)
         if self.stop is None:
-            self.stop = CoverBlock._BEGIN_ONLY_SENTINEL
-            self.ustop = 0xFFFFFFFE
+            self.stop = CoverBlock._WHOLE_BLOCK_SENTINEL
+            self.ustop = 0xFFFFFFFF
 
     def setEnd(self, end) -> None:
         """Reset end of range."""
@@ -157,34 +161,30 @@ class CoverBlock:
         """Check containment of given point."""
         if self.empty():
             return False
-        if self.stop is CoverBlock._WHOLE_BLOCK_SENTINEL and self.start is None:
-            return True  # Whole block
-        uind = CoverBlock.getUIndex(point)
-        start_ind = CoverBlock.getUIndex(self.start) if self.start is not None else 0
-        stop_ind = CoverBlock.getUIndex(self.stop) if self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL else 0xFFFFFFFF
-        if self.stop is None:
-            stop_ind = 0
-        return start_ind <= uind <= stop_ind
+        upoint = CoverBlock.getUIndex(point)
+        ustart = CoverBlock.getUIndex(self.start)
+        ustop = CoverBlock.getUIndex(self.stop)
+        if ustart <= ustop:
+            return ustart <= upoint <= ustop
+        return upoint <= ustop or upoint >= ustart
 
     def boundary(self, point) -> int:
         """Characterize given point as boundary.
 
         Returns:
           0 = not on boundary
-          1 = on start boundary
-          2 = on stop boundary
-          3 = on both (single-point cover)
+          1 = on stop/tail boundary
+          2 = on start/def boundary
         """
         if self.empty():
-            return -1
-        result = 0
-        if self.start is not None and self.start is not CoverBlock._WHOLE_BLOCK_SENTINEL:
-            if CoverBlock.getUIndex(point) == CoverBlock.getUIndex(self.start):
-                result |= 1
-        if self.stop is not None and self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL:
-            if CoverBlock.getUIndex(point) == CoverBlock.getUIndex(self.stop):
-                result |= 2
-        return result
+            return 0
+        val = CoverBlock.getUIndex(point)
+        if CoverBlock.getUIndex(self.start) == val:
+            if self.start is not None:
+                return 2
+        if CoverBlock.getUIndex(self.stop) == val:
+            return 1
+        return 0
 
     def intersect(self, op2: CoverBlock) -> int:
         """Compute intersection with another CoverBlock.
@@ -228,19 +228,31 @@ class CoverBlock:
             self.start = op2.start; self.stop = op2.stop
             self.ustart = op2.ustart; self.ustop = op2.ustop
             return
-        # Take the union — use cached values
-        s1 = self.ustart if self.start is not None else 0
-        e1 = self.ustop if (self.stop is not None and self.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-        s2 = op2.ustart if op2.start is not None else 0
-        e2 = op2.ustop if (op2.stop is not None and op2.stop is not CoverBlock._WHOLE_BLOCK_SENTINEL) else 0xFFFFFFFF
-        if self.stop is None:
-            e1 = s1
-        if op2.stop is None:
-            e2 = s2
-        if s2 < s1:
-            self.start = op2.start; self.ustart = op2.ustart
-        if e2 > e1:
-            self.stop = op2.stop; self.ustop = op2.ustop
+        ustart = self.ustart
+        u2start = op2.ustart
+        internal4 = (ustart == 0) and (op2.stop is CoverBlock._WHOLE_BLOCK_SENTINEL)
+        internal1 = internal4 or op2.contain(self.start)
+        internal3 = (u2start == 0) and (self.stop is CoverBlock._WHOLE_BLOCK_SENTINEL)
+        internal2 = internal3 or self.contain(op2.start)
+
+        if internal1 and internal2:
+            if (ustart != u2start) or internal3 or internal4:
+                self.setAll()
+                return
+        if internal1:
+            self.start = op2.start
+            self.ustart = op2.ustart
+        elif (not internal1) and (not internal2):
+            if ustart < u2start:
+                self.stop = op2.stop
+                self.ustop = op2.ustop
+            else:
+                self.start = op2.start
+                self.ustart = op2.ustart
+            return
+        if internal3 or op2.contain(self.stop):
+            self.stop = op2.stop
+            self.ustop = op2.ustop
 
     def print(self, s) -> None:
         """Print a description of the covered range.
@@ -290,20 +302,19 @@ class Cover:
 
     def compareTo(self, op2: Cover) -> int:
         """Give ordering of this and another Cover."""
-        keys1 = sorted(self._cover.keys())
-        keys2 = sorted(op2._cover.keys())
-        for k1, k2 in zip(keys1, keys2):
-            if k1 != k2:
-                return -1 if k1 < k2 else 1
-        if len(keys1) != len(keys2):
-            return -1 if len(keys1) < len(keys2) else 1
-        return 0
+        a = min(self._cover.keys()) if self._cover else 1000000
+        b = min(op2._cover.keys()) if op2._cover else 1000000
+        if a < b:
+            return -1
+        if a == b:
+            return 0
+        return 1
 
     def getCoverBlock(self, i: int) -> CoverBlock:
         """Get the CoverBlock corresponding to the i-th block."""
         return self._cover.get(i, Cover._emptyBlock)
 
-    def intersect(self, op2: Cover) -> int:
+    def _intersectCover(self, op2: Cover) -> int:
         """Characterize the intersection between this and another Cover.
 
         Returns:
@@ -324,6 +335,46 @@ class Cover:
                 result = 1
         return result
 
+    def _intersectOpSet(self, opSet: PcodeOpSet, rep) -> bool:
+        """Test intersection against a PcodeOpSet with secondary alias checks."""
+        if not opSet._opList:
+            return False
+        set_block = 0
+        op_index = opSet._blockStart[set_block]
+        set_index = opSet._opList[op_index].getParent().getIndex()
+        for cover_index in sorted(self._cover.keys()):
+            while cover_index > set_index:
+                set_block += 1
+                if set_block >= len(opSet._blockStart):
+                    return False
+                op_index = opSet._blockStart[set_block]
+                set_index = opSet._opList[op_index].getParent().getIndex()
+            if cover_index < set_index:
+                continue
+            cover_block = self._cover[cover_index]
+            op_max = len(opSet._opList)
+            next_block = set_block + 1
+            if next_block < len(opSet._blockStart):
+                op_max = opSet._blockStart[next_block]
+            while op_index < op_max:
+                op = opSet._opList[op_index]
+                if cover_block.contain(op) and cover_block.boundary(op) == 0:
+                    if opSet.affectsTest(op, rep):
+                        return True
+                op_index += 1
+            set_block = next_block
+            if set_block >= len(opSet._blockStart):
+                return False
+            op_index = opSet._blockStart[set_block]
+            set_index = opSet._opList[op_index].getParent().getIndex()
+        return False
+
+    def intersect(self, op2, rep=None):
+        """Dispatch intersection against another Cover or a PcodeOpSet."""
+        if isinstance(op2, Cover):
+            return self._intersectCover(op2)
+        return self._intersectOpSet(op2, rep)
+
     def intersectByBlock(self, blk: int, op2: Cover) -> int:
         """Characterize the intersection on a specific block."""
         cb1 = self._cover.get(blk)
@@ -341,7 +392,12 @@ class Cover:
         cb = self._cover.get(blk)
         if cb is None:
             return False
-        return cb.contain(op)
+        if cb.contain(op):
+            if max_ == 1:
+                return True
+            if cb.boundary(op) == 0:
+                return True
+        return False
 
     def merge(self, op2: Cover) -> None:
         """Merge this with another Cover block by block."""
@@ -355,23 +411,35 @@ class Cover:
 
     def rebuild(self, vn) -> None:
         """Reset this based on def-use of a single Varnode."""
-        self.clear()
         self.addDefPoint(vn)
-        for op in vn.getDescendants():
-            self.addRefPoint(op, vn)
+        path = [vn]
+        pos = 0
+        while pos < len(path):
+            cur_vn = path[pos]
+            pos += 1
+            for op in cur_vn.getDescendants():
+                self.addRefPoint(op, vn)
+                out_vn = op.getOut()
+                if out_vn is not None and out_vn.isImplied():
+                    path.append(out_vn)
 
     def addDefPoint(self, vn) -> None:
         """Reset to the single point where the given Varnode is defined."""
+        self.clear()
         defop = vn.getDef()
-        if defop is None:
-            return
-        parent = defop.getParent()
-        if parent is None:
-            return
-        blk = parent.getIndex()
-        if blk not in self._cover:
-            self._cover[blk] = CoverBlock()
-        self._cover[blk].setBegin(defop)
+        if defop is not None:
+            parent = defop.getParent()
+            if parent is None:
+                return
+            blk = parent.getIndex()
+            if blk not in self._cover:
+                self._cover[blk] = CoverBlock()
+            self._cover[blk].setBegin(defop)
+            self._cover[blk].setEnd(defop)
+        elif vn.isInput():
+            block = self._cover.setdefault(0, CoverBlock())
+            block.setBegin(CoverBlock._BEGIN_ONLY_SENTINEL)
+            block.setEnd(CoverBlock._BEGIN_ONLY_SENTINEL)
 
     def addRefRecurse(self, bl) -> None:
         """Add cover recursively backward from block bottom.
@@ -395,10 +463,7 @@ class Cover:
                 block.setEnd(CoverBlock._WHOLE_BLOCK_SENTINEL)
 
             if ustop == 0 and block.getStart() is None:
-                if (op is not None and
-                        op is not CoverBlock._BEGIN_ONLY_SENTINEL and
-                        op is not CoverBlock._WHOLE_BLOCK_SENTINEL and
-                        op.code() == OpCode.CPUI_MULTIEQUAL):
+                if op is not None and op.code() == OpCode.CPUI_MULTIEQUAL:
                     for j in range(bl.sizeIn()):
                         self.addRefRecurse(bl.getIn(j))
 
@@ -431,8 +496,6 @@ class Cover:
                 if ustop >= CoverBlock.getUIndex(startop):
                     if (op is not None and
                             op is not CoverBlock._BEGIN_ONLY_SENTINEL and
-                            op is not CoverBlock._WHOLE_BLOCK_SENTINEL and
-                            hasattr(op, 'code') and
                             op.code() == OpCode.CPUI_MULTIEQUAL and
                             startop is None):
                         for j in range(bl.sizeIn()):
@@ -458,6 +521,7 @@ class Cover:
         """
         op = vn.getDef()
         if op is None:
+            op = CoverBlock._BEGIN_ONLY_SENTINEL
             blk = 0
         else:
             parent = op.getParent()
@@ -466,11 +530,6 @@ class Cover:
             blk = parent.getIndex()
         cb = self._cover.get(blk)
         if cb is None:
-            return 0
-        if op is None:
-            # Input varnode — check if block 0 is covered from beginning
-            if not cb.empty():
-                return 1
             return 0
         if cb.contain(op):
             boundtype = cb.boundary(op)

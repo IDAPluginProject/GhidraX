@@ -575,6 +575,8 @@ class TypeOpBranch(TypeOp):
     """CPUI_BRANCH."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_BRANCH, "BRANCH")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.special | getattr(PcOp, 'branch', 0) | getattr(PcOp, 'coderef', 0) | getattr(PcOp, 'nocollapse', 0)
     def getInputLocal(self, op, slot):
         return self.tlst.getTypeVoid()
     def getOutputLocal(self, op):

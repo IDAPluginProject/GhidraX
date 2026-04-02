@@ -311,6 +311,11 @@ class ActionActiveParam(Action):
         return ActionActiveParam(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
+        from ghidra.database.varmap import AliasChecker
+
+        aliascheck = AliasChecker()
+        stackspace = data.getArch().getStackSpace() if hasattr(data, 'getArch') and data.getArch() is not None and hasattr(data.getArch(), 'getStackSpace') else None
+        aliascheck.gather(data, stackspace, True)
         for i in range(data.numCalls()):
             fc = data.getCallSpecs(i)
             if fc is None:
@@ -324,7 +329,7 @@ class ActionActiveParam(Action):
                 trimmable = (activeinput.getNumPasses() > 0) or (fc.getOp().code() != OpCode.CPUI_CALLIND)
                 if not activeinput.isFullyChecked():
                     if hasattr(fc, 'checkInputTrialUse'):
-                        fc.checkInputTrialUse(data)
+                        fc.checkInputTrialUse(data, aliascheck)
                 activeinput.finishPass()
                 if activeinput.getNumPasses() > activeinput.getMaxPass():
                     activeinput.markFullyChecked()
@@ -356,24 +361,110 @@ class ActionReturnRecovery(Action):
     def __init__(self, g): super().__init__(0, "returnrecovery", g)
     def clone(self, gl):
         return ActionReturnRecovery(self._basegroup) if gl.contains(self._basegroup) else None
+
+    @staticmethod
+    def buildReturnOutput(active, retop, data) -> None:
+        from ghidra.core.opcodes import OpCode
+
+        newparam = [retop.getIn(0)]
+        for i in range(active.getNumTrials()):
+            curtrial = active.getTrial(i)
+            if not curtrial.isUsed():
+                break
+            if curtrial.getSlot() >= retop.numInput():
+                break
+            newparam.append(retop.getIn(curtrial.getSlot()))
+
+        if len(newparam) <= 2:
+            data.opSetAllInput(retop, newparam)
+            return
+
+        if len(newparam) == 3:
+            lovn = newparam[1]
+            hivn = newparam[2]
+            triallo = active.getTrial(0)
+            trialhi = active.getTrial(1)
+            arch = data.getArch() if hasattr(data, "getArch") else None
+            joinaddr = None
+            if arch is not None and hasattr(arch, "constructJoinAddress"):
+                joinaddr = arch.constructJoinAddress(
+                    arch.translate,
+                    trialhi.getAddress(),
+                    trialhi.getSize(),
+                    triallo.getAddress(),
+                    triallo.getSize(),
+                )
+            newop = data.newOp(2, retop.getAddr())
+            data.opSetOpcode(newop, OpCode.CPUI_PIECE)
+            if joinaddr is not None:
+                newwhole = data.newVarnodeOut(trialhi.getSize() + triallo.getSize(), joinaddr, newop)
+            else:
+                newwhole = data.newUniqueOut(trialhi.getSize() + triallo.getSize(), newop)
+            newwhole.setWriteMask()
+            data.opInsertBefore(newop, retop)
+            newparam.pop()
+            newparam[-1] = newwhole
+            data.opSetAllInput(retop, newparam)
+            data.opSetInput(newop, hivn, 0)
+            data.opSetInput(newop, lovn, 1)
+            return
+
+        newparam = [retop.getIn(0)]
+        offmatch = 0
+        preexist = None
+        for i in range(active.getNumTrials()):
+            curtrial = active.getTrial(i)
+            if not curtrial.isUsed():
+                break
+            if curtrial.getSlot() >= retop.numInput():
+                break
+            if preexist is None:
+                preexist = retop.getIn(curtrial.getSlot())
+                offmatch = curtrial.getOffset() + curtrial.getSize()
+            elif offmatch == curtrial.getOffset():
+                offmatch += curtrial.getSize()
+                vn = retop.getIn(curtrial.getSlot())
+                newop = data.newOp(2, retop.getAddr())
+                data.opSetOpcode(newop, OpCode.CPUI_PIECE)
+                addr = preexist.getAddr()
+                if vn.getAddr() < addr:
+                    addr = vn.getAddr()
+                newout = data.newVarnodeOut(preexist.getSize() + vn.getSize(), addr, newop)
+                newout.setWriteMask()
+                data.opSetInput(newop, vn, 0)
+                data.opSetInput(newop, preexist, 1)
+                data.opInsertBefore(newop, retop)
+                preexist = newout
+            else:
+                break
+        if preexist is not None:
+            newparam.append(preexist)
+        data.opSetAllInput(retop, newparam)
+
     def apply(self, data):
         active = data.getActiveOutput()
         if active is None:
             return 0
+        from ghidra.analysis.ancestor import AncestorRealistic
         from ghidra.core.opcodes import OpCode
-        for op in list(data._obank.beginAlive()):
-            if op.code() != OpCode.CPUI_RETURN or op.isDead():
+
+        maxancestor = data.getArch().trim_recurse_max if hasattr(data, 'getArch') and data.getArch() is not None else 0
+        ancestorReal = AncestorRealistic()
+        for op in list(data.beginOp(OpCode.CPUI_RETURN)):
+            if op.isDead():
                 continue
-            if hasattr(op, 'getHaltType') and op.getHaltType() != 0:
+            if op.getHaltType() != 0:
                 continue
             for i in range(active.getNumTrials()):
                 trial = active.getTrial(i)
                 if trial.isChecked():
                     continue
                 slot = trial.getSlot()
-                if slot < op.numInput():
-                    vn = op.getIn(slot)
-                    if not vn.isConstant():
+                if slot >= op.numInput():
+                    continue
+                vn = op.getIn(slot)
+                if ancestorReal.execute(op, slot, trial, False):
+                    if data.ancestorOpUse(maxancestor, vn, op, trial, 0, 0):
                         trial.markActive()
                 self._count += 1
         active.finishPass()
@@ -383,6 +474,12 @@ class ActionReturnRecovery(Action):
             proto = data.getFuncProto() if hasattr(data, 'getFuncProto') else None
             if proto is not None and hasattr(proto, 'deriveOutputMap'):
                 proto.deriveOutputMap(active)
+            for op in list(data.beginOp(OpCode.CPUI_RETURN)):
+                if op.isDead():
+                    continue
+                if op.getHaltType() != 0:
+                    continue
+                ActionReturnRecovery.buildReturnOutput(active, op, data)
             data.clearActiveOutput()
             self._count += 1
         return 0
@@ -398,6 +495,8 @@ class ActionRestrictLocal(Action):
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
         from ghidra.core.space import IPTR_SPACEBASE
+        from ghidra.fspec.fspec import EffectRecord
+        localmap = data.getScopeLocal() if hasattr(data, 'getScopeLocal') else None
         # Mark spacebase parameters of locked calls as not mapped
         for i in range(data.numCalls()):
             fc = data.getCallSpecs(i)
@@ -419,15 +518,14 @@ class ActionRestrictLocal(Action):
                 if addr.getSpace().getType() != IPTR_SPACEBASE:
                     continue
                 off = (spoff + addr.getOffset()) & ((1 << (addr.getSpace().getAddrSize() * 8)) - 1)
-                localmap = data.getScopeLocal() if hasattr(data, 'getScopeLocal') else None
                 if localmap is not None and hasattr(localmap, 'markNotMapped'):
                     localmap.markNotMapped(addr.getSpace(), off, param.getSize(), True)
 
-        # Mark storage for saved (unaffected) registers as not mapped
+        # Mark storage for saved registers/return-address slots as not mapped.
         proto = data.getFuncProto()
-        if hasattr(proto, 'effectBegin'):
+        if localmap is not None and hasattr(proto, 'effectBegin'):
             for eff in proto.effectBegin():
-                if hasattr(eff, 'getType') and eff.getType() == 1:  # killedbycall
+                if hasattr(eff, 'getType') and eff.getType() == EffectRecord.killedbycall:
                     continue
                 vn = data.findVarnodeInput(eff.getSize(), eff.getAddress()) if hasattr(data, 'findVarnodeInput') else None
                 if vn is not None and vn.isUnaffected():
@@ -437,9 +535,24 @@ class ActionRestrictLocal(Action):
                         outvn = op.getOut()
                         if outvn is None:
                             continue
-                        localmap = data.getScopeLocal() if hasattr(data, 'getScopeLocal') else None
-                        if localmap is not None and hasattr(localmap, 'markNotMapped'):
+                        if hasattr(localmap, 'isUnaffectedStorage') and not localmap.isUnaffectedStorage(outvn):
+                            continue
+                        if hasattr(localmap, 'markNotMapped'):
                             localmap.markNotMapped(outvn.getSpace(), outvn.getOffset(), outvn.getSize(), False)
+            # Return-address effects are tracked on the saved INDIRECT output, but the
+            # corresponding effect input is not always materialized at the translated
+            # stack offset. Mark the saved storage directly so the later restructure pass
+            # can clear mapped/addrforce exactly like the native pipeline.
+            for vn in list(data._vbank.beginLoc()):
+                if not vn.isWritten() or not (hasattr(vn, 'isReturnAddress') and vn.isReturnAddress()):
+                    continue
+                defop = vn.getDef()
+                if defop is None or defop.code() != OpCode.CPUI_INDIRECT:
+                    continue
+                if hasattr(localmap, 'isUnaffectedStorage') and not localmap.isUnaffectedStorage(vn):
+                    continue
+                if hasattr(localmap, 'markNotMapped'):
+                    localmap.markNotMapped(vn.getSpace(), vn.getOffset(), vn.getSize(), False)
         return 0
 
 class ActionDynamicMapping(Action):
@@ -467,7 +580,7 @@ class ActionRestructureVarnode(Action):
     C++ ref: ``ActionRestructureVarnode::apply`` in coreaction.cc
     """
     def __init__(self, g):
-        super().__init__(0, "restructurevarnode", g)
+        super().__init__(0, "restructure_varnode", g)
         self._numpass: int = 0
     def clone(self, gl):
         return ActionRestructureVarnode(self._basegroup) if gl.contains(self._basegroup) else None
@@ -657,7 +770,7 @@ class ActionUnjustifiedParams(Action):
 
     C++ ref: ``ActionUnjustifiedParams::apply`` in coreaction.cc
     """
-    def __init__(self, g): super().__init__(0, "unjustifiedparams", g)
+    def __init__(self, g): super().__init__(0, "unjustparams", g)
     def clone(self, gl):
         return ActionUnjustifiedParams(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
@@ -1282,6 +1395,8 @@ class ActionMarkImplied(Action):
         # Check input intersection
         for i in range(op.numInput()):
             defvn = op.getIn(i)
+            if defvn is None:
+                continue
             if defvn.isConstant():
                 continue
             if hasattr(data, 'getMerge'):
@@ -1839,7 +1954,7 @@ class ActionMappedLocalSync(Action):
 
     C++ ref: ``ActionMappedLocalSync::apply`` in coreaction.cc
     """
-    def __init__(self, g): super().__init__(0, "mappedlocalsync", g)
+    def __init__(self, g): super().__init__(0, "mapped_local_sync", g)
     def clone(self, gl):
         return ActionMappedLocalSync(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
@@ -2105,6 +2220,5 @@ class ActionFinalStructure(Action):
         if hasattr(graph, 'markUnstructured'):
             graph.markUnstructured()
         if hasattr(graph, 'markLabelBumpUp'):
-            graph.markLabelBumpUp(True)
-        self._count += 1
+            graph.markLabelBumpUp(False)
         return 0

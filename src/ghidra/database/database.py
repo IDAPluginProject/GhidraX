@@ -792,7 +792,10 @@ class Scope(ABC):
         return entry.getSymbol() if entry else None
 
     def queryContainer(self, addr: Address, size: int, usepoint: Address) -> Optional[SymbolEntry]:
-        return self.findContainer(addr, size, usepoint)
+        up = usepoint if usepoint else Address()
+        basescope = self._mapQueryScope(addr, up)
+        _, entry = self._stackContainer(basescope, None, addr, size, up)
+        return entry
 
     def queryFunction(self, addr: Address) -> Optional[FunctionSymbol]:
         """Find a function starting at the given address.
@@ -827,29 +830,51 @@ class Scope(ABC):
             return self.parent.queryCodeLabel(addr)
         return None
 
+    def _mapQueryScope(self, addr: Address, usepoint: Address) -> 'Scope':
+        db = getattr(getattr(self, 'glb', None), 'symboltab', None)
+        if db is not None and hasattr(db, 'mapScope'):
+            basescope = db.mapScope(self, addr, usepoint)
+            if basescope is not None:
+                return basescope
+        return self
+
+    def _stackContainer(self, scope1: Optional['Scope'], scope2: Optional['Scope'],
+                        addr: Address, size: int, usepoint: Address):
+        if addr.isConstant():
+            return None, None
+        curscope = scope1
+        visited = set()
+        while curscope is not None and curscope is not scope2 and id(curscope) not in visited:
+            visited.add(id(curscope))
+            entry = curscope.findContainer(addr, size, usepoint)
+            if entry is not None:
+                return curscope, entry
+            if curscope.inScope(addr, size, usepoint):
+                return curscope, None
+            curscope = curscope.parent
+        return None, None
+
     def queryProperties(self, addr: Address, size: int, usepoint, flags_ref):
         """Query boolean properties of a memory range (base Scope implementation).
 
         C++ ref: ``Scope::queryProperties`` in database.cc
-        Delegates to findClosestFit/findAddr, then falls back to scope-based flags.
         Returns the SymbolEntry if found, else None.
         """
         from ghidra.ir.varnode import Varnode
         up = usepoint if usepoint else Address()
-        entry = self.findClosestFit(addr, size, up) if hasattr(self, 'findClosestFit') else None
-        if entry is None and hasattr(self, 'findAddr'):
-            entry = self.findAddr(addr, up)
-        flags = 0
+        basescope = self._mapQueryScope(addr, up)
+        finalscope, entry = self._stackContainer(basescope, None, addr, size, up)
+        db = getattr(getattr(self, 'glb', None), 'symboltab', None)
         if entry is not None:
             flags = entry.getAllFlags()
-        else:
+        elif finalscope is not None:
             flags = Varnode.mapped | Varnode.addrtied
-            if self.isGlobal():
+            if finalscope.isGlobal():
                 flags |= Varnode.persist
-            if hasattr(self, 'glb') and self.glb is not None:
-                db = getattr(self.glb, 'symboltab', None)
-                if db is not None and hasattr(db, 'getProperty'):
-                    flags |= db.getProperty(addr)
+            if db is not None and hasattr(db, 'getProperty'):
+                flags |= db.getProperty(addr)
+        else:
+            flags = db.getProperty(addr) if db is not None and hasattr(db, 'getProperty') else 0
         if isinstance(flags_ref, list) and flags_ref:
             flags_ref[0] = flags
         return entry
@@ -1242,7 +1267,7 @@ class Scope(ABC):
     # --- Misc ---
 
     def inScope(self, addr: Address, size: int, usepoint: Address) -> bool:
-        return self.findContainer(addr, size, usepoint) is not None
+        return self.rangetree.inRange(addr, size)
 
     def inRange(self, addr: Address, size: int) -> bool:
         """Check if the given address range is owned by this Scope."""
@@ -1332,7 +1357,9 @@ class Scope(ABC):
                 return self.makeNameUnique(rn)
             s = ""
             if ct is not None and hasattr(ct, 'printNameBase'):
-                s += ct.printNameBase()
+                buf = []
+                ct.printNameBase(buf)
+                s += "".join(buf)
             spacename = addr.getSpace().getName() if addr.getSpace() is not None else "mem"
             spacename = spacename[0].upper() + spacename[1:]
             s += spacename
@@ -1355,7 +1382,9 @@ class Scope(ABC):
         if (flags & VN.addrtied) != 0:
             s = ""
             if ct is not None and hasattr(ct, 'printNameBase'):
-                s += ct.printNameBase()
+                buf = []
+                ct.printNameBase(buf)
+                s += "".join(buf)
             spacename = addr.getSpace().getName() if addr.getSpace() is not None else "mem"
             spacename = spacename[0].upper() + spacename[1:]
             s += spacename
@@ -1618,10 +1647,7 @@ class ScopeInternal(Scope):
 
     def queryByAddr(self, addr: Address, sz: int) -> Optional[Symbol]:
         """Find a symbol that covers the given address range."""
-        entry = self.findContainer(addr, sz, Address())
-        if entry is not None:
-            return entry.getSymbol()
-        return None
+        return super().queryByAddr(addr, sz)
 
     def queryProperties(self, addr: Address, size: int, usepoint, flags_ref):
         """Query boolean properties of the given address range.
@@ -1629,28 +1655,7 @@ class ScopeInternal(Scope):
         C++ ref: ``Scope::queryProperties`` in database.cc
         Returns the SymbolEntry if found, else None.
         """
-        from ghidra.ir.varnode import Varnode
-        up = usepoint if usepoint else Address()
-        # Try to find a containing symbol entry
-        entry = self.findClosestFit(addr, size, up)
-        if entry is None:
-            entry = self.findAddr(addr, up)
-        flags = 0
-        if entry is not None:
-            flags = entry.getAllFlags()
-        else:
-            # No symbol found — set flags based on scope properties
-            flags = Varnode.mapped | Varnode.addrtied
-            if self.isGlobal():
-                flags |= Varnode.persist
-            # Add property flags from the database
-            if hasattr(self, 'glb') and self.glb is not None:
-                db = getattr(self.glb, 'symboltab', None)
-                if db is not None and hasattr(db, 'getProperty'):
-                    flags |= db.getProperty(addr)
-        if isinstance(flags_ref, list) and flags_ref:
-            flags_ref[0] = flags
-        return entry
+        return super().queryProperties(addr, size, usepoint, flags_ref)
 
     def assignDefaultNames(self, base: int) -> int:
         """Assign default names to all unnamed symbols.
@@ -1993,7 +1998,16 @@ class Database:
         """
         if isinstance(addr_or_spc, Address):
             # mapScope(qpoint, addr, usepoint) — resolve
-            return scope_or_qpoint
+            qpoint = scope_or_qpoint
+            addr = addr_or_spc
+            for scope in self._scopeMap.values():
+                if scope is self._globalScope:
+                    continue
+                if getattr(scope, 'fd', None) is not None:
+                    continue
+                if scope.rangetree.inRange(addr, 1):
+                    return scope
+            return qpoint
         # mapScope(scope, spc, first, last) — add range
         scope_or_qpoint.addRange(addr_or_spc, first_or_usepoint, last)
 
@@ -2116,6 +2130,15 @@ class Database:
         C++ ref: ``Database::addRange``
         """
         scope.addRange(spc, first, last)
+
+    def setRange(self, scope, rlist: RangeList) -> None:
+        """Replace the full ownership range of a scope.
+
+        C++ ref: ``Database::setRange``
+        """
+        if scope is None:
+            return
+        scope.rangetree = RangeList(rlist)
 
     def removeRange(self, scope, spc, first: int, last: int) -> None:
         """Remove an address range from a scope's ownership.

@@ -21,6 +21,7 @@ _VN_CONST      = 0x02     # Varnode.constant
 _VN_ANNOT      = 0x04     # Varnode.annotation
 _VN_INSERT     = 0x20     # Varnode.insert
 _VN_HK         = 0x26     # isHeritageKnown: insert|constant|annotation
+_VN_ADDRTIED   = 0x8000   # Varnode.addrtied
 _VN_ADDRFORCE  = 0x100000  # Varnode.addrforce
 _OP_MARKER_FL  = 0x40     # PcodeOp.marker
 
@@ -423,7 +424,7 @@ class RuleOrConsume(Rule):
 # =========================================================================
 
 class RuleTrivialArith(Rule):
-    """Remove trivial arithmetic operations: V + 0 => V, V * 1 => V, etc."""
+    """Simplify ops with identical inputs, matching native RuleTrivialArith."""
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "trivialarith")
@@ -435,47 +436,66 @@ class RuleTrivialArith(Rule):
 
     def getOpList(self) -> List[int]:
         return [
-            int(OpCode.CPUI_INT_ADD), int(OpCode.CPUI_INT_SUB),
-            int(OpCode.CPUI_INT_MULT), int(OpCode.CPUI_INT_DIV), int(OpCode.CPUI_INT_SDIV),
-            int(OpCode.CPUI_INT_OR), int(OpCode.CPUI_INT_XOR),
-            int(OpCode.CPUI_INT_AND),
-            int(OpCode.CPUI_INT_LEFT), int(OpCode.CPUI_INT_RIGHT), int(OpCode.CPUI_INT_SRIGHT),
+            int(OpCode.CPUI_INT_NOTEQUAL), int(OpCode.CPUI_INT_SLESS), int(OpCode.CPUI_INT_LESS),
             int(OpCode.CPUI_BOOL_XOR), int(OpCode.CPUI_BOOL_AND), int(OpCode.CPUI_BOOL_OR),
+            int(OpCode.CPUI_INT_EQUAL), int(OpCode.CPUI_INT_SLESSEQUAL), int(OpCode.CPUI_INT_LESSEQUAL),
+            int(OpCode.CPUI_INT_XOR), int(OpCode.CPUI_INT_AND), int(OpCode.CPUI_INT_OR),
+            int(OpCode.CPUI_FLOAT_EQUAL), int(OpCode.CPUI_FLOAT_NOTEQUAL),
+            int(OpCode.CPUI_FLOAT_LESS), int(OpCode.CPUI_FLOAT_LESSEQUAL),
         ]
 
     def applyOp(self, op, data) -> int:
-        opc = op.code()
+        if op.numInput() != 2:
+            return 0
+        in0 = op.getIn(0)
+        in1 = op.getIn(1)
+        if in0 is None or in1 is None:
+            return 0
+        if in0 is not in1:
+            if not in0.isWritten() or not in1.isWritten():
+                return 0
+            def0 = in0.getDef()
+            def1 = in1.getDef()
+            if def0 is None or def1 is None or not def0.isCseMatch(def1):
+                return 0
+
         outvn = op.getOut()
         if outvn is None:
             return 0
-        in1 = op.getIn(1)
-        if in1 is None or not in1.isConstant():
-            return 0
-        val = in1.getOffset()
-        size = outvn.getSize()
-        mask = calc_mask(size)
-        trivial_slot = -1
 
-        if opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB,
-                    OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR,
-                    OpCode.CPUI_INT_LEFT, OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT,
-                    OpCode.CPUI_BOOL_XOR, OpCode.CPUI_BOOL_OR):
-            if val == 0:
-                trivial_slot = 0  # Keep input 0
-        elif opc in (OpCode.CPUI_INT_MULT, OpCode.CPUI_INT_DIV, OpCode.CPUI_INT_SDIV):
-            if val == 1:
-                trivial_slot = 0
-        elif opc == OpCode.CPUI_INT_AND:
-            if (val & mask) == mask:
-                trivial_slot = 0
-        elif opc == OpCode.CPUI_BOOL_AND:
-            if val != 0:
-                trivial_slot = 0
-
-        if trivial_slot < 0:
+        opc = op.code()
+        new_vn = None
+        if opc in (
+            OpCode.CPUI_INT_NOTEQUAL,
+            OpCode.CPUI_INT_SLESS,
+            OpCode.CPUI_INT_LESS,
+            OpCode.CPUI_BOOL_XOR,
+            OpCode.CPUI_FLOAT_NOTEQUAL,
+            OpCode.CPUI_FLOAT_LESS,
+        ):
+            new_vn = data.newConstant(1, 0)
+        elif opc in (
+            OpCode.CPUI_INT_EQUAL,
+            OpCode.CPUI_INT_SLESSEQUAL,
+            OpCode.CPUI_INT_LESSEQUAL,
+            OpCode.CPUI_FLOAT_EQUAL,
+            OpCode.CPUI_FLOAT_LESSEQUAL,
+        ):
+            new_vn = data.newConstant(1, 1)
+        elif opc == OpCode.CPUI_INT_XOR:
+            new_vn = data.newConstant(outvn.getSize(), 0)
+        elif opc not in (
+            OpCode.CPUI_BOOL_AND,
+            OpCode.CPUI_BOOL_OR,
+            OpCode.CPUI_INT_AND,
+            OpCode.CPUI_INT_OR,
+        ):
             return 0
+
         data.opSetOpcode(op, OpCode.CPUI_COPY)
         data.opRemoveInput(op, 1)
+        if new_vn is not None:
+            data.opSetInput(op, new_vn, 0)
         return 1
 
 
@@ -596,7 +616,7 @@ class RuleCollapseConstants(Rule):
         if out is None or not op.isCollapsible():
             return 0
         opc = op._opcode_enum
-        # Skip ops that must not be constant-folded (matches C++ truth)
+        # Skip ops that must not be constant-folded (matches the current stable behavior)
         if opc in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68):
             return 0
         # Need all constant inputs for binary/unary ops
@@ -646,7 +666,10 @@ class RulePropagateCopy(Rule):
     # Applies to all opcodes (no getOpList)
 
     def applyOp(self, op, data) -> int:
+        if op.isReturnCopy():
+            return 0
         op_is_marker = op._flags & _OP_MARKER_FL
+        op_out = op.getOut()
         for i, vn in enumerate(op._inrefs):
             if vn is None or not (vn._flags & _VN_WRITTEN):
                 continue
@@ -664,6 +687,13 @@ class RulePropagateCopy(Rule):
                 if invn._flags & _VN_CONST:
                     continue
                 if vn._flags & _VN_ADDRFORCE:
+                    continue
+                if (
+                    op_out is not None
+                    and (invn._flags & _VN_ADDRTIED)
+                    and (op_out._flags & _VN_ADDRTIED)
+                    and invn.getAddr() != op_out.getAddr()
+                ):
                     continue
             data.opSetInput(op, invn, i)
             return 1
@@ -703,7 +733,14 @@ class Rule2Comp2Mult(Rule):
 # =========================================================================
 
 class RuleSub2Add(Rule):
-    """Convert INT_SUB with constant to INT_ADD: V - c => V + (-c)"""
+    """Convert subtraction into addition via an explicit multiply-by-minus-one.
+
+    Native Ghidra does not directly negate the constant operand in-place.
+    It materializes ``vn * -1`` as a temporary op, rewires the subtraction to
+    consume that temporary, then converts the opcode to ``INT_ADD``. The
+    temporary immediately feeds the native ``collapseconstants ->
+    propagatecopy -> earlyremoval`` chain, which affects action trace counts.
+    """
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "sub2add")
@@ -718,13 +755,16 @@ class RuleSub2Add(Rule):
 
     def applyOp(self, op, data) -> int:
         vn = op.getIn(1)
-        if vn is None or not vn.isConstant():
+        if vn is None:
             return 0
-        size = vn.getSize()
-        mask = calc_mask(size)
-        val = (mask - vn.getOffset() + 1) & mask  # Two's complement negate
+        newop = data.newOp(2, op.getAddr())
+        data.opSetOpcode(newop, OpCode.CPUI_INT_MULT)
+        newvn = data.newUniqueOut(vn.getSize(), newop)
+        data.opSetInput(op, newvn, 1)
+        data.opSetInput(newop, vn, 0)
+        data.opSetInput(newop, data.newConstant(vn.getSize(), calc_mask(vn.getSize())), 1)
         data.opSetOpcode(op, OpCode.CPUI_INT_ADD)
-        data.opSetInput(op, data.newConstant(size, val), 1)
+        data.opInsertBefore(newop, op)
         return 1
 
 
@@ -820,16 +860,31 @@ class RuleShift2Mult(Rule):
         outvn = op.getOut()
         if outvn is None:
             return 0
-        vn = op.getIn(1)
-        if vn is None or not vn.isConstant():
+        constvn = op.getIn(1)
+        if constvn is None or not constvn.isConstant():
             return 0
-        sa = vn.getOffset()
-        size = outvn.getSize()
-        if sa == 0 or sa >= size * 8:
+        sa = constvn.getOffset()
+        if sa >= 32:
             return 0
-        mult_val = (1 << sa) & calc_mask(size)
+
+        # Native only rewrites the shift if the value is participating in an
+        # arithmetic expression, either via its defining input or a descendant.
+        arithmetic_use = False
+        in0 = op.getIn(0)
+        arithop = in0.getDef() if in0 is not None and in0.isWritten() else None
+        descendants = outvn.getDescendants() if hasattr(outvn, "getDescendants") else []
+        for desc in [arithop, *descendants]:
+            if desc is None:
+                continue
+            if desc.code() in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB, OpCode.CPUI_INT_MULT):
+                arithmetic_use = True
+                break
+        if not arithmetic_use:
+            return 0
+
+        mult_val = 1 << sa
         data.opSetOpcode(op, OpCode.CPUI_INT_MULT)
-        data.opSetInput(op, data.newConstant(size, mult_val), 1)
+        data.opSetInput(op, data.newConstant(outvn.getSize(), mult_val), 1)
         return 1
 
 
@@ -1086,12 +1141,12 @@ class RuleScarry(Rule):
 
 
 # =========================================================================
-# RuleBoolNegate
-# !(V == W) => V != W, !(V < W) => W <= V, etc.
+# RuleBooleanNegate
+# V == false => !V, V == true => V, and NOTEQUAL variants.
 # =========================================================================
 
 class RuleBooleanNegate(Rule):
-    """Push BOOL_NEGATE into comparison: !(V==W) => V!=W."""
+    """Simplify equality/inequality tests against boolean values."""
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "booleannegate")
@@ -1101,25 +1156,29 @@ class RuleBooleanNegate(Rule):
         return RuleBooleanNegate(self._basegroup)
 
     def getOpList(self) -> List[int]:
-        return [int(OpCode.CPUI_BOOL_NEGATE)]
+        return [int(OpCode.CPUI_INT_NOTEQUAL), int(OpCode.CPUI_INT_EQUAL)]
 
     def applyOp(self, op, data) -> int:
-        from ghidra.core.opcodes import get_booleanflip
-        invn = op.getIn(0)
-        if invn is None or not invn.isWritten(): return 0
-        flipop = invn.getDef()
-        if not flipop.isBoolOutput(): return 0
-        opc = flipop.code()
-        comp, reorder = get_booleanflip(opc)
-        if comp == OpCode.CPUI_MAX: return 0
-        # We can fold the negate into the comparison
-        data.opSetOpcode(op, comp)
-        if reorder:
-            data.opSetInput(op, flipop.getIn(1), 0)
-            data.opInsertInput(op, flipop.getIn(0), 1)
+        opc = op.code()
+        constvn = op.getIn(1)
+        subbool = op.getIn(0)
+        if not constvn.isConstant():
+            return 0
+        val = constvn.getOffset()
+        if val not in (0, 1):
+            return 0
+        negate = (opc == OpCode.CPUI_INT_NOTEQUAL)
+        if val == 0:
+            negate = not negate
+        if not subbool.isBooleanValue(data.isTypeRecoveryOn()):
+            return 0
+
+        data.opRemoveInput(op, 1)
+        data.opSetInput(op, subbool, 0)
+        if negate:
+            data.opSetOpcode(op, OpCode.CPUI_BOOL_NEGATE)
         else:
-            data.opSetInput(op, flipop.getIn(0), 0)
-            data.opInsertInput(op, flipop.getIn(1), 1)
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
         return 1
 
 
@@ -1649,7 +1708,7 @@ class RuleAndCompare(Rule):
             return 0
         if basevn.isFree(): return 0
         newop = data.newOp(2, andop.getAddr())
-        newop.setOpcodeEnum(OpCode.CPUI_INT_AND)
+        data.opSetOpcode(newop, OpCode.CPUI_INT_AND)
         newout = data.newUniqueOut(basevn.getSize(), newop)
         data.opSetInput(newop, basevn, 0)
         data.opSetInput(newop, data.newConstant(basevn.getSize(), andconst), 1)

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Optional, List, Tuple
 from bisect import bisect_left
 
 from ghidra.ir.cover import Cover, PcodeOpSet
+from ghidra.ir.op import PcodeOp
 from ghidra.core.opcodes import OpCode
 
 # Pre-cached Varnode flag constants for hot merge test paths
@@ -320,12 +321,13 @@ class Merge:
         from ghidra.ir.varnode import Varnode as VnCls
         vn.setImplied()
         op = vn.getDef()
-        if op is not None:
-            for i in range(op.numInput()):
-                defvn = op.getIn(i)
-                if not defvn.hasCover():
-                    continue
-                defvn.setFlags(VnCls.coverdirty)
+        if op is None:
+            return
+        for i in range(op.numInput()):
+            defvn = op.getIn(i)
+            if defvn is None or not defvn.hasCover():
+                continue
+            defvn.setFlags(VnCls.coverdirty)
 
     @staticmethod
     def findSingleCopy(high: HighVariable, singlelist: List[Varnode]) -> None:
@@ -515,20 +517,26 @@ class Merge:
         if not markedop:
             return
         # Insert a COPY to isolate reads
+        afterop = None
         if vn.isInput():
             bl = self._data.getBasicBlocks().getBlock(0) if hasattr(self._data, 'getBasicBlocks') else None
             pc = bl.getStart() if bl is not None else vn.getAddr()
         else:
+            bl = vn.getDef().getParent()
             pc = vn.getDef().getAddr()
+            if vn.getDef().code() == OpCode.CPUI_INDIRECT:
+                iop_vn = vn.getDef().getIn(1)
+                if iop_vn is not None and hasattr(PcodeOp, 'getOpFromConst'):
+                    afterop = PcodeOp.getOpFromConst(iop_vn.getAddr())
+            if afterop is None:
+                afterop = vn.getDef()
         copyop = self._allocateCopyTrim(vn, pc, markedop[0])
         if copyop is None:
             return
-        # Insert after def
         if vn.isInput():
             if hasattr(self._data, 'opInsertBegin') and bl is not None:
                 self._data.opInsertBegin(copyop, bl)
         else:
-            afterop = vn.getDef()
             if hasattr(self._data, 'opInsertAfter'):
                 self._data.opInsertAfter(copyop, afterop)
         # Replace reads
@@ -596,15 +604,66 @@ class Merge:
         markedop: List[PcodeOp] = []
         for op in list(vn.getDescendants()):
             insertop = False
-            for bvn in blocksort:
-                vn2 = bvn.getVarnode()
-                if vn2 is vn:
+            single = Cover()
+            single.addDefPoint(vn)
+            single.addRefPoint(op, vn)
+            for blocknum, _ in single.begin():
+                slot = BlockVarnode.findFront(blocknum, blocksort)
+                if slot == -1:
                     continue
-                overlaptype = vn.characterizeOverlap(vn2)
-                if overlaptype == 0:
-                    continue
-                insertop = True
-                break
+                while slot < len(blocksort):
+                    bvn = blocksort[slot]
+                    if bvn.getIndex() != blocknum:
+                        break
+                    vn2 = bvn.getVarnode()
+                    slot += 1
+                    if vn2 is vn:
+                        continue
+                    boundtype = single.containVarnodeDef(vn2)
+                    if boundtype == 0:
+                        continue
+                    overlaptype = vn.characterizeOverlap(vn2)
+                    if overlaptype == 0:
+                        continue
+                    if overlaptype == 1:
+                        off = int(vn.getOffset() - vn2.getOffset())
+                        if vn.partialCopyShadow(vn2, off):
+                            continue
+                    if boundtype == 2:
+                        def2 = vn2.getDef()
+                        def1 = vn.getDef()
+                        if def2 is None:
+                            if def1 is None:
+                                if vn.getCreateIndex() < vn2.getCreateIndex():
+                                    continue
+                            else:
+                                continue
+                        elif def1 is not None and def2.getSeqNum().getOrder() < def1.getSeqNum().getOrder():
+                            continue
+                    elif boundtype == 3:
+                        if not vn2.isAddrForce():
+                            continue
+                        if not vn2.isWritten():
+                            continue
+                        indop = vn2.getDef()
+                        if indop is None or indop.code() != OpCode.CPUI_INDIRECT:
+                            continue
+                        effect_op = None
+                        if hasattr(PcodeOp, 'getOpFromConst'):
+                            effect_op = PcodeOp.getOpFromConst(indop.getIn(1).getAddr())
+                        if effect_op is not op:
+                            continue
+                        if overlaptype != 1:
+                            if vn.copyShadow(indop.getIn(0)):
+                                continue
+                        else:
+                            off = int(vn.getOffset() - vn2.getOffset())
+                            if vn.partialCopyShadow(indop.getIn(0), off):
+                                continue
+                    insertop = True
+                    break
+                if insertop:
+                    break
             if insertop:
                 markedop.append(op)
         self.snipReads(vn, markedop)

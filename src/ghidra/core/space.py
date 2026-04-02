@@ -399,7 +399,7 @@ class UniqueSpace(AddrSpace):
                  fl: int = 0) -> None:
         super().__init__(manager, trans, IPTR_INTERNAL, UniqueSpace.NAME,
                          False, UniqueSpace.SIZE, 1, ind,
-                         AddrSpace.hasphysical | AddrSpace.heritaged | fl,
+                         AddrSpace.hasphysical | AddrSpace.heritaged | AddrSpace.does_deadcode | fl,
                          0, 0)
         self._shortcut = 'u'
 

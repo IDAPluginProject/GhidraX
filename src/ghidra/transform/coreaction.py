@@ -65,6 +65,199 @@ class _PropState:
         self._advance_op()
 
 
+class _StackEqn:
+    __slots__ = ("var1", "var2", "rhs")
+
+    def __init__(self, var1: int, var2: int, rhs: int):
+        self.var1 = var1
+        self.var2 = var2
+        self.rhs = rhs
+
+
+class _StackSolver:
+    """Recover stack-pointer deltas across calls.
+
+    Python port of the private native StackSolver helper in coreaction.cc.
+    """
+
+    __slots__ = ("eqs", "guess", "vnlist", "companion", "spacebase", "soln",
+                 "missedvariables", "_eqs_by_var")
+
+    _UNKNOWN = 65535
+
+    def __init__(self):
+        self.eqs = []
+        self.guess = []
+        self.vnlist = []
+        self.companion = []
+        self.spacebase = None
+        self.soln = []
+        self.missedvariables = 0
+        self._eqs_by_var = {}
+
+    def getNumVariables(self) -> int:
+        return len(self.vnlist)
+
+    def getVariable(self, i: int):
+        return self.vnlist[i]
+
+    def getCompanion(self, i: int) -> int:
+        return self.companion[i]
+
+    def getSolution(self, i: int) -> int:
+        return self.soln[i]
+
+    def propagate(self, varnum: int, val: int) -> None:
+        if self.soln[varnum] != self._UNKNOWN:
+            return
+        self.soln[varnum] = val
+        workstack = [varnum]
+        while workstack:
+            cur = workstack.pop()
+            for eqn in self._eqs_by_var.get(cur, ()):
+                if self.soln[eqn.var2] != self._UNKNOWN:
+                    continue
+                self.soln[eqn.var2] = self.soln[cur] - eqn.rhs
+                workstack.append(eqn.var2)
+
+    def duplicate(self) -> None:
+        size = len(self.eqs)
+        for i in range(size):
+            eqn = self.eqs[i]
+            self.eqs.append(_StackEqn(eqn.var2, eqn.var1, -eqn.rhs))
+        self.eqs.sort(key=lambda eqn: eqn.var1)
+        self._eqs_by_var = {}
+        for eqn in self.eqs:
+            self._eqs_by_var.setdefault(eqn.var1, []).append(eqn)
+
+    def solve(self) -> None:
+        size = len(self.guess)
+        self.soln = [self._UNKNOWN] * len(self.vnlist)
+        self.duplicate()
+        self.propagate(0, 0)
+        lastcount = size + 2
+        while True:
+            count = 0
+            for eqn in self.guess:
+                var1 = eqn.var1
+                var2 = eqn.var2
+                if self.soln[var1] != self._UNKNOWN and self.soln[var2] == self._UNKNOWN:
+                    self.propagate(var2, self.soln[var1] - eqn.rhs)
+                elif self.soln[var1] == self._UNKNOWN and self.soln[var2] != self._UNKNOWN:
+                    self.propagate(var1, self.soln[var2] + eqn.rhs)
+                elif self.soln[var1] == self._UNKNOWN and self.soln[var2] == self._UNKNOWN:
+                    count += 1
+            if count == 0 or count == lastcount:
+                break
+            lastcount = count
+
+    def build(self, data, id_spc, spcbase: int) -> None:
+        from ghidra.core.address import Address
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.space import IPTR_IOP
+        from ghidra.fspec.fspec import ProtoModel
+
+        spacebasedata = id_spc.getSpacebase(spcbase)
+        self.spacebase = Address(spacebasedata.space, spacebasedata.offset)
+
+        vnlist = []
+        for vn in sorted(list(data._vbank.beginLoc())):
+            if vn.getSize() != spacebasedata.size:
+                continue
+            if vn.getAddr() != self.spacebase:
+                continue
+            if vn.isFree():
+                break
+            vnlist.append(vn)
+
+        self.vnlist = vnlist
+        self.companion = [-1] * len(vnlist)
+        self.missedvariables = 0
+        if not self.vnlist:
+            return
+        if not self.vnlist[0].isInput():
+            raise RuntimeError("Input value of stackpointer is not used")
+
+        index_map = {id(vn): idx for idx, vn in enumerate(self.vnlist)}
+
+        for i in range(1, len(self.vnlist)):
+            vn = self.vnlist[i]
+            op = vn.getDef()
+            if op is None:
+                self.missedvariables += 1
+                continue
+
+            if op.code() == OpCode.CPUI_INT_ADD:
+                othervn = op.getIn(0)
+                constvn = op.getIn(1)
+                if othervn.isConstant():
+                    constvn = othervn
+                    othervn = op.getIn(1)
+                if not constvn.isConstant() or othervn.getAddr() != self.spacebase:
+                    self.missedvariables += 1
+                    continue
+                other_index = index_map.get(id(othervn))
+                if other_index is None:
+                    self.missedvariables += 1
+                    continue
+                self.eqs.append(_StackEqn(i, other_index, constvn.getOffset()))
+            elif op.code() == OpCode.CPUI_COPY:
+                othervn = op.getIn(0)
+                if othervn.getAddr() != self.spacebase:
+                    self.missedvariables += 1
+                    continue
+                other_index = index_map.get(id(othervn))
+                if other_index is None:
+                    self.missedvariables += 1
+                    continue
+                self.eqs.append(_StackEqn(i, other_index, 0))
+            elif op.code() == OpCode.CPUI_INDIRECT:
+                othervn = op.getIn(0)
+                if othervn.getAddr() != self.spacebase:
+                    self.missedvariables += 1
+                    continue
+                other_index = index_map.get(id(othervn))
+                if other_index is None:
+                    self.missedvariables += 1
+                    continue
+                self.companion[i] = other_index
+                iopvn = op.getIn(1)
+                if iopvn.getSpace() is not None and iopvn.getSpace().getType() == IPTR_IOP:
+                    iop = data.getOpFromConst(iopvn.getAddr()) if hasattr(data, 'getOpFromConst') else getattr(iopvn, '_iop_ref', None)
+                    fc = data.getCallSpecs(iop) if iop is not None and hasattr(data, 'getCallSpecs') else None
+                    if fc is not None and fc.getExtraPop() != ProtoModel.extrapop_unknown:
+                        self.eqs.append(_StackEqn(i, other_index, fc.getExtraPop()))
+                        continue
+                self.guess.append(_StackEqn(i, other_index, 4))
+            elif op.code() == OpCode.CPUI_MULTIEQUAL:
+                for j in range(op.numInput()):
+                    othervn = op.getIn(j)
+                    if othervn.getAddr() != self.spacebase:
+                        self.missedvariables += 1
+                        continue
+                    other_index = index_map.get(id(othervn))
+                    if other_index is None:
+                        self.missedvariables += 1
+                        continue
+                    self.eqs.append(_StackEqn(i, other_index, 0))
+            elif op.code() == OpCode.CPUI_INT_AND:
+                othervn = op.getIn(0)
+                constvn = op.getIn(1)
+                if othervn.isConstant():
+                    constvn = othervn
+                    othervn = op.getIn(1)
+                if not constvn.isConstant() or othervn.getAddr() != self.spacebase:
+                    self.missedvariables += 1
+                    continue
+                other_index = index_map.get(id(othervn))
+                if other_index is None:
+                    self.missedvariables += 1
+                    continue
+                self.eqs.append(_StackEqn(i, other_index, 0))
+            else:
+                self.missedvariables += 1
+
+
 # --- Simple Action stubs that delegate to Funcdata methods ---
 
 class ActionStart(Action):
@@ -280,11 +473,11 @@ class ActionDirectWrite(Action):
         _VN_DWRITE   = 0x80000  # Varnode.directwrite
         _VN_INDCR    = 0x400000  # Varnode.indirect_creation (for isIndirectZero)
         _OP_MARKER   = 0x40     # PcodeOp.marker
-        _OP_RETURNS  = 0x08     # PcodeOp.returns (isAssignment)
         _OPC_COPY    = 1; _OPC_PIECE = 62; _OPC_SUBPIECE = 63
         _OPC_INDIRECT = 61      # CPUI_INDIRECT
         prop = self._propagateIndirect
         worklist = []
+        proto = data.getFuncProto() if hasattr(data, 'getFuncProto') else None
         for vn in list(data._vbank.beginLoc()):
             vn_flags = vn._flags
             vn._flags = vn_flags & ~_VN_DWRITE  # clearDirectWrite
@@ -292,12 +485,28 @@ class ActionDirectWrite(Action):
                 if vn_flags & (_VN_PERSIST | _VN_SPBASE):
                     vn._flags |= _VN_DWRITE
                     worklist.append(vn)
+                elif proto is not None and hasattr(proto, 'possibleInputParam'):
+                    if proto.possibleInputParam(vn.getAddr(), vn.getSize()):
+                        vn._flags |= _VN_DWRITE
+                        worklist.append(vn)
             elif vn_flags & _VN_WRITTEN:
                 op = vn._def
                 if not (op._flags & _OP_MARKER):
                     if vn_flags & _VN_PERSIST:
                         vn._flags |= _VN_DWRITE
                         worklist.append(vn)
+                    elif op._opcode_enum == _OPC_COPY:
+                        if hasattr(vn, 'isStackStore') and vn.isStackStore():
+                            invn = op._inrefs[0] if op._inrefs else None
+                            if invn is not None and invn.isWritten():
+                                curop = invn._def
+                                if curop is not None and curop._opcode_enum == _OPC_COPY:
+                                    invn = curop._inrefs[0] if curop._inrefs else invn
+                            if invn is not None and invn.isWritten():
+                                defop = invn._def
+                                if defop is not None and (defop._flags & _OP_MARKER):
+                                    vn._flags |= _VN_DWRITE
+                                    worklist.append(vn)
                     elif op._opcode_enum not in (_OPC_COPY, _OPC_PIECE, _OPC_SUBPIECE):
                         vn._flags |= _VN_DWRITE
                         worklist.append(vn)
@@ -316,7 +525,7 @@ class ActionDirectWrite(Action):
         while worklist:
             vn = worklist.pop()
             for op in vn._descend:
-                if not (op._flags & _OP_RETURNS):  # isAssignment
+                if op._output is None:  # isAssignment
                     continue
                 dvn = op._output
                 if dvn is None:
@@ -748,14 +957,10 @@ class ActionStackPtrFlow(Action):
     def analyzeExtraPop(data, stackspace, spcbase):
         """Analyze extra pop for call sites using a stack equation solver.
 
-        For now, use a simplified approach: resolve each stack-pointer def
-        that is an INDIRECT (from a call) by converting it to SP + constant.
-        Full StackSolver is not yet ported.
-
         C++ ref: ``ActionStackPtrFlow::analyzeExtraPop``
         """
         from ghidra.core.opcodes import OpCode
-        from ghidra.core.address import Address, calc_mask
+        from ghidra.core.address import calc_mask
         from ghidra.core.space import IPTR_IOP
         from ghidra.fspec.fspec import ProtoModel
 
@@ -770,52 +975,46 @@ class ActionStackPtrFlow(Action):
         if hasattr(myfp, 'getExtraPop') and myfp.getExtraPop() != ProtoModel.extrapop_unknown:
             return
 
-        if not hasattr(stackspace, 'numSpacebase') or stackspace.numSpacebase() == 0:
+        solver = _StackSolver()
+        try:
+            solver.build(data, stackspace, spcbase)
+        except Exception as err:
+            if hasattr(data, 'warningHeader'):
+                data.warningHeader(f"Stack frame is not setup normally: {err}")
             return
-        spacebasedata = stackspace.getSpacebase(spcbase)
-        if spacebasedata is None:
+        if solver.getNumVariables() == 0:
             return
-        sb_space = spacebasedata.space if hasattr(spacebasedata, 'space') else None
-        sb_offset = spacebasedata.offset if hasattr(spacebasedata, 'offset') else 0
-        sb_size = spacebasedata.size if hasattr(spacebasedata, 'size') else 4
-        if sb_space is None:
-            return
-        spacebase_addr = Address(sb_space, sb_offset)
+        solver.solve()
 
-        # Find input varnode for the stack pointer
-        spcbasein = None
-        if hasattr(data, 'findVarnodeInput'):
-            spcbasein = data.findVarnodeInput(sb_size, spacebase_addr)
-        if spcbasein is None:
-            return
-
-        # Simplified: for each SP def that is INDIRECT from a call,
-        # set it to SP + extrapop (the default model's extrapop).
-        extrapop = myfp.getExtraPop() if hasattr(myfp, 'getExtraPop') else 0
-        if extrapop == ProtoModel.extrapop_unknown:
-            # Try to use a reasonable default (e.g. 4 for x86-32 cdecl)
-            extrapop = getattr(myfp, '_extrapop', 0)
-            if extrapop == ProtoModel.extrapop_unknown:
-                return
-
-        for vn in list(data._vbank.beginLoc()):
-            if vn.getSpace() is not sb_space:
-                continue
-            if vn.getOffset() != sb_offset or vn.getSize() != sb_size:
-                continue
-            if vn is spcbasein:
-                continue
-            if not vn.isWritten():
+        invn = solver.getVariable(0)
+        warningprinted = False
+        for i in range(1, solver.getNumVariables()):
+            vn = solver.getVariable(i)
+            soln = solver.getSolution(i)
+            if soln == _StackSolver._UNKNOWN:
+                if not warningprinted and hasattr(data, 'warningHeader'):
+                    data.warningHeader(f"Unable to track spacebase fully for {stackspace.getName()}")
+                    warningprinted = True
                 continue
             op = vn.getDef()
-            if op.code() != OpCode.CPUI_INDIRECT:
+            if op is None:
                 continue
-            # Check if it's an INDIRECT from a call (input[1] in IOP space)
-            if op.numInput() < 2:
-                continue
-            iopvn = op.getIn(1)
-            if iopvn.getSpace() is None or iopvn.getSpace().getType() != IPTR_IOP:
-                continue
+            if op.code() == OpCode.CPUI_INDIRECT:
+                iopvn = op.getIn(1)
+                if iopvn.getSpace() is not None and iopvn.getSpace().getType() == IPTR_IOP:
+                    iop = data.getOpFromConst(iopvn.getAddr()) if hasattr(data, 'getOpFromConst') else getattr(iopvn, '_iop_ref', None)
+                    fc = data.getCallSpecs(iop) if iop is not None and hasattr(data, 'getCallSpecs') else None
+                    if fc is not None:
+                        soln2 = 0
+                        comp = solver.getCompanion(i)
+                        if comp >= 0:
+                            compsoln = solver.getSolution(comp)
+                            if compsoln != _StackSolver._UNKNOWN:
+                                soln2 = compsoln
+                        fc.setEffectiveExtraPop(soln - soln2)
+            sz = invn.getSize()
+            data.opSetOpcode(op, OpCode.CPUI_INT_ADD)
+            data.opSetAllInput(op, [invn, data.newConstant(sz, soln & calc_mask(sz))])
 
     def apply(self, data):
         if self._analysis_finished:

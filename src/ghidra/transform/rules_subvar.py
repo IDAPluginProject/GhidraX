@@ -636,13 +636,44 @@ class RuleSplitFlow(Rule):
         return [OpCode.CPUI_SUBPIECE]
     def applyOp(self, op, data):
         from ghidra.analysis.subflow import SplitFlow
-        outvn = op.getOut()
-        if outvn.isTypeLock() if hasattr(outvn, 'isTypeLock') else False:
+        lowSize = int(op.getIn(1).getOffset())
+        if lowSize == 0:
             return 0
         invn = op.getIn(0)
         if not invn.isWritten():
             return 0
-        lowSize = outvn.getSize()
+        if (hasattr(invn, "isPrecisLo") and invn.isPrecisLo()) or (hasattr(invn, "isPrecisHi") and invn.isPrecisHi()):
+            return 0
+        outvn = op.getOut()
+        if outvn.getSize() + lowSize != invn.getSize():
+            return 0
+
+        concatOp = None
+        multiOp = invn.getDef()
+        while multiOp.code() == OpCode.CPUI_INDIRECT:
+            tmpvn = multiOp.getIn(0)
+            if not tmpvn.isWritten():
+                return 0
+            multiOp = tmpvn.getDef()
+
+        if multiOp.code() == OpCode.CPUI_PIECE:
+            if invn.getDef() is not multiOp:
+                concatOp = multiOp
+        elif multiOp.code() == OpCode.CPUI_MULTIEQUAL:
+            for index in range(multiOp.numInput()):
+                cur_in = multiOp.getIn(index)
+                if not cur_in.isWritten():
+                    continue
+                tmpOp = cur_in.getDef()
+                if tmpOp.code() == OpCode.CPUI_PIECE:
+                    concatOp = tmpOp
+                    break
+
+        if concatOp is None:
+            return 0
+        if concatOp.getIn(1).getSize() != lowSize:
+            return 0
+
         splitflow = SplitFlow(data, invn, lowSize)
         if not splitflow.doTrace():
             return 0

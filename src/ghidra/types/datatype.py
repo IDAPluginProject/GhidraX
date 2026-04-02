@@ -35,6 +35,22 @@ def _coveringmask(val: int) -> int:
     return res
 
 
+def _subtype_result(subtype, newoff: int, out_holder=None):
+    """Return Python-friendly or C++-style getSubType results.
+
+    Native ``Datatype::getSubType`` returns the subtype directly and writes the
+    adjusted offset through an out-parameter. Older Python ports returned a
+    ``(subtype, newoff)`` tuple. Support both calling conventions.
+    """
+    if isinstance(out_holder, list):
+        if out_holder:
+            out_holder[0] = newoff
+        else:
+            out_holder.append(newoff)
+        return subtype
+    return subtype, newoff
+
+
 # =========================================================================
 # Metatype enums
 # =========================================================================
@@ -361,9 +377,9 @@ class Datatype:
     def printRaw(self) -> str:
         return self.name if self.name else metatype2string(self.metatype)
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         """Recover component data-type one-level down. Returns (subtype, newoff)."""
-        return None, off
+        return _subtype_result(None, off, newoff)
 
     def findTruncation(self, off: int, sz: int, op=None, slot: int = -1) -> Tuple[Optional[TypeField], int]:
         """Find an immediate subfield given a byte range.
@@ -695,10 +711,10 @@ class TypePointer(Datatype):
     def getDepend(self, index: int) -> Optional[Datatype]:
         return self.ptrto
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         if self.ptrto is not None:
-            return self.ptrto, off
-        return None, off
+            return _subtype_result(self.ptrto, off, newoff)
+        return _subtype_result(None, off, newoff)
 
     def compare(self, op: Datatype, level: int) -> int:
         res = super().compare(op, level)
@@ -929,15 +945,15 @@ class TypeArray(Datatype):
     def getDepend(self, index: int) -> Optional[Datatype]:
         return self.arrayof
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         if off >= self.size:
-            return Datatype.getSubType(self, off)
+            return Datatype.getSubType(self, off, newoff)
         if self.arrayof is not None:
             align_sz = self.arrayof.getAlignSize()
             if align_sz > 0:
-                newoff = off % align_sz
-                return self.arrayof, newoff
-        return None, off
+                resoff = off % align_sz
+                return _subtype_result(self.arrayof, resoff, newoff)
+        return _subtype_result(None, off, newoff)
 
     def getSubEntry(self, off: int, sz: int) -> Tuple[Optional[Datatype], int, int]:
         """Figure out what a byte range overlaps.
@@ -1332,13 +1348,13 @@ class TypeStruct(Datatype):
             return None, 0
         return f, noff
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         """C++ ref: TypeStruct::getSubType"""
         i = self.getFieldIter(off)
         if i < 0:
-            return Datatype.getSubType(self, off)
+            return Datatype.getSubType(self, off, newoff)
         f = self.field[i]
-        return f.type, off - f.offset
+        return _subtype_result(f.type, off - f.offset, newoff)
 
     def getHoleSize(self, off: int) -> int:
         """C++ ref: TypeStruct::getHoleSize"""
@@ -1822,18 +1838,22 @@ class TypePartialStruct(Datatype):
                     return eltype
         return self._stripped
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         """C++ ref: TypePartialStruct::getSubType"""
         size_left = self.size - off
         off += self._offset
         ct = self._container
         while ct is not None:
-            ct, off = ct.getSubType(off)
+            result = ct.getSubType(off)
+            if isinstance(result, tuple):
+                ct, off = result
+            else:
+                ct = result
             if ct is None:
                 break
             if ct.getSize() - off <= size_left:
                 break
-        return ct, off
+        return _subtype_result(ct, off, newoff)
 
     def getHoleSize(self, off: int) -> int:
         """C++ ref: TypePartialStruct::getHoleSize"""
@@ -2185,12 +2205,12 @@ class TypeCode(Datatype):
             return -1
         return 0
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         """C++ ref: TypeCode::getSubType"""
         if self.factory is not None and off == 0:
             # Return pointer to code type at offset 0
-            return None, off
-        return None, off
+            return _subtype_result(None, off, newoff)
+        return _subtype_result(None, off, newoff)
 
     def compare(self, op: Datatype, level: int) -> int:
         res = super().compare(op, level)
@@ -2275,17 +2295,26 @@ class TypeSpacebase(Datatype):
         """
         if self.glb is None:
             return None
-        if self.localframe is None:
-            # Global scope
-            if hasattr(self.glb, 'symboltab'):
-                return self.glb.symboltab
+        symboltab = getattr(self.glb, 'symboltab', None)
+        if symboltab is None:
             return None
-        # Function-local scope
-        if hasattr(self.glb, 'symboltab'):
-            scope = self.glb.symboltab
-            if hasattr(scope, 'findFunction'):
-                return scope.findFunction(self.localframe)
-        return None
+        scope = symboltab.getGlobalScope() if hasattr(symboltab, 'getGlobalScope') else symboltab
+        if scope is None:
+            return None
+        if self.localframe is None:
+            return scope
+        if hasattr(self.localframe, 'isInvalid') and self.localframe.isInvalid():
+            return scope
+        if hasattr(scope, 'queryFunction'):
+            funcsym = scope.queryFunction(self.localframe)
+            if funcsym is not None:
+                if hasattr(funcsym, 'getFunction'):
+                    fd = funcsym.getFunction()
+                    if fd is not None and hasattr(fd, 'getScopeLocal'):
+                        return fd.getScopeLocal()
+                if hasattr(funcsym, 'getScopeLocal'):
+                    return funcsym.getScopeLocal()
+        return scope
 
     def getAddress(self, off: int, sz: int, point=None):
         """Construct an Address given an offset.
@@ -2297,36 +2326,91 @@ class TypeSpacebase(Datatype):
             return Address(self.spaceid, off)
         return None
 
-    def getSubType(self, off: int) -> Tuple[Optional[Datatype], int]:
+    def getSubType(self, off: int, newoff=None):
         """Lookup component type via symbol table.
 
         C++ ref: TypeSpacebase::getSubType
         """
         scope = self.getMap()
-        if scope is not None and hasattr(scope, 'queryProperties'):
-            # Try to find a symbol at this offset
-            try:
-                addr = self.getAddress(off, 1)
-                if addr is not None and hasattr(scope, 'findAddr'):
-                    sym = scope.findAddr(addr)
-                    if sym is not None and hasattr(sym, 'getType'):
-                        dt = sym.getType()
-                        if dt is not None:
-                            return dt, 0
-            except Exception:
-                pass
-        return None, off
+        ws = self.spaceid.getWordSize() if self.spaceid is not None and hasattr(self.spaceid, 'getWordSize') else 1
+        addr_off = off if ws == 1 else off // ws
+        addr = self.getAddress(addr_off, -1)
+        if addr is None or scope is None or not hasattr(scope, 'queryContainer'):
+            unknown = self.glb.types.getBase(1, TYPE_UNKNOWN) if self.glb is not None and hasattr(self.glb, 'types') else None
+            return _subtype_result(unknown, 0, newoff)
+        try:
+            from ghidra.core.address import Address
+            smallest = scope.queryContainer(addr, 1, Address())
+        except Exception:
+            smallest = None
+        if smallest is None:
+            unknown = self.glb.types.getBase(1, TYPE_UNKNOWN) if self.glb is not None and hasattr(self.glb, 'types') else None
+            return _subtype_result(unknown, 0, newoff)
+        suboff = (addr.getOffset() - smallest.getAddr().getOffset()) + smallest.getOffset()
+        symbol = smallest.getSymbol() if hasattr(smallest, 'getSymbol') else None
+        dt = symbol.getType() if symbol is not None and hasattr(symbol, 'getType') else None
+        if dt is None and self.glb is not None and hasattr(self.glb, 'types'):
+            dt = self.glb.types.getBase(1, TYPE_UNKNOWN)
+        return _subtype_result(dt, suboff, newoff)
 
     def nearestArrayedComponentForward(self, off: int) -> Tuple[Optional[Datatype], int, int]:
         """C++ ref: TypeSpacebase::nearestArrayedComponentForward"""
         scope = self.getMap()
-        if scope is not None and hasattr(scope, 'queryProperties'):
-            # Simplified: look in symbol table for array-typed symbol
-            pass
+        if scope is None or self.spaceid is None or not hasattr(scope, 'queryContainer'):
+            return None, 0, 0
+        from ghidra.core.address import Address
+        ws = self.spaceid.getWordSize() if hasattr(self.spaceid, 'getWordSize') else 1
+        addr_off = off if ws == 1 else off // ws
+        addr = self.getAddress(addr_off, -1)
+        if addr is None:
+            return None, 0, 0
+        smallest = scope.queryContainer(addr, 1, Address())
+        if smallest is None or smallest.getOffset() != 0:
+            next_addr = addr + 32
+        else:
+            symbol = smallest.getSymbol()
+            symbol_type = symbol.getType() if symbol is not None and hasattr(symbol, 'getType') else None
+            if symbol_type is not None and symbol_type.getMetatype() == TYPE_STRUCT:
+                struct_off = addr.getOffset() - smallest.getAddr().getOffset()
+                res, _dummy_off, el_size = symbol_type.nearestArrayedComponentForward(struct_off)
+                if res is not None:
+                    return symbol_type, struct_off, el_size
+            step = smallest.getSize() if hasattr(smallest, 'getSize') else 0
+            step = step if ws == 1 else step // ws
+            next_addr = smallest.getAddr() + step
+        if next_addr < addr:
+            return None, 0, 0
+        smallest = scope.queryContainer(next_addr, 1, Address())
+        if smallest is None or smallest.getOffset() != 0:
+            return None, 0, 0
+        symbol = smallest.getSymbol()
+        symbol_type = symbol.getType() if symbol is not None and hasattr(symbol, 'getType') else None
+        newoff_val = addr.getOffset() - smallest.getAddr().getOffset()
+        if symbol_type is None:
+            return None, 0, 0
+        if symbol_type.getMetatype() == TYPE_ARRAY:
+            base = symbol_type.getBase() if hasattr(symbol_type, 'getBase') else None
+            el_size = base.getAlignSize() if base is not None and hasattr(base, 'getAlignSize') else 0
+            return symbol_type, newoff_val, el_size
+        if symbol_type.getMetatype() == TYPE_STRUCT:
+            res, _dummy_off, el_size = symbol_type.nearestArrayedComponentForward(0)
+            if res is not None:
+                return symbol_type, newoff_val, el_size
         return None, 0, 0
 
     def nearestArrayedComponentBackward(self, off: int) -> Tuple[Optional[Datatype], int, int]:
         """C++ ref: TypeSpacebase::nearestArrayedComponentBackward"""
+        subtype, newoff_val = self.getSubType(off)
+        if subtype is None:
+            return None, 0, 0
+        if subtype.getMetatype() == TYPE_ARRAY:
+            base = subtype.getBase() if hasattr(subtype, 'getBase') else None
+            el_size = base.getAlignSize() if base is not None and hasattr(base, 'getAlignSize') else 0
+            return subtype, newoff_val, el_size
+        if subtype.getMetatype() == TYPE_STRUCT:
+            res, _dummy_off, el_size = subtype.nearestArrayedComponentBackward(newoff_val)
+            if res is not None:
+                return subtype, newoff_val, el_size
         return None, 0, 0
 
     def compare(self, op: Datatype, level: int) -> int:

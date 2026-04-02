@@ -1272,6 +1272,8 @@ class BlockGraph(FlowBlock):
 class BlockBasic(FlowBlock):
     """A basic block for p-code operations."""
 
+    _SEQNUM_MAX = 0xFFFFFFFF
+
     def __init__(self, fd=None) -> None:
         super().__init__()
         self._op: list = []
@@ -1285,9 +1287,7 @@ class BlockBasic(FlowBlock):
     def getExitLeaf(self): return self
     def addOp(self, op) -> None:
         """Append a PcodeOp to this basic block."""
-        self._op.append(op)
-        if hasattr(op, 'setParent'):
-            op.setParent(self)
+        self.insertOp(op, len(self._op))
 
     def removeOp(self, op) -> None:
         """Remove a PcodeOp from this basic block."""
@@ -1301,6 +1301,7 @@ class BlockBasic(FlowBlock):
         self._op.insert(pos, op)
         if hasattr(op, 'setParent'):
             op.setParent(self)
+        self._assign_order_for_inserted_op(pos, op)
 
     def getOpList(self):
         """Return the list of PcodeOps."""
@@ -1410,16 +1411,34 @@ class BlockBasic(FlowBlock):
 
     def setOrder(self) -> None:
         if not self._op: return
-        step = (0xFFFFFFFFFFFFFFFF // len(self._op)) - 1
+        step = (self._SEQNUM_MAX // len(self._op)) - 1
         count = 0
         for inst in self._op:
             count += step; inst.setOrder(count)
+
+    def _assign_order_for_inserted_op(self, pos: int, inst) -> None:
+        if pos <= 0:
+            ordbefore = 2
+        else:
+            ordbefore = self._op[pos - 1].getSeqNum().getOrder()
+
+        if pos >= len(self._op) - 1:
+            ordafter = ordbefore + 0x1000000
+            if ordafter > self._SEQNUM_MAX or ordafter <= ordbefore:
+                ordafter = self._SEQNUM_MAX
+        else:
+            ordafter = self._op[pos + 1].getSeqNum().getOrder()
+
+        if ordafter - ordbefore <= 1:
+            self.setOrder()
+            return
+        inst.setOrder((ordafter // 2) + (ordbefore // 2))
 
     def copyRange(self, bb): self._cover = bb._cover
     def mergeRange(self, bb): self._cover.merge(bb._cover)
 
     def insert(self, pos, inst):
-        inst.setParent(self); self._op.insert(pos, inst)
+        self.insertOp(inst, pos)
         from ghidra.core.opcodes import OpCode
         if inst.isBranch() and inst.code() == OpCode.CPUI_BRANCHIND:
             self.setFlag(FlowBlock.f_switch_out)
