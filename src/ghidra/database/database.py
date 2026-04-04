@@ -8,6 +8,8 @@ Core classes: SymbolEntry, Symbol, FunctionSymbol, Scope, ScopeInternal, Databas
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+import inspect
+import os
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
 
 from ghidra.core.address import Address, RangeList
@@ -18,6 +20,151 @@ if TYPE_CHECKING:
     from ghidra.types.datatype import Datatype, TypeFactory
     from ghidra.core.space import AddrSpace
     from ghidra.core.marshal import Encoder, Decoder
+
+
+_FIND_OVERLAP_DEBUG_ADDRS = {
+    int(tok, 0) & ((1 << 64) - 1)
+    for tok in os.environ.get("PYGHIDRA_FIND_OVERLAP_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_FIND_OVERLAP_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_FIND_OVERLAP_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_find_overlap_debug.log",
+)
+_ADD_SYMBOL_DEBUG_ADDRS = {
+    int(tok, 0) & ((1 << 64) - 1)
+    for tok in os.environ.get("PYGHIDRA_ADD_SYMBOL_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_ADD_SYMBOL_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_ADD_SYMBOL_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_add_symbol_debug.log",
+)
+
+
+def _range_list_debug_str(rangelist: RangeList) -> str:
+    if rangelist is None or rangelist.empty():
+        return "[]"
+    parts = []
+    for rng in rangelist:
+        space = getattr(rng, "spc", None)
+        space_name = space.getName() if space is not None and hasattr(space, "getName") else "?"
+        parts.append(f"{space_name}[{rng.getFirst():#x},{rng.getLast():#x}]")
+    return "[" + ", ".join(parts) + "]"
+
+
+def _find_overlap_debug_enabled(addr: Address) -> bool:
+    if not _FIND_OVERLAP_DEBUG_ADDRS or addr is None or addr.isInvalid():
+        return False
+    return (addr.getOffset() & ((1 << 64) - 1)) in _FIND_OVERLAP_DEBUG_ADDRS
+
+
+def _add_symbol_debug_enabled(addr: Address) -> bool:
+    if not _ADD_SYMBOL_DEBUG_ADDRS or addr is None or addr.isInvalid():
+        return False
+    return (addr.getOffset() & ((1 << 64) - 1)) in _ADD_SYMBOL_DEBUG_ADDRS
+
+
+def _add_symbol_debug_log(name: str, addr: Address, usepoint: Optional[Address],
+                          size: int, addrtied: bool, uselimit: RangeList) -> None:
+    if not _add_symbol_debug_enabled(addr):
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        up = "invalid"
+        if usepoint is not None and not usepoint.isInvalid():
+            up = f"{usepoint.getOffset():#x}"
+        with open(_ADD_SYMBOL_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            caller_names = []
+            for frame in inspect.stack()[2:5]:
+                caller_names.append(frame.function)
+            fp.write(
+                f"idx={idx} "
+                f"addr={addr.getOffset():#x}:{size} name={name!r} "
+                f"usepoint={up} addrtied={int(addrtied)} "
+                f"uselimit={_range_list_debug_str(uselimit)} "
+                f"caller={'/'.join(caller_names)}\n"
+            )
+    except OSError:
+        return
+
+
+def _find_overlap_debug_log(addr: Address, size: int, candidates: list["SymbolEntry"],
+                            selected: Optional["SymbolEntry"],
+                            visible_entries: Optional[list["SymbolEntry"]] = None) -> None:
+    if not _find_overlap_debug_enabled(addr):
+        return
+    try:
+        with open(_FIND_OVERLAP_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(
+                f"addr={addr.getOffset():#x}:{size} candidates={len(candidates)} "
+                f"selected_id={id(selected) if selected is not None else 'None'}\n"
+            )
+            if visible_entries is not None:
+                fp.write(f"  visible_entries={len(visible_entries)}\n")
+                for idx, entry in enumerate(visible_entries[:8]):
+                    sym = entry.getSymbol() if hasattr(entry, "getSymbol") else None
+                    name = getattr(sym, "name", "?")
+                    fp.write(
+                        f"  visible[{idx}] entry_id={id(entry)} sym={name} "
+                        f"start={entry.getFirst():#x} end={entry.getLast():#x} "
+                        f"size={entry.getSize()} flags={entry.getAllFlags():#x} "
+                        f"addrtied={int(entry.isAddrTied())} "
+                        f"space_idx={entry.getAddr().getSpace().getIndex() if entry.getAddr().getSpace() is not None and hasattr(entry.getAddr().getSpace(), 'getIndex') else 'None'} "
+                        f"uselimit={_range_list_debug_str(entry.getUseLimit())}\n"
+                    )
+            for idx, entry in enumerate(candidates):
+                sym = entry.getSymbol() if hasattr(entry, "getSymbol") else None
+                name = getattr(sym, "name", "?")
+                fp.write(
+                    f"  idx={idx} entry_id={id(entry)} sym={name} "
+                    f"start={entry.getFirst():#x} end={entry.getLast():#x} "
+                    f"size={entry.getSize()} flags={entry.getAllFlags():#x} "
+                    f"addrtied={int(entry.isAddrTied())} "
+                    f"uselimit={_range_list_debug_str(entry.getUseLimit())}"
+                )
+                if selected is entry:
+                    fp.write(" selected=1")
+                fp.write("\n")
+    except OSError:
+        return
+
+
+def _remove_symbol_debug_log(sym: "Symbol") -> None:
+    entries = getattr(sym, "mapentry", None)
+    if not entries:
+        return
+    matched = []
+    for entry in entries:
+        addr = entry.getAddr() if hasattr(entry, "getAddr") else None
+        if addr is not None and _add_symbol_debug_enabled(addr):
+            matched.append(entry)
+    if not matched:
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        with open(_ADD_SYMBOL_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            caller_names = []
+            for frame in inspect.stack()[2:5]:
+                caller_names.append(frame.function)
+            for entry in matched:
+                fp.write(
+                    f"idx={idx} remove "
+                    f"addr={entry.getAddr().getOffset():#x}:{entry.getSize()} "
+                    f"name={sym.getName()!r} flags={sym.getFlags():#x} "
+                    f"category={sym.getCategory()} "
+                    f"caller={'/'.join(caller_names)}\n"
+                )
+    except OSError:
+        return
 
 
 # =========================================================================
@@ -75,8 +222,10 @@ class SymbolEntry:
         return self.size
 
     def inUse(self, usepoint: Address) -> bool:
-        if self.uselimit.empty():
+        if self.isAddrTied():
             return True
+        if usepoint is None or usepoint.isInvalid():
+            return False
         return self.uselimit.inRange(usepoint, 1)
 
     def getUseLimit(self) -> RangeList:
@@ -1469,10 +1618,30 @@ class ScopeInternal(Scope):
         if isinstance(sym_or_name, str):
             # 4-arg form: create a new Symbol + SymbolEntry
             name = sym_or_name
-            sz = ct.getSize() if ct is not None and hasattr(ct, 'getSize') else (addr.getSpace().getAddrSize() if addr is not None and addr.getSpace() is not None else 4)
+            if ct is not None and hasattr(ct, "hasStripped") and ct.hasStripped():
+                ct = ct.getStripped()
             sym = Symbol(self, name, ct)
             self._addSymbolDirect(sym)
+            sz = sym.getBytesConsumed()
+            if sz == 0:
+                sz = ct.getSize() if ct is not None and hasattr(ct, "getSize") else (
+                    addr.getSpace().getAddrSize() if addr is not None and addr.getSpace() is not None else 4
+                )
             entry = SymbolEntry(sym, addr, sz)
+            if usepoint is not None and not usepoint.isInvalid():
+                entry.uselimit.insertRange(
+                    usepoint.getSpace(),
+                    usepoint.getOffset(),
+                    usepoint.getOffset(),
+                )
+            else:
+                sym.flags |= Varnode.addrtied
+                db = getattr(getattr(self, "glb", None), "symboltab", None)
+                if db is not None and addr is not None and hasattr(db, "getProperty"):
+                    sym.flags |= db.getProperty(addr)
+                if self.isGlobal():
+                    sym.flags |= Varnode.persist
+            _add_symbol_debug_log(name, addr, usepoint, sz, (sym.flags & Varnode.addrtied) != 0, entry.uselimit)
             return self.addMapEntry(sym, entry)
         # Single-arg form: add pre-built Symbol
         sym = sym_or_name
@@ -1500,6 +1669,7 @@ class ScopeInternal(Scope):
             lst.append(sym)
 
     def removeSymbol(self, sym: Symbol) -> None:
+        _remove_symbol_debug_log(sym)
         self._symbolsById.pop(sym.symbolId, None)
         lst = self._symbolsByName.get(sym.name)
         if lst:
@@ -1547,11 +1717,20 @@ class ScopeInternal(Scope):
         bestentry = None
         oldsize = -1
         target_spc = addr.base
+        target_spc_idx = (
+            target_spc.getIndex()
+            if target_spc is not None and hasattr(target_spc, "getIndex")
+            else None
+        )
         target_off = addr.offset
         end = target_off + size - 1
         for entries_list in self._entriesByAddr.values():
             for entry in entries_list:
-                if entry.addr.base is not target_spc:
+                entry_spc = entry.addr.base
+                if target_spc_idx is not None and entry_spc is not None and hasattr(entry_spc, "getIndex"):
+                    if entry_spc.getIndex() != target_spc_idx:
+                        continue
+                elif entry_spc is not target_spc:
                     continue
                 e_off = entry.addr.offset
                 esz = entry.size
@@ -1703,17 +1882,40 @@ class ScopeInternal(Scope):
 
     def findOverlap(self, addr: Address, size: int) -> Optional[SymbolEntry]:
         """Find any symbol entry that overlaps the given range."""
+        debug_enabled = _find_overlap_debug_enabled(addr)
+        selected = None
+        candidates = [] if debug_enabled else None
+        visible_entries = [] if debug_enabled else None
+        target_spc = addr.getSpace()
+        target_spc_idx = (
+            target_spc.getIndex()
+            if target_spc is not None and hasattr(target_spc, "getIndex")
+            else None
+        )
         for entries_list in self._entriesByAddr.values():
             for entry in entries_list:
-                if entry.addr.getSpace() is not addr.getSpace():
+                entry_spc = entry.addr.getSpace()
+                if target_spc_idx is not None and entry_spc is not None and hasattr(entry_spc, "getIndex"):
+                    if entry_spc.getIndex() != target_spc_idx:
+                        continue
+                elif entry_spc is not target_spc:
                     continue
+                if visible_entries is not None:
+                    visible_entries.append(entry)
                 e_start = entry.getFirst()
                 e_end = entry.getLast()
                 a_start = addr.getOffset()
                 a_end = a_start + size - 1
                 if e_start <= a_end and a_start <= e_end:
+                    if candidates is not None:
+                        candidates.append(entry)
+                        if selected is None:
+                            selected = entry
+                        continue
                     return entry
-        return None
+        if candidates is not None:
+            _find_overlap_debug_log(addr, size, candidates, selected, visible_entries)
+        return selected
 
     def findClosestFit(self, addr: Address, size: int, usepoint: Address) -> Optional[SymbolEntry]:
         """Find the closest fitting symbol entry for the given range."""

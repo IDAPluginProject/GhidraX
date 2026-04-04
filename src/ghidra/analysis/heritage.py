@@ -2793,6 +2793,8 @@ class Heritage:
                 if slot >= len(inrefs):
                     continue
                 vnin = inrefs[slot]
+                if vnin is None:
+                    continue
                 if vnin.isHeritageKnown():
                     continue
                 addr_key = vnin.getAddr()

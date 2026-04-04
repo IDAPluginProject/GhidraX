@@ -343,9 +343,7 @@ class ParamActive:
         """Get trial corresponding to the given input Varnode slot."""
         adj = 1 if (self._stackplaceholder < 0 or slot < self._stackplaceholder) else 2
         idx = slot - adj
-        if 0 <= idx < len(self._trial):
-            return self._trial[idx]
-        return self._trial[0] if self._trial else None
+        return self._trial[idx]
 
     def joinTrial(self, slot: int, addr: Address, sz: int) -> None:
         """Join adjacent parameter trials."""

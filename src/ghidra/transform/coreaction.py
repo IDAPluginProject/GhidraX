@@ -602,51 +602,170 @@ class ActionSegmentize(Action):
         return 0
 
 class ActionInternalStorage(Action):
-    """Detect and warn about internal storage issues (unique space inputs).
+    """Mark STOREs fed by internal storage as unmapped when appropriate.
 
-    C++ ref: ``ActionInternalStorage::apply`` in coreaction.hh
+    C++ ref: ``ActionInternalStorage::apply`` in coreaction.cc
     """
     def __init__(self, g): super().__init__(0, "internalstorage", g)
     def clone(self, gl):
         return ActionInternalStorage(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
-        from ghidra.core.space import IPTR_INTERNAL
-        for vn in data._vbank.beginDef():
-            if not vn.isInput():
+        from ghidra.core.opcodes import OpCode
+
+        proto = data.getFuncProto() if hasattr(data, "getFuncProto") else None
+        if proto is None or not hasattr(proto, "internalBegin"):
+            return 0
+
+        vbank = getattr(data, "_vbank", None)
+        if vbank is None:
+            return 0
+
+        for storage in proto.internalBegin():
+            if storage is None:
                 continue
-            if vn.getSpace().getType() == IPTR_INTERNAL:
-                if hasattr(data, 'warningHeader'):
-                    data.warningHeader("Illegal input varnode in unique space")
-                break
+            if hasattr(storage, "getAddr"):
+                addr = storage.getAddr()
+            else:
+                space = getattr(storage, "space", None)
+                offset = getattr(storage, "offset", 0)
+                from ghidra.core.address import Address
+                addr = Address(space, offset)
+            size = storage.size if hasattr(storage, "size") else getattr(storage, "getSize", lambda: 0)()
+            if size <= 0 or addr is None:
+                continue
+
+            if hasattr(vbank, "beginLocSize"):
+                varnodes = list(vbank.beginLocSize(size, addr))
+            elif hasattr(vbank, "findLoc"):
+                varnodes = list(vbank.findLoc(addr, size))
+            else:
+                varnodes = [
+                    vn for vn in vbank.beginLoc()
+                    if vn.getSize() == size and vn.getAddr() == addr
+                ]
+
+            for vn in varnodes:
+                for op in list(vn.getDescendants()):
+                    if op.code() != OpCode.CPUI_STORE:
+                        continue
+                    if vn.isEventualConstant(3, 0):
+                        op.setStoreUnmapped()
         return 0
 
 class ActionMultiCse(Action):
-    """Eliminate redundant MULTIEQUAL ops sharing all inputs in same block."""
+    """Eliminate redundant MULTIEQUAL ops using native matching semantics."""
     def __init__(self, g): super().__init__(0, "multicse", g)
     def clone(self, gl):
         return ActionMultiCse(self._basegroup) if gl.contains(self._basegroup) else None
-    def apply(self, data):
+    @staticmethod
+    def _unwrapCopy(vn):
         from ghidra.core.opcodes import OpCode
+
+        if vn is not None and vn.isWritten():
+            defop = vn.getDef()
+            if defop is not None and defop.code() == OpCode.CPUI_COPY:
+                return defop.getIn(0)
+        return vn
+
+    @staticmethod
+    def preferredOutput(out1, out2):
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.space import IPTR_INTERNAL
+
+        for op in out1.getDescendants():
+            if op.code() == OpCode.CPUI_RETURN:
+                return False
+        for op in out2.getDescendants():
+            if op.code() == OpCode.CPUI_RETURN:
+                return True
+        if not out1.isAddrTied():
+            if out2.isAddrTied():
+                return True
+            spc1 = out1.getSpace()
+            spc2 = out2.getSpace()
+            if spc1 is not None and spc1.getType() == IPTR_INTERNAL:
+                if spc2 is not None and spc2.getType() != IPTR_INTERNAL:
+                    return True
+        return False
+
+    @staticmethod
+    def findMatch(bl, target, in_vn):
+        from ghidra.core.expression import functionalEqualityLevel
+
+        for op in bl.beginOp():
+            if op is target:
+                break
+            numinput = op.numInput()
+            for i in range(numinput):
+                vn = ActionMultiCse._unwrapCopy(op.getIn(i))
+                if vn is in_vn:
+                    break
+            else:
+                continue
+
+            for j in range(numinput):
+                in1 = ActionMultiCse._unwrapCopy(op.getIn(j))
+                in2 = ActionMultiCse._unwrapCopy(target.getIn(j))
+                if in1 is in2:
+                    continue
+                buf1 = [None, None]
+                buf2 = [None, None]
+                if functionalEqualityLevel(in1, in2, buf1, buf2) != 0:
+                    break
+            else:
+                return op
+        return None
+
+    def processBlock(self, data, bl):
+        from ghidra.core.opcodes import OpCode
+
+        vnlist = []
+        targetop = None
+        pairop = None
+        for op in bl.beginOp():
+            opc = op.code()
+            if opc == OpCode.CPUI_COPY:
+                continue
+            if opc != OpCode.CPUI_MULTIEQUAL:
+                break
+
+            vnpos = len(vnlist)
+            for i in range(op.numInput()):
+                vn = self._unwrapCopy(op.getIn(i))
+                vnlist.append(vn)
+                if vn.isMark():
+                    pairop = self.findMatch(bl, op, vn)
+                    if pairop is not None:
+                        targetop = op
+                        break
+            if targetop is not None:
+                break
+            for i in range(vnpos, len(vnlist)):
+                vnlist[i].setMark()
+
+        for vn in vnlist:
+            vn.clearMark()
+
+        if targetop is None:
+            return False
+
+        out1 = pairop.getOut()
+        out2 = targetop.getOut()
+        if self.preferredOutput(out1, out2):
+            data.totalReplace(out1, out2)
+            data.opDestroy(pairop)
+        else:
+            data.totalReplace(out2, out1)
+            data.opDestroy(targetop)
+        self._count += 1
+        return True
+
+    def apply(self, data):
         graph = data.getBasicBlocks()
         for i in range(graph.getSize()):
             bl = graph.getBlock(i)
-            ops = list(bl.getOps()) if hasattr(bl, 'getOps') else []
-            mequals = [op for op in ops if op.code() == OpCode.CPUI_MULTIEQUAL]
-            for idx in range(len(mequals)):
-                target = mequals[idx]
-                for jdx in range(idx):
-                    pair = mequals[jdx]
-                    if pair.numInput() != target.numInput():
-                        continue
-                    match = True
-                    for k in range(target.numInput()):
-                        if target.getIn(k) is not pair.getIn(k):
-                            match = False; break
-                    if match:
-                        data.totalReplace(target.getOut(), pair.getOut())
-                        data.opDestroy(target)
-                        self._count += 1
-                        break
+            while self.processBlock(data, bl):
+                pass
         return 0
 
 class ActionShadowVar(Action):
@@ -1035,14 +1154,90 @@ class ActionLaneDivide(Action):
     def __init__(self, g): super().__init__(Action.rule_onceperfunc, "lanedivide", g)
     def clone(self, gl):
         return ActionLaneDivide(self._basegroup) if gl.contains(self._basegroup) else None
+    @staticmethod
+    def collectLaneSizes(vn, allowedLanes, checkLanes):
+        from ghidra.core.opcodes import OpCode
+
+        descendants = list(vn.getDescendants())
+        step = 0
+        idx = 0
+        if not descendants:
+            step = 1
+        while step < 2:
+            if step == 0:
+                op = descendants[idx]
+                idx += 1
+                if idx >= len(descendants):
+                    step = 1
+                if op.code() != OpCode.CPUI_SUBPIECE:
+                    continue
+                curSize = op.getOut().getSize()
+            else:
+                step = 2
+                if not vn.isWritten():
+                    continue
+                op = vn.getDef()
+                if op.code() != OpCode.CPUI_PIECE:
+                    continue
+                curSize = op.getIn(0).getSize()
+                tmpSize = op.getIn(1).getSize()
+                if tmpSize < curSize:
+                    curSize = tmpSize
+            if allowedLanes.allowedLane(curSize):
+                checkLanes.addLaneSize(curSize)
+
+    def processVarnode(self, data, vn, lanedRegister, mode):
+        from ghidra.analysis.subflow import LaneDivide
+        from ghidra.transform.transform import LaneDescription, LanedRegister
+
+        checkLanes = LanedRegister()
+        allowDowncast = mode > 0
+        if mode < 2:
+            self.collectLaneSizes(vn, lanedRegister, checkLanes)
+        else:
+            arch = data.getArch()
+            types = arch.types if arch is not None and hasattr(arch, 'types') else None
+            defaultSize = types.getSizeOfPointer() if types is not None and hasattr(types, 'getSizeOfPointer') else 8
+            if defaultSize != 4:
+                defaultSize = 8
+            checkLanes.addLaneSize(defaultSize)
+
+        for curSize in checkLanes:
+            description = LaneDescription(lanedRegister.getWholeSize(), curSize)
+            laneDivide = LaneDivide(data, vn, description, allowDowncast)
+            if laneDivide.doTrace():
+                laneDivide.apply()
+                self._count += 1
+                return True
+        return False
+
     def apply(self, data):
-        # Would iterate laned register accesses and divide into lanes
-        # using LaneDescription and LaneDivide infrastructure
-        if hasattr(data, 'beginLaneAccess'):
+        data.setLanedRegGenerated()
+        for mode in range(3):
+            allStorageProcessed = True
             for vdata, lanedReg in data.beginLaneAccess():
-                pass  # Process each laned register
-            if hasattr(data, 'clearLanedAccessMap'):
-                data.clearLanedAccessMap()
+                addr = vdata.getAddr()
+                sz = vdata.size
+                viter = list(data._vbank.beginLocSize(sz, addr))
+                idx = 0
+                allVarnodesProcessed = True
+                while idx < len(viter):
+                    vn = viter[idx]
+                    if vn.hasNoDescend():
+                        idx += 1
+                        continue
+                    if self.processVarnode(data, vn, lanedReg, mode):
+                        viter = list(data._vbank.beginLocSize(sz, addr))
+                        idx = 0
+                        allVarnodesProcessed = True
+                    else:
+                        idx += 1
+                        allVarnodesProcessed = False
+                if not allVarnodesProcessed:
+                    allStorageProcessed = False
+            if allStorageProcessed:
+                break
+        data.clearLanedAccessMap()
         return 0
 
 class ActionConstantPtr(Action):

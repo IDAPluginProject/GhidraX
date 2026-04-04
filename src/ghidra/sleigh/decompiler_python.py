@@ -17,9 +17,13 @@ from __future__ import annotations
 import os
 import traceback
 
+from ghidra.core.address import Address
+from ghidra.core.opcodes import OpCode
+from ghidra.analysis.funcdata import Funcdata
 from ghidra.sleigh.lifter import Lifter
 from ghidra.sleigh.arch_map import add_sla_search_dir, default_context_for_target
 from ghidra.arch.archshim import ArchitectureStandalone
+from ghidra.arch.loadimage import LoadImageBytes
 from ghidra.analysis.flowlifter import (
     _split_basic_blocks,
     _setup_call_specs,
@@ -105,6 +109,21 @@ def _rebind_existing_opcodes(fd) -> None:
         fd.opSetOpcode(op, op.code())
 
 
+def _restore_unique_base_after_flow(fd, arch, initial_unique_base: int) -> None:
+    if not hasattr(fd, "beginOpAll") or not hasattr(arch, "_unique_base"):
+        return
+    for op in fd.beginOpAll():
+        out = op.getOut() if hasattr(op, "getOut") else None
+        if out is None:
+            continue
+        spc = out.getSpace() if hasattr(out, "getSpace") else None
+        if spc is None or spc.getName() != "unique":
+            continue
+        if out.getOffset() >= initial_unique_base:
+            return
+    arch._unique_base = initial_unique_base
+
+
 def _build_full_action_ready_funcdata(
     lifter: Lifter,
     arch: ArchitectureStandalone,
@@ -112,13 +131,21 @@ def _build_full_action_ready_funcdata(
     target: str,
     entry: int,
     func_size: int,
+    *,
+    preserve_unresolved_branchind: bool = False,
 ):
     _reset_lifter_analysis_state(lifter)
-    fd = lifter.lift_function(func_name, entry, func_size)
+    # Jump-table recovery can run during followFlow(), so the shim must have
+    # the default action groups installed before control-flow generation starts.
+    if hasattr(arch, "allacts") and arch.allacts is not None:
+        arch.allacts.universalAction(arch)
+        arch.allacts.resetDefaults()
+    code_space = arch.getDefaultCodeSpace()
+    initial_unique_base = arch.getUniqueBase() if hasattr(arch, "getUniqueBase") else 0x10000000
+    fd = Funcdata(func_name, func_name, None, Address(code_space, entry), None, func_size)
     fd.setArch(arch)
-    _rebind_existing_opcodes(fd)
-    _split_basic_blocks(fd, lifter=lifter)
-    _setup_call_specs(fd, lifter=lifter)
+    fd.followFlow(Address(code_space, 0), Address(code_space, code_space.getHighest()))
+    _restore_unique_base_after_flow(fd, arch, initial_unique_base)
     _bind_blocks_to_funcdata(fd)
     return fd
 
@@ -209,7 +236,11 @@ def _prepare_funcdata_for_full_actions(
     context = _context_from_target(target)
     lifter = Lifter(sla_path, context)
     lifter.set_image(base_addr, image)
-    arch = ArchitectureStandalone(lifter._spc_mgr, target=target)
+    arch = ArchitectureStandalone(lifter._spc_mgr, target=target, sla_path=sla_path)
+    if getattr(arch, "loader", None) is None and hasattr(arch, "getDefaultCodeSpace"):
+        code_space = arch.getDefaultCodeSpace()
+        if code_space is not None:
+            arch.loader = LoadImageBytes(image, Address(code_space, base_addr))
     _install_tracked_context(arch, target, entry)
     fd = _build_full_action_ready_funcdata(
         lifter=lifter,
@@ -221,6 +252,38 @@ def _prepare_funcdata_for_full_actions(
     )
     _install_full_action_restart_rebuilder(fd, arch, lifter, target, func_size)
     return lifter, arch, fd
+
+
+def _build_jumptable_prelude_funcdata(
+    lifter: Lifter,
+    arch: ArchitectureStandalone,
+    func_name: str,
+    target: str,
+    entry: int,
+    func_size: int,
+):
+    return _build_full_action_ready_funcdata(
+        lifter=lifter,
+        arch=arch,
+        func_name=func_name,
+        target=target,
+        entry=entry,
+        func_size=func_size,
+        preserve_unresolved_branchind=True,
+    )
+
+
+def _is_indirect_thunk_prelude_candidate(fd, func_size: int) -> bool:
+    if func_size <= 0:
+        return False
+    bblocks = fd.getBasicBlocks() if hasattr(fd, "getBasicBlocks") else None
+    if bblocks is None or bblocks.getSize() != 1:
+        return False
+    bb = bblocks.getBlock(0)
+    ops = list(bb.getOpList()) if hasattr(bb, "getOpList") else []
+    if len(ops) != 1:
+        return False
+    return ops[0].code() == OpCode.CPUI_BRANCHIND
 
 
 class DecompilerPython:
@@ -316,7 +379,7 @@ class DecompilerPython:
                     self._safe(lambda: _split_basic_blocks(fd, lifter=lifter), "FlowInfo")
 
                 # 3. Attach architecture shim
-                arch = ArchitectureStandalone(lifter._spc_mgr)
+                arch = ArchitectureStandalone(lifter._spc_mgr, target=target, sla_path=sla_path)
                 fd.setArch(arch)
 
                 # 3b. Create FuncCallSpecs for CALL/CALLIND ops

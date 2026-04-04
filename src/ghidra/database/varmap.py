@@ -6,16 +6,188 @@ Classes for tracking local variables and reconstructing stack layout.
 
 from __future__ import annotations
 import bisect
+import inspect
+import os
 from typing import List
 from ghidra.core.address import Address, AddrSpace, calc_mask, sign_extend
 from ghidra.core.opcodes import OpCode
 from ghidra.core.marshal import AttributeId, ElementId
-from ghidra.database.database import ScopeInternal
+from ghidra.database.database import ScopeInternal, Symbol
 
 ATTRIB_LOCK = AttributeId("lock", 133)
 ATTRIB_MAIN = AttributeId("main", 134)
 
 ELEM_LOCALDB = ElementId("localdb", 228)
+_MARK_UNALIASED_DEBUG_ADDRS = {
+    int(tok, 0) & ((1 << 64) - 1)
+    for tok in os.environ.get("PYGHIDRA_MARK_UNALIASED_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_MARK_UNALIASED_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_MARK_UNALIASED_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_mark_unaliased_debug.log",
+)
+_ALIAS_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_ALIAS_DEBUG_LOG",
+    "",
+).strip()
+_MAPSTATE_DEBUG_ADDRS = {
+    int(tok, 0) & ((1 << 64) - 1)
+    for tok in os.environ.get("PYGHIDRA_MAPSTATE_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_MAPSTATE_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_MAPSTATE_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_mapstate_debug.log",
+)
+
+
+def _mark_not_mapped_debug_log(spc, first: int, sz: int, parameter: bool,
+                               before_min: int, before_max: int,
+                               after_min: int, after_max: int) -> None:
+    path = os.getenv("PYGHIDRA_MARK_NOT_MAPPED_DEBUG_LOG", "").strip()
+    if not path:
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        caller = inspect.stack()[2].function
+    except Exception:
+        caller = "?"
+    try:
+        stack_desc = []
+        for frame in inspect.stack()[1:5]:
+            filename = os.path.basename(frame.filename)
+            stack_desc.append(f"{filename}:{frame.function}:{frame.lineno}")
+        stack_str = " -> ".join(stack_desc)
+    except Exception:
+        stack_str = "?"
+    try:
+        spc_name = spc.getName() if spc is not None and hasattr(spc, "getName") else "?"
+    except Exception:
+        spc_name = "?"
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(
+                "[markNotMapped] "
+                f"idx={idx} caller={caller} space={spc_name} "
+                f"first={first:#x} size={sz} parameter={int(parameter)} "
+                f"before=({before_min:#x},{before_max:#x}) "
+                f"after=({after_min:#x},{after_max:#x}) "
+                f"stack={stack_str}\n"
+            )
+    except Exception:
+        return
+
+
+def _mark_unaliased_debug_enabled(entry) -> bool:
+    if not _MARK_UNALIASED_DEBUG_ADDRS or entry is None:
+        return False
+    try:
+        return (entry.getAddr().getOffset() & ((1 << 64) - 1)) in _MARK_UNALIASED_DEBUG_ADDRS
+    except Exception:
+        return False
+
+
+def _mark_unaliased_debug_log(entry, message: str) -> None:
+    if not _mark_unaliased_debug_enabled(entry):
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        sym = entry.getSymbol()
+        name = sym.getName() if sym is not None and hasattr(sym, "getName") else "?"
+        addr = entry.getAddr().getOffset()
+        size = entry.getSize()
+        with open(_MARK_UNALIASED_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(f"[markUnaliased] idx={idx} addr={addr:#x}:{size} sym={name} {message}\n")
+    except Exception:
+        return
+
+
+def _mark_unaliased_debug_log_start(entries, alias_count: int) -> None:
+    if not _MARK_UNALIASED_DEBUG_LOG:
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        offsets = []
+        for entry in entries[:16]:
+            offsets.append(f"{entry.getAddr().getOffset():#x}")
+        with open(_MARK_UNALIASED_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(
+                f"[markUnaliased] idx={idx} start entries={len(entries)} alias_count={alias_count} "
+                f"sample=[{', '.join(offsets)}]\n"
+            )
+    except Exception:
+        return
+
+
+def _alias_debug_log(message: str) -> None:
+    if not _ALIAS_DEBUG_LOG:
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        with open(_ALIAS_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(f"[alias] idx={idx} {message}\n")
+    except Exception:
+        return
+
+
+def _range_hint_debug_covers(hint, targets: set[int]) -> bool:
+    if hint is None or not targets:
+        return False
+    try:
+        start = hint.start & ((1 << 64) - 1)
+        end = (hint.start + hint.size - 1) & ((1 << 64) - 1)
+    except Exception:
+        return False
+    for target in targets:
+        if start <= target <= end:
+            return True
+    return False
+
+
+def _mapstate_debug_log(message: str) -> None:
+    if not _MAPSTATE_DEBUG_ADDRS:
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        with open(_MAPSTATE_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(f"[mapstate] idx={idx} {message}\n")
+    except Exception:
+        return
+
+
+def _range_hint_debug_desc(hint) -> str:
+    if hint is None:
+        return "<none>"
+    try:
+        type_name = hint.type.getName() if hint.type is not None else "None"
+    except Exception:
+        type_name = "<?>"
+    return (
+        f"start={hint.start:#x} size={hint.size} sstart={hint.sstart:#x} "
+        f"rangeType={hint.rangeType} highind={hint.highind} flags={hint.flags:#x} "
+        f"type={type_name}"
+    )
 
 
 # =========================================================================
@@ -148,9 +320,12 @@ class RangeHint:
             mod += a.type.getAlignSize()
         sub = a.type
         while sub is not None and sub.getAlignSize() > b.type.getAlignSize():
-            sub = sub.getSubType(mod)
-            if sub is not None:
-                mod = mod  # getSubType may update mod in C++, simplified here
+            # Native updates the component offset via an out-parameter.
+            # Use the same calling convention here so getSubType() yields a
+            # Datatype instead of the legacy Python (subtype, newoff) tuple.
+            newoff = [mod]
+            sub = sub.getSubType(mod, newoff)
+            mod = newoff[0]
         if sub is not None:
             if sub.getAlignSize() == b.type.getAlignSize():
                 return True
@@ -380,12 +555,35 @@ class AliasChecker:
         self._aliasBoundary = self._localExtreme
         spacebase = self._fd.findSpacebaseInput(self._space)
         if spacebase is None:
+            _alias_debug_log("spacebase=None")
             return
         AliasChecker.gatherAdditiveBase(spacebase, self._addBase)
+        _alias_debug_log(
+            f"start direction={self._direction} localBoundary={self._localBoundary:#x} "
+            f"localExtreme={self._localExtreme:#x} addbase_count={len(self._addBase)}"
+        )
         for ab in self._addBase:
             offset = AliasChecker.gatherOffset(ab.base)
             offset = AddrSpace.addressToByte(offset, self._space.getWordSize())
             self._alias.append(offset)
+            try:
+                base_desc = f"{ab.base.getAddr().getOffset():#x}:{ab.base.getSize()}"
+            except Exception:
+                base_desc = "?:?"
+            try:
+                defop = ab.base.getDef()
+                if defop is not None:
+                    def_desc = (
+                        f"{defop.getAddr().getOffset():#x}#{defop.getSeqNum().getOrder()} "
+                        f"opc={defop.code()}"
+                    )
+                else:
+                    def_desc = "None"
+            except Exception:
+                def_desc = "?"
+            _alias_debug_log(
+                f"candidate offset={offset:#x} base={base_desc} def={def_desc}"
+            )
             if self._direction == 1:
                 if offset < self._localBoundary:
                     continue
@@ -394,6 +592,14 @@ class AliasChecker:
                     continue
             if offset < self._aliasBoundary:
                 self._aliasBoundary = offset
+                _alias_debug_log(f"aliasBoundary update offset={offset:#x}")
+        if self._alias:
+            _alias_debug_log(
+                "final aliases=[" + ", ".join(f"{off:#x}" for off in self._alias) + "] "
+                f"aliasBoundary={self._aliasBoundary:#x}"
+            )
+        else:
+            _alias_debug_log(f"final aliases=[] aliasBoundary={self._aliasBoundary:#x}")
 
     def gather(self, f, spc, defer: bool) -> None:
         self._fd = f
@@ -517,8 +723,13 @@ class MapState:
     """A container for hints about the data-type layout of an address space."""
 
     def __init__(self, spc, rn, pm, dt) -> None:
+        from ghidra.core.address import RangeList
+
         self._spaceid = spc
-        self._range = rn
+        # Native MapState stores its own RangeList copy and trims parameter
+        # ranges from that working set only. Mutating the caller's scope range
+        # tree here drops stack-parameter ownership and later heritage guards.
+        self._range = RangeList(rn) if rn is not None else RangeList()
         self._maplist: List[RangeHint] = []
         self._iter: int = 0
         self._defaultType = dt
@@ -565,12 +776,19 @@ class MapState:
             ct = self._defaultType
         sz = ct.getSize()
         if not self._range.inRange(Address(self._spaceid, st), sz):
+            if _MAPSTATE_DEBUG_ADDRS and any(st <= target <= st + sz - 1 for target in _MAPSTATE_DEBUG_ADDRS):
+                type_name = ct.getName() if ct is not None and hasattr(ct, "getName") else "<?>"
+                _mapstate_debug_log(
+                    f"addRange_skip start={st:#x} size={sz} fl={fl:#x} rt={rt} hi={hi} type={type_name}"
+                )
             return
         sst = AddrSpace.byteToAddress(st, self._spaceid.getWordSize())
         sst = sign_extend(sst, self._spaceid.getAddrSize() * 8 - 1)
         sst = AddrSpace.addressToByte(sst, self._spaceid.getWordSize())
         newRange = RangeHint(st, sz, sst, ct, fl, rt, hi)
         self._maplist.append(newRange)
+        if _range_hint_debug_covers(newRange, _MAPSTATE_DEBUG_ADDRS):
+            _mapstate_debug_log(f"addRange {_range_hint_debug_desc(newRange)}")
 
     def _addFixedType(self, start: int, ct, flags: int, types) -> None:
         if ct is None:
@@ -808,6 +1026,8 @@ class ScopeLocal(ScopeInternal):
     def markNotMapped(self, spc, first: int, sz: int, parameter: bool) -> None:
         if self._space != spc:
             return
+        before_min = self._minParamOffset
+        before_max = self._maxParamOffset
         last = first + sz - 1
         if last < first:
             last = spc.getHighest()
@@ -825,12 +1045,27 @@ class ScopeLocal(ScopeInternal):
             if sym.isTypeLocked():
                 if not parameter or sym.getCategory() != sym.function_parameter:
                     self._fd.warningHeader("Variable defined which should be unmapped: " + sym.getName())
+                _mark_not_mapped_debug_log(
+                    spc, first, sz, parameter,
+                    before_min, before_max,
+                    self._minParamOffset, self._maxParamOffset,
+                )
                 return
             elif sym.getCategory() == sym.fake_input:
+                _mark_not_mapped_debug_log(
+                    spc, first, sz, parameter,
+                    before_min, before_max,
+                    self._minParamOffset, self._maxParamOffset,
+                )
                 return
             self.removeSymbol(sym)
             overlap = self.findOverlap(addr, sz)
         self.glb.symboltab.removeRange(self, self._space, first, last)
+        _mark_not_mapped_debug_log(
+            spc, first, sz, parameter,
+            before_min, before_max,
+            self._minParamOffset, self._maxParamOffset,
+        )
 
     def encode(self, encoder) -> None:
         encoder.openElement(ELEM_LOCALDB)
@@ -904,8 +1139,8 @@ class ScopeLocal(ScopeInternal):
         state.gatherOpen(self._fd)
         state.gatherSymbols(self._getMapTable(self._space))
         self._overlapProblems = self._restructure(state)
-        self.clearUnlockedCategory(0)  # Symbol.function_parameter = 0
-        self.clearCategory(-2)  # Symbol.fake_input
+        self.clearUnlockedCategory(Symbol.function_parameter)
+        self.clearCategory(Symbol.fake_input)
         self._fakeInputSymbols()
         state.sortAlias()
         if aliasyes:
@@ -922,13 +1157,33 @@ class ScopeLocal(ScopeInternal):
         cur.__dict__.update(state.next().__dict__)
         while state.getNext():
             nxt = state.next()
+            if (_range_hint_debug_covers(cur, _MAPSTATE_DEBUG_ADDRS)
+                    or _range_hint_debug_covers(nxt, _MAPSTATE_DEBUG_ADDRS)):
+                _mapstate_debug_log(
+                    f"restructure cur={_range_hint_debug_desc(cur)} nxt={_range_hint_debug_desc(nxt)}"
+                )
             if nxt.sstart < cur.sstart + cur.size:
                 if cur.merge(nxt, self._space, self.glb.types):
                     overlapProblems = True
+                    if _range_hint_debug_covers(cur, _MAPSTATE_DEBUG_ADDRS):
+                        _mapstate_debug_log(
+                            f"merge_overlap result={_range_hint_debug_desc(cur)} overlapProblems=1"
+                        )
             else:
-                if not cur.attemptJoin(nxt):
+                joined = cur.attemptJoin(nxt)
+                if (_range_hint_debug_covers(cur, _MAPSTATE_DEBUG_ADDRS)
+                        or _range_hint_debug_covers(nxt, _MAPSTATE_DEBUG_ADDRS)):
+                    _mapstate_debug_log(
+                        f"attemptJoin joined={int(joined)} cur={_range_hint_debug_desc(cur)} "
+                        f"nxt={_range_hint_debug_desc(nxt)}"
+                    )
+                if not joined:
                     if cur.rangeType == RangeHint.open:
                         cur.size = nxt.sstart - cur.sstart
+                        if _range_hint_debug_covers(cur, _MAPSTATE_DEBUG_ADDRS):
+                            _mapstate_debug_log(
+                                f"truncate_open result={_range_hint_debug_desc(cur)}"
+                            )
                     if self._adjustFit(cur):
                         self._createEntry(cur)
                     cur = RangeHint()
@@ -966,6 +1221,14 @@ class ScopeLocal(ScopeInternal):
         num = a.size // ct.getAlignSize()
         if num > 1:
             ct = self.glb.types.getTypeArray(num, ct)
+        if _range_hint_debug_covers(a, _MAPSTATE_DEBUG_ADDRS):
+            try:
+                ct_name = ct.getName()
+            except Exception:
+                ct_name = "<?>"
+            _mapstate_debug_log(
+                f"createEntry hint={_range_hint_debug_desc(a)} concretize={ct_name} num={num}"
+            )
         self.addSymbol("", ct, addr, usepoint)
 
     def _collectNameRecs(self) -> None:
@@ -1038,6 +1301,7 @@ class ScopeLocal(ScopeInternal):
         rangemap = self._getMapTable(self._space)
         if rangemap is None:
             return
+        _mark_unaliased_debug_log_start(rangemap, len(alias))
         ranges = []
         try:
             ranges = list(self.getRangeTree())
@@ -1068,8 +1332,26 @@ class ScopeLocal(ScopeInternal):
             symbol = entry.getSymbol()
             if aliason and (curoff - curalias > 0xffff):
                 aliason = False
+            _alias_debug_log(
+                f"markUnaliased entry={entry.getAddr().getOffset():#x}:{entry.getSize()} "
+                f"aliason={int(aliason)} curalias={curalias:#x} alias_i={i} "
+                f"sym_flags={symbol.getFlags():#x}"
+            )
+            _mark_unaliased_debug_log(
+                entry,
+                f"pre aliason={int(aliason)} curalias={curalias:#x} "
+                f"range_index={range_index} alias_i={i}",
+            )
             if not aliason:
                 symbol.getScope().setAttribute(symbol, Varnode.nolocalalias)
+                _alias_debug_log(
+                    f"markUnaliased set entry={entry.getAddr().getOffset():#x}:{entry.getSize()} "
+                    f"sym_flags={symbol.getFlags():#x}"
+                )
+                _mark_unaliased_debug_log(
+                    entry,
+                    f"set nolocalalias flags={symbol.getFlags():#x}",
+                )
             if symbol.isTypeLocked() and alias_block_level != 0:
                 if alias_block_level == 3:
                     aliason = False
@@ -1103,7 +1385,7 @@ class ScopeLocal(ScopeInternal):
                 ct = self._fd.getArch().types.getBase(size, 'unknown')
                 try:
                     sym = self.addSymbol("", ct, addr, usepoint).getSymbol()
-                    self.setCategory(sym, -2, -1)  # Symbol.fake_input
+                    self.setCategory(sym, Symbol.fake_input, -1)
                 except RuntimeError as err:
                     self._fd.warningHeader(str(err))
 
@@ -1210,8 +1492,37 @@ class ScopeLocal(ScopeInternal):
 
     def _getMapTable(self, spc):
         """Get the map table for the given space (helper)."""
-        if hasattr(self, 'maptable') and spc is not None:
-            idx = spc.getIndex()
-            if idx < len(self.maptable):
-                return self.maptable[idx]
-        return None
+        if spc is None or not hasattr(self, "_entriesByAddr"):
+            return None
+        target_spc_idx = spc.getIndex() if hasattr(spc, "getIndex") else None
+
+        def _entry_sort_key(entry):
+            last = entry.getLast()
+            if entry.isAddrTied():
+                return (last, -1, -1, entry.getFirst())
+            first_range = entry.getUseLimit().getFirstRange()
+            if first_range is None:
+                return (last, 0x7FFFFFFF, 0xFFFFFFFFFFFFFFFF, entry.getFirst())
+            return (
+                last,
+                first_range.getSpace().getIndex(),
+                first_range.getFirst(),
+                entry.getFirst(),
+            )
+
+        entries = []
+        for entries_list in self._entriesByAddr.values():
+            for entry in entries_list:
+                if entry.isDynamic():
+                    continue
+                entry_spc = entry.getAddr().getSpace()
+                if target_spc_idx is not None and entry_spc is not None and hasattr(entry_spc, "getIndex"):
+                    if entry_spc.getIndex() != target_spc_idx:
+                        continue
+                elif entry_spc is not spc:
+                    continue
+                entries.append(entry)
+        if not entries:
+            return None
+        entries.sort(key=_entry_sort_key)
+        return entries

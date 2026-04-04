@@ -363,6 +363,8 @@ class ActionDeadCode(Action):
         op = vn._def
         if op is None or op._opcode_enum != _OPC_INDIRECT or not op.isMarker():
             return False
+        if not op.isIndirectCreation():
+            return False
         if op.isIndirectStore():
             return False
         if len(op._inrefs) < 1:

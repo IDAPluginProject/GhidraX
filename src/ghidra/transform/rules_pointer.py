@@ -1390,6 +1390,10 @@ class RuleStoreVarnode(Rule):
         data.opRemoveInput(op, 1)
         data.opRemoveInput(op, 0)
         data.opSetOpcode(op, OpCode.CPUI_COPY)
+        if hasattr(op, 'isStoreUnmapped') and op.isStoreUnmapped():
+            localmap = data.getScopeLocal() if hasattr(data, 'getScopeLocal') else None
+            if localmap is not None and hasattr(localmap, 'markNotMapped'):
+                localmap.markNotMapped(baseoff, offoff, size, False)
         return 1
 
 

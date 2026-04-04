@@ -427,6 +427,8 @@ class TypeOpCopy(TypeOp):
     """CPUI_COPY — propagates type directly through."""
     def __init__(self, tlst):
         super().__init__(tlst, OpCode.CPUI_COPY, "COPY")
+        from ghidra.ir.op import PcodeOp as PcOp
+        self.opflags = PcOp.unary | getattr(PcOp, 'nocollapse', 0)
     def getInputCast(self, op, slot, castStrategy=None):
         if castStrategy is None: return None
         outvn = op.getOut()

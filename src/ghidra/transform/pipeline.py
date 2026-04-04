@@ -106,8 +106,13 @@ def _run_full_decompile_action(fd, timeout_seconds: float = 30.0) -> None:
         Action.clear_deadline()
 
     try:
-        allacts = ActionDatabase()
-        allacts.universalAction(fd.getArch())
+        arch = fd.getArch()
+        allacts = getattr(arch, "allacts", None)
+        if allacts is None:
+            allacts = ActionDatabase()
+            if arch is not None:
+                arch.allacts = allacts
+        allacts.universalAction(arch)
         allacts.resetDefaults()
         root = allacts.getCurrent()
         root.reset(fd)

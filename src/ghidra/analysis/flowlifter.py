@@ -28,7 +28,7 @@ from ghidra.core.opcodes import OpCode
 # _split_basic_blocks
 # =========================================================================
 
-def _split_basic_blocks(fd, lifter=None) -> None:
+def _split_basic_blocks(fd, lifter=None, preserve_unresolved_branchind: bool = False) -> None:
     """Split a single-block Funcdata into proper basic blocks.
 
     Analyzes PcodeOps for branch/return instructions and splits the
@@ -56,32 +56,34 @@ def _split_basic_blocks(fd, lifter=None) -> None:
     if lifter is not None and hasattr(lifter, '_insn_fall_throughs'):
         insn_fall_throughs = lifter._insn_fall_throughs
 
-    # --- Step 0b: Convert BRANCHIND → CALLIND + synthetic RETURN ---
-    # C++ FlowInfo::truncateIndirectJump converts unresolved BRANCHIND ops
-    # to CALLIND and inserts a synthetic RETURN after them.
-    # For resolved jump tables, keep BRANCHIND as-is.
+    # --- Step 0b: Optional BRANCHIND preservation ---
+    # The normal prebuilt Python full-action path historically converts
+    # unresolved BRANCHIND ops to CALLIND+RETURN up front.  For native-style
+    # jumptable thunk staging, we sometimes need to preserve the raw BRANCHIND
+    # temporarily so the synthetic pre-pass sees the same starting IR.
     original_ops = set(id(op) for op in all_ops)  # track original block ops
-    new_all_ops = []
-    for op in all_ops:
-        new_all_ops.append(op)
-        if op.code() == OpCode.CPUI_BRANCHIND:
-            op_addr = op.getSeqNum().getAddr().getOffset()
-            if op_addr in jumptables:
-                # Jump table resolved — keep BRANCHIND, don't convert
-                continue
-            # Convert BRANCHIND → CALLIND
-            fd.opSetOpcode(op, OpCode.CPUI_CALLIND)
-            # Create synthetic RETURN op after the CALLIND
-            # Matches C++ FlowInfo::artificialHalt which calls
-            # newVarnodeIop → newConstant(sizeof(op), op->getTime())
-            ret_op = fd.newOp(1, op.getSeqNum().getAddr())
-            fd.opSetOpcode(ret_op, OpCode.CPUI_RETURN)
-            # Create const varnode matching C++ newVarnodeIop behavior
-            uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
-            ret_in = fd.newConstant(4, uniq)
-            fd.opSetInput(ret_op, ret_in, 0)
-            new_all_ops.append(ret_op)
-    all_ops = new_all_ops
+    if not preserve_unresolved_branchind:
+        new_all_ops = []
+        for op in all_ops:
+            new_all_ops.append(op)
+            if op.code() == OpCode.CPUI_BRANCHIND:
+                op_addr = op.getSeqNum().getAddr().getOffset()
+                if op_addr in jumptables:
+                    # Jump table resolved — keep BRANCHIND, don't convert
+                    continue
+                # Convert BRANCHIND → CALLIND
+                fd.opSetOpcode(op, OpCode.CPUI_CALLIND)
+                # Create synthetic RETURN op after the CALLIND
+                # Matches C++ FlowInfo::artificialHalt which calls
+                # newVarnodeIop → newConstant(sizeof(op), op->getTime())
+                ret_op = fd.newOp(1, op.getSeqNum().getAddr())
+                fd.opSetOpcode(ret_op, OpCode.CPUI_RETURN)
+                # Create const varnode matching C++ newVarnodeIop behavior
+                uniq = ret_op.getSeqNum().getTime() if hasattr(ret_op.getSeqNum(), 'getTime') else 0
+                ret_in = fd.newConstant(4, uniq)
+                fd.opSetInput(ret_op, ret_in, 0)
+                new_all_ops.append(ret_op)
+        all_ops = new_all_ops
 
     # --- Step 0c: Add trailing RETURN if function doesn't end with terminator ---
     # C++ FlowInfo::artificialHalt adds a synthetic RETURN when flow falls off

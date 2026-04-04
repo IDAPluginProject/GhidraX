@@ -63,8 +63,15 @@ def _action_debug_log(action_name: str, op, message: str) -> None:
         addr = "?"
     path = os.getenv("PYGHIDRA_ACTION_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_rule_debug.log")
     try:
+        idx = Action.getActiveTraceSerial()  # type: ignore[name-defined]
+    except Exception:
+        idx = 0
+    prefix = f"[action:{action_name}]"
+    if idx > 0:
+        prefix += f" idx={idx}"
+    try:
         with open(path, "a", encoding="utf-8") as fp:
-            fp.write(f"[action:{action_name}] addr={addr} {message}\n")
+            fp.write(f"{prefix} addr={addr} {message}\n")
     except Exception:
         return
 
@@ -148,6 +155,8 @@ class Action(ABC):
     # Class-level deadline (monotonic seconds). 0 = no deadline.
     _deadline: float = 0.0
     _trace_recorder: Optional[ActionTraceRecorder] = None
+    _trace_serial: int = 0
+    _active_trace_serial: int = 0
 
     @classmethod
     def set_deadline(cls, seconds: float) -> None:
@@ -165,10 +174,28 @@ class Action(ABC):
     @classmethod
     def set_trace_recorder(cls, recorder: Optional[ActionTraceRecorder]) -> None:
         cls._trace_recorder = recorder
+        cls._trace_serial = 0
+        cls._active_trace_serial = 0
 
     @classmethod
     def clear_trace_recorder(cls) -> None:
         cls._trace_recorder = None
+        cls._trace_serial = 0
+        cls._active_trace_serial = 0
+
+    @classmethod
+    def begin_trace_action(cls) -> int:
+        cls._trace_serial += 1
+        cls._active_trace_serial = cls._trace_serial
+        return cls._active_trace_serial
+
+    @classmethod
+    def end_trace_action(cls) -> None:
+        cls._active_trace_serial = 0
+
+    @classmethod
+    def getActiveTraceSerial(cls) -> int:
+        return cls._active_trace_serial
 
     @classmethod
     def notify_trace_recorder(cls, action: "Action", data: "Funcdata", change_count: int) -> None:
@@ -517,9 +544,13 @@ class ActionGroup(Action):
             self._state_idx = 0
         while self._state_idx < len(self._list):
             ac = self._list[self._state_idx]
-            res = ac.perform(data)
-            if res >= 0:
-                Action.notify_trace_recorder(ac, data, res)
+            Action.begin_trace_action()
+            try:
+                res = ac.perform(data)
+                if res >= 0:
+                    Action.notify_trace_recorder(ac, data, res)
+            finally:
+                Action.end_trace_action()
             if res > 0:
                 self._count += res
                 if self.checkActionBreak():
@@ -873,12 +904,22 @@ class ActionPool(Action):
 
     @staticmethod
     def _firstTrackedOp(data: Funcdata) -> Optional[PcodeOp]:
+        get_bank = getattr(data, "getOpBank", None)
+        if get_bank is not None:
+            bank = get_bank()
+            if hasattr(bank, "firstOp"):
+                return bank.firstOp()
         for op in data.beginOpAll():
             return op
         return None
 
     @staticmethod
     def _nextTrackedOp(data: Funcdata, seq) -> Optional[PcodeOp]:
+        get_bank = getattr(data, "getOpBank", None)
+        if get_bank is not None:
+            bank = get_bank()
+            if hasattr(bank, "nextAfter"):
+                return bank.nextAfter(seq)
         for op in data.beginOpAll():
             try:
                 if op.getSeqNum() > seq:

@@ -574,6 +574,21 @@ class Lifter:
         max_instructions = 200000
         max_jumptable_targets = 500  # cap total targets to prevent cascading
         total_jt_targets = 0
+        function_limit = entry + size if size > 0 else None
+
+        def in_function_bounds(addr: int) -> bool:
+            if function_limit is None:
+                return True
+            return entry <= addr < function_limit
+
+        def enqueue_target(target_addr: int, *, fallthrough: bool = False) -> None:
+            if not in_function_bounds(target_addr):
+                return
+            if fallthrough:
+                worklist.appendleft(target_addr)
+            else:
+                worklist.append(target_addr)
+
         # C++ FlowInfo processes fall-throughs linearly (immediate) before
         # branch targets (queued in addrlist FIFO).  We simulate this with a
         # deque: fall-throughs → front (left), branch targets → back (right).
@@ -583,6 +598,8 @@ class Lifter:
 
         while worklist:
             addr = worklist.popleft()
+            if not in_function_bounds(addr):
+                continue
             if addr in visited:
                 continue
             if len(insn_list) >= max_instructions:
@@ -599,7 +616,8 @@ class Lifter:
 
             insn_list.append(insn)
             next_addr = addr + insn.length
-            self._insn_fall_throughs[addr] = next_addr
+            if in_function_bounds(next_addr):
+                self._insn_fall_throughs[addr] = next_addr
 
             # Determine control flow from the last pcode op
             has_branch = False
@@ -612,14 +630,14 @@ class Lifter:
                     if native_op.inputs:
                         tgt = native_op.inputs[0]
                         if tgt.space != "const":
-                            worklist.append(tgt.offset)
+                            enqueue_target(tgt.offset)
                 elif opc_val == OpCode.CPUI_CBRANCH.value:
                     # Branch target → back; fall-through → front
                     if native_op.inputs:
                         tgt = native_op.inputs[0]
                         if tgt.space != "const":
-                            worklist.append(tgt.offset)
-                    worklist.appendleft(next_addr)
+                            enqueue_target(tgt.offset)
+                    enqueue_target(next_addr, fallthrough=True)
                 elif opc_val == OpCode.CPUI_BRANCHIND.value:
                     has_branch = True
                     # Try to resolve jump table targets → back
@@ -629,13 +647,13 @@ class Lifter:
                             self._jumptables[addr] = targets
                             total_jt_targets += len(targets)
                             for tgt in targets:
-                                worklist.append(tgt)
+                                enqueue_target(tgt)
                 elif opc_val == OpCode.CPUI_RETURN.value:
                     has_return = True
 
             # If no explicit branch/return, fall through → front
             if not has_branch and not has_return:
-                worklist.appendleft(next_addr)
+                enqueue_target(next_addr, fallthrough=True)
 
         if not insn_list:
             return fd

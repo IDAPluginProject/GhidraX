@@ -722,14 +722,22 @@ class Merge:
         """Trim the input HighVariable of the given PcodeOp so its Cover is tiny."""
         if not hasattr(self._data, 'newOp'):
             return
-        pc = op.getAddr()
+        if op.code() == OpCode.CPUI_MULTIEQUAL:
+            inbl = op.getParent().getIn(slot)
+            pc = inbl.getStop()
+        else:
+            inbl = None
+            pc = op.getAddr()
         vn = op.getIn(slot)
         copyop = self._allocateCopyTrim(vn, pc, op)
         if copyop is None:
             return
         if hasattr(self._data, 'opSetInput'):
             self._data.opSetInput(op, copyop.getOut(), slot)
-        if hasattr(self._data, 'opInsertBefore'):
+        if op.code() == OpCode.CPUI_MULTIEQUAL:
+            if hasattr(self._data, 'opInsertEnd') and inbl is not None:
+                self._data.opInsertEnd(copyop, inbl)
+        elif hasattr(self._data, 'opInsertBefore'):
             self._data.opInsertBefore(copyop, op)
 
     def mergeRangeMust(self, varnodes: list) -> None:

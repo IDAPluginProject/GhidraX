@@ -249,6 +249,7 @@ class TransformVar:
     piece_temp = 4
     constant = 5
     constant_iop = 6
+    constant_spaceid = 7
 
     # Flags
     split_terminator = 1
@@ -312,6 +313,11 @@ class TransformVar:
             iop_space = fd.getArch().getIopSpace()
             indeffect = fd.getOpFromConst(Address(iop_space, self.val))
             self.replacement = fd.newVarnodeIop(indeffect)
+        elif self.type == TransformVar.constant_spaceid:
+            spc = getattr(self, "spaceid", None)
+            if spc is None:
+                raise LowlevelError("Missing spaceid for TransformVar")
+            self.replacement = fd.newVarnodeSpace(spc)
         else:
             raise LowlevelError("Bad TransformVar type")
 
@@ -456,6 +462,13 @@ class TransformManager:
         res = TransformVar()
         res.initialize(TransformVar.constant_iop, None,
                        vn.getSize() * 8, vn.getSize(), vn.getOffset())
+        self.newVarnodes.append(res)
+        return res
+
+    def newSpaceid(self, spc) -> TransformVar:
+        res = TransformVar()
+        res.initialize(TransformVar.constant_spaceid, None, 8 * 8, 8, 0)
+        res.spaceid = spc
         self.newVarnodes.append(res)
         return res
 

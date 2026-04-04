@@ -6,6 +6,7 @@ The PcodeOp and PcodeOpBank classes.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
 from ghidra.core.address import Address, SeqNum
 from ghidra.core.error import LowlevelError
@@ -357,6 +358,22 @@ class PcodeOp:
 
     # --- Navigation ---
 
+    @staticmethod
+    def _get_parent_ops(block) -> list["PcodeOp"] | tuple[()]:
+        if block is None:
+            return ()
+        if hasattr(block, 'getOps'):
+            ops = block.getOps()
+            if ops is not None:
+                return ops
+        if hasattr(block, '_op'):
+            ops = getattr(block, '_op')
+            if ops is not None:
+                return ops
+        if hasattr(block, 'beginOp'):
+            return list(block.beginOp())
+        return ()
+
     def nextOp(self) -> Optional[PcodeOp]:
         """Return the next op in sequence from this op.
 
@@ -366,7 +383,7 @@ class PcodeOp:
         p = self._parent
         if p is None:
             return None
-        ops = p.getOps() if hasattr(p, 'getOps') else []
+        ops = self._get_parent_ops(p)
         found = False
         for op in ops:
             if found:
@@ -381,7 +398,7 @@ class PcodeOp:
             p = p.getOut(0) if hasattr(p, 'getOut') else None
             if p is None:
                 return None
-            ops = p.getOps() if hasattr(p, 'getOps') else []
+            ops = self._get_parent_ops(p)
             for op in ops:
                 return op
             # Empty block, keep going
@@ -396,7 +413,7 @@ class PcodeOp:
         if p is None:
             return None
         prev = None
-        ops = p.getOps() if hasattr(p, 'getOps') else []
+        ops = self._get_parent_ops(p)
         for op in ops:
             if op is self:
                 return prev
@@ -794,6 +811,8 @@ class PcodeOpBank:
         self._returnlist: dict = {} # id(op) -> op
         self._useroplist: dict = {} # id(op) -> op
         self._opcode_idx: dict = {}  # opcode_int -> {id(op): op} for O(1) beginByOpcode
+        self._ordered_optree_cache: Optional[List[tuple[SeqNum, PcodeOp]]] = None
+        self._ordered_optree_keys: Optional[List[SeqNum]] = None
         self._uniqid: int = 0
 
     @staticmethod
@@ -815,6 +834,7 @@ class PcodeOpBank:
         self._returnlist.clear()
         self._useroplist.clear()
         self._opcode_idx.clear()
+        self._invalidateOrderedOptreeCache()
 
     def clearCodeLists(self) -> None:
         """Clear the opcode-specific code lists.
@@ -848,6 +868,7 @@ class PcodeOpBank:
             sq = addr_or_sq
         op = PcodeOp(inputs, sq)
         self._optree[sq] = op
+        self._invalidateOrderedOptreeCache()
         self._deadlist[id(op)] = op  # O(1) insert
         op.setFlag(PcodeOp.dead)
         return op
@@ -858,6 +879,7 @@ class PcodeOpBank:
             raise LowlevelError("Deleting integrated op")
         sq = op.getSeqNum()
         self._optree.pop(sq, None)
+        self._invalidateOrderedOptreeCache()
         oid = id(op)
         self._deadlist.pop(oid, None)   # O(1)
         if self._alivelist.pop(oid, None) is not None:
@@ -924,8 +946,35 @@ class PcodeOpBank:
     def findOp(self, num: SeqNum) -> Optional[PcodeOp]:
         return self._optree.get(num)
 
+    def _invalidateOrderedOptreeCache(self) -> None:
+        self._ordered_optree_cache = None
+        self._ordered_optree_keys = None
+
     def _orderedOptreeItems(self) -> List[tuple[SeqNum, PcodeOp]]:
-        return sorted(self._optree.items(), key=lambda item: item[0])
+        cache = self._ordered_optree_cache
+        if cache is None:
+            cache = sorted(self._optree.items(), key=lambda item: item[0])
+            self._ordered_optree_cache = cache
+            self._ordered_optree_keys = [sq for sq, _ in cache]
+        return cache
+
+    def firstOp(self) -> Optional[PcodeOp]:
+        ordered = self._orderedOptreeItems()
+        if not ordered:
+            return None
+        return ordered[0][1]
+
+    def nextAfter(self, seq: SeqNum) -> Optional[PcodeOp]:
+        ordered = self._orderedOptreeItems()
+        if not ordered:
+            return None
+        keys = self._ordered_optree_keys
+        if keys is None:
+            return None
+        idx = bisect_right(keys, seq)
+        if idx >= len(ordered):
+            return None
+        return ordered[idx][1]
 
     def target(self, addr: Address) -> Optional[PcodeOp]:
         """Find the first executing PcodeOp for a target address."""
@@ -977,10 +1026,11 @@ class PcodeOpBank:
 
     def getNextDead(self, op: PcodeOp) -> Optional[PcodeOp]:
         """Get the next op after the given op in the dead list."""
+        dead_ops = list(self._deadlist.values())
         try:
-            idx = self._deadlist.index(op)
-            if idx + 1 < len(self._deadlist):
-                return self._deadlist[idx + 1]
+            idx = dead_ops.index(op)
+            if idx + 1 < len(dead_ops):
+                return dead_ops[idx + 1]
         except ValueError:
             pass
         return None
@@ -1009,29 +1059,36 @@ class PcodeOpBank:
 
     def insertAfterDead(self, op: PcodeOp, prev: PcodeOp) -> None:
         """Insert the given PcodeOp after a point in the dead list."""
-        try:
-            idx = self._deadlist.index(prev)
-            self._deadlist.insert(idx + 1, op)
-        except ValueError:
-            self._deadlist.append(op)
+        op_id = id(op)
+        items = [(oid, dead_op) for oid, dead_op in self._deadlist.items() if oid != op_id]
+        insert_idx = len(items)
+        for idx, (_, dead_op) in enumerate(items):
+            if dead_op is prev:
+                insert_idx = idx + 1
+                break
+        items.insert(insert_idx, (op_id, op))
+        self._deadlist = dict(items)
 
     def moveSequenceDead(self, firstop: PcodeOp, lastop: PcodeOp, prev: PcodeOp) -> None:
         """Move a sequence of PcodeOps in the dead list to after prev."""
-        # Collect the ops in the sequence
-        try:
-            first_idx = self._deadlist.index(firstop)
-            last_idx = self._deadlist.index(lastop)
-        except ValueError:
+        items = list(self._deadlist.items())
+        first_idx = next((idx for idx, (_, dead_op) in enumerate(items) if dead_op is firstop), -1)
+        last_idx = next((idx for idx, (_, dead_op) in enumerate(items) if dead_op is lastop), -1)
+        if first_idx < 0 or last_idx < first_idx:
             return
-        seq = self._deadlist[first_idx:last_idx + 1]
-        for op in seq:
-            self._deadlist.remove(op)
-        try:
-            insert_idx = self._deadlist.index(prev) + 1
-        except ValueError:
-            insert_idx = len(self._deadlist)
-        for i, op in enumerate(seq):
-            self._deadlist.insert(insert_idx + i, op)
+
+        seq = items[first_idx:last_idx + 1]
+        seq_ids = {oid for oid, _ in seq}
+        remaining = [(oid, dead_op) for oid, dead_op in items if oid not in seq_ids]
+
+        insert_idx = len(remaining)
+        for idx, (_, dead_op) in enumerate(remaining):
+            if dead_op is prev:
+                insert_idx = idx + 1
+                break
+
+        new_items = remaining[:insert_idx] + seq + remaining[insert_idx:]
+        self._deadlist = dict(new_items)
 
     def markIncidentalCopy(self, firstop: PcodeOp, lastop: PcodeOp) -> None:
         """Mark any COPY ops in the given range as incidental."""

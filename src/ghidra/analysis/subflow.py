@@ -2651,7 +2651,10 @@ class LaneDivide(TransformManager):
                 self.opSetOutput(addOp, ptrVn)
                 self.opSetInput(addOp, basePtr, 0)
                 self.opSetInput(addOp, self.newConstant(ptrSize, 0, bytePos), 1)
-            self.opSetInput(ropStore, self.newConstant(spaceConstSize, 0, spaceConst), 0)
+            if spc is not None:
+                self.opSetInput(ropStore, self.newSpaceid(spc), 0)
+            else:
+                self.opSetInput(ropStore, self.newConstant(spaceConstSize, 0, spaceConst), 0)
             self.opSetInput(ropStore, ptrVn, 1)
             self.opSetInput(ropStore, inVars[i], 2)
             bytePos += self._description.getSize(skipLanes + i)
@@ -2679,7 +2682,10 @@ class LaneDivide(TransformManager):
                 self.opSetOutput(addOp, ptrVn)
                 self.opSetInput(addOp, basePtr, 0)
                 self.opSetInput(addOp, self.newConstant(ptrSize, 0, bytePos), 1)
-            self.opSetInput(ropLoad, self.newConstant(spaceConstSize, 0, spaceConst), 0)
+            if spc is not None:
+                self.opSetInput(ropLoad, self.newSpaceid(spc), 0)
+            else:
+                self.opSetInput(ropLoad, self.newConstant(spaceConstSize, 0, spaceConst), 0)
             self.opSetInput(ropLoad, ptrVn, 1)
             self.opSetOutput(ropLoad, outVars[i])
             bytePos += self._description.getSize(skipLanes + i)

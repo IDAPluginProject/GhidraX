@@ -1358,16 +1358,46 @@ class BlockBasic(FlowBlock):
         FlowBlock.negateCondition(self, True)
 
     def isComplex(self) -> bool:
-        st = 1 if self.sizeOut() >= 2 else 0
+        # Mirror BlockBasic::isComplex() in native block.cc:
+        # only count statements that would need explicit printing, not every
+        # temporary-producing op inside the block.
+        statement = 1 if self.sizeOut() >= 2 else 0
+        arch = self._data.getArch() if self._data is not None and hasattr(self._data, "getArch") else None
+        maxref = getattr(arch, "max_implied_ref", 2)
+
         for inst in self._op:
-            if inst.isMarker(): continue
-            vn = inst.getOut()
-            if inst.isCall(): st += 1
-            elif vn is None:
-                if inst.isFlowBreak(): continue
-                st += 1
-            else: st += 1
-            if st > 2: return True
+            if inst.isMarker():
+                continue
+
+            outvn = inst.getOut()
+            if inst.isCall():
+                statement += 1
+            elif outvn is None:
+                if inst.isFlowBreak():
+                    continue
+                statement += 1
+            else:
+                yesstatement = False
+                if outvn.hasNoDescend():
+                    yesstatement = True
+                elif outvn.isAddrTied():
+                    yesstatement = True
+                else:
+                    totalref = 0
+                    for desc in outvn.getDescendants():
+                        if desc.isMarker() or desc.getParent() is not self:
+                            yesstatement = True
+                            break
+                        totalref += 1
+                        if totalref > maxref:
+                            yesstatement = True
+                            break
+                if yesstatement:
+                    statement += 1
+
+            if statement > 2:
+                return True
+
         return False
 
     def unblockedMulti(self, outslot: int) -> bool:

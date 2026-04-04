@@ -7,6 +7,7 @@ Each Rule triggers on a specific localized data-flow configuration.
 
 from __future__ import annotations
 
+import os
 from typing import Optional, List, TYPE_CHECKING
 
 from ghidra.core.opcodes import OpCode
@@ -24,6 +25,59 @@ _VN_HK         = 0x26     # isHeritageKnown: insert|constant|annotation
 _VN_ADDRTIED   = 0x8000   # Varnode.addrtied
 _VN_ADDRFORCE  = 0x100000  # Varnode.addrforce
 _OP_MARKER_FL  = 0x40     # PcodeOp.marker
+_OPC_INDIRECT  = 61       # OpCode.CPUI_INDIRECT
+
+
+def _propcopy_debug_enabled(op) -> bool:
+    spec = os.getenv("PYGHIDRA_PROPCOPY_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _propcopy_debug_log(op, message: str) -> None:
+    if not _propcopy_debug_enabled(op):
+        return
+    path = os.getenv(
+        "PYGHIDRA_PROPCOPY_DEBUG_LOG",
+        "D:/BIGAI/pyghidra/temp/python_propcopy_debug.log",
+    )
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = op.getSeqNum().getOrder()
+    except Exception:
+        seq = "?"
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            prefix = "[propcopy]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
 
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
@@ -52,6 +106,31 @@ class RuleEarlyRemoval(Rule):
     _OP_CALL_OR_INDSRC = 0x404   # PcodeOp.call | PcodeOp.indirect_source
     _VN_AUTOLIVE = 0x40100000   # Varnode.addrforce | Varnode.autolive_hold
 
+    @staticmethod
+    def _isRedundantInputMarker(vn: Varnode) -> bool:
+        """Return True for call-effect markers that only mirror a live input.
+
+        Native `oppool1` will drop these once no descendants remain.  In Python,
+        the marker can still be carrying `addrforce`, which incorrectly blocks
+        `RuleEarlyRemoval` even though the original input varnode already pins
+        the storage location.
+        """
+        if vn is None:
+            return False
+        op = vn._def
+        if op is None or op._opcode_enum != _OPC_INDIRECT:
+            return False
+        if not (op._flags & _OP_MARKER_FL):
+            return False
+        if op.isIndirectCreation() or op.isIndirectStore():
+            return False
+        if not op._inrefs:
+            return False
+        invn = op._inrefs[0]
+        if invn is None or not invn.isInput():
+            return False
+        return invn.getAddr() == vn.getAddr() and invn.getSize() == vn.getSize()
+
     def applyOp(self, op: PcodeOp, data: Funcdata) -> int:
         if op._flags & self._OP_CALL_OR_INDSRC:
             return 0
@@ -61,7 +140,10 @@ class RuleEarlyRemoval(Rule):
         if vn._descend:
             return 0
         if vn._flags & self._VN_AUTOLIVE:
-            return 0
+            if self._isRedundantInputMarker(vn):
+                vn.clearAddrForce()
+            else:
+                return 0
         spc = vn._loc.base
         if spc is not None and spc.doesDeadcode():
             if not data.deadRemovalAllowedSeen(spc):
@@ -615,10 +697,6 @@ class RuleCollapseConstants(Rule):
         out = op._output
         if out is None or not op.isCollapsible():
             return 0
-        opc = op._opcode_enum
-        # Skip ops that must not be constant-folded (matches the current stable behavior)
-        if opc in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 60, 61, 62, 63, 64, 65, 66, 67, 68):
-            return 0
         # Need all constant inputs for binary/unary ops
         inrefs = op._inrefs
         numinput = len(inrefs)
@@ -670,6 +748,15 @@ class RulePropagateCopy(Rule):
             return 0
         op_is_marker = op._flags & _OP_MARKER_FL
         op_out = op.getOut()
+        if op_is_marker:
+            try:
+                out_flags = 0 if op_out is None else op_out._flags
+                _propcopy_debug_log(
+                    op,
+                    f"enter op_flags={op._flags:#x} out_flags={out_flags:#x}",
+                )
+            except Exception:
+                pass
         for i, vn in enumerate(op._inrefs):
             if vn is None or not (vn._flags & _VN_WRITTEN):
                 continue
@@ -685,8 +772,18 @@ class RulePropagateCopy(Rule):
                 continue  # Self-defined
             if op_is_marker:
                 if invn._flags & _VN_CONST:
+                    _propcopy_debug_log(
+                        op,
+                        f"skip slot={i} reason=const vn_flags={vn._flags:#x} "
+                        f"invn_flags={invn._flags:#x} copyop_flags={copyop._flags:#x}",
+                    )
                     continue
                 if vn._flags & _VN_ADDRFORCE:
+                    _propcopy_debug_log(
+                        op,
+                        f"skip slot={i} reason=addrforce vn_flags={vn._flags:#x} "
+                        f"invn_flags={invn._flags:#x} copyop_flags={copyop._flags:#x}",
+                    )
                     continue
                 if (
                     op_out is not None
@@ -694,7 +791,19 @@ class RulePropagateCopy(Rule):
                     and (op_out._flags & _VN_ADDRTIED)
                     and invn.getAddr() != op_out.getAddr()
                 ):
+                    _propcopy_debug_log(
+                        op,
+                        f"skip slot={i} reason=addrtied_mismatch vn_flags={vn._flags:#x} "
+                        f"invn_flags={invn._flags:#x} out_flags={op_out._flags:#x} "
+                        f"copyop_flags={copyop._flags:#x}",
+                    )
                     continue
+                _propcopy_debug_log(
+                    op,
+                    f"fire slot={i} vn_flags={vn._flags:#x} invn_flags={invn._flags:#x} "
+                    f"copyop_flags={copyop._flags:#x} copy_seq={copyop.getSeqNum().getOrder()} "
+                    f"copy_out_flags={(copyop.getOut()._flags if copyop.getOut() is not None else 0):#x}",
+                )
             data.opSetInput(op, invn, i)
             return 1
         return 0
@@ -973,7 +1082,7 @@ class RuleTermOrder(Rule):
 # =========================================================================
 
 class RuleTrivialBool(Rule):
-    """Simplify CBRANCH with constant boolean: always-true or always-false."""
+    """Simplify boolean ops with a constant second input."""
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "trivialbool")
@@ -983,21 +1092,39 @@ class RuleTrivialBool(Rule):
         return RuleTrivialBool(self._basegroup)
 
     def getOpList(self) -> List[int]:
-        return [int(OpCode.CPUI_CBRANCH)]
+        return [
+            int(OpCode.CPUI_BOOL_XOR),
+            int(OpCode.CPUI_BOOL_AND),
+            int(OpCode.CPUI_BOOL_OR),
+        ]
 
     def applyOp(self, op, data) -> int:
-        boolVn = op.getIn(1)
-        if boolVn is None or not boolVn.isConstant(): return 0
-        val = boolVn.getOffset()
-        if op.isBooleanFlip():
-            val = 1 - val
-        if val != 0:
-            # Always taken: convert to unconditional BRANCH
-            data.opSetOpcode(op, OpCode.CPUI_BRANCH)
-            data.opRemoveInput(op, 1)
+        vnconst = op.getIn(1)
+        if vnconst is None or not vnconst.isConstant():
+            return 0
+        val = vnconst.getOffset()
+
+        if op.code() == OpCode.CPUI_BOOL_XOR:
+            vn = op.getIn(0)
+            opc = OpCode.CPUI_BOOL_NEGATE if val == 1 else OpCode.CPUI_COPY
+        elif op.code() == OpCode.CPUI_BOOL_AND:
+            opc = OpCode.CPUI_COPY
+            if val == 1:
+                vn = op.getIn(0)
+            else:
+                vn = data.newConstant(1, 0)
+        elif op.code() == OpCode.CPUI_BOOL_OR:
+            opc = OpCode.CPUI_COPY
+            if val == 1:
+                vn = data.newConstant(1, 1)
+            else:
+                vn = op.getIn(0)
         else:
-            # Never taken: remove the branch
-            data.opDestroy(op)
+            return 0
+
+        data.opRemoveInput(op, 1)
+        data.opSetOpcode(op, opc)
+        data.opSetInput(op, vn, 0)
         return 1
 
 
@@ -1019,39 +1146,34 @@ class RuleIdentityEl(Rule):
 
     def getOpList(self) -> List[int]:
         return [
-            int(OpCode.CPUI_INT_ADD), int(OpCode.CPUI_INT_SUB),
-            int(OpCode.CPUI_INT_XOR), int(OpCode.CPUI_INT_OR),
-            int(OpCode.CPUI_INT_AND), int(OpCode.CPUI_INT_MULT),
+            int(OpCode.CPUI_INT_ADD),
+            int(OpCode.CPUI_INT_XOR),
+            int(OpCode.CPUI_INT_OR),
+            int(OpCode.CPUI_BOOL_XOR),
+            int(OpCode.CPUI_BOOL_OR),
+            int(OpCode.CPUI_INT_MULT),
         ]
 
     def applyOp(self, op, data) -> int:
-        opc = op.code()
-        outvn = op.getOut()
-        if outvn is None:
+        constvn = op.getIn(1)
+        if constvn is None or not constvn.isConstant():
             return 0
-        # Check if input 0 is the identity element (after TermOrder, constants are in slot 1)
-        # But we also need to check slot 0 in case TermOrder hasn't run
-        for slot in [0, 1]:
-            vn = op.getIn(slot)
-            if vn is None or not vn.isConstant(): continue
-            val = vn.getOffset()
-            size = outvn.getSize()
-            mask = calc_mask(size)
-            is_identity = False
-            if opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_INT_SUB, OpCode.CPUI_INT_XOR, OpCode.CPUI_INT_OR):
-                is_identity = (val == 0)
-            elif opc == OpCode.CPUI_INT_AND:
-                is_identity = ((val & mask) == mask)
-            elif opc == OpCode.CPUI_INT_MULT:
-                is_identity = (val == 1)
-            if is_identity:
-                if opc == OpCode.CPUI_INT_SUB and slot == 0:
-                    continue  # 0 - V is not identity
-                other = op.getIn(1 - slot)
-                data.opSetOpcode(op, OpCode.CPUI_COPY)
-                data.opSetInput(op, other, 0)
-                data.opRemoveInput(op, 1)
-                return 1
+        val = constvn.getOffset()
+        opc = op.code()
+        if val == 0 and opc != OpCode.CPUI_INT_MULT:
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opRemoveInput(op, 1)
+            return 1
+        if opc != OpCode.CPUI_INT_MULT:
+            return 0
+        if val == 1:
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opRemoveInput(op, 1)
+            return 1
+        if val == 0:
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opRemoveInput(op, 0)
+            return 1
         return 0
 
 

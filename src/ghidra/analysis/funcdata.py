@@ -14,6 +14,10 @@ from typing import TYPE_CHECKING, Optional, List, Iterator
 
 _PTR_SIZE: int = _struct.calcsize('P')  # sizeof(void*): 8 on 64-bit, 4 on 32-bit
 _FUNC_INSERT_DEBUG = os.environ.get("PYGHIDRA_DEBUG_HERITAGE_ORDER", "")
+_SYNC_DEBUG_ADDRS = os.environ.get("PYGHIDRA_SYNC_DEBUG_ADDRS", "").strip()
+_SYNC_DEBUG_LOG = os.environ.get("PYGHIDRA_SYNC_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_sync_debug.log")
+_PARAMUSE_DEBUG = os.environ.get("PYGHIDRA_PARAMUSE_DEBUG", "").strip()
+_PARAMUSE_DEBUG_LOG = os.environ.get("PYGHIDRA_PARAMUSE_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_paramuse_debug.log")
 
 
 def _debug_insert_event(kind: str, op: PcodeOp, anchor: PcodeOp, bl: Optional[BlockBasic]) -> None:
@@ -34,6 +38,89 @@ def _debug_insert_event(kind: str, op: PcodeOp, anchor: PcodeOp, bl: Optional[Bl
         f"anchor=@0x{anchor_seq.getAddr().getOffset():x} anchor_opc={anchor.code()} block_ops={block_len}",
         file=sys.stderr,
     )
+
+
+def _sync_debug_should_log(vn) -> bool:
+    if not _SYNC_DEBUG_ADDRS:
+        return False
+    try:
+        off = vn.getAddr().getOffset()
+    except Exception:
+        return False
+    if _SYNC_DEBUG_ADDRS == "*":
+        return True
+    for part in _SYNC_DEBUG_ADDRS.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _sync_debug_log(vn, message: str) -> None:
+    if not _sync_debug_should_log(vn):
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        addr = vn.getAddr()
+        spc = addr.getSpace()
+        text = f"{spc.getName() if spc is not None else 'none'}[{addr.getOffset():#x}:{vn.getSize()}]"
+    except Exception:
+        text = "?"
+    try:
+        with open(_SYNC_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            prefix = "[sync]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} vn={text} {message}\n")
+    except Exception:
+        return
+
+
+def _sync_debug_rangelist(rangelist) -> str:
+    try:
+        if rangelist is None or rangelist.empty():
+            return "[]"
+        parts = []
+        for rng in rangelist:
+            space = getattr(rng, "spc", None)
+            space_name = space.getName() if space is not None and hasattr(space, "getName") else "?"
+            parts.append(f"{space_name}[{rng.getFirst():#x},{rng.getLast():#x}]")
+        return "[" + ", ".join(parts) + "]"
+    except Exception:
+        return "<?>"
+
+
+def _paramuse_debug_enabled(opmatch, trial) -> bool:
+    if not _PARAMUSE_DEBUG:
+        return False
+    if _PARAMUSE_DEBUG == "*":
+        return True
+    try:
+        op_part, trial_part = _PARAMUSE_DEBUG.split("/", 1)
+        op_off = opmatch.getAddr().getOffset()
+        trial_off = trial.getAddress().getOffset()
+        return op_off == int(op_part, 0) and trial_off == int(trial_part, 0)
+    except Exception:
+        return False
+
+
+def _paramuse_debug_log(opmatch, trial, message: str) -> None:
+    if not _paramuse_debug_enabled(opmatch, trial):
+        return
+    try:
+        with open(_PARAMUSE_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            fp.write(f"{message}\n")
+    except Exception:
+        return
 
 from ghidra.core.address import Address, SeqNum
 from ghidra.core.opcodes import OpCode
@@ -254,10 +341,18 @@ class Funcdata:
         C++ ref: ``Funcdata::getFirstReturnOp``
         """
         from ghidra.core.opcodes import OpCode
-        for op in self._obank.beginOp(OpCode.CPUI_RETURN):
+        if hasattr(self._obank, 'beginByOpcode'):
+            op_iter = self._obank.beginByOpcode(OpCode.CPUI_RETURN)
+        elif hasattr(self._obank, 'beginAll'):
+            op_iter = self._obank.beginAll()
+        else:
+            op_iter = ()
+        for op in op_iter:
             if op.isDead():
                 continue
             if hasattr(op, 'getHaltType') and op.getHaltType() != 0:
+                continue
+            if op.code() != OpCode.CPUI_RETURN:
                 continue
             return op
         return None
@@ -1413,21 +1508,21 @@ class Funcdata:
         """Create a new PcodeOp at the given address."""
         return self._obank.create(inputs, addr)
 
-    def newOpBefore(self, op: PcodeOp, opc: OpCode, out: Optional[Varnode],
-                    in0: Optional[Varnode], in1: Optional[Varnode] = None) -> PcodeOp:
-        """Create and insert a new PcodeOp before the given op."""
-        numinputs = 1 if in1 is None else 2
+    def newOpBefore(self, op: PcodeOp, opc: OpCode, in0: Varnode,
+                    in1: Varnode, in2: Optional[Varnode] = None) -> PcodeOp:
+        """Create and insert a new PcodeOp before the given op.
+
+        C++ ref: ``Funcdata::newOpBefore``
+        """
+        numinputs = 2 if in2 is None else 3
         newop = self._obank.create(numinputs, op.getAddr())
         self.opSetOpcode(newop, opc)
-        if out is not None:
-            newop.setOutput(out)
-            out.setDef(newop)
-        if in0 is not None:
-            newop.setInput(in0, 0)
-            in0.addDescend(newop)
-        if in1 is not None:
-            newop.setInput(in1, 1)
-            in1.addDescend(newop)
+        self.newUniqueOut(in0.getSize(), newop)
+        self.opSetInput(newop, in0, 0)
+        self.opSetInput(newop, in1, 1)
+        if in2 is not None:
+            self.opSetInput(newop, in2, 2)
+        self.opInsertBefore(newop, op)
         return newop
 
     def opSetOpcode(self, op: PcodeOp, opc: OpCode) -> None:
@@ -1454,32 +1549,29 @@ class Funcdata:
             self.opUnsetOutput(op)
         if vn.getDef() is not None:
             self.opUnsetOutput(vn.getDef())
-        if vn.isFree():
-            vn = self._vbank.setDef(vn, op)
-        else:
-            vn.setDef(op)
+        vn = self._vbank.setDef(vn, op)
         self.setVarnodeProperties(vn)
         op.setOutput(vn)
 
     def opSetInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
         """Set an input of a PcodeOp.
 
-        If *vn* is a free varnode that already has a descendant, clone it
-        first so the "free varnode has one descendant" invariant is preserved.
-        This matches C++ Ghidra behaviour (op.cc: PcodeOp::setInput).
+        Native Ghidra only clones constants that already have a descendant,
+        because constants should generally be single-use unless they are a
+        spacebase.
         """
+        if vn is op.getIn(slot):
+            return
         old = op.getIn(slot)
         if old is not None:
-            old.eraseDescend(op)
-        # Clone free varnodes that already have a descendant
-        if vn.isFree() and not vn.isSpacebase() and len(vn._descend) > 0:
-            from ghidra.core.address import Address
-            addr = vn.getAddr()
-            clone = self.newVarnode(vn.getSize(), addr)
-            clone._flags = vn._flags  # Preserve flags (input, constant, etc.)
+            self.opUnsetInput(op, slot)
+        if vn.isConstant() and not vn.isSpacebase() and len(vn._descend) > 0:
+            clone = self.newConstant(vn.getSize(), vn.getOffset())
+            if hasattr(clone, 'copySymbol'):
+                clone.copySymbol(vn)
             vn = clone
-        op.setInput(vn, slot)
         vn.addDescend(op)
+        op.setInput(vn, slot)
 
     def opSwapInput(self, op: PcodeOp, slot1: int, slot2: int) -> None:
         """Swap two inputs of a PcodeOp."""
@@ -1498,19 +1590,16 @@ class Funcdata:
     def opInsertInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
         """Insert a new input into a PcodeOp at the given slot.
 
-        If *vn* is a free varnode that already has a descendant, clone it
-        first so the "free varnode has one descendant" invariant is preserved.
-        This matches the clone logic in opSetInput.
+        Match native constant-cloning semantics from ``Funcdata::opSetInput``.
         """
-        # Clone free varnodes that already have a descendant
-        if vn.isFree() and not vn.isSpacebase() and len(vn._descend) > 0:
-            addr = vn.getAddr()
-            clone = self.newVarnode(vn.getSize(), addr)
-            clone._flags = vn._flags
+        if vn.isConstant() and not vn.isSpacebase() and len(vn._descend) > 0:
+            clone = self.newConstant(vn.getSize(), vn.getOffset())
+            if hasattr(clone, 'copySymbol'):
+                clone.copySymbol(vn)
             vn = clone
         op.insertInput(slot)
-        op.setInput(vn, slot)
         vn.addDescend(op)
+        op.setInput(vn, slot)
 
     def opSetAllInput(self, op: PcodeOp, inputs: List[Varnode]) -> None:
         """Set all inputs of a PcodeOp at once.
@@ -1534,10 +1623,12 @@ class Funcdata:
         C++ ref: ``Funcdata::opUnsetOutput``
         """
         out = op.getOut()
-        if out is not None:
-            out._def = None
-            out.clearFlags(Varnode.written)
+        if out is None:
+            return
         op.setOutput(None)
+        self._vbank.makeFree(out)
+        if hasattr(out, 'clearCover'):
+            out.clearCover()
 
     def opDestroy(self, op: PcodeOp) -> None:
         """Unlink and retire a PcodeOp, matching native ``Funcdata::opDestroy``.
@@ -1768,6 +1859,8 @@ class Funcdata:
     @staticmethod
     def cseFindInBlock(op, vn, bl, earliest):
         """Find a duplicate calculation of op reading vn in block bl before earliest."""
+        from ghidra.core.expression import functionalEqualityLevel
+
         for desc in vn.getDescendants():
             if desc is op:
                 continue
@@ -1780,15 +1873,10 @@ class Funcdata:
             outvn2 = desc.getOut()
             if outvn2 is None:
                 continue
-            if outvn1 is not None and outvn2 is not None:
-                if op.code() == desc.code() and op.numInput() == desc.numInput():
-                    match = True
-                    for i in range(op.numInput()):
-                        if op.getIn(i) is not desc.getIn(i):
-                            match = False
-                            break
-                    if match:
-                        return desc
+            buf1 = [None, None]
+            buf2 = [None, None]
+            if functionalEqualityLevel(outvn1, outvn2, buf1, buf2) == 0:
+                return desc
         return None
 
     def cseElimination(self, op1, op2):
@@ -2056,55 +2144,15 @@ class Funcdata:
             raise RuntimeError("Cannot (currently) nodesplit block with out flow")
         if b.sizeIn() <= 1:
             raise RuntimeError("Cannot nodesplit block with only 1 in edge")
+        for i in range(b.sizeIn()):
+            if b.getIn(i).isMark():
+                raise RuntimeError("Cannot nodesplit block with redundant in edges")
+            b.setMark()
+        for i in range(b.sizeIn()):
+            b.clearMark()
         bprime = self.nodeSplitBlockEdge(b, inedge)
-        # Clone ops from b into bprime (C++ ref: CloneBlockOps::cloneBlock + patchInputs)
-        origToClone = {}  # map original op -> cloned op
-        cloneList = []    # list of (cloneOp, origOp) pairs
-        if hasattr(b, 'getOpList'):
-            # Phase 1: build skeleton clones with outputs
-            for origop in list(b.getOpList()):
-                if origop.isBranch():
-                    if origop.code() != OpCode.CPUI_BRANCH:
-                        raise RuntimeError("Cannot duplicate 2-way or n-way branch in nodesplit")
-                    continue
-                dup = self.newOp(origop.numInput(), origop.getAddr())
-                self.opSetOpcode(dup, origop.code())
-                # Clone output varnode
-                if origop.getOut() is not None:
-                    opvn = origop.getOut()
-                    self.newVarnodeOut(opvn.getSize(), opvn.getAddr(), dup)
-                origToClone[id(origop)] = dup
-                cloneList.append((dup, origop))
-                self.opInsertEnd(dup, bprime)
-            # Phase 2: patch inputs (C++ ref: CloneBlockOps::patchInputs)
-            for dup, origop in cloneList:
-                if origop.code() == OpCode.CPUI_MULTIEQUAL:
-                    # Convert clone to COPY taking the inedge input
-                    self.opSetOpcode(dup, OpCode.CPUI_COPY)
-                    if hasattr(dup, 'setNumInputs'):
-                        dup.setNumInputs(1)
-                    self.opSetInput(dup, origop.getIn(inedge), 0)
-                    # Remove inedge from original MULTIEQUAL
-                    self.opRemoveInput(origop, inedge)
-                    if origop.numInput() == 1:
-                        self.opSetOpcode(origop, OpCode.CPUI_COPY)
-                else:
-                    for i in range(origop.numInput()):
-                        inv = origop.getIn(i)
-                        if inv.isConstant():
-                            cloneVn = inv  # Constants can be shared
-                        elif hasattr(inv, 'isAnnotation') and inv.isAnnotation():
-                            cloneVn = self.newCodeRef(inv.getAddr())
-                        elif inv.isWritten():
-                            defOp = inv.getDef()
-                            mapped = origToClone.get(id(defOp))
-                            if mapped is not None and mapped.getOut() is not None:
-                                cloneVn = mapped.getOut()
-                            else:
-                                cloneVn = inv
-                        else:
-                            cloneVn = inv
-                        self.opSetInput(dup, cloneVn, i)
+        cloner = CloneBlockOps(self)
+        cloner.cloneBlock(b, bprime, inedge)
         self.structureReset()
 
     def pushBranch(self, bb, slot: int, bbnew) -> None:
@@ -2563,27 +2611,65 @@ class Funcdata:
         marked = {id(invn)}
         res = True
         i = 0
+        _paramuse_debug_log(
+            opmatch,
+            trial,
+            "onlyOpUse:start "
+            f"invn={invn.getAddr().getOffset():#x}:{invn.getSize()} "
+            f"mainFlags={mainFlags:#x} "
+            f"written={int(invn.isWritten())} "
+            f"input={int(invn.isInput())} "
+            f"typelock={int(invn.isTypeLock()) if hasattr(invn, 'isTypeLock') else -1} "
+            f"directwrite={int(invn.isDirectWrite()) if hasattr(invn, 'isDirectWrite') else -1} "
+            f"def={invn.getDef().code().name + '@' + hex(invn.getDef().getAddr().getOffset()) if invn.isWritten() else 'None'}",
+        )
         while i < len(varlist) and res:
             vn, baseFlags = varlist[i]
             i += 1
+            _paramuse_debug_log(
+                opmatch,
+                trial,
+                "onlyOpUse:visit "
+                f"vn={vn.getAddr().getOffset():#x}:{vn.getSize()} "
+                f"baseFlags={baseFlags:#x}",
+            )
             for op in vn.getDescendants():
                 if op is opmatch:
                     trialSlot = trial.getSlot() if hasattr(trial, 'getSlot') else 0
                     if op.getIn(trialSlot) is vn:
+                        _paramuse_debug_log(
+                            opmatch,
+                            trial,
+                            "onlyOpUse:skip-opmatch "
+                            f"op={op.code().name}@{op.getAddr().getOffset():#x}",
+                        )
                         continue
                 curFlags = baseFlags
                 opc = op.code()
+                debug_action = "continue"
                 if opc in (OpCode.CPUI_BRANCH, OpCode.CPUI_CBRANCH,
                            OpCode.CPUI_BRANCHIND, OpCode.CPUI_LOAD, OpCode.CPUI_STORE):
+                    debug_action = "fail-memory-use"
                     res = False
                     break
                 elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+                    debug_action = "call-doubleuse"
                     if self.checkCallDoubleUse(opmatch, op, vn, curFlags, trial):
+                        _paramuse_debug_log(
+                            opmatch,
+                            trial,
+                            "onlyOpUse:call-ok "
+                            f"op={op.code().name}@{op.getAddr().getOffset():#x} "
+                            f"vn={vn.getAddr().getOffset():#x}:{vn.getSize()} "
+                            f"flags={curFlags:#x}",
+                        )
                         continue
+                    debug_action = "fail-call"
                     res = False
                     break
                 elif opc == OpCode.CPUI_INDIRECT:
                     curFlags |= TraverseNode.indirectalt
+                    debug_action = "mark-indirectalt"
                 elif opc == OpCode.CPUI_COPY:
                     outvn = op.getOut()
                     if outvn is not None and hasattr(outvn, 'getSpace'):
@@ -2591,35 +2677,91 @@ class Funcdata:
                             if not (hasattr(op, 'isIncidentalCopy') and op.isIncidentalCopy()):
                                 if not (hasattr(vn, 'isIncidentalCopy') and vn.isIncidentalCopy()):
                                     curFlags |= TraverseNode.actionalt
+                                    debug_action = "mark-actionalt"
                 elif opc == OpCode.CPUI_RETURN:
                     if opmatch.code() == OpCode.CPUI_RETURN:
                         trialSlot = trial.getSlot() if hasattr(trial, 'getSlot') else 0
                         if op.getIn(trialSlot) is vn:
+                            _paramuse_debug_log(
+                                opmatch,
+                                trial,
+                                "onlyOpUse:return-same-slot "
+                                f"op={op.getAddr().getOffset():#x}",
+                            )
                             continue
+                    elif self.getActiveOutput() is not None:
+                        if op.getIn(0) is not vn:
+                            if not TraverseNode.isAlternatePathValid(vn, curFlags):
+                                _paramuse_debug_log(
+                                    opmatch,
+                                    trial,
+                                    "onlyOpUse:return-ignore "
+                                    f"op={op.getAddr().getOffset():#x} "
+                                    f"flags={curFlags:#x}",
+                                )
+                                continue
+                    debug_action = "fail-return"
                     res = False
                     break
                 elif opc in (OpCode.CPUI_MULTIEQUAL, OpCode.CPUI_INT_SEXT,
                              OpCode.CPUI_INT_ZEXT, OpCode.CPUI_CAST):
-                    pass  # Follow through
+                    debug_action = "pass-through"
                 elif opc == OpCode.CPUI_PIECE:
                     if op.getIn(0) is vn:
                         if (curFlags & TraverseNode.lsb_truncated) != 0:
+                            _paramuse_debug_log(
+                                opmatch,
+                                trial,
+                                "onlyOpUse:piece-ignore "
+                                f"op={op.getAddr().getOffset():#x} "
+                                f"flags={curFlags:#x}",
+                            )
                             continue
                         curFlags |= TraverseNode.concat_high
+                        debug_action = "mark-concat-high"
                 elif opc == OpCode.CPUI_SUBPIECE:
                     if op.getIn(1).getOffset() != 0:
                         if (curFlags & TraverseNode.concat_high) == 0:
                             curFlags |= TraverseNode.lsb_truncated
+                            debug_action = "mark-lsb-truncated"
                 else:
                     curFlags |= TraverseNode.actionalt
+                    debug_action = "mark-actionalt-default"
                 subvn = op.getOut()
+                _paramuse_debug_log(
+                    opmatch,
+                    trial,
+                    "onlyOpUse:desc "
+                    f"op={opc.name}@{op.getAddr().getOffset():#x} "
+                    f"vn={vn.getAddr().getOffset():#x}:{vn.getSize()} "
+                    f"action={debug_action} flags={curFlags:#x} "
+                    f"out={subvn.getAddr().getOffset():#x}:{subvn.getSize()}" if subvn is not None else
+                    "onlyOpUse:desc "
+                    f"op={opc.name}@{op.getAddr().getOffset():#x} "
+                    f"vn={vn.getAddr().getOffset():#x}:{vn.getSize()} "
+                    f"action={debug_action} flags={curFlags:#x} out=None",
+                )
                 if subvn is not None:
                     if hasattr(subvn, 'isPersist') and subvn.isPersist():
+                        _paramuse_debug_log(
+                            opmatch,
+                            trial,
+                            "onlyOpUse:fail-persist "
+                            f"out={subvn.getAddr().getOffset():#x}:{subvn.getSize()}",
+                        )
                         res = False
                         break
                     if id(subvn) not in marked:
                         varlist.append((subvn, curFlags))
                         marked.add(id(subvn))
+                        _paramuse_debug_log(
+                            opmatch,
+                            trial,
+                            "onlyOpUse:enqueue "
+                            f"out={subvn.getAddr().getOffset():#x}:{subvn.getSize()} "
+                            f"flags={curFlags:#x}",
+                        )
+        _paramuse_debug_log(opmatch, trial, f"onlyOpUse:end result={int(res)}")
         return res
 
     def ancestorOpUse(self, maxlevel: int, invn, op, trial, offset: int, mainFlags: int) -> bool:
@@ -2630,24 +2772,52 @@ class Funcdata:
 
         C++ ref: ``Funcdata::ancestorOpUse``
         """
+        def _alog(message: str) -> None:
+            _paramuse_debug_log(op, trial, message)
+
+        _alog(
+            "ancestorOpUse:enter "
+            f"maxlevel={maxlevel} invn={invn.getAddr().getOffset():#x}:{invn.getSize()} "
+            f"written={int(invn.isWritten())} input={int(invn.isInput())} "
+            f"offset={offset} mainFlags={mainFlags:#x} "
+            f"def={invn.getDef().code().name + '@' + hex(invn.getDef().getAddr().getOffset()) if invn.isWritten() else 'None'}"
+        )
         if maxlevel == 0:
+            _paramuse_debug_log(op, trial, f"ancestorOpUse:maxlevel0 invn={invn.getAddr().getOffset():#x}:{invn.getSize()}")
             return False
         if not invn.isWritten():
+            _paramuse_debug_log(
+                op,
+                trial,
+                "ancestorOpUse:base "
+                f"invn={invn.getAddr().getOffset():#x}:{invn.getSize()} "
+                f"input={int(invn.isInput())} "
+                f"typelock={int(invn.isTypeLock()) if hasattr(invn, 'isTypeLock') else -1} "
+                f"mainFlags={mainFlags:#x}",
+            )
             if not invn.isInput():
+                _alog("ancestorOpUse:return base-not-input=0")
                 return False
             if not invn.isTypeLock():
+                _alog("ancestorOpUse:return base-not-typelock=0")
                 return False
-            return self.onlyOpUse(invn, op, trial, mainFlags)
+            res = self.onlyOpUse(invn, op, trial, mainFlags)
+            _alog(f"ancestorOpUse:return base-onlyOpUse={int(res)}")
+            return res
 
         defop = invn.getDef()
         opc = defop.code()
         if opc == OpCode.CPUI_INDIRECT:
             if hasattr(defop, 'isIndirectCreation') and defop.isIndirectCreation():
+                _alog("ancestorOpUse:return indirect-creation=0")
                 return False
             from ghidra.analysis.ancestor import TraverseNode
-            return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags | TraverseNode.indirect)
+            res = self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags | TraverseNode.indirect)
+            _alog(f"ancestorOpUse:return indirect-recurse={int(res)}")
+            return res
         elif opc == OpCode.CPUI_MULTIEQUAL:
             if hasattr(defop, 'isMark') and defop.isMark():
+                _alog("ancestorOpUse:return multiequal-marked=0")
                 return False
             if hasattr(defop, 'setMark'):
                 defop.setMark()
@@ -2655,21 +2825,30 @@ class Funcdata:
                 if self.ancestorOpUse(maxlevel - 1, defop.getIn(j), op, trial, offset, mainFlags):
                     if hasattr(defop, 'clearMark'):
                         defop.clearMark()
+                    _alog(f"ancestorOpUse:return multiequal-input{j}=1")
                     return True
             if hasattr(defop, 'clearMark'):
                 defop.clearMark()
+            _alog("ancestorOpUse:return multiequal=0")
             return False
         elif opc == OpCode.CPUI_COPY:
             inSpace = invn.getSpace().getType() if hasattr(invn, 'getSpace') and invn.getSpace() is not None else IPTR_INTERNAL
             isIncidental = (hasattr(defop, 'isIncidentalCopy') and defop.isIncidentalCopy()) or \
                            (hasattr(defop.getIn(0), 'isIncidentalCopy') and defop.getIn(0).isIncidentalCopy())
             if inSpace == IPTR_INTERNAL or isIncidental:
-                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags)
+                res = self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset, mainFlags)
+                _alog(f"ancestorOpUse:return copy-recurse={int(res)}")
+                return res
         elif opc == OpCode.CPUI_PIECE:
             if offset == 0:
-                return self.ancestorOpUse(maxlevel - 1, defop.getIn(1), op, trial, 0, mainFlags)
+                res = self.ancestorOpUse(maxlevel - 1, defop.getIn(1), op, trial, 0, mainFlags)
+                _alog(f"ancestorOpUse:return piece-lo={int(res)}")
+                return res
             if offset == defop.getIn(1).getSize():
-                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, 0, mainFlags)
+                res = self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, 0, mainFlags)
+                _alog(f"ancestorOpUse:return piece-hi={int(res)}")
+                return res
+            _alog("ancestorOpUse:return piece-miss=0")
             return False
         elif opc == OpCode.CPUI_SUBPIECE:
             newOff = defop.getIn(1).getOffset()
@@ -2683,11 +2862,17 @@ class Funcdata:
             inSpace = invn.getSpace().getType() if hasattr(invn, 'getSpace') and invn.getSpace() is not None else IPTR_INTERNAL
             isIncidental = (hasattr(defop, 'isIncidentalCopy') and defop.isIncidentalCopy()) or \
                            (hasattr(defop.getIn(0), 'isIncidentalCopy') and defop.getIn(0).isIncidentalCopy())
-            if inSpace == IPTR_INTERNAL or isIncidental:
-                return self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset + newOff, mainFlags)
+            overlapOffset = invn.overlap(defop.getIn(0)) if hasattr(invn, 'overlap') else -1
+            if inSpace == IPTR_INTERNAL or isIncidental or overlapOffset == newOff:
+                res = self.ancestorOpUse(maxlevel - 1, defop.getIn(0), op, trial, offset + newOff, mainFlags)
+                _alog(f"ancestorOpUse:return subpiece-recurse={int(res)}")
+                return res
         elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
+            _alog("ancestorOpUse:return call-def=0")
             return False
-        return self.onlyOpUse(invn, op, trial, mainFlags)
+        res = self.onlyOpUse(invn, op, trial, mainFlags)
+        _alog(f"ancestorOpUse:return fallback-onlyOpUse={int(res)}")
+        return res
 
     def checkCallDoubleUse(self, opmatch, op, vn, fl, trial) -> bool:
         """Check if a Varnode is legitimately used in two different call sites.
@@ -2892,7 +3077,7 @@ class Funcdata:
 
     def beginLaneAccess(self):
         """Beginning iterator over laned accesses."""
-        return iter(self._lanedMap) if hasattr(self, '_lanedMap') else iter({})
+        return iter(self._lanedMap.items()) if hasattr(self, '_lanedMap') else iter(())
 
     def endLaneAccess(self):
         """Ending iterator over laned accesses."""
@@ -3155,10 +3340,10 @@ class Funcdata:
                         if cur is not None:
                             cur.reset(partial)
                             cur.perform(partial)
-                    if oldactname is not None and hasattr(self._glb.allacts, 'setCurrent'):
+                    if oldactname and hasattr(self._glb.allacts, 'setCurrent'):
                         self._glb.allacts.setCurrent(oldactname)
                 except Exception as err:
-                    if oldactname is not None and hasattr(self._glb.allacts, 'setCurrent'):
+                    if oldactname and hasattr(self._glb.allacts, 'setCurrent'):
                         self._glb.allacts.setCurrent(oldactname)
                     self.warning(str(err), op.getAddr())
                     return 'fail_normal'
@@ -3207,7 +3392,16 @@ class Funcdata:
 
         C++ ref: ``Funcdata::opInsertBegin``
         """
-        bl.insertOp(op, 0)
+        from ghidra.core.opcodes import OpCode
+
+        idx = 0
+        if op.code() != OpCode.CPUI_MULTIEQUAL:
+            ops = bl.getOpList()
+            while idx < len(ops):
+                if ops[idx].code() != OpCode.CPUI_MULTIEQUAL:
+                    break
+                idx += 1
+        bl.insertOp(op, idx)
         self.opMarkAlive(op)
 
     def opInsertEnd(self, op: PcodeOp, bl: BlockBasic) -> None:
@@ -3223,12 +3417,31 @@ class Funcdata:
 
         C++ ref: ``Funcdata::opInsertAfter``
         """
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.space import IPTR_IOP
+        from ghidra.ir.op import PcodeOp
+
+        if prev.isMarker() and prev.code() == OpCode.CPUI_INDIRECT:
+            invn = prev.getIn(1)
+            if invn is not None:
+                spc = invn.getSpace()
+                if spc is not None and spc.getType() == IPTR_IOP:
+                    targ_op = PcodeOp.getOpFromConst(invn.getAddr())
+                    if targ_op is not None and not targ_op.isDead():
+                        prev = targ_op
+
         bl = prev.getParent()
         if bl is not None:
             ops = bl.getOpList()
             try:
                 idx = ops.index(prev)
-                bl.insertOp(op, idx + 1)
+                idx += 1
+                if op.code() != OpCode.CPUI_MULTIEQUAL:
+                    while idx < len(ops):
+                        if ops[idx].code() != OpCode.CPUI_MULTIEQUAL:
+                            break
+                        idx += 1
+                bl.insertOp(op, idx)
                 _debug_insert_event("opInsertAfter", op, prev, bl)
             except ValueError:
                 bl.addOp(op)
@@ -3315,12 +3528,55 @@ class Funcdata:
 
         C++ ref: ``Funcdata::truncatedFlow``
         """
-        # Truncated flow re-uses an existing FlowInfo to generate ops/blocks
-        # for a subset of the function body. Minimal implementation.
-        if flow is not None and hasattr(flow, 'generateOps'):
-            flow.generateOps()
-        if flow is not None and hasattr(flow, 'generateBlocks'):
-            flow.generateBlocks()
+        from copy import copy
+
+        from ghidra.analysis.flow import FlowInfo
+        from ghidra.core.error import LowlevelError
+        from ghidra.core.space import IPTR_FSPEC
+
+        if not self._obank.empty():
+            raise LowlevelError("Trying to do truncated flow on pre-existing pcode")
+
+        for op in list(fd._obank.getDeadList()):
+            self.cloneOp(op, op.getSeqNum())
+        self._obank.setUniqId(fd._obank.getUniqId())
+
+        for oldspec in list(fd._qlst):
+            newop = self.findOp(oldspec.getOp().getSeqNum())
+            newspec = oldspec.clone(newop)
+            invn0 = newop.getIn(0)
+            if invn0 is not None and invn0.getSpace().getType() == IPTR_FSPEC:
+                newvn0 = self.newVarnodeCallSpecs(newspec)
+                self.opSetInput(newop, newvn0, 0)
+                self.deleteVarnode(invn0)
+            self.addCallSpecs(newspec)
+
+        for oldjt in list(fd._jumpvec):
+            indop = oldjt.getIndirectOp()
+            if indop is None:
+                continue
+            newop = self.findOp(indop.getSeqNum())
+            if newop is None:
+                raise LowlevelError("Could not trace jumptable across partial clone")
+
+            jtclone = copy(oldjt)
+            jtclone.addresstable = list(oldjt.addresstable)
+            jtclone.label = list(oldjt.label)
+            jtclone.loadpoints = list(oldjt.loadpoints)
+            jtclone.block2addr = list(oldjt.block2addr)
+            if oldjt.jmodel is not None and hasattr(oldjt.jmodel, "clone"):
+                jtclone.jmodel = oldjt.jmodel.clone(jtclone)
+            if oldjt.origmodel is not None and hasattr(oldjt.origmodel, "clone"):
+                jtclone.origmodel = oldjt.origmodel.clone(jtclone)
+            jtclone.setIndirectOp(newop)
+            self._jumpvec.append(jtclone)
+
+        partialflow = FlowInfo(self, self._obank, self._bblocks, self._qlst, flow)
+        if partialflow.hasInject():
+            partialflow.injectPcode()
+        partialflow.clearFlags(~FlowInfo.possible_unreachable)
+        partialflow.generateBlocks()
+        self._flags |= Funcdata.blocks_generated
 
     def inlineFlow(self, inlinefd, flow, callop) -> int:
         """In-line the p-code of another function into \b this function.
@@ -3542,7 +3798,7 @@ class Funcdata:
         """
         newop = self._obank.create(op.numInput(), seq)
         self.opSetOpcode(newop, op.code())
-        fl = op.flags & (PcodeOp.startmark | PcodeOp.startbasic)
+        fl = getattr(op, "_flags", 0) & (PcodeOp.startmark | PcodeOp.startbasic)
         if fl != 0:
             newop.setFlag(fl)
         if op.getOut() is not None:
@@ -3625,6 +3881,8 @@ class Funcdata:
 
     def opUninsert(self, op) -> None:
         """Remove the given PcodeOp from its basic block without destroying it."""
+        if hasattr(self._obank, 'markDead'):
+            self._obank.markDead(op)
         bl = op.getParent()
         if bl is not None and hasattr(bl, 'removeOp'):
             bl.removeOp(op)
@@ -4317,16 +4575,42 @@ class Funcdata:
                             ct = None
                 else:
                     fl &= ~(Varnode.typelock | Varnode.namelock)
+                _sync_debug_log(
+                    vnexemplar,
+                    "path=entry "
+                    f"usepoint={vnexemplar.getUsePoint(self) if hasattr(vnexemplar, 'getUsePoint') else Address()} "
+                    f"entry_addr={entry.getAddr() if hasattr(entry, 'getAddr') else '?'} "
+                    f"entry_size={entry.getSize() if hasattr(entry, 'getSize') else '?'} "
+                    f"entry_sym={getattr(entry.getSymbol(), 'name', '?') if hasattr(entry, 'getSymbol') else '?'} "
+                    f"entry_addrtied={int(entry.isAddrTied()) if hasattr(entry, 'isAddrTied') else -1} "
+                    f"entry_use={_sync_debug_rangelist(entry.getUseLimit()) if hasattr(entry, 'getUseLimit') else '<?>'} "
+                    f"fl={fl:#x} unmappedAliasCheck={int(unmappedAliasCheck)}",
+                )
             else:
+                in_scope = False
+                is_unmapped_unaliased = False
                 if hasattr(lm, 'inScope') and lm.inScope(vnexemplar.getAddr(), vnexemplar.getSize(),
                         vnexemplar.getUsePoint(self) if hasattr(vnexemplar, 'getUsePoint') else Address()):
+                    in_scope = True
                     fl = Varnode.mapped | Varnode.addrtied
                 elif unmappedAliasCheck and hasattr(lm, 'isUnmappedUnaliased'):
-                    fl = Varnode.nolocalalias if lm.isUnmappedUnaliased(vnexemplar) else 0
+                    is_unmapped_unaliased = lm.isUnmappedUnaliased(vnexemplar)
+                    fl = Varnode.nolocalalias if is_unmapped_unaliased else 0
                 else:
                     fl = 0
+                _sync_debug_log(
+                    vnexemplar,
+                    "path=no_entry "
+                    f"usepoint={vnexemplar.getUsePoint(self) if hasattr(vnexemplar, 'getUsePoint') else Address()} "
+                    f"in_scope={int(in_scope)} "
+                    f"is_unmapped_unaliased={int(is_unmapped_unaliased)} "
+                    f"fl={fl:#x} unmappedAliasCheck={int(unmappedAliasCheck)}",
+                )
             if self.syncVarnodesWithSymbol(group, fl, ct):
                 updateoccurred = True
+                _sync_debug_log(vnexemplar, f"sync_applied=1 post_flags={vnexemplar.getFlags():#x}")
+            else:
+                _sync_debug_log(vnexemplar, f"sync_applied=0 post_flags={vnexemplar.getFlags():#x}")
             i = j
         return updateoccurred
 
@@ -4629,7 +4913,7 @@ class Funcdata:
             return
         if not hasattr(self, '_lanedMap'):
             self._lanedMap = {}
-        key = (addr.getSpace(), addr.getOffset(), sz)
+        key = VarnodeData(addr.getSpace(), addr.getOffset(), sz)
         self._lanedMap[key] = lanedReg
 
     def recoverJumpTable(self, op, flow=None, mode_ref=None):
@@ -4663,10 +4947,9 @@ class Funcdata:
                 if not (hasattr(jt, 'isPartial') and jt.isPartial()):
                     return jt  # Previously calculated (NOT override, NOT incomplete)
             # Recover based on override / partial information
-            partial = Funcdata(self._name + "_jtpartial", self._glb,
-                               self._baseaddr, self._funcp, self._size) \
-                if hasattr(self, '_name') else Funcdata("_jtpartial", self._glb,
-                                                         self._baseaddr, self._funcp, 0)
+            partial_name = (self._name + "_jtpartial") if hasattr(self, "_name") else "_jtpartial"
+            partial = Funcdata(partial_name, partial_name, None, self._baseaddr, None, self._size if hasattr(self, "_size") else 0)
+            partial.setArch(self._glb)
             mode_ref[0] = self.stageJumpTable(partial, jt, op, flow)
             if mode_ref[0] != 'success':
                 return None
@@ -4688,10 +4971,9 @@ class Funcdata:
             return None
 
         trialjt = JumpTable(self._glb)
-        partial = Funcdata(self._name + "_jtpartial", self._glb,
-                           self._baseaddr, self._funcp, self._size) \
-            if hasattr(self, '_name') else Funcdata("_jtpartial", self._glb,
-                                                     self._baseaddr, self._funcp, 0)
+        partial_name = (self._name + "_jtpartial") if hasattr(self, "_name") else "_jtpartial"
+        partial = Funcdata(partial_name, partial_name, None, self._baseaddr, None, self._size if hasattr(self, "_size") else 0)
+        partial.setArch(self._glb)
         mode_ref[0] = self.stageJumpTable(partial, trialjt, op, flow)
         if mode_ref[0] != 'success':
             return None
@@ -5189,17 +5471,18 @@ class CloneBlockOps:
             return None
         dup = self.data.newOp(op.numInput(), op.getAddr())
         self.data.opSetOpcode(dup, op.code())
-        fl = op.flags & (PcodeOp.startbasic | PcodeOp.nocollapse | PcodeOp.startmark |
+        op_flags = getattr(op, "flags", getattr(op, "_flags", 0))
+        fl = op_flags & (PcodeOp.startbasic | PcodeOp.nocollapse | PcodeOp.startmark |
                          PcodeOp.nonprinting | PcodeOp.halt | PcodeOp.badinstruction |
                          PcodeOp.unimplemented | PcodeOp.noreturn | PcodeOp.missing |
                          PcodeOp.indirect_creation | PcodeOp.indirect_store |
                          PcodeOp.no_indirect_collapse | PcodeOp.calculated_bool | PcodeOp.ptrflow)
         dup.setFlag(fl)
-        if hasattr(op, 'addlflags') and hasattr(dup, 'setAdditionalFlag'):
-            afl = op.addlflags & (PcodeOp.special_prop | PcodeOp.special_print |
-                                  PcodeOp.incidental_copy | PcodeOp.is_cpool_transformed |
-                                  PcodeOp.stop_type_propagation | PcodeOp.store_unmapped)
-            dup.setAdditionalFlag(afl)
+        op_addlflags = getattr(op, "addlflags", getattr(op, "_addlflags", 0))
+        afl = op_addlflags & (PcodeOp.special_prop | PcodeOp.special_print |
+                              PcodeOp.incidental_copy | PcodeOp.is_cpool_transformed |
+                              PcodeOp.stop_type_propagation | PcodeOp.store_unmapped)
+        dup.setAdditionalFlag(afl)
         self.cloneList.append((dup, op))
         self.origToClone[id(op)] = dup
         return dup
@@ -5220,9 +5503,9 @@ class CloneBlockOps:
                    Varnode.indirect_creation | Varnode.return_address |
                    Varnode.precislo | Varnode.precishi | Varnode.incidental_copy)
         newvn.setFlags(vflags)
-        if hasattr(opvn, 'addlflags') and hasattr(newvn, 'addlflags'):
-            aflags = opvn.addlflags & (Varnode.writemask | Varnode.ptrflow | Varnode.stack_store)
-            newvn.addlflags |= aflags
+        opvn_addlflags = getattr(opvn, "addlflags", getattr(opvn, "_addlflags", 0))
+        aflags = opvn_addlflags & (Varnode.writemask | Varnode.ptrflow | Varnode.stack_store)
+        newvn._addlflags |= aflags
 
     def patchInputs(self, inedge: int) -> None:
         """Set the input Varnodes of all cloned ops.

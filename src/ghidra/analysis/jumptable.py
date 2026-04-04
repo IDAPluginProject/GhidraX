@@ -310,10 +310,11 @@ class GuardRecord:
         self.cbranch = cbranch
         self.readOp = readOp
         self.vn = vn
-        self.baseVn = vn
         self.indpath: int = path
-        self.bitsPreserved: int = 0
-        self.range = rng
+        self.range = rng._makeCopy() if rng is not None and hasattr(rng, "_makeCopy") else rng
+        bits_preserved_out: list = []
+        self.baseVn = self.quasiCopy(vn, bits_preserved_out) if vn is not None else None
+        self.bitsPreserved: int = bits_preserved_out[0] if bits_preserved_out else 0
         self.unrolled: bool = unrolled
 
     def isUnrolled(self) -> bool:
@@ -566,6 +567,27 @@ class JumpTable:
     fail_callother = 4
 
     def __init__(self, glb=None, addr: Optional[Address] = None) -> None:
+        if isinstance(glb, JumpTable) and addr is None:
+            op2 = glb
+            self.glb = op2.glb
+            self.opaddress = op2.opaddress
+            self.indirect = None
+            self.jmodel = op2.jmodel.clone(self) if op2.jmodel is not None and hasattr(op2.jmodel, "clone") else None
+            self.origmodel = None
+            self.addresstable = list(op2.addresstable)
+            self.label = []
+            self.loadpoints = list(op2.loadpoints)
+            self.defaultBlock = -1
+            self.lastBlock = op2.lastBlock
+            self.switchVarConsume = 0xFFFFFFFFFFFFFFFF
+            self.maxaddsub = op2.maxaddsub
+            self.maxleftright = op2.maxleftright
+            self.maxext = op2.maxext
+            self.partialTable = op2.partialTable
+            self.collectloads = op2.collectloads
+            self.defaultIsFolded = False
+            self.block2addr = []
+            return
         self.glb = glb
         self.opaddress: Address = addr if addr is not None else Address()
         self.indirect = None  # PcodeOp
@@ -694,13 +716,17 @@ class JumpTable:
 
     def recoverAddresses(self, fd) -> None:
         """Recover the raw jump-table addresses."""
+        from ghidra.core.error import LowlevelError
+
+        self.recoverModel(fd)
         if self.jmodel is None:
-            self.jmodel = JumpModelTrivial(self)
-        if not self.jmodel.recoverModel(fd, self.indirect, 0, 1024):
-            return
+            raise LowlevelError(f"Could not recover jumptable at {self.opaddress}. Too many branches")
+        if self.jmodel.getTableSize() == 0:
+            raise LowlevelError(f"Jumptable with 0 entries at {self.opaddress}")
         self.addresstable.clear()
         self.jmodel.buildAddresses(fd, self.indirect, self.addresstable,
                                    self.loadpoints if self.collectloads else None)
+        self.sanityCheck(fd)
 
     def recoverLabels(self, fd) -> None:
         """Recover case labels for this jump-table."""
@@ -789,9 +815,33 @@ class JumpTable:
 
     def recoverModel(self, fd) -> bool:
         """Recover the model for this jump-table."""
-        if self.jmodel is None:
-            self.jmodel = JumpModelTrivial(self)
-        return self.jmodel.recoverModel(fd, self.indirect, 0, 1024)
+        max_jumptable_size = (
+            self.glb.max_jumptable_size
+            if self.glb is not None and hasattr(self.glb, "max_jumptable_size")
+            else 1024
+        )
+        matchsize = len(self.addresstable)
+
+        if self.jmodel is not None:
+            if self.jmodel.isOverride():
+                return self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size)
+            self.jmodel = None
+
+        # JumpAssisted is not implemented in Python yet. Follow the native
+        # fallback order for the common switch models.
+        jbasic = JumpBasic(self)
+        self.jmodel = jbasic
+        if self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size):
+            return True
+
+        jbasic2 = JumpBasic2(self)
+        jbasic2.initializeStart(jbasic.pathMeld)
+        self.jmodel = jbasic2
+        if self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size):
+            return True
+
+        self.jmodel = None
+        return False
 
     def sanityCheck(self, fd) -> bool:
         """Verify the recovered jump-table."""
@@ -1102,25 +1152,124 @@ class EmulateFunction:
     """A light-weight emulator to calculate switch targets from switch variables."""
 
     def __init__(self, fd=None) -> None:
+        from ghidra.emulate.emulateutil import EmulatePcodeOp
+
+        class _JumpTableEmulator(EmulatePcodeOp):
+            def __init__(self, outer, fd):
+                super().__init__(fd.getArch() if fd is not None and hasattr(fd, "getArch") else None)
+                self._outer = outer
+
+            def getVarnodeValue(self, vn) -> int:
+                return self._outer.getVarnodeValue(vn)
+
+            def setVarnodeValue(self, vn, val: int) -> None:
+                self._outer.setVarnodeValue(vn, val)
+
+            def fallthruOp(self) -> None:
+                self._outer._lastOp = self.currentOp
+
+            def executeBranch(self) -> None:
+                from ghidra.core.error import LowlevelError
+
+                raise LowlevelError("Branch encountered emulating jumptable calculation")
+
+            def executeBranchind(self) -> None:
+                from ghidra.core.error import LowlevelError
+
+                raise LowlevelError("Indirect branch encountered emulating jumptable calculation")
+
+            def executeCall(self) -> None:
+                self.fallthruOp()
+
+            def executeCallind(self) -> None:
+                self.fallthruOp()
+
+            def executeCallother(self) -> None:
+                self.fallthruOp()
+
+            def executeLoad(self) -> None:
+                from ghidra.core.address import Address
+                from ghidra.core.space import AddrSpace as _AddrSpace
+
+                off = self.getVarnodeValue(self.currentOp.getIn(1))
+                spc = self.currentOp.getIn(0).getSpaceFromConst()
+                off = _AddrSpace.addressToByte(off, spc.getWordSize())
+                sz = self.currentOp.getOut().getSize()
+                if self._outer._loadpoints is not None:
+                    self._outer._loadpoints.append(LoadTable(Address(spc, off), sz))
+                res = self.getLoadImageValue(spc, off, sz)
+                self.setVarnodeValue(self.currentOp.getOut(), res)
+
         self._fd = fd
         self._varnodeMap: dict = {}
         self._loadpoints = None
+        self._lastOp = None
+        self._emu = _JumpTableEmulator(self, fd) if fd is not None else None
 
     def setLoadCollect(self, val) -> None:
         self._loadpoints = val
 
     def getVarnodeValue(self, vn) -> int:
-        return self._varnodeMap.get(id(vn), 0)
+        if vn is not None and hasattr(vn, "isConstant") and vn.isConstant():
+            return vn.getOffset()
+        key = id(vn)
+        if key in self._varnodeMap:
+            return self._varnodeMap[key]
+        if self._emu is not None and vn is not None:
+            return self._emu.getLoadImageValue(vn.getSpace(), vn.getOffset(), vn.getSize())
+        return 0
 
     def setVarnodeValue(self, vn, val: int) -> None:
         self._varnodeMap[id(vn)] = val
 
+    def setExecuteAddress(self, addr: Address) -> None:
+        from ghidra.core.error import LowlevelError
+
+        if addr.getSpace() is None or not addr.getSpace().hasPhysical():
+            raise LowlevelError("Bad execute address")
+        current_op = self._fd.target(addr) if self._fd is not None and hasattr(self._fd, "target") else None
+        if current_op is None:
+            raise LowlevelError("Could not set execute address")
+        self._emu.setCurrentOp(current_op)
+
     def emulatePath(self, val: int, pathMeld, startop, startvn) -> int:
         """Emulate a path through the function, returning the destination address offset."""
-        if startvn is not None:
+        from ghidra.arch.loadimage import DataUnavailError
+        from ghidra.core.error import LowlevelError
+        from ghidra.core.opcodes import OpCode
+
+        i = 0
+        while i < pathMeld.numOps():
+            if pathMeld.getOp(i) is startop:
+                break
+            i += 1
+        if startop.code() == OpCode.CPUI_MULTIEQUAL:
+            j = 0
+            while j < startop.numInput():
+                if startop.getIn(j) is startvn:
+                    break
+                j += 1
+            if j == startop.numInput() or i == 0:
+                raise LowlevelError("Cannot start jumptable emulation with unresolved MULTIEQUAL")
+            startvn = startop.getOut()
+            i -= 1
+            startop = pathMeld.getOp(i)
+        if i == pathMeld.numOps():
+            raise LowlevelError("Bad jumptable emulation")
+        if startvn is not None and not startvn.isConstant():
             self.setVarnodeValue(startvn, val)
-        # Would execute ops along the path here
-        return val
+        while i > 0:
+            curop = pathMeld.getOp(i)
+            i -= 1
+            self._emu.setCurrentOp(curop)
+            self._emu.lastOp = self._lastOp
+            try:
+                self._emu.executeCurrentOp()
+            except DataUnavailError:
+                raise LowlevelError(f"Could not emulate address calculation at {curop.getAddr()}")
+            self._lastOp = self._emu.lastOp
+        invn = pathMeld.getOp(0).getIn(0)
+        return self.getVarnodeValue(invn)
 
 
 class JumpBasic(JumpModel):
@@ -1370,7 +1519,7 @@ class JumpBasic(JumpModel):
                 toswitchval = not toswitchval
             bl = prevbl
             vn = cbranch.getIn(1)
-            rng = CircleRange(1 if toswitchval else 0, 1)
+            rng = CircleRange.fromBool(toswitchval)
 
             indpathstore = (1 - indpath) if (hasattr(prevbl, 'getFlipPath') and prevbl.getFlipPath()) else indpath
             self.selectguards.append(GuardRecord(cbranch, cbranch, indpathstore, rng, vn))
@@ -1395,7 +1544,7 @@ class JumpBasic(JumpModel):
         from ghidra.analysis.rangeutil import CircleRange
         stride = 1
         if vn.isConstant():
-            rng = CircleRange(vn.getOffset(), vn.getSize())
+            rng = CircleRange.fromSingle(vn.getOffset(), vn.getSize())
         elif vn.isWritten() and hasattr(vn.getDef(), 'isBoolOutput') and vn.getDef().isBoolOutput():
             rng = CircleRange(0, 2, 1, 1)
         else:
@@ -1520,7 +1669,7 @@ class JumpBasic(JumpModel):
             return
         if JumpBasic.duplicateVarnodes(varArray):
             vn = varArray[0]
-            rng = CircleRange(True)
+            rng = CircleRange.fromBool(True)
             indpathstore = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
             cbranch = bl.getIn(0).lastOp() if hasattr(bl.getIn(0), 'lastOp') else None
             if cbranch is not None:

@@ -15,7 +15,7 @@ from weakref import WeakValueDictionary
 from ghidra.core.address import Address, Range, RangeList
 from ghidra.core.pcoderaw import VarnodeData
 from ghidra.core.error import LowlevelError
-from ghidra.core.space import IPTR_SPACEBASE
+from ghidra.core.space import IPTR_FSPEC, IPTR_SPACEBASE
 from ghidra.ir.op import OpCode
 from ghidra.types.datatype import (
     Datatype, TypeFactory, MetaType, TypeClass,
@@ -521,17 +521,20 @@ class ProtoModelMerged:
         if not self._modellist:
             return None
         best = None
-        bestScore = 0x7FFFFFFF
+        bestScore = 500
         for model in self._modellist:
             scorer = ScoreProtoModel(True, model, active.getNumTrials() if hasattr(active, 'getNumTrials') else 0)
             for i in range(active.getNumTrials() if hasattr(active, 'getNumTrials') else 0):
                 trial = active.getTrial(i) if hasattr(active, 'getTrial') else None
-                if trial is not None:
+                if trial is not None and trial.isActive():
                     scorer.addParameter(trial.getAddress(), trial.getSize())
             scorer.doScore()
-            if scorer.getScore() < bestScore:
-                bestScore = scorer.getScore()
+            score = scorer.getScore()
+            if score < bestScore:
+                bestScore = score
                 best = model
+                if bestScore == 0:
+                    break
         return best
 
     def isMerged(self) -> bool:
@@ -1967,9 +1970,32 @@ class ParamListStandardOut(ParamListStandard):
         if self.useFillinFallback:
             self.fillinMapFallback(active, False)
             return
+        for i in range(active.getNumTrials()):
+            trial = active.getTrial(i)
+            trial.setEntry(None, 0)
+            if not trial.isActive():
+                continue
+            entry = self.findEntry(trial.getAddress(), trial.getSize(), False)
+            if entry is None:
+                trial.markNoUse()
+                continue
+            res = entry.justifiedContain(trial.getAddress(), trial.getSize())
+            if (trial.isRemFormed() or trial.isIndCreateFormed()) and not entry.isFirstInClass():
+                trial.markNoUse()
+                continue
+            trial.setEntry(entry, res)
+        active.sortTrials()
         for rule in self.modelRules:
             if hasattr(rule, 'fillinOutputMap') and rule.fillinOutputMap(active):
+                for i in range(active.getNumTrials()):
+                    trial = active.getTrial(i)
+                    if trial.isActive():
+                        trial.markUsed()
+                    else:
+                        trial.markNoUse()
+                        trial.setEntry(None, 0)
                 return
+        self.fillinMapFallback(active, True)
 
     def fillinMapFallback(self, active, firstOnly: bool) -> None:
         """Fallback method for determining return value from trials.
@@ -1989,16 +2015,23 @@ class ParamListStandardOut(ParamListStandard):
             if firstOnly:
                 break
         if bestEntry is None:
+            for i in range(active.getNumTrials()):
+                active.getTrial(i).markNoUse()
             return
         for i in range(active.getNumTrials()):
             trial = active.getTrial(i)
             if not trial.isActive():
+                trial.markNoUse()
+                trial.setEntry(None, 0)
                 continue
             entry = self.findEntry(trial.getAddress(), trial.getSize(), True)
             if entry is bestEntry or (entry is not None and entry.getGroup() == bestEntry.getGroup()):
                 trial.markUsed()
+                trial.setEntry(bestEntry, bestEntry.justifiedContain(trial.getAddress(), trial.getSize()))
             else:
                 trial.markNoUse()
+                trial.setEntry(None, 0)
+        active.sortTrials()
 
 
 class ParamListRegister(ParamListStandard):
@@ -3980,8 +4013,11 @@ class FuncProto:
 
     def internalBegin(self):
         """Get iterator to front of internalstorage list."""
-        if self.model is not None and hasattr(self.model, 'internalstorage'):
-            return iter(self.model.internalstorage)
+        if self.model is not None:
+            if hasattr(self.model, 'internalStorage'):
+                return iter(self.model.internalStorage)
+            if hasattr(self.model, 'internalstorage'):
+                return iter(self.model.internalstorage)
         return iter([])
 
     def internalEnd(self):
@@ -4051,6 +4087,15 @@ class FuncCallSpecs:
         self.matchCallCount: int = 0
         self.isinputactive: bool = False
         self.isoutputactive: bool = False
+        if op is not None and op.code() == OpCode.CPUI_CALL:
+            target_vn = op.getIn(0)
+            if target_vn is not None:
+                self.entryaddress = target_vn.getAddr()
+                target_space = self.entryaddress.getSpace()
+                if target_space is not None and target_space.getType() == IPTR_FSPEC:
+                    otherfc = FuncCallSpecs.getFspecFromConst(self.entryaddress)
+                    if otherfc is not None:
+                        self.entryaddress = otherfc.entryaddress
 
     def getOp(self):
         return self.op
@@ -4446,13 +4491,20 @@ class FuncCallSpecs:
         activeIn = self.getActiveInput()
         if activeIn is None:
             return
+        from ghidra.analysis.ancestor import AncestorRealistic
+
+        ancestorReal = AncestorRealistic()
         for i in range(activeIn.getNumTrials()):
             trial = activeIn.getTrial(i)
             if not trial.isActive():
                 continue
             if not trial.hasCondExeEffect():
                 continue
-            trial.markNoUse()
+            slot = trial.getSlot()
+            if self.op is None or slot < 0 or slot >= self.op.numInput():
+                continue
+            if not ancestorReal.execute(self.op, slot, trial, False):
+                trial.markNoUse()
 
     def resolveModel(self, active) -> None:
         """Pick a specific model from merged set based on active trials.
@@ -4628,6 +4680,20 @@ class FuncCallSpecs:
                     vn = self.op.getIn(slot)
                 else:
                     continue
+                if vn.getSize() > sz:
+                    newop = data.newOp(2, self.op.getAddr())
+                    arch = data.getArch() if hasattr(data, 'getArch') else None
+                    translate = getattr(arch, 'translate', None)
+                    if translate is not None and hasattr(translate, 'isBigEndian') and translate.isBigEndian():
+                        outaddr = vn.getAddr() + (vn.getSize() - sz)
+                    else:
+                        outaddr = vn.getAddr()
+                    outvn = data.newVarnodeOut(sz, outaddr, newop)
+                    data.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
+                    data.opSetInput(newop, vn, 0)
+                    data.opSetInput(newop, data.newConstant(1, 0), 1)
+                    data.opInsertBefore(newop, self.op)
+                    vn = outvn
             newparam.append(vn)
             if isspacebase and hasattr(data, 'getScopeLocal'):
                 scope = data.getScopeLocal()

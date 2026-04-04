@@ -811,11 +811,12 @@ class ConditionalJoin:
 
     def _findDups(self) -> bool:
         """Search for duplicate conditional expressions."""
+        from ghidra.core.opcodes import OpCode
         self._cbranch1 = self._block1.lastOp()
-        if self._cbranch1.code() != 7:  # CPUI_CBRANCH
+        if self._cbranch1.code() != OpCode.CPUI_CBRANCH:
             return False
         self._cbranch2 = self._block2.lastOp()
-        if self._cbranch2.code() != 7:  # CPUI_CBRANCH
+        if self._cbranch2.code() != OpCode.CPUI_CBRANCH:
             return False
         if self._cbranch1.isBooleanFlip():
             return False
@@ -842,7 +843,6 @@ class ConditionalJoin:
         if res > 1:
             return False
         op1 = vn1.getDef()
-        from ghidra.core.opcodes import OpCode
         if op1.code() == OpCode.CPUI_SUBPIECE:
             return False
         if op1.code() == OpCode.CPUI_COPY:
@@ -852,20 +852,22 @@ class ConditionalJoin:
 
     def _checkExitBlock(self, exit_bl, in1, in2):
         """Look for additional Varnode pairs in an exit block that need to be merged."""
+        from ghidra.core.opcodes import OpCode
         for op in exit_bl.beginOp():
-            if op.code() == 56:  # CPUI_MULTIEQUAL
+            if op.code() == OpCode.CPUI_MULTIEQUAL:
                 vn1 = op.getIn(in1)
                 vn2 = op.getIn(in2)
                 if vn1 is not vn2:
                     self._mergeneed[ConditionalJoin.MergePair(vn1, vn2)] = None
-            elif op.code() != 1:  # CPUI_COPY
+            elif op.code() != OpCode.CPUI_COPY:
                 break
 
     def _cutDownMultiequals(self, exit_bl, in1, in2):
         """Substitute new joined Varnode in the given exit block."""
+        from ghidra.core.opcodes import OpCode
         lo, hi = (in1, in2) if in1 < in2 else (in2, in1)
         for op in list(exit_bl.beginOp()):
-            if op.code() == 56:  # CPUI_MULTIEQUAL
+            if op.code() == OpCode.CPUI_MULTIEQUAL:
                 vn1 = op.getIn(in1)
                 vn2 = op.getIn(in2)
                 if vn1 is vn2:
@@ -876,20 +878,21 @@ class ConditionalJoin:
                     self._data.opSetInput(op, subvn, lo)
                 if op.numInput() == 1:
                     self._data.opUninsert(op)
-                    self._data.opSetOpcode(op, 1)  # CPUI_COPY
+                    self._data.opSetOpcode(op, OpCode.CPUI_COPY)
                     self._data.opInsertBegin(op, exit_bl)
-            elif op.code() != 1:  # CPUI_COPY
+            elif op.code() != OpCode.CPUI_COPY:
                 break
 
     def _setupMultiequals(self):
         """Create a new Varnode and its defining MULTIEQUAL for each MergePair."""
+        from ghidra.core.opcodes import OpCode
         for pair, val in self._mergeneed.items():
             if val is not None:
                 continue
             vn1 = pair.side1
             vn2 = pair.side2
             multi = self._data.newOp(2, self._cbranch1.getAddr())
-            self._data.opSetOpcode(multi, 56)  # CPUI_MULTIEQUAL
+            self._data.opSetOpcode(multi, OpCode.CPUI_MULTIEQUAL)
             outvn = self._data.newUniqueOut(vn1.getSize(), multi)
             self._data.opSetInput(multi, vn1, 0)
             self._data.opSetInput(multi, vn2, 1)

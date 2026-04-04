@@ -2,11 +2,13 @@
 Remaining rules batch 2a: INDIRECT/MULTIEQUAL collapse rules + misc.
 """
 from __future__ import annotations
+import os
 from ghidra.transform.action import Rule
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import calc_mask
+from ghidra.core.error import LowlevelError
+from ghidra.core.expression import functionalEquality as _functionalEquality
 from ghidra.ir.op import PcodeOp
-from ghidra.ir.varnode import functionalEquality as _functionalEquality
 _IPTR_IOP = 5  # SpaceType.IPTR_IOP — inline to avoid import overhead
 
 _CPUI_COPY    = 1   # OpCode.CPUI_COPY
@@ -19,6 +21,162 @@ _VN_WRITTEN   = 0x10  # Varnode written flag
 _VN_NOLOCALALIAS = 0x400  # Varnode.nolocalalias
 _OP_MARKER    = 0x40  # PcodeOp.marker
 _OP_RETURNS   = 0x08  # PcodeOp.returns (isAssignment)
+
+
+def _indirect_debug_enabled(op) -> bool:
+    spec = os.getenv("PYGHIDRA_INDIRECT_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _indirect_debug_log(op, message: str) -> None:
+    if not _indirect_debug_enabled(op):
+        return
+    path = os.getenv(
+        "PYGHIDRA_INDIRECT_DEBUG_LOG",
+        "D:/BIGAI/pyghidra/temp/python_indirect_debug.log",
+    )
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = op.getSeqNum().getOrder()
+    except Exception:
+        seq = "?"
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            prefix = "[indirectcollapse]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
+
+
+def _pushmulti_debug_enabled(op) -> bool:
+    spec = os.getenv("PYGHIDRA_PUSHMULTI_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _pushmulti_debug_log(op, message: str) -> None:
+    if not _pushmulti_debug_enabled(op):
+        return
+    path = os.getenv(
+        "PYGHIDRA_PUSHMULTI_DEBUG_LOG",
+        "D:/BIGAI/pyghidra/temp/python_pushmulti_debug.log",
+    )
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = op.getSeqNum().getOrder()
+    except Exception:
+        seq = "?"
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            prefix = "[pushmulti]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
+
+
+def _multicollapse_debug_enabled(op) -> bool:
+    spec = os.getenv("PYGHIDRA_MULTICOLLAPSE_DEBUG_ADDRS", "").strip()
+    if not spec:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if spec == "*":
+        return True
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            if off == int(part, 0):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _multicollapse_debug_log(op, message: str) -> None:
+    if not _multicollapse_debug_enabled(op):
+        return
+    path = os.getenv(
+        "PYGHIDRA_MULTICOLLAPSE_DEBUG_LOG",
+        "D:/BIGAI/pyghidra/temp/python_multicollapse_debug.log",
+    )
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = op.getSeqNum().getOrder()
+    except Exception:
+        seq = "?"
+    try:
+        with open(path, "a", encoding="utf-8") as fp:
+            prefix = "[multicollapse]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
 
 
 class RuleMultiCollapse(Rule):
@@ -35,6 +193,7 @@ class RuleMultiCollapse(Rule):
         inrefs = op._inrefs
         for vn in inrefs:
             if not vn.isHeritageKnown():
+                _multicollapse_debug_log(op, "return=0 reason=heritage_unknown")
                 return 0
 
         func_eq = False
@@ -46,6 +205,12 @@ class RuleMultiCollapse(Rule):
             if not copyr.isWritten() or copyr.getDef().code() != OpCode.CPUI_MULTIEQUAL:
                 defcopyr = copyr
                 break
+        if defcopyr is not None:
+            try:
+                desc = f"{defcopyr.getDef().code().name}@{defcopyr.getDef().getAddr().getOffset():#x}"
+            except Exception:
+                desc = "unwritten"
+            _multicollapse_debug_log(op, f"state defcopyr={desc}")
 
         skiplist = [op.getOut()]
         op.getOut().setMark()
@@ -67,14 +232,48 @@ class RuleMultiCollapse(Rule):
                 continue
             elif defcopyr is not copyr and not nofunc and _functionalEquality(defcopyr, copyr):
                 func_eq = True
+                if defcopyr.isWritten():
+                    def_desc = f"{defcopyr.getDef().code().name}@{defcopyr.getDef().getAddr().getOffset():#x}"
+                else:
+                    def_desc = "input"
+                if copyr.isWritten():
+                    copy_desc = f"{copyr.getDef().code().name}@{copyr.getDef().getAddr().getOffset():#x}"
+                else:
+                    copy_desc = "input"
+                _multicollapse_debug_log(
+                    op,
+                    f"state functional_match defcopyr={def_desc} copyr={copy_desc}",
+                )
                 continue
             elif copyr.isWritten() and copyr.getDef().code() == OpCode.CPUI_MULTIEQUAL:
                 newop = copyr.getDef()
                 skiplist.append(copyr)
                 copyr.setMark()
+                _multicollapse_debug_log(
+                    op,
+                    "state expand_multiequal "
+                    f"copyr={newop.code().name}@{newop.getAddr().getOffset():#x} "
+                    f"inputs={newop.numInput()}",
+                )
                 for inv in newop._inrefs:
                     matchlist.append(inv)
             else:
+                if defcopyr is None:
+                    defdesc = "None"
+                elif defcopyr.isWritten():
+                    defdesc = f"{defcopyr.getDef().code().name}@{defcopyr.getDef().getAddr().getOffset():#x}"
+                else:
+                    defdesc = "input"
+                if copyr.isWritten():
+                    copydesc = f"{copyr.getDef().code().name}@{copyr.getDef().getAddr().getOffset():#x}"
+                else:
+                    copydesc = "input"
+                eq = _functionalEquality(defcopyr, copyr) if defcopyr is not None and not nofunc else False
+                _multicollapse_debug_log(
+                    op,
+                    "return=0 reason=nonmatching_branch "
+                    f"defcopyr={defdesc} copyr={copydesc} nofunc={int(nofunc)} eq={int(eq)}",
+                )
                 success = False
                 break
 
@@ -113,9 +312,11 @@ class RuleMultiCollapse(Rule):
                 else:
                     data.totalReplace(vn, defcopyr)
                     data.opDestroy(curOp)
+            _multicollapse_debug_log(op, f"return=1 func_eq={int(func_eq)}")
             return 1
         for vn in skiplist:
             vn.clearMark()
+        _multicollapse_debug_log(op, "return=0 reason=failed")
         return 0
 
 
@@ -131,28 +332,59 @@ class RuleIndirectCollapse(Rule):
     def applyOp(self, op, data):
         inrefs = op._inrefs
         if len(inrefs) < 2:
+            _indirect_debug_log(op, "return=0 reason=missing_input")
             return 0
         iopvn = inrefs[1]
         if iopvn is None:
+            _indirect_debug_log(op, "return=0 reason=missing_iop_varnode")
             return 0
         iopvn_spc = iopvn._loc.base
         if iopvn_spc is None or iopvn_spc._type != _IPTR_IOP:
+            spc_type = None if iopvn_spc is None else iopvn_spc._type
+            _indirect_debug_log(op, f"return=0 reason=bad_iop_space spc_type={spc_type}")
             return 0
         indop = iopvn._iop_ref
         if indop is None:
+            _indirect_debug_log(op, "return=0 reason=missing_indop_ref")
             return 0
 
         outvn = op._output
         if outvn is None:
+            _indirect_debug_log(op, "return=0 reason=missing_output")
             return 0
+        indopc = indop._opcode_enum
+        indop_dead = 1 if (indop._flags & _OP_DEAD) else 0
+        out_nolocal = 1 if (outvn._flags & _VN_NOLOCALALIAS) else 0
+        op_indirect_creation = 1 if (op._flags & _OP_INDIRECT_CREATION) else 0
+        op_no_collapse = 1 if (op._addlflags & _OP_NO_INDIRECT_COLLAPSE) else 0
+        indop_spacebase = 1 if (indop._flags & _OP_SPACEBASE_PTR) else 0
+        _indirect_debug_log(
+            op,
+            "state "
+            f"out_addr={outvn.getAddr().getOffset():#x}:{outvn.getSize()} "
+            f"indop_addr={indop.getAddr().getOffset():#x} "
+            f"indop_seq={indop.getSeqNum().getOrder()} "
+            f"indopc={indopc} indop_dead={indop_dead} "
+            f"out_flags={outvn._flags:#x} out_nolocal={out_nolocal} "
+            f"op_flags={op._flags:#x} op_addl={op._addlflags:#x} "
+            f"indirect_creation={op_indirect_creation} no_indirect_collapse={op_no_collapse} "
+            f"indop_flags={indop._flags:#x} indop_spacebase={indop_spacebase}"
+        )
         if not (indop._flags & _OP_DEAD):
-            indopc = indop._opcode_enum
             if indopc == _CPUI_COPY:
                 # STORE resolved to a COPY — check overlap
                 vn1 = indop._output
                 if vn1 is None:
+                    _indirect_debug_log(op, "return=0 reason=copy_without_output")
                     return 0
                 res = vn1.characterizeOverlap(outvn)
+                _indirect_debug_log(
+                    op,
+                    "copy_overlap "
+                    f"vn1={vn1.getAddr().getOffset():#x}:{vn1.getSize()} "
+                    f"out={outvn.getAddr().getOffset():#x}:{outvn.getSize()} "
+                    f"res={res}",
+                )
                 if res > 0:
                     if res == 2:
                         # Same storage — convert INDIRECT to COPY
@@ -176,26 +408,33 @@ class RuleIndirectCollapse(Rule):
                         data.opSetInput(op, data.newConstant(4, trunc), 1)
                         data.opSetOpcode(op, OpCode.CPUI_SUBPIECE)
                         data.opInsertAfter(op, indop)
+                        _indirect_debug_log(op, "return=1 action=subpiece_from_copy")
                         return 1
+                    _indirect_debug_log(op, "return=0 reason=partial_copy_overlap")
                     return 0  # Partial overlap
             elif outvn._flags & _VN_NOLOCALALIAS:
                 # Guard: do NOT collapse indirect_creation or noIndirectCollapse
                 if (op._flags & _OP_INDIRECT_CREATION) or (op._addlflags & _OP_NO_INDIRECT_COLLAPSE):
+                    _indirect_debug_log(op, "return=0 reason=nolocalalias_guarded")
                     return 0
             elif indop._flags & _OP_SPACEBASE_PTR:
                 if indopc == _CPUI_STORE:
                     guard = data.getStoreGuard(indop)
                     if guard is not None:
                         if guard.isGuarded(outvn._loc):
+                            _indirect_debug_log(op, "return=0 reason=store_guarded")
                             return 0
                     else:
+                        _indirect_debug_log(op, "return=0 reason=store_guard_missing")
                         return 0  # Marked STORE not yet guarded — keep INDIRECT
             else:
+                _indirect_debug_log(op, "return=0 reason=live_indop_unhandled")
                 return 0  # Blocking op still alive and not handled
 
         # Blocking op is dead or effect is gone — collapse
         data.totalReplace(outvn, inrefs[0])
         data.opDestroy(op)
+        _indirect_debug_log(op, "return=1 action=collapse")
         return 1
 
 
@@ -231,17 +470,24 @@ class RulePullsubMulti(Rule):
     def replaceDescendants(origVn, newVn, maxByte, minByte, data):
         """Replace origVn with smaller newVn in all SUBPIECE descendants."""
         for op in list(origVn.getDescendants()):
-            if op.code() == OpCode.CPUI_SUBPIECE:
-                truncAmount = int(op.getIn(1).getOffset())
-                outSize = op.getOut().getSize()
-                data.opSetInput(op, newVn, 0)
-                if newVn.getSize() == outSize:
-                    data.opSetOpcode(op, OpCode.CPUI_COPY)
-                    data.opRemoveInput(op, 1)
-                elif newVn.getSize() > outSize:
-                    newTrunc = truncAmount - minByte
-                    if newTrunc != truncAmount:
-                        data.opSetInput(op, data.newConstant(4, newTrunc), 1)
+            if op.code() != OpCode.CPUI_SUBPIECE:
+                raise LowlevelError("Could not perform -replaceDescendants-")
+            truncAmount = int(op.getIn(1).getOffset())
+            outSize = op.getOut().getSize()
+            data.opSetInput(op, newVn, 0)
+            if newVn.getSize() == outSize:
+                if truncAmount != minByte:
+                    raise LowlevelError("Could not perform -replaceDescendants-")
+                data.opSetOpcode(op, OpCode.CPUI_COPY)
+                data.opRemoveInput(op, 1)
+            elif newVn.getSize() > outSize:
+                newTrunc = truncAmount - minByte
+                if newTrunc < 0:
+                    raise LowlevelError("Could not perform -replaceDescendants-")
+                if newTrunc != truncAmount:
+                    data.opSetInput(op, data.newConstant(4, newTrunc), 1)
+            else:
+                raise LowlevelError("Could not perform -replaceDescendants-")
 
     @staticmethod
     def acceptableSize(size):
@@ -279,11 +525,44 @@ class RulePullsubMulti(Rule):
             newaddr = bb.getStart()
         else:
             if not basevn.isWritten():
-                return None
+                raise LowlevelError("Undefined pullsub")
             newaddr = basevn.getDef().getAddr()
+        smalladdr1 = None
+        usetmp = False
+        baseaddr = basevn.getAddr()
+        if baseaddr.isJoin():
+            usetmp = True
+            arch = data.getArch()
+            joinrec = arch.findJoin(basevn.getOffset()) if arch is not None and hasattr(arch, 'findJoin') else None
+            if joinrec is not None and joinrec.numPieces() > 1:
+                skipleft = shift
+                for i in range(joinrec.numPieces() - 1, -1, -1):
+                    piece = joinrec.getPiece(i)
+                    if skipleft >= piece.size:
+                        skipleft -= piece.size
+                        continue
+                    if skipleft + outsize > piece.size:
+                        break
+                    if piece.space.isBigEndian():
+                        smalladdr1 = piece.getAddr() + (piece.size - (outsize + skipleft))
+                    else:
+                        smalladdr1 = piece.getAddr() + skipleft
+                    usetmp = False
+                    break
+        else:
+            if not basevn.getSpace().isBigEndian():
+                smalladdr1 = baseaddr + shift
+            else:
+                smalladdr1 = baseaddr + (basevn.getSize() - (shift + outsize))
         new_op = data.newOp(2, newaddr)
         data.opSetOpcode(new_op, OpCode.CPUI_SUBPIECE)
-        outvn = data.newUniqueOut(outsize, new_op)
+        if usetmp:
+            outvn = data.newUniqueOut(outsize, new_op)
+        else:
+            if smalladdr1 is None:
+                raise LowlevelError("Undefined pullsub")
+            smalladdr1.renormalize(outsize)
+            outvn = data.newVarnodeOut(outsize, smalladdr1, new_op)
         data.opSetInput(new_op, basevn, 0)
         data.opSetInput(new_op, data.newConstant(4, shift), 1)
         if basevn.isInput():
@@ -294,29 +573,63 @@ class RulePullsubMulti(Rule):
 
     def applyOp(self, op, data):
         invn = op.getIn(0)
-        if not invn.isWritten(): return 0
+        if not invn.isWritten():
+            return 0
         defop = invn.getDef()
-        if defop.code() != OpCode.CPUI_MULTIEQUAL: return 0
-        if not invn.loneDescend(): return 0
-        # Pull SUBPIECE through: replace each MULTIEQUAL input with SUBPIECE of that input
-        shift = int(op.getIn(1).getOffset())
-        outsize = op.getOut().getSize()
-        newinputs = []
-        for i in range(defop.numInput()):
-            inp = defop.getIn(i)
-            subop = data.newOp(2, defop.getAddr())
-            data.opSetOpcode(subop, OpCode.CPUI_SUBPIECE)
-            outvn = data.newUniqueOut(outsize, subop)
-            data.opSetInput(subop, inp, 0)
-            data.opSetInput(subop, data.newConstant(4, shift), 1)
-            data.opInsertBegin(subop, defop.getParent())
-            newinputs.append(outvn)
-        # Replace MULTIEQUAL output size
-        data.opSetOpcode(defop, OpCode.CPUI_MULTIEQUAL)
-        data.opSetAllInput(defop, newinputs)
-        newoutvn = data.newUniqueOut(outsize, defop)
-        data.totalReplace(op.getOut(), newoutvn)
-        data.opDestroy(op)
+        if defop.code() != OpCode.CPUI_MULTIEQUAL:
+            return 0
+        if defop.getParent().hasLoopIn():
+            return 0
+        maxByte, minByte = RulePullsubMulti.minMaxUse(invn)
+        newSize = maxByte - minByte + 1
+        if maxByte < minByte or newSize >= invn.getSize():
+            return 0
+        if not RulePullsubMulti.acceptableSize(newSize):
+            return 0
+        outvn = op.getOut()
+        if outvn.isPrecisLo() or outvn.isPrecisHi():
+            return 0
+
+        if minByte > 8:
+            return 0
+        if minByte < 8:
+            consume = calc_mask(newSize) << (8 * minByte)
+        else:
+            consume = 0
+        consume = (~consume) & calc_mask(8)
+        branches = defop.numInput()
+        for i in range(branches):
+            inVn = defop.getIn(i)
+            if (consume & inVn.getConsume()) != 0:
+                if minByte == 0 and inVn.isWritten():
+                    inDef = inVn.getDef()
+                    opc = inDef.code()
+                    if opc in (OpCode.CPUI_INT_ZEXT, OpCode.CPUI_INT_SEXT):
+                        if newSize == inDef.getIn(0).getSize():
+                            continue
+                return 0
+
+        if not invn.getSpace().isBigEndian():
+            smalladdr2 = invn.getAddr() + minByte
+        else:
+            smalladdr2 = invn.getAddr() + (invn.getSize() - maxByte - 1)
+
+        params = []
+        for i in range(branches):
+            vn_piece = defop.getIn(i)
+            vn_sub = RulePullsubMulti.findSubpiece(vn_piece, newSize, minByte)
+            if vn_sub is None:
+                vn_sub = RulePullsubMulti.buildSubpiece(vn_piece, newSize, minByte, data)
+            params.append(vn_sub)
+
+        new_multi = data.newOp(len(params), defop.getAddr())
+        smalladdr2.renormalize(newSize)
+        new_vn = data.newVarnodeOut(newSize, smalladdr2, new_multi)
+        data.opSetOpcode(new_multi, OpCode.CPUI_MULTIEQUAL)
+        data.opSetAllInput(new_multi, params)
+        data.opInsertBegin(new_multi, defop.getParent())
+
+        RulePullsubMulti.replaceDescendants(invn, new_vn, maxByte, minByte, data)
         return 1
 
 
@@ -365,22 +678,32 @@ class RulePullsubIndirect(Rule):
         if (consume & indir_consume) != 0:
             return 0
 
-        basevn = indir.getIn(0)
-        small1 = RulePullsubMulti.findSubpiece(basevn, newSize, int(op.getIn(1).getOffset()))
-        if small1 is None:
-            small1 = RulePullsubMulti.buildSubpiece(basevn, newSize, int(op.getIn(1).getOffset()), data)
-        if small1 is None:
-            return 0
-
-        new_ind = data.newOp(2, indir.getAddr())
-        data.opSetOpcode(new_ind, OpCode.CPUI_INDIRECT)
-        small2 = data.newUniqueOut(newSize, new_ind)
-        data.opSetInput(new_ind, small1, 0)
-        if hasattr(data, 'newVarnodeIop'):
-            data.opSetInput(new_ind, data.newVarnodeIop(targ_op), 1)
+        if not invn.getSpace().isBigEndian():
+            smalladdr2 = invn.getAddr() + minByte
         else:
-            data.opSetInput(new_ind, indir.getIn(1), 1)
-        data.opInsertBefore(new_ind, indir)
+            smalladdr2 = invn.getAddr() + (invn.getSize() - maxByte - 1)
+
+        if hasattr(indir, 'isIndirectCreation') and indir.isIndirectCreation():
+            possibleout = not indir.getIn(0).isIndirectZero()
+            new_ind = data.newIndirectCreation(targ_op, smalladdr2, newSize, possibleout)
+            small2 = new_ind.getOut()
+        else:
+            basevn = indir.getIn(0)
+            small1 = RulePullsubMulti.findSubpiece(basevn, newSize, int(op.getIn(1).getOffset()))
+            if small1 is None:
+                small1 = RulePullsubMulti.buildSubpiece(basevn, newSize, int(op.getIn(1).getOffset()), data)
+            if small1 is None:
+                return 0
+
+            new_ind = data.newOp(2, indir.getAddr())
+            data.opSetOpcode(new_ind, OpCode.CPUI_INDIRECT)
+            small2 = data.newVarnodeOut(newSize, smalladdr2, new_ind)
+            data.opSetInput(new_ind, small1, 0)
+            if hasattr(data, 'newVarnodeIop'):
+                data.opSetInput(new_ind, data.newVarnodeIop(targ_op), 1)
+            else:
+                data.opSetInput(new_ind, indir.getIn(1), 1)
+            data.opInsertBefore(new_ind, indir)
 
         RulePullsubMulti.replaceDescendants(invn, small2, maxByte, minByte, data)
         return 1
@@ -411,6 +734,7 @@ class RulePushMulti(Rule):
                 continue
             if desc_op.getIn(1) is not in2:
                 continue
+            _pushmulti_debug_log(desc_op, "findSubstitute=existing_multiequal")
             return desc_op
         if in1 is in2:
             return None
@@ -426,48 +750,71 @@ class RulePushMulti(Rule):
             if vn.isConstant():
                 continue
             if vn is op2.getIn(i):
-                return Funcdata.cseFindInBlock(op1, vn, bb, earliest)
+                substitute = Funcdata.cseFindInBlock(op1, vn, bb, earliest)
+                if substitute is not None:
+                    _pushmulti_debug_log(substitute, f"findSubstitute=cse_match via_slot={i}")
+                return substitute
         return None
 
     def applyOp(self, op, data):
         from ghidra.core.expression import functionalEqualityLevel
         if op.numInput() != 2:
+            _pushmulti_debug_log(op, "return=0 reason=bad_arity")
             return 0
         in1 = op.getIn(0)
         in2 = op.getIn(1)
         if not in1.isWritten():
+            _pushmulti_debug_log(op, "return=0 reason=in1_not_written")
             return 0
         if not in2.isWritten():
+            _pushmulti_debug_log(op, "return=0 reason=in2_not_written")
             return 0
         if in1.isSpacebase():
+            _pushmulti_debug_log(op, "return=0 reason=in1_spacebase")
             return 0
         if in2.isSpacebase():
+            _pushmulti_debug_log(op, "return=0 reason=in2_spacebase")
             return 0
         buf1 = [None, None]
         buf2 = [None, None]
         res = functionalEqualityLevel(in1, in2, buf1, buf2)
+        _pushmulti_debug_log(
+            op,
+            "state "
+            f"res={res} "
+            f"in1_def={in1.getDef().code().name}@{in1.getDef().getAddr().getOffset():#x} "
+            f"in2_def={in2.getDef().code().name}@{in2.getDef().getAddr().getOffset():#x}",
+        )
         if res < 0:
+            _pushmulti_debug_log(op, "return=0 reason=functional_lt0")
             return 0
         if res > 1:
+            _pushmulti_debug_log(op, "return=0 reason=functional_gt1")
             return 0
         op1 = in1.getDef()
         if op1.code() == OpCode.CPUI_SUBPIECE:
+            _pushmulti_debug_log(op, "return=0 reason=subpiece")
             return 0
         bl = op.getParent()
         earliest = bl.earliestUse(op.getOut()) if hasattr(bl, 'earliestUse') else None
         if op1.code() == OpCode.CPUI_COPY:
             if res == 0:
+                _pushmulti_debug_log(op, "return=0 reason=copy_res0")
                 return 0
             substitute = RulePushMulti.findSubstitute(buf1[0], buf2[0], bl, earliest)
             if substitute is None:
+                _pushmulti_debug_log(op, "return=0 reason=copy_no_substitute")
                 return 0
             data.totalReplace(op.getOut(), substitute.getOut())
             data.opDestroy(op)
+            _pushmulti_debug_log(op, "return=1 action=copy_replace")
             return 1
         op2 = in2.getDef()
         if in1.loneDescend() is not op:
+            _pushmulti_debug_log(op, "return=0 reason=in1_not_lone_descend")
             return 0
         if in2.loneDescend() is not op:
+            _pushmulti_debug_log(op, "return=0 reason=in2_not_lone_descend")
             return 0
         outvn = op.getOut()
         data.opSetOutput(op1, outvn)
@@ -476,6 +823,7 @@ class RulePushMulti(Rule):
             slot1 = op1.getSlot(buf1[0])
             substitute = RulePushMulti.findSubstitute(buf1[0], buf2[0], bl, earliest)
             if substitute is None:
+                _pushmulti_debug_log(op, f"state create_substitute slot1={slot1}")
                 substitute = data.newOp(2, op.getAddr())
                 data.opSetOpcode(substitute, OpCode.CPUI_MULTIEQUAL)
                 if buf1[0].getAddr() == buf2[0].getAddr() and not buf1[0].isAddrTied():
@@ -491,6 +839,7 @@ class RulePushMulti(Rule):
             data.opInsertBegin(op1, bl)
         data.opDestroy(op)
         data.opDestroy(op2)
+        _pushmulti_debug_log(op, "return=1 action=push")
         return 1
 
 

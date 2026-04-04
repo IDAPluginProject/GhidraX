@@ -76,6 +76,7 @@ class FlowInfo:
         self._inline_head = None
         self._inline_recursion: Optional[Set[Address]] = None
         self._inline_base: Set[Address] = set()
+        self._emitter = None
 
         func_addr = fd.getAddress() if hasattr(fd, 'getAddress') else Address()
 
@@ -104,6 +105,15 @@ class FlowInfo:
 
         if hasattr(fd, 'getOverride') and hasattr(fd.getOverride(), 'hasFlowOverride'):
             self._flowoverride_present = fd.getOverride().hasFlowOverride()
+
+        try:
+            from ghidra.sleigh.pcodeemit import PcodeEmitFd
+
+            emitter = PcodeEmitFd()
+            emitter.setFuncdata(fd)
+            self._emitter = emitter
+        except Exception:
+            self._emitter = None
 
     # ----------------------------------------------------------------
     # Range / option setters

@@ -3,6 +3,7 @@ Corresponds to: coreaction.hh / coreaction.cc (part 2)
 Remaining Action stubs + universalAction pipeline wiring.
 """
 from __future__ import annotations
+import os
 from typing import TYPE_CHECKING
 from ghidra.transform.action import (
     Action, ActionGroup, ActionRestartGroup, ActionPool, ActionDatabase,
@@ -183,21 +184,45 @@ class ActionFuncLink(Action):
         stack placeholder (INT_ADD + LOAD) so heritage can track the
         stack pointer through calls.
         """
-        inputlocked = fc.isInputLocked()
-        spacebase = fc.getSpacebase() if hasattr(fc, 'getSpacebase') else None
+        from ghidra.core.space import IPTR_SPACEBASE
 
-        if not inputlocked:
+        inputlocked = fc.isInputLocked()
+        varargs = fc.isDotdotdot() if hasattr(fc, 'isDotdotdot') else False
+        spacebase = fc.getSpacebase() if hasattr(fc, 'getSpacebase') else None
+        active = fc.getActiveInput() if hasattr(fc, 'getActiveInput') else None
+
+        if (not inputlocked) or varargs:
             if hasattr(fc, 'initActiveInput'):
                 fc.initActiveInput()
+            active = fc.getActiveInput() if hasattr(fc, 'getActiveInput') else None
 
         if inputlocked:
             op = fc.getOp()
             numparam = fc.numParams()
+            setplaceholder = varargs
             for i in range(numparam):
                 param = fc.getParam(i)
                 if param is None:
                     continue
-                data.opInsertInput(op, data.newVarnode(param.getSize(), param.getAddress()), op.numInput())
+                if active is not None:
+                    active.registerTrial(param.getAddress(), param.getSize())
+                    curtrial = active.getTrial(i)
+                    curtrial.markActive()
+                    if varargs:
+                        curtrial.setFixedPosition(i)
+                spc = param.getAddress().getSpace()
+                off = param.getAddress().getOffset()
+                sz = param.getSize()
+                if spc is not None and spc.getType() == IPTR_SPACEBASE:
+                    loadval = data.opStackLoad(spc, off, sz, op, None, False)
+                    data.opInsertInput(op, loadval, op.numInput())
+                    if not setplaceholder:
+                        setplaceholder = True
+                        if hasattr(loadval, 'setSpacebasePlaceholder'):
+                            loadval.setSpacebasePlaceholder()
+                        spacebase = None
+                else:
+                    data.opInsertInput(op, data.newVarnode(sz, param.getAddress()), op.numInput())
 
         if spacebase is not None:
             fc.createPlaceholder(data, spacebase)
@@ -222,7 +247,7 @@ class ActionFuncLink(Action):
 
 class ActionFuncLinkOutOnly(Action):
     """Link only output prototypes for calls (used during noproto phase)."""
-    def __init__(self, g): super().__init__(Action.rule_onceperfunc, "funclinkoutonly", g)
+    def __init__(self, g): super().__init__(Action.rule_onceperfunc, "funclink_outonly", g)
     def clone(self, gl):
         return ActionFuncLinkOutOnly(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
@@ -539,20 +564,6 @@ class ActionRestrictLocal(Action):
                             continue
                         if hasattr(localmap, 'markNotMapped'):
                             localmap.markNotMapped(outvn.getSpace(), outvn.getOffset(), outvn.getSize(), False)
-            # Return-address effects are tracked on the saved INDIRECT output, but the
-            # corresponding effect input is not always materialized at the translated
-            # stack offset. Mark the saved storage directly so the later restructure pass
-            # can clear mapped/addrforce exactly like the native pipeline.
-            for vn in list(data._vbank.beginLoc()):
-                if not vn.isWritten() or not (hasattr(vn, 'isReturnAddress') and vn.isReturnAddress()):
-                    continue
-                defop = vn.getDef()
-                if defop is None or defop.code() != OpCode.CPUI_INDIRECT:
-                    continue
-                if hasattr(localmap, 'isUnaffectedStorage') and not localmap.isUnaffectedStorage(vn):
-                    continue
-                if hasattr(localmap, 'markNotMapped'):
-                    localmap.markNotMapped(vn.getSpace(), vn.getOffset(), vn.getSize(), False)
         return 0
 
 class ActionDynamicMapping(Action):
@@ -595,7 +606,14 @@ class ActionRestructureVarnode(Action):
         try:
             if hasattr(l1, 'restructureVarnode'):
                 l1.restructureVarnode(aliasyes)
-        except (AttributeError, RuntimeError, TypeError):
+        except (AttributeError, RuntimeError, TypeError) as err:
+            path = os.environ.get("PYGHIDRA_RESTRUCTURE_DEBUG_LOG", "").strip()
+            if path:
+                try:
+                    with open(path, "a", encoding="utf-8") as fp:
+                        fp.write(f"aliasyes={int(aliasyes)} exc={type(err).__name__}: {err}\n")
+                except OSError:
+                    pass
             pass  # Infrastructure not fully ported yet
         try:
             if hasattr(data, 'syncVarnodesWithSymbols'):
@@ -1045,6 +1063,37 @@ class ActionMarkExplicit(Action):
         return ActionMarkExplicit(self._basegroup) if gl.contains(self._basegroup) else None
 
     @staticmethod
+    def _debug_log(msg: str) -> None:
+        import os
+
+        log_path = os.environ.get("PYGHIDRA_MARKEXPLICIT_DEBUG_LOG")
+        if not log_path:
+            return
+        with open(log_path, "a", encoding="utf-8") as fp:
+            fp.write(msg)
+            fp.write("\n")
+
+    @staticmethod
+    def _describe_vn(vn) -> str:
+        if vn is None:
+            return "vn=<none>"
+        addr = vn.getAddr()
+        if addr is None:
+            addr_text = "?"
+        else:
+            try:
+                addr_text = f"{addr.getSpace().getName()}:{addr.getOffset():#x}"
+            except Exception:
+                addr_text = str(addr)
+        defop = vn.getDef() if vn.isWritten() else None
+        if defop is None:
+            return f"vn={addr_text}:{vn.getSize()} def=<none>"
+        return (
+            f"vn={addr_text}:{vn.getSize()} "
+            f"def={defop.code().name}@{defop.getAddr().getOffset():#x}"
+        )
+
+    @staticmethod
     def baseExplicit(vn, maxref: int) -> int:
         """Determine if a Varnode should be marked explicit.
 
@@ -1054,6 +1103,39 @@ class ActionMarkExplicit(Action):
         defop = vn.getDef()
         if defop is None:
             return -1
+        if (
+            defop.code().name == "CPUI_LOAD"
+            and hasattr(defop, "getAddr")
+            and defop.getAddr() is not None
+            and defop.getAddr().getOffset() == 0x401195
+        ):
+            high = vn.getHigh()
+            high_instances = None
+            if high is not None and hasattr(high, "numInstances"):
+                try:
+                    high_instances = high.numInstances()
+                except Exception as exc:
+                    high_instances = f"error:{exc}"
+            desc_count = sum(1 for _ in vn.getDescendants())
+            ActionMarkExplicit._debug_log(
+                "load195-state "
+                f"{ActionMarkExplicit._describe_vn(vn)} "
+                f"isAddrTied={vn.isAddrTied()} "
+                f"isMapped={vn.isMapped()} "
+                f"isProtoPartial={vn.isProtoPartial()} "
+                f"hasNoDescend={vn.hasNoDescend()} "
+                f"highInstances={high_instances} "
+                f"descendants={desc_count}"
+            )
+            for idx, desc_op in enumerate(vn.getDescendants()):
+                desc_addr = desc_op.getAddr()
+                ActionMarkExplicit._debug_log(
+                    "load195-desc "
+                    f"idx={idx} "
+                    f"opc={desc_op.code().name} "
+                    f"addr={desc_addr.getOffset():#x} "
+                    f"isMarker={desc_op.isMarker()}"
+                )
         if defop.isMarker():
             return -1
         # Workaround: INDIRECT/MULTIEQUAL are markers in C++ but may lack
@@ -1080,7 +1162,7 @@ class ActionMarkExplicit(Action):
                 return -1
             if useOp.code() == OpCode.CPUI_INT_ZEXT:
                 vnout = useOp.getOut()
-                if vnout is None or not vnout.isAddrTied():
+                if vnout is None or not vnout.isAddrTied() or vnout.contains(vn) != 0:
                     return -1
             elif useOp.code() == OpCode.CPUI_PIECE:
                 # C++ uses PieceNode::findRoot to check if vn is root of PIECE tree
@@ -1151,8 +1233,19 @@ class ActionMarkExplicit(Action):
                         topopc = OpCode.CPUI_COPY
                         if topvn.isWritten():
                             if topvn.getDef().isBoolOutput():
+                                ActionMarkExplicit._debug_log(
+                                    "multipleInteraction-skip-bool "
+                                    f"src={ActionMarkExplicit._describe_vn(vn)} "
+                                    f"top={ActionMarkExplicit._describe_vn(topvn)}"
+                                )
                                 continue  # Try not to make boolean outputs explicit
                             topopc = topvn.getDef().code()
+                        ActionMarkExplicit._debug_log(
+                            "multipleInteraction-candidate "
+                            f"src={ActionMarkExplicit._describe_vn(vn)} "
+                            f"top={ActionMarkExplicit._describe_vn(topvn)} "
+                            f"opc={opc.name} topopc={topopc.name}"
+                        )
                         if opc == OpCode.CPUI_PTRADD:
                             if topopc == OpCode.CPUI_PTRADD:
                                 purgelist.append(topvn)
@@ -1162,6 +1255,9 @@ class ActionMarkExplicit(Action):
             vn.setExplicit()
             vn.clearImplied()
             vn.clearMark()
+            ActionMarkExplicit._debug_log(
+                f"multipleInteraction-explicit {ActionMarkExplicit._describe_vn(vn)}"
+            )
         return len(purgelist)
 
     @staticmethod
@@ -1174,6 +1270,9 @@ class ActionMarkExplicit(Action):
         # Each stack element: (varnode, slot, slotback)
         from ghidra.core.opcodes import OpCode
         stack = []
+        ActionMarkExplicit._debug_log(
+            f"processMultiplier-start maxdup={maxdup} {ActionMarkExplicit._describe_vn(vn)}"
+        )
 
         def _make_elem(v):
             s = 0
@@ -1184,6 +1283,8 @@ class ActionMarkExplicit(Action):
                     s = 1; sb = 2
                 elif opc == OpCode.CPUI_PTRADD:
                     sb = 1
+                elif opc == OpCode.CPUI_SEGMENTOP:
+                    s = 2; sb = 3
                 else:
                     sb = v.getDef().numInput()
             return [v, s, sb]
@@ -1201,16 +1302,30 @@ class ActionMarkExplicit(Action):
                 if finalcount > maxdup:
                     vn.setExplicit()
                     vn.clearImplied()
+                    ActionMarkExplicit._debug_log(
+                        f"processMultiplier-explicit maxdup={maxdup} "
+                        f"{ActionMarkExplicit._describe_vn(vn)}"
+                    )
                     return
                 stack.pop()
             else:
                 op = vncur.getDef()
                 newvn = op.getIn(elem[1])
                 elem[1] += 1
-                if newvn is None or newvn.isMark():
+                if newvn is None:
                     vn.setExplicit()
                     vn.clearImplied()
+                    ActionMarkExplicit._debug_log(
+                        f"processMultiplier-null-input {ActionMarkExplicit._describe_vn(vn)}"
+                    )
                     return
+                if newvn.isMark():
+                    vn.setExplicit()
+                    vn.clearImplied()
+                    ActionMarkExplicit._debug_log(
+                        f"processMultiplier-marked-ancestor {ActionMarkExplicit._describe_vn(vn)} "
+                        f"ancestor={ActionMarkExplicit._describe_vn(newvn)}"
+                    )
                 stack.append(_make_elem(newvn))
 
     @staticmethod
@@ -1252,7 +1367,7 @@ class ActionMarkExplicit(Action):
 
     def apply(self, data):
         multlist = []  # implied varnodes with >1 descendants
-        maxref = getattr(data.getArch(), 'max_implied_ref', 20) if data.getArch() is not None else 20
+        maxref = getattr(data.getArch(), 'max_implied_ref', 2) if data.getArch() is not None else 2
 
         for vn in list(data._vbank.beginDef()):
             if vn.isFree():
@@ -1261,14 +1376,21 @@ class ActionMarkExplicit(Action):
             if desccount < 0:
                 vn.setExplicit()
                 self._count += 1
+                ActionMarkExplicit._debug_log(
+                    f"baseExplicit-explicit desccount={desccount} "
+                    f"{ActionMarkExplicit._describe_vn(vn)}"
+                )
                 if desccount < -1:
                     ActionMarkExplicit.checkNewToConstructor(data, vn)
             elif desccount > 1:
                 vn.setMark()
                 multlist.append(vn)
 
+        ActionMarkExplicit._debug_log(
+            f"apply-summary base_count={self._count} multlist={len(multlist)}"
+        )
         self._count += ActionMarkExplicit.multipleInteraction(multlist)
-        maxdup = getattr(data.getArch(), 'max_term_duplication', 16) if data.getArch() is not None else 16
+        maxdup = getattr(data.getArch(), 'max_term_duplication', 2) if data.getArch() is not None else 2
         for vn in multlist:
             if vn.isMark():
                 ActionMarkExplicit.processMultiplier(vn, maxdup)
@@ -1678,41 +1800,272 @@ class ActionSetCasts(Action):
         return ActionSetCasts(self._basegroup) if gl.contains(self._basegroup) else None
 
     @staticmethod
+    def _debug_enabled(op) -> bool:
+        log_path = os.environ.get("PYGHIDRA_SETCASTS_DEBUG_LOG", "").strip()
+        if not log_path:
+            return False
+        raw_addrs = os.environ.get("PYGHIDRA_SETCASTS_DEBUG_ADDRS", "").strip()
+        if not raw_addrs:
+            return True
+        addr = op.getAddr() if hasattr(op, "getAddr") else None
+        addr_str = str(addr).lower() if addr is not None else ""
+        allowed = {piece.strip().lower() for piece in raw_addrs.split(",") if piece.strip()}
+        return addr_str in allowed
+
+    @staticmethod
+    def _debug_type_name(dt) -> str:
+        if dt is None:
+            return "None"
+        if hasattr(dt, "printRaw"):
+            try:
+                return dt.printRaw()
+            except Exception:
+                pass
+        if hasattr(dt, "getName"):
+            try:
+                name = dt.getName()
+                if name:
+                    return str(name)
+            except Exception:
+                pass
+        meta = None
+        if hasattr(dt, "getMetatype"):
+            try:
+                meta = dt.getMetatype()
+            except Exception:
+                meta = None
+        size = None
+        if hasattr(dt, "getSize"):
+            try:
+                size = dt.getSize()
+            except Exception:
+                size = None
+        return f"{type(dt).__name__}(meta={meta},size={size})"
+
+    @staticmethod
+    def _debug_log(op, message: str) -> None:
+        log_path = os.environ.get("PYGHIDRA_SETCASTS_DEBUG_LOG", "").strip()
+        if not log_path:
+            return
+        addr = op.getAddr() if hasattr(op, "getAddr") else None
+        opc = op.code() if hasattr(op, "code") else None
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"{addr} opc={opc} {message}\n")
+
+    @staticmethod
     def castInput(op, slot: int, data, castStrategy) -> int:
         """Attempt to insert a CAST on input slot of op."""
         from ghidra.core.opcodes import OpCode
+        from ghidra.types.datatype import (
+            TYPE_BOOL,
+            TYPE_INT,
+            TYPE_PARTIALSTRUCT,
+            TYPE_PARTIALUNION,
+            TYPE_UINT,
+            TYPE_UNKNOWN,
+        )
         if castStrategy is None:
             return 0
+        typeop = op.getOpcode() if hasattr(op, "getOpcode") else None
+        if typeop is None or not hasattr(typeop, "getInputCast"):
+            return 0
+        reqtype = typeop.getInputCast(op, slot, castStrategy)
+        if reqtype is None:
+            res_unsigned = castStrategy.markExplicitUnsigned(op, slot) if hasattr(castStrategy, "markExplicitUnsigned") else False
+            res_sized = castStrategy.markExplicitLongSize(op, slot) if hasattr(castStrategy, "markExplicitLongSize") else False
+            if ActionSetCasts._debug_enabled(op):
+                vn = op.getIn(slot)
+                curtype = vn.getHighTypeReadFacing(op) if vn is not None and hasattr(vn, "getHighTypeReadFacing") else None
+                ActionSetCasts._debug_log(
+                    op,
+                    f"castInput slot={slot} req=None cur={ActionSetCasts._debug_type_name(curtype)} "
+                    f"unsigned={res_unsigned} long={res_sized}",
+                )
+            return 1 if (res_unsigned or res_sized) else 0
         vn = op.getIn(slot)
         if vn is None:
             return 0
-        # Get the required input type from the op's TypeOp
-        reqtype = None
-        if hasattr(op, 'getInputLocal') and hasattr(op.getInputLocal(), 'getInputCast'):
-            reqtype = op.getInputLocal().getInputCast(slot, op, castStrategy)
-        if reqtype is None:
-            return 0
-        # Insert a CAST
-        if hasattr(data, 'opInsertCast'):
-            data.opInsertCast(op, slot, reqtype)
+        if ActionSetCasts._debug_enabled(op):
+            curtype = vn.getHighTypeReadFacing(op) if hasattr(vn, "getHighTypeReadFacing") else None
+            ActionSetCasts._debug_log(
+                op,
+                f"castInput slot={slot} req={ActionSetCasts._debug_type_name(reqtype)} "
+                f"cur={ActionSetCasts._debug_type_name(curtype)} const={vn.isConstant()} "
+                f"written={vn.isWritten()} implied={vn.isImplied()}",
+            )
+        vnin = vn
+        if vn.isWritten() and vn.getDef().code() == OpCode.CPUI_CAST:
+            if vn.isImplied():
+                if vn.loneDescend() is op:
+                    vn.updateType(reqtype)
+                    if vn.getType() == reqtype:
+                        return 1
+                vnin = vn.getDef().getIn(0)
+                if reqtype == vnin.getType():
+                    data.opSetInput(op, vnin, slot)
+                    return 1
+        elif vn.isConstant():
+            prev_type = vn.getType() if hasattr(vn, "getType") else None
+            vn.updateType(reqtype)
+            if vn.getType() == reqtype:
+                prev_meta = prev_type.getMetatype() if prev_type is not None and hasattr(prev_type, "getMetatype") else None
+                req_meta = reqtype.getMetatype() if hasattr(reqtype, "getMetatype") else None
+                prev_meta_key = prev_meta.name.lower() if hasattr(prev_meta, "name") else str(prev_meta).lower()
+                req_meta_key = req_meta.name.lower() if hasattr(req_meta, "name") else str(req_meta).lower()
+                prev_size = prev_type.getSize() if prev_type is not None and hasattr(prev_type, "getSize") else None
+                opc = op.code().value if hasattr(op.code(), "value") else int(op.code())
+                if (
+                    prev_type is not None
+                    and prev_type is not reqtype
+                    and prev_size == reqtype.getSize()
+                    and prev_meta_key in (
+                        TYPE_UNKNOWN.name.lower(),
+                        TYPE_PARTIALSTRUCT.name.lower(),
+                        TYPE_PARTIALUNION.name.lower(),
+                        "unknown",
+                        "partialstruct",
+                        "partialunion",
+                    )
+                    and req_meta_key in (
+                        TYPE_UINT.name.lower(),
+                        TYPE_INT.name.lower(),
+                        TYPE_BOOL.name.lower(),
+                        "uint",
+                        "int",
+                        "bool",
+                    )
+                    and opc in (
+                        int(OpCode.CPUI_INT_EQUAL),
+                        int(OpCode.CPUI_INT_NOTEQUAL),
+                        int(OpCode.CPUI_INT_LESS),
+                        int(OpCode.CPUI_INT_LESSEQUAL),
+                        int(OpCode.CPUI_INT_SLESS),
+                        int(OpCode.CPUI_INT_SLESSEQUAL),
+                    )
+                ):
+                    return 0
+                return 1
+
+        newop = data.newOp(1, op.getAddr())
+        vnout = data.newUniqueOut(vnin.getSize(), newop)
+        vnout.updateType(reqtype)
+        vnout.setImplied()
+        data.opSetOpcode(newop, OpCode.CPUI_CAST)
+        data.opSetInput(newop, vnin, 0)
+        data.opSetInput(op, vnout, slot)
+        data.opInsertBefore(newop, op)
+        if ActionSetCasts._debug_enabled(op):
+            ActionSetCasts._debug_log(
+                op,
+                f"castInput inserted slot={slot} req={ActionSetCasts._debug_type_name(reqtype)} "
+                f"from={ActionSetCasts._debug_type_name(vnin.getType() if hasattr(vnin, 'getType') else None)}",
+            )
+        if hasattr(reqtype, "needsResolution") and reqtype.needsResolution():
+            data.forceFacingType(reqtype, -1, newop, -1)
+        high = vn.getHigh() if hasattr(vn, "getHigh") else None
+        high_type = high.getType() if high is not None and hasattr(high, "getType") else None
+        if high_type is not None and hasattr(high_type, "needsResolution") and high_type.needsResolution():
+            data.inheritResolution(high_type, newop, 0, op, slot)
             return 1
-        return 0
+        return 1
 
     @staticmethod
     def castOutput(op, data, castStrategy) -> int:
         """Attempt to insert a CAST on output of op."""
+        from ghidra.core.opcodes import OpCode
+        from ghidra.types.datatype import TYPE_ARRAY, TYPE_PTR, TYPE_STRUCT, TYPE_UNION
         if castStrategy is None:
             return 0
         vn = op.getOut()
         if vn is None:
             return 0
-        outtype = None
-        if hasattr(op, 'getInputLocal') and hasattr(op.getInputLocal(), 'getOutputToken'):
-            outtype = op.getInputLocal().getOutputToken(op, castStrategy)
-        if outtype is None:
+        typeop = op.getOpcode() if hasattr(op, "getOpcode") else None
+        if typeop is None or not hasattr(typeop, "getOutputToken"):
             return 0
-        # Would insert output cast
-        return 0
+        tokenct = typeop.getOutputToken(op, castStrategy)
+        if tokenct is None:
+            return 0
+
+        high = vn.getHigh() if hasattr(vn, "getHigh") else None
+        out_high_type = high.getType() if high is not None and hasattr(high, "getType") else vn.getType()
+        if out_high_type is None:
+            return 0
+        if ActionSetCasts._debug_enabled(op):
+            ActionSetCasts._debug_log(
+                op,
+                f"castOutput token={ActionSetCasts._debug_type_name(tokenct)} "
+                f"high={ActionSetCasts._debug_type_name(out_high_type)} "
+                f"vn={ActionSetCasts._debug_type_name(vn.getType() if hasattr(vn, 'getType') else None)} "
+                f"implied={vn.isImplied()} typelock={vn.isTypeLock()}",
+            )
+        if tokenct == out_high_type:
+            return 0
+
+        out_high_resolve = out_high_type
+        if hasattr(out_high_type, "needsResolution") and out_high_type.needsResolution():
+            if out_high_type != vn.getType() and hasattr(out_high_type, "resolveInFlow"):
+                out_high_type.resolveInFlow(op, -1)
+            if hasattr(out_high_type, "findResolve"):
+                out_high_resolve = out_high_type.findResolve(op, -1)
+
+        force = False
+        if vn.isImplied():
+            if vn.isTypeLock():
+                out_op = vn.loneDescend() if hasattr(vn, "loneDescend") else None
+                if out_op is None or out_op.code() != OpCode.CPUI_RETURN:
+                    force = out_high_resolve != tokenct
+            elif hasattr(out_high_resolve, "getMetatype") and out_high_resolve.getMetatype() != TYPE_PTR:
+                vn.updateType(tokenct)
+                if hasattr(vn, "getHighTypeDefFacing"):
+                    out_high_resolve = vn.getHighTypeDefFacing()
+                else:
+                    out_high_resolve = vn.getType()
+            elif (
+                hasattr(tokenct, "getMetatype")
+                and tokenct.getMetatype() == TYPE_PTR
+                and hasattr(out_high_resolve, "getPtrTo")
+            ):
+                outct = out_high_resolve.getPtrTo()
+                meta = outct.getMetatype() if outct is not None and hasattr(outct, "getMetatype") else None
+                if meta not in (TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION):
+                    vn.updateType(tokenct)
+                    if hasattr(vn, "getHighTypeDefFacing"):
+                        out_high_resolve = vn.getHighTypeDefFacing()
+                    else:
+                        out_high_resolve = vn.getType()
+
+        if not force:
+            ct = castStrategy.castStandard(out_high_resolve, tokenct, False, True) if hasattr(castStrategy, "castStandard") else tokenct
+            if ActionSetCasts._debug_enabled(op):
+                ActionSetCasts._debug_log(
+                    op,
+                    f"castOutput compare resolve={ActionSetCasts._debug_type_name(out_high_resolve)} "
+                    f"token={ActionSetCasts._debug_type_name(tokenct)} "
+                    f"castStandard={ActionSetCasts._debug_type_name(ct)}",
+                )
+            if ct is None:
+                return 0
+
+        newout = data.newUnique(vn.getSize())
+        newout.updateType(tokenct)
+        newout.setImplied()
+        newop = data.newOp(1, op.getAddr())
+        data.opSetOpcode(newop, OpCode.CPUI_CAST)
+        data.opSetOutput(newop, vn)
+        data.opSetInput(newop, newout, 0)
+        data.opSetOutput(op, newout)
+        data.opInsertAfter(newop, op)
+        if ActionSetCasts._debug_enabled(op):
+            ActionSetCasts._debug_log(
+                op,
+                f"castOutput inserted token={ActionSetCasts._debug_type_name(tokenct)} "
+                f"force={force}",
+            )
+        if hasattr(tokenct, "needsResolution") and tokenct.needsResolution():
+            data.forceFacingType(tokenct, -1, newop, 0)
+        if hasattr(out_high_type, "needsResolution") and out_high_type.needsResolution():
+            data.inheritResolution(out_high_type, newop, -1, op, -1)
+        return 1
 
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
@@ -1720,9 +2073,15 @@ class ActionSetCasts(Action):
         castStrategy = None
         arch = data.getArch()
         if arch is not None:
-            if hasattr(arch, 'print') and arch.print is not None:
-                if hasattr(arch.print, 'getCastStrategy'):
-                    castStrategy = arch.print.getCastStrategy()
+            printer = None
+            if hasattr(arch, "getPrintLanguage"):
+                printer = arch.getPrintLanguage()
+            elif hasattr(arch, "print_"):
+                printer = arch.print_
+            elif hasattr(arch, "print"):
+                printer = arch.print
+            if printer is not None and hasattr(printer, "getCastStrategy"):
+                castStrategy = printer.getCastStrategy()
 
         # Walk basic blocks in order
         bblocks = data.getBasicBlocks() if hasattr(data, 'getBasicBlocks') else None
@@ -1894,7 +2253,8 @@ class ActionInputPrototype(Action):
         if hasattr(data, 'getScopeLocal') and data.getScopeLocal() is not None:
             localmap = data.getScopeLocal()
             if hasattr(localmap, 'clearCategory'):
-                localmap.clearCategory(0)  # Symbol::fake_input = 0
+                from ghidra.database.database import Symbol
+                localmap.clearCategory(Symbol.fake_input)
         if hasattr(proto, 'clearUnlockedInput'):
             proto.clearUnlockedInput()
         if not proto.isInputLocked():
@@ -2183,6 +2543,7 @@ class ActionNormalizeBranches(Action):
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
         graph = data.getBasicBlocks()
+        fliplist = []
         for i in range(graph.getSize()):
             bb = graph.getBlock(i)
             if bb.sizeOut() != 2:
@@ -2190,13 +2551,14 @@ class ActionNormalizeBranches(Action):
             cbranch = bb.lastOp()
             if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
                 continue
-            # Attempt to normalize: flip if the boolean input can be simplified
-            # by removing a BOOL_NEGATE
-            inv = cbranch.getIn(1)
-            if inv.isWritten() and inv.getDef().code() == OpCode.CPUI_BOOL_NEGATE:
-                # Flip the branch and remove the negate
-                bb.negateCondition(True)
-                self._count += 1
+            fliplist.clear()
+            if data.opFlipInPlaceTest(cbranch, fliplist) != 0:
+                continue
+            data.opFlipInPlaceExecute(fliplist)
+            bb.flipInPlaceExecute()
+            self._count += 1
+        if hasattr(data, 'clearDeadOps'):
+            data.clearDeadOps()
         return 0
 
 class ActionFinalStructure(Action):

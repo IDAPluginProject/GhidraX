@@ -11,11 +11,15 @@ C++ ref: architecture.hh / architecture.cc (subset)
 
 from __future__ import annotations
 
+from pathlib import Path
+import xml.etree.ElementTree as ET
 from typing import Callable, List, Optional
 
 from ghidra.core.address import Address
 from ghidra.arch.userop import UserOpManage
 from ghidra.ir.typeop import registerTypeOps
+from ghidra.output.printlanguage import PrintLanguageCapability
+from ghidra.output.printc import PrintC  # Register default print capability
 from ghidra.types.datatype import TypeFactory
 from ghidra.transform.action import ActionDatabase
 
@@ -275,9 +279,10 @@ def _build_default_proto_model(spc_mgr, glb, target: str | None = None) -> 'Prot
 
 
 class _TranslateShim:
-    """Minimal Translate-like shim that delegates getRegisterName to native SLEIGH."""
+    """Minimal Translate-like shim backed by the native SLEIGH binding."""
 
     def __init__(self, spc_mgr) -> None:
+        self._spc_mgr = spc_mgr
         self._native = getattr(spc_mgr, '_native', None)
 
     def getRegisterName(self, base, off: int, size: int) -> str:
@@ -289,6 +294,28 @@ class _TranslateShim:
         except Exception:
             return ""
 
+    def oneInstruction(self, emit, addr: Address) -> int:
+        """Decode one instruction and stream its p-code to *emit*."""
+        if self._native is None:
+            return 0
+
+        from ghidra.core.opcodes import OpCode
+        from ghidra.core.pcoderaw import VarnodeData
+
+        result = self._native.pcode(addr.getOffset())
+        for native_op in result.ops:
+            outvar = None
+            if native_op.has_output:
+                out = native_op.output
+                outvar = VarnodeData(self._spc_mgr.getSpaceByName(out.space), out.offset, out.size)
+
+            vars_ = []
+            for inp in native_op.inputs:
+                vars_.append(VarnodeData(self._spc_mgr.getSpaceByName(inp.space), inp.offset, inp.size))
+
+            emit.dump(addr, OpCode(native_op.opcode), outvar, vars_, len(vars_))
+        return result.length
+
 
 class ArchitectureStandalone:
     """Minimal Architecture-like object for Heritage and Action pipeline.
@@ -299,7 +326,7 @@ class ArchitectureStandalone:
     This shim wraps the Lifter's AddrSpaceManager.
     """
 
-    def __init__(self, spc_mgr, target: str | None = None) -> None:
+    def __init__(self, spc_mgr, target: str | None = None, sla_path: str | None = None) -> None:
         self._spc_mgr = spc_mgr
         self.context = None  # No tracked context by default
         self.types = _build_shim_type_factory(spc_mgr)
@@ -307,10 +334,13 @@ class ArchitectureStandalone:
         self.analyze_for_loops = False
         self.nan_ignore_all = False
         self.nan_ignore_compare = True
+        self.alias_block_level = 2
         self.cpool = None
         self._unique_base: int = 0x10000000
         self._errors: List[str] = []
         self.trim_recurse_max = 5
+        self.max_implied_ref = 2
+        self.max_term_duplication = 2
         self.max_instructions = 100000
         self.flowoptions = 0x10
         self.extra_pop = 0
@@ -321,9 +351,11 @@ class ArchitectureStandalone:
         self.lanerecords = []
         self.allacts = ActionDatabase()
         self.userops = UserOpManage()
+        self.print_ = PrintLanguageCapability.getDefault().buildLanguage(self)
         self.translate = _TranslateShim(spc_mgr)
         self._restart_rebuilder: Optional[Callable] = None
         self.inst = registerTypeOps(self.types, self.translate)
+        self._load_laned_registers(sla_path)
         # Create a symbol database with a global scope
         from ghidra.database.database import Database
         self.symboltab = Database(self)
@@ -337,6 +369,48 @@ class ArchitectureStandalone:
         self.evalfp_current = None
         self.evalfp_called = None
         self.userops.initialize(self)
+        if self.print_ is not None and hasattr(self.print_, "initializeFromArchitecture"):
+            self.print_.initializeFromArchitecture()
+
+    def _load_laned_registers(self, sla_path: str | None) -> None:
+        if not sla_path:
+            return
+        pspec_path = Path(sla_path).with_suffix(".pspec")
+        if not pspec_path.is_file():
+            return
+        native = getattr(self._spc_mgr, "_native", None)
+        if native is None or not hasattr(native, "get_registers"):
+            return
+        try:
+            regs = native.get_registers()
+            root = ET.parse(pspec_path).getroot()
+        except Exception:
+            return
+
+        from ghidra.transform.transform import LanedRegister
+
+        mask_list: list[int] = []
+        for reg_elem in root.findall(".//register_data/register"):
+            lane_sizes = reg_elem.get("vector_lane_sizes", "")
+            if not lane_sizes:
+                continue
+            reg_name = reg_elem.get("name", "")
+            reg_info = regs.get(reg_name)
+            if reg_info is None:
+                continue
+            size = int(reg_info[2])
+            laned_register = LanedRegister()
+            laned_register.parseSizes(size, lane_sizes)
+            size_index = laned_register.getWholeSize()
+            while len(mask_list) <= size_index:
+                mask_list.append(0)
+            mask_list[size_index] |= laned_register.getSizeBitMask()
+
+        self.lanerecords = [
+            LanedRegister(size, mask)
+            for size, mask in enumerate(mask_list)
+            if mask != 0
+        ]
 
     def numSpaces(self) -> int:
         return self._spc_mgr.numSpaces()
@@ -365,6 +439,9 @@ class ArchitectureStandalone:
 
     def getDefaultDataSpace(self):
         return self._spc_mgr._defaultDataSpace
+
+    def getPrintLanguage(self):
+        return self.print_
 
     def getJoinSpace(self):
         return getattr(self._spc_mgr, '_joinSpace', None)
