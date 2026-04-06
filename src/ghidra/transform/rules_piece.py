@@ -152,23 +152,79 @@ class Rule2Comp2Sub(Rule):
 
 
 class RuleSubNormal(Rule):
-    """Pull SUBPIECE back through INT_RIGHT: sub(V,c) => sub(V >> c*8, 0)."""
+    """Normalize SUBPIECE through INT_RIGHT / INT_SRIGHT.
+
+    C++ ref: ``RuleSubNormal::applyOp`` in ``ruleaction.cc``.
+    """
     def __init__(self, g): super().__init__(g, 0, "subnormal")
     def clone(self, gl):
         return RuleSubNormal(self._basegroup) if gl.contains(self._basegroup) else None
     def getOpList(self): return [int(OpCode.CPUI_SUBPIECE)]
     def applyOp(self, op, data):
+        shiftout = op.getIn(0)
+        if not shiftout.isWritten():
+            return 0
+        shiftop = shiftout.getDef()
+        opc = shiftop.code()
+        if opc not in (OpCode.CPUI_INT_RIGHT, OpCode.CPUI_INT_SRIGHT):
+            return 0
+        if not shiftop.getIn(1).isConstant():
+            return 0
+        a = shiftop.getIn(0)
+        if a.isFree():
+            return 0
+        outvn = op.getOut()
+        if outvn.isPrecisHi() or outvn.isPrecisLo():
+            return 0
+
+        n = int(shiftop.getIn(1).getOffset())
         c = int(op.getIn(1).getOffset())
-        if c == 0: return 0
-        a = op.getIn(0)
-        if a.isFree(): return 0
-        d = c * 8
-        shiftop = data.newOp(2, op.getAddr())
-        data.opSetOpcode(shiftop, OpCode.CPUI_INT_RIGHT)
-        newout = data.newUniqueOut(a.getSize(), shiftop)
-        data.opSetInput(shiftop, a, 0)
-        data.opSetInput(shiftop, data.newConstant(4, d), 1)
-        data.opInsertBefore(shiftop, op)
-        data.opSetInput(op, newout, 0)
-        data.opSetInput(op, data.newConstant(4, 0), 1)
+        k = n // 8
+        insize = a.getSize()
+        outsize = outvn.getSize()
+
+        # Total shift + output width must either consume the full input, or
+        # the shift must already be byte aligned.
+        if (n + 8 * c + 8 * outsize < 8 * insize) and (n != k * 8):
+            return 0
+
+        if k + c + outsize > insize:
+            trunc_size = insize - c - k
+            if n == k * 8 and trunc_size > 0 and trunc_size.bit_count() == 1:
+                c += k
+                newop = data.newOp(2, op.getAddr())
+                newopc = OpCode.CPUI_INT_SEXT if opc == OpCode.CPUI_INT_SRIGHT else OpCode.CPUI_INT_ZEXT
+                data.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
+                data.newUniqueOut(trunc_size, newop)
+                data.opSetInput(newop, a, 0)
+                data.opSetInput(newop, data.newConstant(4, c), 1)
+                data.opInsertBefore(newop, op)
+
+                data.opSetInput(op, newop.getOut(), 0)
+                data.opRemoveInput(op, 1)
+                data.opSetOpcode(op, newopc)
+                return 1
+            k = insize - c - outsize
+
+        c += k
+        n -= k * 8
+        if n == 0:
+            data.opSetInput(op, a, 0)
+            data.opSetInput(op, data.newConstant(4, c), 1)
+            return 1
+        if n >= outsize * 8:
+            n = outsize * 8
+            if opc == OpCode.CPUI_INT_SRIGHT:
+                n -= 1
+
+        newop = data.newOp(2, op.getAddr())
+        data.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
+        data.newUniqueOut(outsize, newop)
+        data.opSetInput(newop, a, 0)
+        data.opSetInput(newop, data.newConstant(4, c), 1)
+        data.opInsertBefore(newop, op)
+
+        data.opSetInput(op, newop.getOut(), 0)
+        data.opSetInput(op, data.newConstant(4, n), 1)
+        data.opSetOpcode(op, opc)
         return 1

@@ -109,7 +109,16 @@ class TypeOp:
 
     def getInputCast(self, op, slot: int, castStrategy=None) -> Optional[Datatype]:
         """Find the data-type of the input to a specific PcodeOp."""
-        return None  # No cast needed by default
+        if castStrategy is None:
+            return None
+        vn = op.getIn(slot)
+        if vn is None or vn.isAnnotation():
+            return None
+        reqtype = op.inputTypeLocal(slot) if hasattr(op, "inputTypeLocal") else None
+        curtype = vn.getHighTypeReadFacing(op) if hasattr(vn, "getHighTypeReadFacing") else None
+        if reqtype is None or curtype is None:
+            return None
+        return castStrategy.castStandard(reqtype, curtype, False, True)
 
     def propagateType(self, alttype, op, invn, outvn, inslot: int, outslot: int):
         """Propagate an incoming data-type across a specific PcodeOp."""
@@ -1641,7 +1650,7 @@ class TypeOpSubpiece(TypeOpFunc):
         if ct is not None:
             byteOff = TypeOpSubpiece.computeByteOffsetForComposite(op)
             if hasattr(ct, 'findTruncation'):
-                field = ct.findTruncation(byteOff, outvn.getSize(), op, 1, 0)
+                field = ct.findTruncation(byteOff, outvn.getSize(), op, 1, [0])
                 if field is not None:
                     if outvn.getSize() == field.type.getSize():
                         return field.type
@@ -1673,7 +1682,9 @@ class TypeOpSubpiece(TypeOpFunc):
         meta = alttype.getMetatype()
         if meta == TYPE_UNION or meta == getattr(alttype, 'TYPE_PARTIALUNION', -999):
             if hasattr(alttype, 'resolveTruncation'):
-                field = alttype.resolveTruncation(byteOff, op, 1, byteOff)
+                trunc_off = [byteOff]
+                field = alttype.resolveTruncation(byteOff, op, 1, trunc_off)
+                byteOff = trunc_off[0]
                 alttype = field.type if field is not None else None
         while alttype is not None and (byteOff != 0 or alttype.getSize() != outvn.getSize()):
             if hasattr(alttype, 'getSubType'):

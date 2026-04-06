@@ -16,8 +16,68 @@ C++ refs:
 """
 from __future__ import annotations
 
+import os
+
 from ghidra.core.opcodes import OpCode
 from ghidra.transform.ruleaction import Rule
+
+
+def _parse_subvar_debug_addr_spec(spec: str) -> tuple[bool, set[int]]:
+    spec = spec.strip()
+    if not spec:
+        return False, set()
+    if spec == "*":
+        return True, set()
+    addrs: set[int] = set()
+    for part in spec.split(","):
+        part = part.strip().lower()
+        if not part:
+            continue
+        try:
+            addrs.add(int(part, 0))
+        except Exception:
+            continue
+    return False, addrs
+
+
+_SUBVAR_DEBUG_ADDRS_ALL, _SUBVAR_DEBUG_ADDRS = _parse_subvar_debug_addr_spec(
+    os.getenv("PYGHIDRA_SUBVAR_DEBUG_ADDRS", "")
+)
+_SUBVAR_DEBUG_ENABLED = _SUBVAR_DEBUG_ADDRS_ALL or bool(_SUBVAR_DEBUG_ADDRS)
+_SUBVAR_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_SUBVAR_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_subvar_debug.log",
+)
+
+
+def _subvar_debug_should_log(op) -> bool:
+    if not _SUBVAR_DEBUG_ENABLED:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if _SUBVAR_DEBUG_ADDRS_ALL:
+        return True
+    return off in _SUBVAR_DEBUG_ADDRS
+
+
+def _subvar_debug_log(op, message: str) -> None:
+    if not _subvar_debug_should_log(op):
+        return
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = f"{op.getSeqNum().getOrder():#x}"
+    except Exception:
+        seq = "?"
+    try:
+        with open(_SUBVAR_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
+            fp.write(f"[subvar] addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
 
 
 class RuleOrPredicate(Rule):
@@ -507,7 +567,20 @@ class RuleStringCopy(Rule):
             return 0
         if not (hasattr(outvn, 'isAddrTied') and outvn.isAddrTied()):
             return 0
-        return 0
+        scope_local = data.getScopeLocal() if hasattr(data, 'getScopeLocal') else None
+        if scope_local is None:
+            return 0
+        entry = scope_local.queryContainer(outvn.getAddr(), outvn.getSize(), op.getAddr())
+        if entry is None:
+            return 0
+        from ghidra.analysis.constseq import StringSequence
+
+        sequence = StringSequence(data, ct, entry, op, outvn.getAddr())
+        if not sequence.isValid():
+            return 0
+        if not sequence.transform():
+            return 0
+        return 1
 
 
 class RuleStringStore(Rule):
@@ -537,7 +610,14 @@ class RuleStringStore(Rule):
             return 0
         if hasattr(ptrto, 'isOpaqueString') and ptrto.isOpaqueString():
             return 0
-        return 0
+        from ghidra.analysis.constseq import HeapSequence
+
+        sequence = HeapSequence(data, ptrto, op)
+        if not sequence.isValid():
+            return 0
+        if not sequence.transform():
+            return 0
+        return 1
 
 
 # ---------------------------------------------------------------------------
@@ -603,6 +683,7 @@ class RuleSubvarSubpiece(Rule):
         flowsize = outvn.getSize()
         sa = int(op.getIn(1).getOffset())
         if flowsize + sa > 8:
+            _subvar_debug_log(op, f"skip reason=flowsize_plus_sa flowsize={flowsize} sa={sa}")
             return 0
         mask = calc_mask(flowsize)
         mask <<= (8 * sa)
@@ -610,8 +691,14 @@ class RuleSubvarSubpiece(Rule):
         if not aggressive:
             consume = vn.getConsume() if hasattr(vn, 'getConsume') else 0
             if (consume & mask) != consume:
+                _subvar_debug_log(
+                    op,
+                    f"skip reason=consume_mask consume={consume:#x} mask={mask:#x} "
+                    f"vn_flags={(vn._flags if hasattr(vn, '_flags') else 0):#x}",
+                )
                 return 0
             if op.getOut().hasNoDescend():
+                _subvar_debug_log(op, "skip reason=no_descend")
                 return 0
         big = False
         if flowsize >= 8 and vn.isInput():
@@ -619,7 +706,17 @@ class RuleSubvarSubpiece(Rule):
                 big = True
         subflow = SubvariableFlow(data, vn, mask, aggressive, False, big)
         if not subflow.doTrace():
+            _subvar_debug_log(
+                op,
+                f"skip reason=trace_fail aggressive={int(bool(aggressive))} big={int(bool(big))} "
+                f"consume={(vn.getConsume() if hasattr(vn, 'getConsume') else 0):#x} mask={mask:#x}",
+            )
             return 0
+        _subvar_debug_log(
+            op,
+            f"fire aggressive={int(bool(aggressive))} big={int(bool(big))} "
+            f"consume={(vn.getConsume() if hasattr(vn, 'getConsume') else 0):#x} mask={mask:#x}",
+        )
         subflow.doReplacement()
         return 1
 

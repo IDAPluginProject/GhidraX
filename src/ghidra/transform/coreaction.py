@@ -893,9 +893,10 @@ class ActionStackPtrFlow(Action):
         self._analysis_finished = False
     def clone(self, gl):
         return ActionStackPtrFlow(self._basegroup, self._stackspace) if gl.contains(self._basegroup) else None
-    # NOTE: No reset() override — C++ inherits Action::reset which does NOT
-    # clear analysis_finished.  Clearing it here caused infinite re-analysis
-    # on every mainloop repeat.
+
+    def reset(self, data):
+        super().reset(data)
+        self._analysis_finished = False
 
     @staticmethod
     def isStackRelative(spcbasein, vn):
@@ -1279,41 +1280,419 @@ class ActionConditionalConst(Action):
     def __init__(self, g): super().__init__(0, "condconst", g)
     def clone(self, gl):
         return ActionConditionalConst(self._basegroup) if gl.contains(self._basegroup) else None
+
+    class _ConstPoint:
+        __slots__ = ("vn", "constVn", "value", "constBlock", "inSlot", "blockIsDom")
+
+        def __init__(self, vn, const_or_val, constBlock, inSlot: int, blockIsDom: bool):
+            self.vn = vn
+            if hasattr(const_or_val, "getOffset"):
+                self.constVn = const_or_val
+                self.value = const_or_val.getOffset()
+            else:
+                self.constVn = None
+                self.value = const_or_val
+            self.constBlock = constBlock
+            self.inSlot = inSlot
+            self.blockIsDom = blockIsDom
+
+    @staticmethod
+    def _iter_unique_descendants(vn):
+        descs = list(vn.beginDescend()) if hasattr(vn, "beginDescend") else list(vn.getDescendants())
+        i = 0
+        while i < len(descs):
+            op = descs[i]
+            i += 1
+            while i < len(descs) and descs[i] is op:
+                i += 1
+            yield op
+
+    @staticmethod
+    def clearMarks(opList) -> None:
+        for op in opList:
+            op.clearMark()
+
+    @staticmethod
+    def collectReachable(vn, phiNodeEdges, reachable) -> None:
+        from ghidra.core.expression import PcodeOpNode
+        from ghidra.core.opcodes import OpCode
+
+        if phiNodeEdges:
+            phiNodeEdges.sort()
+            excised = {(id(edge.op), edge.slot) for edge in phiNodeEdges}
+        else:
+            excised = set()
+        count = 0
+        if vn.isWritten():
+            op = vn.getDef()
+            if op is not None and op.code() == OpCode.CPUI_MULTIEQUAL:
+                op.setMark()
+                reachable.append(op)
+        while True:
+            for op in ActionConditionalConst._iter_unique_descendants(vn):
+                if op.isMark():
+                    continue
+                opc = op.code()
+                if opc == OpCode.CPUI_MULTIEQUAL:
+                    reached = False
+                    for slot in range(op.numInput()):
+                        if op.getIn(slot) is not vn:
+                            continue
+                        if (id(op), slot) not in excised:
+                            reached = True
+                            break
+                    if not reached:
+                        continue
+                elif opc not in (OpCode.CPUI_COPY, OpCode.CPUI_INDIRECT):
+                    continue
+                reachable.append(op)
+                op.setMark()
+            if count >= len(reachable):
+                break
+            outvn = reachable[count].getOut()
+            count += 1
+            if outvn is None:
+                continue
+            vn = outvn
+
+    @staticmethod
+    def flowToAlternatePath(op) -> bool:
+        from ghidra.core.opcodes import OpCode
+
+        if op.isMark():
+            return True
+        vn = op.getOut()
+        if vn is None:
+            return False
+        markSet = [vn]
+        vn.setMark()
+        count = 0
+        foundPath = False
+        while count < len(markSet):
+            curvn = markSet[count]
+            count += 1
+            for nextOp in ActionConditionalConst._iter_unique_descendants(curvn):
+                opc = nextOp.code()
+                if opc == OpCode.CPUI_MULTIEQUAL:
+                    if nextOp.isMark():
+                        foundPath = True
+                        break
+                elif opc not in (OpCode.CPUI_COPY, OpCode.CPUI_INDIRECT):
+                    continue
+                outVn = nextOp.getOut()
+                if outVn is None or outVn.isMark():
+                    continue
+                outVn.setMark()
+                markSet.append(outVn)
+            if foundPath:
+                break
+        for marked in markSet:
+            marked.clearMark()
+        return foundPath
+
+    @staticmethod
+    def flowTogether(edges, idx: int, result) -> bool:
+        reachable = []
+        outvn = edges[idx].op.getOut()
+        if outvn is None:
+            return False
+        ActionConditionalConst.collectReachable(outvn, [], reachable)
+        res = False
+        for j in range(len(edges)):
+            if idx == j or result[j] == 0:
+                continue
+            if edges[j].op.isMark():
+                result[idx] = 2
+                result[j] = 2
+                res = True
+        ActionConditionalConst.clearMarks(reachable)
+        return res
+
+    @staticmethod
+    def placeCopy(op, bl, constVn, data):
+        from ghidra.core.opcodes import OpCode
+
+        lastOp = bl.lastOp() if bl is not None else None
+        if lastOp is None:
+            addr = op.getAddr()
+        else:
+            addr = lastOp.getAddr()
+        copyOp = data.newOp(1, addr)
+        data.opSetOpcode(copyOp, OpCode.CPUI_COPY)
+        outVn = data.newUniqueOut(constVn.getSize(), copyOp)
+        data.opSetInput(copyOp, constVn, 0)
+        if lastOp is not None and lastOp.isBranch():
+            data.opInsertBefore(copyOp, lastOp)
+        else:
+            data.opInsert(copyOp, bl, None)
+        return outVn
+
+    @staticmethod
+    def placeMultipleConstants(phiNodeEdges, marks, constVn, data) -> None:
+        from ghidra.block.block import FlowBlock
+
+        blocks = []
+        op = None
+        for i in range(len(phiNodeEdges)):
+            if marks[i] != 2:
+                continue
+            op = phiNodeEdges[i].op
+            bl = op.getParent()
+            if bl is None:
+                continue
+            inbl = bl.getIn(phiNodeEdges[i].slot)
+            if inbl is not None:
+                blocks.append(inbl)
+        if op is None or not blocks:
+            return
+        rootBlock = FlowBlock.findCommonBlock(blocks)
+        outVn = ActionConditionalConst.placeCopy(op, rootBlock, constVn, data)
+        for i in range(len(phiNodeEdges)):
+            if marks[i] != 2:
+                continue
+            data.opSetInput(phiNodeEdges[i].op, outVn, phiNodeEdges[i].slot)
+
+    @staticmethod
+    def pushConstant(points, op) -> None:
+        from ghidra.ir.op import PcodeOp
+
+        if (op.getEvalType() & PcodeOp.special) != 0:
+            return
+        opcode = op.getOpcode()
+        if opcode is not None and opcode.isFloatingPointOp():
+            return
+        outvn = op.getOut()
+        if outvn is None or outvn.getSize() > 8:
+            return
+        point = points[0]
+        vn = point.vn
+        slot = op.getSlot(vn)
+        if slot >= op.numInput():
+            return
+        inputs = [0] * op.numInput()
+        for i in range(op.numInput()):
+            if i == slot:
+                inputs[i] = point.value
+            else:
+                inVn = op.getIn(i)
+                if inVn is None or inVn.getSize() > 8 or not inVn.isConstant():
+                    return
+                inputs[i] = inVn.getOffset()
+        outval, evalError = op.executeSimple(inputs)
+        if evalError:
+            return
+        points.append(ActionConditionalConst._ConstPoint(outvn, outval, point.constBlock, point.inSlot, point.blockIsDom))
+
+    def handlePhiNodes(self, varVn, constVn, phiNodeEdges, data) -> None:
+        alternateFlow = []
+        results = [0] * len(phiNodeEdges)
+        self.collectReachable(varVn, phiNodeEdges, alternateFlow)
+        alternate = 0
+        for i in range(len(phiNodeEdges)):
+            if not self.flowToAlternatePath(phiNodeEdges[i].op):
+                results[i] = 1
+                alternate += 1
+        self.clearMarks(alternateFlow)
+
+        hasFlowTogether = False
+        if alternate > 1:
+            for i in range(len(results)):
+                if results[i] == 0:
+                    continue
+                if self.flowTogether(phiNodeEdges, i, results):
+                    hasFlowTogether = True
+
+        for i in range(len(phiNodeEdges)):
+            if results[i] != 1:
+                continue
+            op = phiNodeEdges[i].op
+            slot = phiNodeEdges[i].slot
+            bl = op.getParent()
+            if bl is None:
+                continue
+            pred = bl.getIn(slot)
+            if pred is None:
+                continue
+            outVn = self.placeCopy(op, pred, constVn, data)
+            data.opSetInput(op, outVn, slot)
+            self._count += 1
+        if hasFlowTogether:
+            self.placeMultipleConstants(phiNodeEdges, results, constVn, data)
+            self._count += 1
+
+    def testAlternatePath(self, vn, op, slot: int, depth: int) -> bool:
+        from ghidra.core.opcodes import OpCode
+
+        for i in range(op.numInput()):
+            if i == slot:
+                continue
+            inVn = op.getIn(i)
+            if inVn is vn:
+                return True
+            if inVn is not None and inVn.isWritten():
+                curOp = inVn.getDef()
+                if curOp is None:
+                    continue
+                opc = curOp.code()
+                if opc in (OpCode.CPUI_INT_ADD, OpCode.CPUI_PTRSUB, OpCode.CPUI_PTRADD):
+                    if curOp.getIn(0) is vn or curOp.getIn(1) is vn:
+                        return True
+                elif opc == OpCode.CPUI_MULTIEQUAL:
+                    if depth == 0:
+                        continue
+                    if self.testAlternatePath(vn, curOp, -1, depth - 1):
+                        return True
+        return False
+
+    def propagateConstant(self, points, useMultiequal: bool, data) -> None:
+        from ghidra.core.expression import PcodeOpNode
+        from ghidra.core.opcodes import OpCode
+
+        phiNodeEdges = []
+        while points:
+            point = points[0]
+            varVn = point.vn
+            constVn = point.constVn
+            constBlock = point.constBlock
+            descs = list(varVn.beginDescend()) if hasattr(varVn, "beginDescend") else []
+            idx = 0
+            while idx < len(descs):
+                op = descs[idx]
+                idx += 1
+                while idx < len(descs) and descs[idx] is op:
+                    idx += 1
+                opc = op.code()
+                if opc == OpCode.CPUI_INDIRECT:
+                    continue
+                elif opc == OpCode.CPUI_MULTIEQUAL:
+                    if not useMultiequal:
+                        continue
+                    outVn = op.getOut()
+                    if outVn is not None and varVn.isAddrTied() and varVn.getAddr() == outVn.getAddr():
+                        continue
+                    bl = op.getParent()
+                    if bl is constBlock:
+                        if point.inSlot < op.numInput() and op.getIn(point.inSlot) is varVn:
+                            if point.value > 1:
+                                continue
+                            if outVn is not None and outVn.isAddrTied():
+                                continue
+                            if self.testAlternatePath(varVn, op, point.inSlot, 2):
+                                continue
+                            phiNodeEdges.append(PcodeOpNode(op, point.inSlot))
+                    elif point.blockIsDom and bl is not None:
+                        for slot in range(op.numInput()):
+                            if op.getIn(slot) is not varVn:
+                                continue
+                            pred = bl.getIn(slot)
+                            if pred is not None and constBlock.dominates(pred):
+                                phiNodeEdges.append(PcodeOpNode(op, slot))
+                    continue
+                elif opc == OpCode.CPUI_COPY:
+                    outVn = op.getOut()
+                    followOp = outVn.loneDescend() if outVn is not None else None
+                    if followOp is None or followOp.isMarker() or followOp.code() == OpCode.CPUI_COPY:
+                        continue
+
+                if not point.blockIsDom:
+                    continue
+                parent = op.getParent()
+                if parent is not None and constBlock.dominates(parent):
+                    if constVn is None:
+                        constVn = data.newConstant(varVn.getSize(), point.value)
+                        point.constVn = constVn
+                    if opc == OpCode.CPUI_RETURN:
+                        copyBeforeRet = data.newOp(1, op.getAddr())
+                        data.opSetOpcode(copyBeforeRet, OpCode.CPUI_COPY)
+                        data.opSetInput(copyBeforeRet, constVn, 0)
+                        data.newVarnodeOut(varVn.getSize(), varVn.getAddr(), copyBeforeRet)
+                        data.opSetInput(op, copyBeforeRet.getOut(), 1)
+                        data.opInsertBefore(copyBeforeRet, op)
+                    else:
+                        slot = op.getSlot(varVn)
+                        if slot >= op.numInput():
+                            continue
+                        data.opSetInput(op, constVn, slot)
+                    self._count += 1
+                else:
+                    self.pushConstant(points, op)
+
+            if phiNodeEdges:
+                if constVn is None:
+                    constVn = data.newConstant(varVn.getSize(), point.value)
+                    point.constVn = constVn
+                self.handlePhiNodes(varVn, constVn, phiNodeEdges, data)
+                phiNodeEdges.clear()
+            points.pop(0)
+
+    @staticmethod
+    def findConstCompare(points, boolVn, bl, blockDom, flipEdge: bool) -> None:
+        from ghidra.core.opcodes import OpCode
+
+        if not boolVn.isWritten():
+            return
+        compOp = boolVn.getDef()
+        if compOp is None:
+            return
+        opc = compOp.code()
+        if opc == OpCode.CPUI_BOOL_NEGATE:
+            flipEdge = not flipEdge
+            boolVn = compOp.getIn(0)
+            if boolVn is None or not boolVn.isWritten():
+                return
+            compOp = boolVn.getDef()
+            if compOp is None:
+                return
+            opc = compOp.code()
+        if opc == OpCode.CPUI_INT_EQUAL:
+            constEdge = 1
+        elif opc == OpCode.CPUI_INT_NOTEQUAL:
+            constEdge = 0
+        else:
+            return
+        varVn = compOp.getIn(0)
+        constVn = compOp.getIn(1)
+        if varVn is None or constVn is None:
+            return
+        if not constVn.isConstant():
+            if not varVn.isConstant():
+                return
+            varVn, constVn = constVn, varVn
+        if varVn.loneDescend() is not None:
+            return
+        if flipEdge:
+            constEdge = 1 - constEdge
+        outBlock = bl.getOut(constEdge)
+        if outBlock is None:
+            return
+        points.append(ActionConditionalConst._ConstPoint(varVn, constVn, outBlock, bl.getOutRevIndex(constEdge), blockDom[constEdge]))
+
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
+        useMultiequal = True
+        arch = data.getArch() if hasattr(data, "getArch") else None
+        stackSpace = arch.getStackSpace() if arch is not None and hasattr(arch, "getStackSpace") else None
+        if stackSpace is not None and hasattr(data, "numHeritagePasses"):
+            numPasses = data.numHeritagePasses(stackSpace)
+            if numPasses <= 0:
+                useMultiequal = False
         graph = data.getBasicBlocks()
+        points = []
+        blockDom = [False, False]
         for i in range(graph.getSize()):
             bl = graph.getBlock(i)
             cbranch = bl.lastOp()
             if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
                 continue
             boolVn = cbranch.getIn(1)
-            if boolVn.loneDescend() is not None:
-                continue  # Only read once (by the CBRANCH itself)
-            # The boolean is read elsewhere: propagate bool=0 / bool=1
-            # down the false/true branches respectively
+            blockDom[0] = bl.getOut(0).restrictedByConditional(bl)
+            blockDom[1] = bl.getOut(1).restrictedByConditional(bl)
             flipEdge = cbranch.isBooleanFlip()
-            falseVal = 1 if flipEdge else 0
-            trueVal = 0 if flipEdge else 1
-            # For each descendant of boolVn that is dominated by one branch,
-            # replace boolVn with the appropriate constant
-            for desc in list(boolVn.getDescendants()):
-                if desc is cbranch:
-                    continue
-                parent = desc.getParent()
-                if parent is None:
-                    continue
-                # Check if desc's block is dominated by false or true out
-                falseOut = bl.getFalseOut()
-                trueOut = bl.getTrueOut()
-                if falseOut is not None and falseOut.dominates(parent):
-                    slot = desc.getSlot(boolVn)
-                    data.opSetInput(desc, data.newConstant(boolVn.getSize(), falseVal), slot)
-                    self._count += 1
-                elif trueOut is not None and trueOut.dominates(parent):
-                    slot = desc.getSlot(boolVn)
-                    data.opSetInput(desc, data.newConstant(boolVn.getSize(), trueVal), slot)
-                    self._count += 1
+            if boolVn.loneDescend() is None:
+                points.append(self._ConstPoint(boolVn, 1 if flipEdge else 0, bl.getFalseOut(), bl.getOutRevIndex(0), blockDom[0]))
+                points.append(self._ConstPoint(boolVn, 0 if flipEdge else 1, bl.getTrueOut(), bl.getOutRevIndex(1), blockDom[1]))
+            self.findConstCompare(points, boolVn, bl, blockDom, flipEdge)
+            self.propagateConstant(points, useMultiequal, data)
         return 0
 
 class ActionInferTypes(Action):

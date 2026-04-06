@@ -5,6 +5,7 @@ Utilities for merging low-level Varnodes into high-level variables.
 """
 
 from __future__ import annotations
+import os
 from typing import TYPE_CHECKING, Optional, List, Tuple
 from bisect import bisect_left
 
@@ -27,6 +28,15 @@ _HV_TYPEDIRTY       = 4
 _SPEC_EXCL = _VN_INPUT | _VN_PERSIST | _VN_ADDRTIED
 # isExtraOut = (flags & (indirect_creation | addrtied)) == indirect_creation
 _EXTRAOUT_MASK = _VN_INDIRECT_CREATE | _VN_ADDRTIED
+_MERGE_DEBUG_ADDRS = {
+    int(tok, 0)
+    for tok in os.environ.get("PYGHIDRA_MERGE_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_MERGE_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_MERGE_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_merge_debug.log",
+).strip()
 
 if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
@@ -34,6 +44,35 @@ if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
     from ghidra.analysis.funcdata import Funcdata
     from ghidra.block.block import FlowBlock, BlockBasic
+
+
+def _merge_debug_should_log(addr) -> bool:
+    if not _MERGE_DEBUG_LOG or not _MERGE_DEBUG_ADDRS:
+        return False
+    try:
+        off = addr.getOffset()
+    except Exception:
+        return False
+    return off in _MERGE_DEBUG_ADDRS
+
+
+def _merge_debug_log(addr, message: str) -> None:
+    if not _merge_debug_should_log(addr):
+        return
+    try:
+        from ghidra.transform.action import Action
+
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        with open(_MERGE_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            prefix = "[merge]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr.getOffset():#x} {message}\n")
+    except Exception:
+        return
 
 
 # =========================================================================
@@ -535,9 +574,18 @@ class Merge:
             return
         if vn.isInput():
             if hasattr(self._data, 'opInsertBegin') and bl is not None:
+                _merge_debug_log(
+                    copyop.getAddr(),
+                    f"snipReads insert=begin vn={vn} block={bl.getIndex() if bl is not None else '?'}",
+                )
                 self._data.opInsertBegin(copyop, bl)
         else:
             if hasattr(self._data, 'opInsertAfter'):
+                _merge_debug_log(
+                    copyop.getAddr(),
+                    f"snipReads insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
+                    f"prev_opc={afterop.code()} vn={vn}",
+                )
                 self._data.opInsertAfter(copyop, afterop)
         # Replace reads
         for op in markedop:
@@ -716,6 +764,12 @@ class Merge:
         self._data.opSetOutput(copyop, vn)
         self._data.opSetInput(copyop, uniq, 0)
         if hasattr(self._data, 'opInsertAfter'):
+            _merge_debug_log(
+                copyop.getAddr(),
+                f"trimOpOutput insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
+                f"prev_opc={afterop.code()} op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} "
+                f"op_opc={op.code()}",
+            )
             self._data.opInsertAfter(copyop, afterop)
 
     def trimOpInput(self, op: PcodeOp, slot: int) -> None:
@@ -736,8 +790,17 @@ class Merge:
             self._data.opSetInput(op, copyop.getOut(), slot)
         if op.code() == OpCode.CPUI_MULTIEQUAL:
             if hasattr(self._data, 'opInsertEnd') and inbl is not None:
+                _merge_debug_log(
+                    copyop.getAddr(),
+                    f"trimOpInput insert=end op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} slot={slot}",
+                )
                 self._data.opInsertEnd(copyop, inbl)
         elif hasattr(self._data, 'opInsertBefore'):
+            _merge_debug_log(
+                copyop.getAddr(),
+                f"trimOpInput insert=before op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} "
+                f"op_opc={op.code()} slot={slot}",
+            )
             self._data.opInsertBefore(copyop, op)
 
     def mergeRangeMust(self, varnodes: list) -> None:
@@ -816,6 +879,10 @@ class Merge:
         if copyop is not None and hasattr(self._data, 'opSetInput'):
             self._data.opSetInput(indop, copyop.getOut(), 0)
             if hasattr(self._data, 'opInsertBefore'):
+                _merge_debug_log(
+                    copyop.getAddr(),
+                    f"mergeIndirect insert=before indop={indop.getAddr().getOffset():#x}#{indop.getSeqNum().getOrder()}",
+                )
                 self._data.opInsertBefore(copyop, indop)
         if not self.mergeTestRequired(outvn.getHigh(), indop.getIn(0).getHigh()) or \
            not self.merge(indop.getIn(0).getHigh(), outvn.getHigh(), False):

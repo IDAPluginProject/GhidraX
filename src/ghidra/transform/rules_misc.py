@@ -156,16 +156,39 @@ class RuleSubZext(Rule):
                 if subvn.loneDescend() != op: return 0
                 constvn = subop.getIn(1)
                 rightVal = constvn.getOffset() * 8
-                newvn = data.newUniqueOut(basevn.getSize(), data.newOp(2, op.getAddr()))
-                shiftop = newvn.getDef()
-                data.opSetOpcode(shiftop, OpCode.CPUI_INT_RIGHT)
-                data.opSetInput(shiftop, basevn, 0)
-                data.opSetInput(shiftop, data.newConstant(constvn.getSize(), rightVal), 1)
-                data.opInsertBefore(shiftop, op)
+                newvn = data.newUnique(basevn.getSize())
                 data.opSetInput(op, newvn, 0)
+                data.opSetOpcode(subop, OpCode.CPUI_INT_RIGHT)
+                data.opSetInput(subop, data.newConstant(constvn.getSize(), rightVal), 1)
+                data.opSetOutput(subop, newvn)
             else:
                 data.opSetInput(op, basevn, 0)
             val = calc_mask(subvn.getSize())
+            constvn = data.newConstant(basevn.getSize(), val)
+            data.opSetOpcode(op, OpCode.CPUI_INT_AND)
+            data.opInsertInput(op, constvn, 1)
+            return 1
+        elif subop.code() == OpCode.CPUI_INT_RIGHT:
+            shiftop = subop
+            if not shiftop.getIn(1).isConstant(): return 0
+            midvn = shiftop.getIn(0)
+            if not midvn.isWritten(): return 0
+            subop = midvn.getDef()
+            if subop.code() != OpCode.CPUI_SUBPIECE: return 0
+            basevn = subop.getIn(0)
+            if basevn.isFree(): return 0
+            if basevn.getSize() != op.getOut().getSize(): return 0
+            if midvn.loneDescend() != shiftop: return 0
+            if subvn.loneDescend() != op: return 0
+            val = calc_mask(midvn.getSize())
+            sa = shiftop.getIn(1).getOffset()
+            val >>= sa
+            sa += subop.getIn(1).getOffset() * 8
+            newvn = data.newUnique(basevn.getSize())
+            data.opSetInput(op, newvn, 0)
+            data.opSetInput(shiftop, basevn, 0)
+            data.opSetInput(shiftop, data.newConstant(shiftop.getIn(1).getSize(), sa), 1)
+            data.opSetOutput(shiftop, newvn)
             constvn = data.newConstant(basevn.getSize(), val)
             data.opSetOpcode(op, OpCode.CPUI_INT_AND)
             data.opInsertInput(op, constvn, 1)

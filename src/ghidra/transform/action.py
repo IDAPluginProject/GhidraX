@@ -29,29 +29,75 @@ _RULE_TYPE_DISABLE: int = 1
 _OP_DEAD: int = 0x20
 
 
-def _action_debug_should_log(action_name: str, op) -> bool:
-    spec = os.getenv("PYGHIDRA_ACTION_DEBUG_ADDRS", "").strip()
+def _parse_debug_addr_spec(spec: str) -> tuple[bool, set[int]]:
+    spec = spec.strip()
     if not spec:
-        return False
-    action_filter = os.getenv("PYGHIDRA_ACTION_DEBUG_NAME", "").strip()
-    if action_filter and action_filter != action_name:
-        return False
-    try:
-        off = op.getAddr().getOffset()
-    except Exception:
-        return False
+        return False, set()
     if spec == "*":
-        return True
+        return True, set()
+    addrs: set[int] = set()
     for part in spec.split(","):
         part = part.strip().lower()
         if not part:
             continue
         try:
-            if off == int(part, 0):
-                return True
+            addrs.add(int(part, 0))
         except Exception:
             continue
-    return False
+    return False, addrs
+
+
+_ACTION_DEBUG_NAME_FILTER = os.getenv("PYGHIDRA_ACTION_DEBUG_NAME", "").strip()
+_ACTION_DEBUG_ADDRS_ALL, _ACTION_DEBUG_ADDRS = _parse_debug_addr_spec(
+    os.getenv("PYGHIDRA_ACTION_DEBUG_ADDRS", "")
+)
+_ACTION_DEBUG_ENABLED = _ACTION_DEBUG_ADDRS_ALL or bool(_ACTION_DEBUG_ADDRS)
+_ACTION_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_ACTION_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_rule_debug.log"
+)
+
+_ACTION_PERFORM_DEBUG_SPEC = os.getenv("PYGHIDRA_ACTION_PERFORM_DEBUG_NAME", "").strip()
+_ACTION_PERFORM_DEBUG_ALL = _ACTION_PERFORM_DEBUG_SPEC == "*"
+_ACTION_PERFORM_DEBUG_NAMES = {
+    part.strip() for part in _ACTION_PERFORM_DEBUG_SPEC.split(",") if part.strip()
+}
+_ACTION_PERFORM_DEBUG_ENABLED = _ACTION_PERFORM_DEBUG_ALL or bool(_ACTION_PERFORM_DEBUG_NAMES)
+_ACTION_PERFORM_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_ACTION_PERFORM_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_action_perform_debug.log",
+)
+
+_ACTION_FIRE_DEBUG_SPEC = os.getenv("PYGHIDRA_ACTION_FIRE_DEBUG_NAME", "").strip()
+_ACTION_FIRE_DEBUG_ALL = _ACTION_FIRE_DEBUG_SPEC == "*"
+_ACTION_FIRE_DEBUG_NAMES = {
+    part.strip() for part in _ACTION_FIRE_DEBUG_SPEC.split(",") if part.strip()
+}
+_ACTION_FIRE_DEBUG_ENABLED = _ACTION_FIRE_DEBUG_ALL or bool(_ACTION_FIRE_DEBUG_NAMES)
+_ACTION_FIRE_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_ACTION_FIRE_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_action_fire_debug.log",
+)
+
+_ACTION_NOTIFY_DEBUG_SPEC = os.getenv("PYGHIDRA_ACTION_NOTIFY_DEBUG_NAME", "").strip()
+_ACTION_NOTIFY_DEBUG_ALL = _ACTION_NOTIFY_DEBUG_SPEC == "*"
+_ACTION_NOTIFY_DEBUG_NAMES = {
+    part.strip() for part in _ACTION_NOTIFY_DEBUG_SPEC.split(",") if part.strip()
+}
+_ACTION_NOTIFY_DEBUG_ENABLED = _ACTION_NOTIFY_DEBUG_ALL or bool(_ACTION_NOTIFY_DEBUG_NAMES)
+
+
+def _action_debug_should_log(action_name: str, op) -> bool:
+    if not _ACTION_DEBUG_ENABLED:
+        return False
+    if _ACTION_DEBUG_NAME_FILTER and _ACTION_DEBUG_NAME_FILTER != action_name:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if _ACTION_DEBUG_ADDRS_ALL:
+        return True
+    return off in _ACTION_DEBUG_ADDRS
 
 
 def _action_debug_log(action_name: str, op, message: str) -> None:
@@ -61,7 +107,6 @@ def _action_debug_log(action_name: str, op, message: str) -> None:
         addr = f"{op.getAddr().getOffset():#x}"
     except Exception:
         addr = "?"
-    path = os.getenv("PYGHIDRA_ACTION_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_rule_debug.log")
     try:
         idx = Action.getActiveTraceSerial()  # type: ignore[name-defined]
     except Exception:
@@ -70,10 +115,113 @@ def _action_debug_log(action_name: str, op, message: str) -> None:
     if idx > 0:
         prefix += f" idx={idx}"
     try:
-        with open(path, "a", encoding="utf-8") as fp:
+        with open(_ACTION_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
             fp.write(f"{prefix} addr={addr} {message}\n")
     except Exception:
         return
+
+
+def _action_perform_debug_enabled(action_name: str) -> bool:
+    if not _ACTION_PERFORM_DEBUG_ENABLED:
+        return False
+    if _ACTION_PERFORM_DEBUG_ALL:
+        return True
+    return action_name in _ACTION_PERFORM_DEBUG_NAMES
+
+
+def _action_perform_debug_log(action_name: str, message: str) -> None:
+    if not _action_perform_debug_enabled(action_name):
+        return
+    try:
+        idx = Action.getActiveTraceSerial()  # type: ignore[name-defined]
+    except Exception:
+        idx = 0
+    prefix = f"[action-perform:{action_name}]"
+    if idx > 0:
+        prefix += f" idx={idx}"
+    try:
+        with open(_ACTION_PERFORM_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
+            fp.write(f"{prefix} {message}\n")
+    except Exception:
+        return
+
+
+def _action_notify_debug_enabled(action_name: str) -> bool:
+    if not _ACTION_NOTIFY_DEBUG_ENABLED:
+        return False
+    if _ACTION_NOTIFY_DEBUG_ALL:
+        return True
+    return action_name in _ACTION_NOTIFY_DEBUG_NAMES
+
+
+def _action_fire_debug_enabled(action_name: str) -> bool:
+    if not _ACTION_FIRE_DEBUG_ENABLED:
+        return False
+    if _ACTION_FIRE_DEBUG_ALL:
+        return True
+    return action_name in _ACTION_FIRE_DEBUG_NAMES
+
+
+def _action_fire_debug_log(action_name: str, iter_num: int, rule_name: str, op, res: int) -> None:
+    if not _action_fire_debug_enabled(action_name):
+        return
+    try:
+        idx = Action.getActiveTraceSerial()  # type: ignore[name-defined]
+    except Exception:
+        idx = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = f"{op.getSeqNum().getOrder():#x}"
+    except Exception:
+        seq = "?"
+    try:
+        opc = int(op.code())
+    except Exception:
+        opc = -1
+    try:
+        with open(_ACTION_FIRE_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
+            prefix = f"[action-fire:{action_name}]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(
+                f"{prefix} iter={iter_num} addr={addr} seq={seq} "
+                f"rule={rule_name} res={res} opc={opc}\n"
+            )
+    except Exception:
+        return
+
+
+if not _ACTION_DEBUG_ENABLED:
+    def _action_debug_should_log(action_name: str, op) -> bool:
+        return False
+
+    def _action_debug_log(action_name: str, op, message: str) -> None:
+        return
+
+
+if not _ACTION_PERFORM_DEBUG_ENABLED:
+    def _action_perform_debug_enabled(action_name: str) -> bool:
+        return False
+
+    def _action_perform_debug_log(action_name: str, message: str) -> None:
+        return
+
+
+if not _ACTION_NOTIFY_DEBUG_ENABLED:
+    def _action_notify_debug_enabled(action_name: str) -> bool:
+        return False
+
+
+if not _ACTION_FIRE_DEBUG_ENABLED:
+    def _action_fire_debug_enabled(action_name: str) -> bool:
+        return False
+
+    def _action_fire_debug_log(action_name: str, iter_num: int, rule_name: str, op, res: int) -> None:
+        return
+
 
 # =========================================================================
 # Helper
@@ -157,6 +305,8 @@ class Action(ABC):
     _trace_recorder: Optional[ActionTraceRecorder] = None
     _trace_serial: int = 0
     _active_trace_serial: int = 0
+    _active_perform_name: str = ""
+    _active_perform_iter: int = 0
 
     @classmethod
     def set_deadline(cls, seconds: float) -> None:
@@ -198,13 +348,29 @@ class Action(ABC):
         return cls._active_trace_serial
 
     @classmethod
+    def getActivePerformIter(cls) -> int:
+        return cls._active_perform_iter
+
+    @classmethod
     def notify_trace_recorder(cls, action: "Action", data: "Funcdata", change_count: int) -> None:
         recorder = cls._trace_recorder
         if recorder is None:
             return
+        if _action_notify_debug_enabled(action.getName()):
+            _action_perform_debug_log(
+                action.getName(),
+                f"notify_enter change_count={change_count} recorder=1",
+            )
         try:
             recorder.on_action_complete(action, data, change_count)
-        except Exception:
+            if _action_notify_debug_enabled(action.getName()):
+                _action_perform_debug_log(action.getName(), "notify_ok")
+        except Exception as exc:
+            if _action_notify_debug_enabled(action.getName()):
+                _action_perform_debug_log(
+                    action.getName(),
+                    f"notify_exc type={type(exc).__name__} msg={exc}",
+                )
             # Debug tracing must never interfere with the core pipeline.
             return
 
@@ -303,10 +469,20 @@ class Action(ABC):
         C++ ref: Action::perform in action.cc — loops until lcount >= count
         with no artificial iteration cap.
         """
+        if self._status == Action.status_start:
+            self._count = 0
         _iter_count = 0
         _t0 = _time.perf_counter()
         while True:
             _iter_count += 1
+            _action_perform_debug_log(
+                self._name,
+                f"iter={_iter_count} enter status={self._status} count={self._count}",
+            )
+            _prev_perform_name = Action._active_perform_name
+            _prev_perform_iter = Action._active_perform_iter
+            Action._active_perform_name = self._name
+            Action._active_perform_iter = _iter_count
             # --- wall-clock deadline check ---
             if Action.past_deadline():
                 elapsed = _time.perf_counter() - _t0
@@ -341,6 +517,8 @@ class Action(ABC):
             if self._status == Action.status_start:
                 self._count = 0
                 if self.checkStartBreak():
+                    Action._active_perform_name = _prev_perform_name
+                    Action._active_perform_iter = _prev_perform_iter
                     self._status = Action.status_breakstarthit
                     return -1
                 self._count_tests += 1
@@ -362,17 +540,32 @@ class Action(ABC):
 
             # Only check results if we actually called apply()
             if self._status != Action.status_actionbreak:
+                _action_perform_debug_log(
+                    self._name,
+                    f"iter={_iter_count} after_apply res={res} lcount={self._lcount} count={self._count}",
+                )
                 if res < 0:
+                    Action._active_perform_name = _prev_perform_name
+                    Action._active_perform_iter = _prev_perform_iter
                     self._status = Action.status_mid
                     return res
                 elif self._lcount < self._count:
                     self.issueWarning(data.getArch())
                     self._count_apply += 1
                     if self.checkActionBreak():
+                        Action._active_perform_name = _prev_perform_name
+                        Action._active_perform_iter = _prev_perform_iter
                         self._status = Action.status_actionbreak
                         return -1
 
+            Action._active_perform_name = _prev_perform_name
+            Action._active_perform_iter = _prev_perform_iter
             self._status = Action.status_repeat
+            _action_perform_debug_log(
+                self._name,
+                f"iter={_iter_count} repeat_check changed={int(self._lcount < self._count)} "
+                f"repeat={int((self._flags & Action.rule_repeatapply) != 0)}",
+            )
             if not (self._lcount < self._count and (self._flags & Action.rule_repeatapply) != 0):
                 break
 
@@ -540,13 +733,29 @@ class ActionGroup(Action):
             ac.resetStats()
 
     def apply(self, data: Funcdata) -> int:
+        _action_perform_debug_log(
+            self._name,
+            f"apply_enter status={self._status} state_idx={self._state_idx}",
+        )
         if self._status != Action.status_mid:
             self._state_idx = 0
+            _action_perform_debug_log(
+                self._name,
+                f"apply_reset status={self._status} state_idx={self._state_idx}",
+            )
         while self._state_idx < len(self._list):
             ac = self._list[self._state_idx]
+            _action_perform_debug_log(
+                self._name,
+                f"apply_subaction idx={self._state_idx} name={ac.getName()}",
+            )
             Action.begin_trace_action()
             try:
                 res = ac.perform(data)
+                _action_perform_debug_log(
+                    self._name,
+                    f"apply_result idx={self._state_idx} name={ac.getName()} res={res}",
+                )
                 if res >= 0:
                     Action.notify_trace_recorder(ac, data, res)
             finally:
@@ -963,6 +1172,13 @@ class ActionPool(Action):
                 if res > 0:
                     rl._count_apply += 1
                     self._count += res
+                    _action_fire_debug_log(
+                        self._name,
+                        Action.getActivePerformIter(),
+                        rl.getName(),
+                        op,
+                        res,
+                    )
                     ActionPool._global_rule_counts[rl.getName()] = (
                         ActionPool._global_rule_counts.get(rl.getName(), 0) + 1
                     )
@@ -1034,6 +1250,13 @@ class ActionPool(Action):
             if res > 0:
                 rl._count_apply += 1
                 self._count += res
+                _action_fire_debug_log(
+                    self._name,
+                    Action.getActivePerformIter(),
+                    rl.getName(),
+                    op,
+                    res,
+                )
                 ActionPool._global_rule_counts[rl.getName()] = (
                     ActionPool._global_rule_counts.get(rl.getName(), 0) + 1
                 )
@@ -1166,6 +1389,13 @@ class ActionPool(Action):
                     if res > 0:
                         rl._count_apply += 1
                         count += res
+                        _action_fire_debug_log(
+                            self._name,
+                            Action.getActivePerformIter(),
+                            rl.getName(),
+                            op,
+                            res,
+                        )
                         rn = rl._name
                         _gcounts[rn] = _gcounts_get(rn, 0) + 1
                         if (rl._flags & _WARN_CHK) == _WARN_ON:

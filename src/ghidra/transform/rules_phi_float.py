@@ -127,6 +127,23 @@ def _pushmulti_debug_log(op, message: str) -> None:
         return
 
 
+def _pushmulti_var_desc(vn) -> str:
+    try:
+        if vn is None:
+            return "None"
+        if vn.isWritten():
+            defop = vn.getDef()
+            return (
+                f"{defop.code().name}@{defop.getAddr().getOffset():#x}"
+                f":{defop.getSeqNum().getOrder()}"
+            )
+        if vn.isConstant():
+            return f"const[{vn.getOffset():#x}:{vn.getSize()}]"
+        return f"{vn.getAddr()}:{vn.getSize()}"
+    except Exception:
+        return "<?>"
+
+
 def _multicollapse_debug_enabled(op) -> bool:
     spec = os.getenv("PYGHIDRA_MULTICOLLAPSE_DEBUG_ADDRS", "").strip()
     if not spec:
@@ -725,7 +742,22 @@ class RulePushMulti(Rule):
     def findSubstitute(in1, in2, bb, earliest):
         """Find an existing MULTIEQUAL of in1,in2 in bb, or a CSE match."""
         from ghidra.core.expression import functionalEqualityLevel
+        _pushmulti_debug_log(
+            earliest if earliest is not None else (in1.getDef() if in1.isWritten() else in2.getDef()),
+            "findSubstitute:start "
+            f"in1={_pushmulti_var_desc(in1)} "
+            f"in2={_pushmulti_var_desc(in2)} "
+            f"earliest={(earliest.getSeqNum().getOrder() if earliest is not None else 'None')}",
+        )
         for desc_op in list(in1.getDescendants()):
+            _pushmulti_debug_log(
+                desc_op,
+                "findSubstitute:candidate "
+                f"parent_match={int(desc_op.getParent() is bb)} "
+                f"opcode={desc_op.code().name} "
+                f"in0={_pushmulti_var_desc(desc_op.getIn(0)) if desc_op.numInput() > 0 else 'None'} "
+                f"in1={_pushmulti_var_desc(desc_op.getIn(1)) if desc_op.numInput() > 1 else 'None'}",
+            )
             if desc_op.getParent() is not bb:
                 continue
             if desc_op.code() != OpCode.CPUI_MULTIEQUAL:
@@ -737,10 +769,22 @@ class RulePushMulti(Rule):
             _pushmulti_debug_log(desc_op, "findSubstitute=existing_multiequal")
             return desc_op
         if in1 is in2:
+            _pushmulti_debug_log(
+                in1.getDef() if in1.isWritten() else earliest,
+                "findSubstitute:return=None reason=same_input",
+            )
             return None
         buf1 = [None, None]
         buf2 = [None, None]
-        if functionalEqualityLevel(in1, in2, buf1, buf2) != 0:
+        feq = functionalEqualityLevel(in1, in2, buf1, buf2)
+        _pushmulti_debug_log(
+            in1.getDef() if in1.isWritten() else earliest,
+            "findSubstitute:functional "
+            f"res={feq} "
+            f"buf1={_pushmulti_var_desc(buf1[0])} "
+            f"buf2={_pushmulti_var_desc(buf2[0])}",
+        )
+        if feq != 0:
             return None
         op1 = in1.getDef()
         op2 = in2.getDef()
@@ -753,7 +797,14 @@ class RulePushMulti(Rule):
                 substitute = Funcdata.cseFindInBlock(op1, vn, bb, earliest)
                 if substitute is not None:
                     _pushmulti_debug_log(substitute, f"findSubstitute=cse_match via_slot={i}")
+                else:
+                    _pushmulti_debug_log(
+                        op1,
+                        "findSubstitute:return=None "
+                        f"reason=no_cse via_slot={i} shared={_pushmulti_var_desc(vn)}",
+                    )
                 return substitute
+        _pushmulti_debug_log(op1, "findSubstitute:return=None reason=no_shared_slot")
         return None
 
     def applyOp(self, op, data):
@@ -848,33 +899,27 @@ class RuleSelectCse(Rule):
     def __init__(self, g): super().__init__(g, 0, "selectcse")
     def clone(self, gl):
         return RuleSelectCse(self._basegroup) if gl.contains(self._basegroup) else None
-    def getOpList(self): return [OpCode.CPUI_INT_AND, OpCode.CPUI_INT_OR, OpCode.CPUI_INT_XOR]
+    def getOpList(self): return [OpCode.CPUI_SUBPIECE, OpCode.CPUI_INT_SRIGHT]
     def applyOp(self, op, data):
-        bl = op.getParent()
-        if bl is None: return 0
-        opc = op._opcode_enum
-        ins = op._inrefs
-        in0 = ins[0] if ins else None
-        in1 = ins[1] if len(ins) > 1 else None
-        if in0 is None:
+        vn = op.getIn(0)
+        if vn is None:
             return 0
-        is_commutative = opc in (27, 28, 26)  # INT_AND=27, INT_OR=28, INT_XOR=26
-        # Search in0._descend (ops that READ in0) — O(fan-out) vs O(block_size)
-        for other in in0._descend:
-            if other is op or other._opcode_enum != opc or other.getParent() is not bl:
+        opc = op.code()
+        hashlist = []
+        outlist = []
+
+        for other in vn._descend:
+            if other.code() != opc:
                 continue
-            o_ins = other._inrefs
-            o0 = o_ins[0] if o_ins else None
-            o1 = o_ins[1] if len(o_ins) > 1 else None
-            if o0 is in0 and o1 is in1:
-                data.totalReplace(op.getOut(), other.getOut())
-                data.opDestroy(op)
-                return 1
-            if is_commutative and o0 is in1 and o1 is in0:
-                data.totalReplace(op.getOut(), other.getOut())
-                data.opDestroy(op)
-                return 1
-        return 0
+            h = other.getCseHash()
+            if h == 0:
+                continue
+            hashlist.append((h, other))
+        if len(hashlist) <= 1:
+            return 0
+
+        data.cseEliminateList(hashlist, outlist)
+        return 1 if outlist else 0
 
 
 class RuleCollectTerms(Rule):

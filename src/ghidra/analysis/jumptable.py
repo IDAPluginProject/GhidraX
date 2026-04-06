@@ -572,7 +572,7 @@ class JumpTable:
             self.glb = op2.glb
             self.opaddress = op2.opaddress
             self.indirect = None
-            self.jmodel = op2.jmodel.clone(self) if op2.jmodel is not None and hasattr(op2.jmodel, "clone") else None
+            self.jmodel = None
             self.origmodel = None
             self.addresstable = list(op2.addresstable)
             self.label = []
@@ -647,8 +647,7 @@ class JumpTable:
         self.maxext = mext
 
     def setLastAsDefault(self) -> None:
-        if self.addresstable:
-            self.lastBlock = len(self.addresstable) - 1
+        self.defaultBlock = self.lastBlock
 
     def setDefaultBlock(self, bl: int) -> None:
         self.defaultBlock = bl
@@ -712,7 +711,12 @@ class JumpTable:
                 if count == i:
                     return ip.addressIndex
                 count += 1
-        raise Exception("Could not get jumptable index for block")
+        block_start = bl.getStart() if hasattr(bl, 'getStart') else None
+        mapping = [(ip.blockPosition, ip.addressIndex) for ip in self.block2addr]
+        raise Exception(
+            f"Could not get jumptable index for block start={block_start} pos={pos} "
+            f"ordinal={i} block2addr={mapping}"
+        )
 
     def recoverAddresses(self, fd) -> None:
         """Recover the raw jump-table addresses."""
@@ -730,15 +734,43 @@ class JumpTable:
 
     def recoverLabels(self, fd) -> None:
         """Recover case labels for this jump-table."""
-        if self.jmodel is None:
-            return
         self.label.clear()
-        self.jmodel.buildLabels(fd, self.addresstable, self.label, self.jmodel)
+        if self.jmodel is not None:
+            if self.origmodel is None or self.origmodel.getTableSize() == 0:
+                self.jmodel.findUnnormalized(self.maxaddsub, self.maxleftright, self.maxext)
+                self.jmodel.buildLabels(fd, self.addresstable, self.label, self.jmodel)
+            else:
+                self.jmodel.findUnnormalized(self.maxaddsub, self.maxleftright, self.maxext)
+                self.jmodel.buildLabels(fd, self.addresstable, self.label, self.origmodel)
+        else:
+            self.jmodel = JumpModelTrivial(self)
+            max_jumptable_size = (
+                self.glb.max_jumptable_size
+                if self.glb is not None and hasattr(self.glb, "max_jumptable_size")
+                else 1024
+            )
+            self.jmodel.recoverModel(fd, self.indirect, len(self.addresstable), max_jumptable_size)
+            self.jmodel.buildAddresses(fd, self.indirect, self.addresstable)
+            self.trivialSwitchOver()
+            self.jmodel.buildLabels(fd, self.addresstable, self.label, self.origmodel)
+        self.clearSavedModel()
 
     def foldInNormalization(self, fd) -> None:
         """Hide the normalization code."""
         if self.jmodel is not None:
-            self.jmodel.foldInNormalization(fd, self.indirect)
+            from ghidra.core.address import calc_mask, minimalmask
+            from ghidra.core.opcodes import OpCode
+
+            switchvn = self.jmodel.foldInNormalization(fd, self.indirect)
+            if switchvn is None:
+                return
+
+            self.switchVarConsume = minimalmask(switchvn.getNZMask())
+            if self.switchVarConsume >= calc_mask(switchvn.getSize()):
+                if switchvn.isWritten():
+                    op = switchvn.getDef()
+                    if op.code() == OpCode.CPUI_INT_SEXT:
+                        self.switchVarConsume = calc_mask(op.getIn(0).getSize())
 
     def foldInGuards(self, fd) -> bool:
         if self.jmodel is not None:
@@ -961,21 +993,68 @@ class JumpTable:
         """Force a given basic-block to be a switch destination."""
         addr = bl.getStart() if hasattr(bl, 'getStart') else Address()
         self.addresstable.append(addr)
+        parent = self.indirect.getParent() if self.indirect is not None else None
+        if parent is not None:
+            self.lastBlock = parent.sizeOut()
+            self.block2addr.append(IndexPair(self.lastBlock, len(self.addresstable) - 1))
         self.label.append(lab)
+
+    def saveModel(self) -> None:
+        if self.origmodel is not None:
+            self.origmodel = None
+        self.origmodel = self.jmodel
+        self.jmodel = None
+
+    def restoreSavedModel(self) -> None:
+        self.jmodel = self.origmodel
+        self.origmodel = None
+
+    def clearSavedModel(self) -> None:
+        self.origmodel = None
 
     def matchModel(self, fd) -> None:
         """Try to match JumpTable model to the existing function."""
-        if self.jmodel is None:
-            self.jmodel = JumpModelTrivial(self)
+        from ghidra.core.error import LowlevelError
+
+        if not self.isRecovered():
+            raise LowlevelError("Trying to recover jumptable labels without addresses")
+
+        if self.jmodel is not None:
+            if not self.jmodel.isOverride():
+                self.saveModel()
+            else:
+                self.clearSavedModel()
+                if hasattr(fd, "warning"):
+                    fd.warning("Switch is manually overridden", self.opaddress)
+
+        self.recoverModel(fd)
+        if self.jmodel is not None and self.jmodel.getTableSize() != len(self.addresstable):
+            if len(self.addresstable) == 1 and self.jmodel.getTableSize() > 1:
+                override = fd.getOverride() if hasattr(fd, "getOverride") else None
+                if override is not None and hasattr(override, "insertMultistageJump"):
+                    override.insertMultistageJump(self.opaddress)
+                if hasattr(fd, "setRestartPending"):
+                    fd.setRestartPending(True)
+                return
+            if hasattr(fd, "warning"):
+                fd.warning("Could not find normalized switch variable to match jumptable", self.opaddress)
 
     def clear(self) -> None:
+        self.clearSavedModel()
+        if self.jmodel is not None:
+            if self.jmodel.isOverride():
+                self.jmodel.clear()
+            else:
+                self.jmodel = None
         self.addresstable.clear()
+        self.block2addr.clear()
+        self.indirect = None
+        self.switchVarConsume = 0xFFFFFFFFFFFFFFFF
+        self.partialTable = False
         self.label.clear()
         self.loadpoints.clear()
         self.defaultBlock = -1
         self.lastBlock = -1
-        if self.jmodel is not None:
-            self.jmodel.clear()
 
 
 # RecoveryMode as class-level enum on JumpTable

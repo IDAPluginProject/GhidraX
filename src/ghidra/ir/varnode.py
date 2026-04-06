@@ -1303,6 +1303,33 @@ def varnode_compare_def_loc(a: Varnode, b: Varnode) -> bool:
     return False
 
 
+def _sort_space_key(space) -> int:
+    if space is None:
+        return -1
+    try:
+        return space.getIndex()
+    except Exception:
+        return -1
+
+
+def _sort_address_key(addr: Address) -> tuple[int, int]:
+    return (_sort_space_key(addr.getSpace()), addr.getOffset())
+
+
+def _sort_varnode_def_loc_key(vn: Varnode) -> tuple[int, ...]:
+    input_or_written = vn.getFlags() & (Varnode.input | Varnode.written)
+    key = [((input_or_written - 1) & 0xFFFFFFFF)]
+    if input_or_written == Varnode.written:
+        seq = vn.getDef().getSeqNum()
+        key.extend((*_sort_address_key(seq.getAddr()), seq.getTime()))
+    key.extend((*_sort_address_key(vn.getAddr()), vn.getSize()))
+    if input_or_written == 0:
+        key.append(vn.getCreateIndex())
+    else:
+        key.append(0)
+    return tuple(key)
+
+
 # =========================================================================
 # VarnodeBank
 # =========================================================================
@@ -1319,7 +1346,7 @@ class VarnodeBank:
         self._manage = manage  # AddrSpaceManager
         self._loc_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
         self._def_tree: Dict[int, Varnode] = {}  # keyed by id(vn)
-        self._addr_idx: Dict[tuple, List] = {}   # (offset, size) -> [id(vn), ...]
+        self._addr_idx: Dict[tuple, List] = {}   # (space-id, offset, size) -> [id(vn), ...]
         self._space_varnodes: Dict[int, set] = {}  # id(space) -> {vn, ...}
         self._create_index: int = 0
         self._uniq_space = None
@@ -1333,6 +1360,13 @@ class VarnodeBank:
                 if hasattr(trans, 'getUniqueStart'):
                     self._uniqbase = trans.getUniqueStart(0)  # ANALYSIS=0
             self._uniq_id = self._uniqbase
+
+    @staticmethod
+    def _addr_key(addr: Address, size: int) -> tuple[int, int, int]:
+        space = addr.getSpace() if hasattr(addr, 'getSpace') else None
+        space_id = id(space) if space is not None else 0
+        offset = addr.getOffset() if hasattr(addr, 'getOffset') else addr.offset
+        return (space_id, offset, size)
 
     def clear(self) -> None:
         self._loc_tree.clear()
@@ -1355,7 +1389,7 @@ class VarnodeBank:
         vnid = id(vn)
         self._loc_tree[vnid] = vn
         self._def_tree[vnid] = vn
-        key = (m.offset, s)
+        key = self._addr_key(m, s)
         bucket = self._addr_idx.get(key)
         if bucket is None:
             self._addr_idx[key] = [vnid]
@@ -1386,7 +1420,7 @@ class VarnodeBank:
         vnid = id(vn)
         self._loc_tree.pop(vnid, None)
         self._def_tree.pop(vnid, None)
-        key = (vn._loc.offset, vn._size)
+        key = self._addr_key(vn._loc, vn._size)
         bucket = self._addr_idx.get(key)
         if bucket is not None:
             try:
@@ -1410,7 +1444,7 @@ class VarnodeBank:
         self._addr_idx.clear()
         self._space_varnodes.clear()
         for vnid, vn in self._loc_tree.items():
-            key = (vn._loc.offset, vn._size)
+            key = self._addr_key(vn._loc, vn._size)
             bucket = self._addr_idx.get(key)
             if bucket is None:
                 self._addr_idx[key] = [vnid]
@@ -1430,18 +1464,18 @@ class VarnodeBank:
         return iter(self._loc_tree.values())
 
     def beginDef(self) -> Iterator[Varnode]:
-        return iter(self._def_tree.values())
+        return iter(sorted(self._def_tree.values(), key=_sort_varnode_def_loc_key))
 
     def findLoc(self, addr: Address, size: int) -> List[Varnode]:
         """Find all Varnodes at the given location and size."""
-        bucket = self._addr_idx.get((addr.offset, size))
+        bucket = self._addr_idx.get(self._addr_key(addr, size))
         if bucket is None:
             return []
         return [self._loc_tree[vnid] for vnid in bucket if vnid in self._loc_tree]
 
     def findInput(self, size: int, addr: Address) -> Optional[Varnode]:
         """Find an input Varnode of given size at given address."""
-        bucket = self._addr_idx.get((addr.offset, size))
+        bucket = self._addr_idx.get(self._addr_key(addr, size))
         if bucket is None:
             return None
         loc_tree = self._loc_tree
@@ -1499,7 +1533,7 @@ class VarnodeBank:
 
     def xref(self, vn: Varnode) -> Varnode:
         """Insert a Varnode into the sorted lists, handling duplicates."""
-        key = (vn._loc.offset, vn._size)
+        key = self._addr_key(vn._loc, vn._size)
         bucket = self._addr_idx.get(key)
         _IP_WR = 0x18  # Varnode.input | Varnode.written
         _WR    = 0x10  # Varnode.written
@@ -1645,17 +1679,29 @@ class VarnodeBank:
     def beginDefFlags(self, fl: int) -> List[Varnode]:
         """Get Varnodes by definition property."""
         if fl == Varnode.input:
-            return [vn for vn in self._def_tree.values() if vn.isInput()]
+            return sorted(
+                (vn for vn in self._def_tree.values() if vn.isInput()),
+                key=_sort_varnode_def_loc_key,
+            )
         elif fl == Varnode.written:
-            return [vn for vn in self._def_tree.values() if vn.isWritten()]
+            return sorted(
+                (vn for vn in self._def_tree.values() if vn.isWritten()),
+                key=_sort_varnode_def_loc_key,
+            )
         else:
-            return [vn for vn in self._def_tree.values() if vn.isFree()]
+            return sorted(
+                (vn for vn in self._def_tree.values() if vn.isFree()),
+                key=_sort_varnode_def_loc_key,
+            )
 
     def beginDefFlagsAddr(self, fl: int, addr: Address) -> List[Varnode]:
         """Get Varnodes by definition property and address."""
         if fl == Varnode.input:
-            return [vn for vn in self._def_tree.values()
-                    if vn.isInput() and vn.getAddr() == addr]
+            return sorted(
+                (vn for vn in self._def_tree.values()
+                 if vn.isInput() and vn.getAddr() == addr),
+                key=_sort_varnode_def_loc_key,
+            )
         return []
 
     def overlapLoc(self, startiter, bounds: list) -> int:

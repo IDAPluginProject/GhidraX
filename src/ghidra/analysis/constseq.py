@@ -20,8 +20,6 @@ class WriteNode:
         self.slot: int = slot
 
     def __lt__(self, other):
-        if self.op is None or other.op is None:
-            return False
         return self.op.getSeqNum().getOrder() < other.op.getSeqNum().getOrder()
 
 
@@ -38,7 +36,7 @@ class ArraySequence:
         self._fd = fd
         self.rootOp = root
         self.charType = ct
-        self.block = None
+        self.block = root.getParent() if root is not None else None
         self.numElements: int = 0
         self.moveOps: List[WriteNode] = []
         self.byteArray: List[int] = []
@@ -267,31 +265,48 @@ class StringSequence(ArraySequence):
         charSize = self.charType.getSize() if hasattr(self.charType, 'getSize') else 1
         alignSize = self.charType.getAlignSize() if hasattr(self.charType, 'getAlignSize') else charSize
 
-        if hasattr(self._fd, 'beginLoc') and hasattr(self._fd, 'endLoc'):
-            for vn in self._fd.iterLoc(beginAddr, endAddr):
-                if not vn.isWritten():
+        varnodes = ()
+        if hasattr(self._fd, 'iterLoc'):
+            varnodes = self._fd.iterLoc(beginAddr, endAddr)
+        elif hasattr(self._fd, 'beginLoc'):
+            beginSpace = beginAddr.getSpace()
+            beginOff = beginAddr.getOffset()
+            endOff = endAddr.getOffset()
+            filtered = []
+            for vn in self._fd.beginLoc():
+                vnSpace = vn.getSpace() if hasattr(vn, 'getSpace') else vn.getAddr().getSpace()
+                if vnSpace != beginSpace:
                     continue
-                op = vn.getDef()
-                if op.code() != OpCode.CPUI_COPY:
+                vnOff = vn.getOffset() if hasattr(vn, 'getOffset') else vn.getAddr().getOffset()
+                if vnOff < beginOff or vnOff > endOff:
                     continue
-                if op.getParent() != self.block:
-                    continue
-                if not op.getIn(0).isConstant():
-                    continue
-                if vn.getSize() != charSize:
+                filtered.append(vn)
+            varnodes = filtered
+
+        for vn in varnodes:
+            if not vn.isWritten():
+                continue
+            op = vn.getDef()
+            if op.code() != OpCode.CPUI_COPY:
+                continue
+            if op.getParent() != self.block:
+                continue
+            if not op.getIn(0).isConstant():
+                continue
+            if vn.getSize() != charSize:
+                return False
+            tmpDiff = vn.getOffset() - self.startAddr.getOffset()
+            if tmpDiff < diff:
+                if tmpDiff + alignSize == diff:
                     return False
-                tmpDiff = vn.getOffset() - self.startAddr.getOffset()
-                if tmpDiff < diff:
-                    if tmpDiff + alignSize == diff:
-                        return False
+                continue
+            elif tmpDiff > diff:
+                if tmpDiff - diff < alignSize:
                     continue
-                elif tmpDiff > diff:
-                    if tmpDiff - diff < alignSize:
-                        continue
-                    if tmpDiff - diff > alignSize:
-                        break
-                    diff = tmpDiff
-                self.moveOps.append(WriteNode(vn.getOffset(), op, -1))
+                if tmpDiff - diff > alignSize:
+                    break
+                diff = tmpDiff
+            self.moveOps.append(WriteNode(vn.getOffset(), op, -1))
         return len(self.moveOps) >= self.MINIMUM_SEQUENCE_LENGTH
 
     def constructTypedPointer(self, insertPoint):
@@ -315,6 +330,10 @@ class StringSequence(ArraySequence):
         self._fd.opSetInput(ptrsub, self._fd.newConstant(spacePtr.getSize(), baseOff), 1)
         spacePtr = self._fd.newUniqueOut(spacePtr.getSize(), ptrsub)
         self._fd.opInsertBefore(ptrsub, insertPoint)
+        if hasattr(types, 'getTypePointerStripArray') and hasattr(spacePtr, 'updateType'):
+            curType = types.getTypePointerStripArray(spacePtr.getSize(), baseType, wordSize)
+            if curType is not None:
+                spacePtr.updateType(curType)
         curOff = self.rootAddr.getOffset() - self.entry.getFirst()
         while baseType != self.charType:
             elSize = -1
@@ -342,6 +361,10 @@ class StringSequence(ArraySequence):
             self._fd.opSetInput(ptrsub, spacePtr, 0)
             spacePtr = self._fd.newUniqueOut(spacePtr.getSize(), ptrsub)
             self._fd.opInsertBefore(ptrsub, insertPoint)
+            if hasattr(types, 'getTypePointerStripArray') and hasattr(spacePtr, 'updateType'):
+                curType = types.getTypePointerStripArray(spacePtr.getSize(), baseType, wordSize)
+                if curType is not None:
+                    spacePtr.updateType(curType)
             curOff = newOff[0] if isinstance(newOff, list) else newOff
         if curOff != 0:
             addOp = self._fd.newOp(2, insertPoint.getAddr())
@@ -351,6 +374,10 @@ class StringSequence(ArraySequence):
             self._fd.opSetInput(addOp, self._fd.newConstant(spacePtr.getSize(), subOff), 1)
             spacePtr = self._fd.newUniqueOut(spacePtr.getSize(), addOp)
             self._fd.opInsertBefore(addOp, insertPoint)
+            if hasattr(types, 'getTypePointer') and hasattr(spacePtr, 'updateType'):
+                curType = types.getTypePointer(spacePtr.getSize(), self.charType, wordSize)
+                if curType is not None:
+                    spacePtr.updateType(curType)
         return spacePtr
 
     def buildStringCopy(self):
@@ -381,6 +408,10 @@ class StringSequence(ArraySequence):
         self._fd.opSetInput(copyOp, destPtr, 1)
         self._fd.opSetInput(copyOp, srcPtr, 2)
         lenVn = self._fd.newConstant(4, index)
+        if hasattr(copyOp, 'inputTypeLocal') and hasattr(lenVn, 'updateType'):
+            lenType = copyOp.inputTypeLocal(3)
+            if lenType is not None:
+                lenVn.updateType(lenType)
         self._fd.opSetInput(copyOp, lenVn, 3)
         self._fd.opInsertBefore(copyOp, insertPoint)
         return copyOp
@@ -787,6 +818,10 @@ class HeapSequence(ArraySequence):
         self._fd.opSetInput(copyOp, destPtr, 1)
         self._fd.opSetInput(copyOp, srcPtr, 2)
         lenVn = self._fd.newConstant(4, index)
+        if hasattr(copyOp, 'inputTypeLocal') and hasattr(lenVn, 'updateType'):
+            lenType = copyOp.inputTypeLocal(3)
+            if lenType is not None:
+                lenVn.updateType(lenType)
         self._fd.opSetInput(copyOp, lenVn, 3)
         self._fd.opInsertBefore(copyOp, insertPoint)
         return copyOp

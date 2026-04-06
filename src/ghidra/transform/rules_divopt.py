@@ -6,6 +6,7 @@ from __future__ import annotations
 from ghidra.transform.action import Rule
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import calc_mask, mostsigbit_set
+from ghidra.types.datatype import TYPE_UINT
 
 
 class RuleDivOpt(Rule):
@@ -912,14 +913,29 @@ class RuleAddUnsigned(Rule):
     def applyOp(self, op, data):
         constvn = op.getIn(1)
         if not constvn.isConstant(): return 0
+        dt = constvn.getTypeReadFacing(op) if hasattr(constvn, "getTypeReadFacing") else constvn.getType()
+        if dt is None or dt.getMetatype() != TYPE_UINT: return 0
+        if dt.isCharPrint(): return 0
         val = constvn.getOffset()
         mask = calc_mask(constvn.getSize())
         sa = constvn.getSize() * 6  # 1/4 less than full bitsize
         quarter = (mask >> sa) << sa
         if (val & quarter) != quarter: return 0  # Top quarter bits must be 1s
+        entry = constvn.getSymbolEntry() if hasattr(constvn, "getSymbolEntry") else None
+        if entry is not None and hasattr(entry, "getSymbol"):
+            sym = entry.getSymbol()
+            from ghidra.database.database import EquateSymbol
+            if isinstance(sym, EquateSymbol) and sym.isNameLocked():
+                return 0
         negval = (-val) & mask
+        if dt.isEnumType():
+            if not dt.hasNamedValue(negval) and dt.hasNamedValue((~val) & mask):
+                return 0
         data.opSetOpcode(op, OpCode.CPUI_INT_SUB)
-        data.opSetInput(op, data.newConstant(constvn.getSize(), negval), 1)
+        cvn = data.newConstant(constvn.getSize(), negval)
+        if hasattr(cvn, "copySymbol"):
+            cvn.copySymbol(constvn)
+        data.opSetInput(op, cvn, 1)
         return 1
 
 

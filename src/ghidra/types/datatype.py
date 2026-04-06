@@ -51,6 +51,17 @@ def _subtype_result(subtype, newoff: int, out_holder=None):
     return subtype, newoff
 
 
+def _field_result(field, newoff: int, out_holder=None):
+    """Return Python-friendly or C++-style field lookup results."""
+    if isinstance(out_holder, list):
+        if out_holder:
+            out_holder[0] = newoff
+        else:
+            out_holder.append(newoff)
+        return field
+    return field, newoff
+
+
 # =========================================================================
 # Metatype enums
 # =========================================================================
@@ -381,13 +392,13 @@ class Datatype:
         """Recover component data-type one-level down. Returns (subtype, newoff)."""
         return _subtype_result(None, off, newoff)
 
-    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1) -> Tuple[Optional[TypeField], int]:
+    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1, newoff=None):
         """Find an immediate subfield given a byte range.
 
         C++ ref: Datatype::findTruncation
-        Returns (field, newoff) or (None, 0).
+        Supports both tuple-return and out-parameter calling conventions.
         """
-        return None, 0
+        return _field_result(None, 0, newoff)
 
     def nearestArrayedComponentForward(self, off: int) -> Tuple[Optional[Datatype], int, int]:
         """Find first array component at or after offset.
@@ -482,13 +493,13 @@ class Datatype:
         """
         return -1
 
-    def resolveTruncation(self, offset: int, op, slot: int) -> Tuple[Optional[TypeField], int]:
+    def resolveTruncation(self, offset: int, op, slot: int, newoff=None):
         """Resolve truncation for union-like types.
 
         C++ ref: Datatype::resolveTruncation
-        Returns (field, newoff) or (None, 0).
+        Supports both tuple-return and out-parameter calling conventions.
         """
-        return None, 0
+        return _field_result(None, 0, newoff)
 
     def isPtrsubMatching(self, off: int, extra: int, multiplier: int) -> bool:
         """Is this data-type suitable as input to a CPUI_PTRSUB op.
@@ -1333,20 +1344,20 @@ class TypeStruct(Datatype):
             return lo
         return -1
 
-    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1) -> Tuple[Optional[TypeField], int]:
+    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1, newoff=None):
         """Find field containing byte range [off, off+sz).
 
         C++ ref: TypeStruct::findTruncation
-        Returns (field, newoff) or (None, 0).
+        Supports both tuple-return and out-parameter calling conventions.
         """
         i = self.getFieldIter(off)
         if i < 0:
-            return None, 0
+            return _field_result(None, 0, newoff)
         f = self.field[i]
         noff = off - f.offset
         if f.type is not None and noff + sz > f.type.getSize():
-            return None, 0
-        return f, noff
+            return _field_result(None, 0, newoff)
+        return _field_result(f, noff, newoff)
 
     def getSubType(self, off: int, newoff=None):
         """C++ ref: TypeStruct::getSubType"""
@@ -1633,11 +1644,23 @@ class TypeUnion(Datatype):
             if f.type and f.type.getSize() > self.size:
                 self.size = f.type.getSize()
 
-    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1) -> Tuple[Optional[TypeField], int]:
-        """C++ ref: TypeUnion::findTruncation — delegates to resolveTruncation."""
-        return self.resolveTruncation(off, op, slot)
+    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1, newoff=None):
+        """C++ ref: TypeUnion::findTruncation.
 
-    def resolveTruncation(self, offset: int, op, slot: int) -> Tuple[Optional[TypeField], int]:
+        This only uses a cached union resolution, matching native behavior.
+        """
+        fd = op.getParent().getFuncdata() if (op is not None and hasattr(op.getParent(), 'getFuncdata')) else None
+        if fd is not None:
+            res = fd.getUnionField(self, op, slot)
+            if res is not None and res.getFieldNum() >= 0:
+                fld = self.getField(res.getFieldNum())
+                trunc_off = off - fld.offset
+                if fld.type is not None and trunc_off + sz > fld.type.getSize():
+                    return _field_result(None, 0, newoff)
+                return _field_result(fld, trunc_off, newoff)
+        return _field_result(None, 0, newoff)
+
+    def resolveTruncation(self, offset: int, op, slot: int, newoff=None):
         """Resolve truncation within union fields.
 
         C++ ref: TypeUnion::resolveTruncation
@@ -1650,23 +1673,21 @@ class TypeUnion(Datatype):
             if res is not None:
                 if res.getFieldNum() >= 0:
                     fld = self.getField(res.getFieldNum())
-                    newoff = offset - fld.offset
-                    return fld, newoff
+                    return _field_result(fld, offset - fld.offset, newoff)
             elif op.code() == OpCode.CPUI_SUBPIECE and slot == 1:
                 scoreFields = ScoreUnionFields(fd.getArch().types, self, op, slot,
                                                unionType=self, offset=offset)
                 fd.setUnionField(self, op, slot, scoreFields.getResult())
                 if scoreFields.getResult().getFieldNum() >= 0:
-                    return self.getField(scoreFields.getResult().getFieldNum()), 0
+                    return _field_result(self.getField(scoreFields.getResult().getFieldNum()), 0, newoff)
             else:
                 scoreFields = ScoreUnionFields(fd.getArch().types, self, op, slot,
                                                unionType=self, offset=offset)
                 fd.setUnionField(self, op, slot, scoreFields.getResult())
                 if scoreFields.getResult().getFieldNum() >= 0:
                     fld = self.getField(scoreFields.getResult().getFieldNum())
-                    newoff = offset - fld.offset
-                    return fld, newoff
-        return None, 0
+                    return _field_result(fld, offset - fld.offset, newoff)
+        return _field_result(None, 0, newoff)
 
     def resolveInFlow(self, op, slot: int) -> Datatype:
         """Resolve union based on PcodeOp context.
@@ -1930,11 +1951,11 @@ class TypePartialUnion(Datatype):
     def getStripped(self) -> Optional[Datatype]:
         return self._stripped
 
-    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1) -> Tuple[Optional[TypeField], int]:
+    def findTruncation(self, off: int, sz: int, op=None, slot: int = -1, newoff=None):
         """C++ ref: TypePartialUnion::findTruncation"""
         if self._container is not None:
-            return self._container.findTruncation(off + self._offset, sz, op, slot)
-        return None, 0
+            return self._container.findTruncation(off + self._offset, sz, op, slot, newoff)
+        return _field_result(None, 0, newoff)
 
     def numDepend(self) -> int:
         if self._container is not None:
@@ -1983,11 +2004,11 @@ class TypePartialUnion(Datatype):
             return self._container.findCompatibleResolve(ct)
         return -1
 
-    def resolveTruncation(self, offset: int, op, slot: int) -> Tuple[Optional[TypeField], int]:
+    def resolveTruncation(self, offset: int, op, slot: int, newoff=None):
         """C++ ref: TypePartialUnion::resolveTruncation"""
         if self._container is not None:
-            return self._container.resolveTruncation(offset + self._offset, op, slot)
-        return None, 0
+            return self._container.resolveTruncation(offset + self._offset, op, slot, newoff)
+        return _field_result(None, 0, newoff)
 
     def compare(self, op: Datatype, level: int) -> int:
         res = super().compare(op, level)

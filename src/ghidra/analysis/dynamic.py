@@ -658,9 +658,8 @@ class DynamicHash:
 
     @staticmethod
     def getComparable(h: int) -> int:
-        """Get the portion of the hash used for comparison (strips position/total)."""
-        mask = 0x3F << 49
-        return h & ~mask
+        """Get the low 32-bit formal hash used for collision comparison."""
+        return h & 0xFFFFFFFF
 
     # ----------------------------------------------------------------
     # Gather helpers (C++ ref: DynamicHash::gather*)

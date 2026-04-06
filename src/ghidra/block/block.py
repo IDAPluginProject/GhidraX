@@ -1788,7 +1788,7 @@ class BlockCondition(BlockGraph):
         FlowBlock.printHeader(self, s)
 
     def isComplex(self) -> bool:
-        return True
+        return self.getBlock(0).isComplex() if self.getSize() > 0 else True
 
     def nextFlowAfter(self, bl): return None
 

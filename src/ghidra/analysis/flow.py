@@ -8,12 +8,14 @@ A class for generating the control-flow structure for a single function.
 from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, List, Dict, Set
 
-from ghidra.core.address import Address
+from ghidra.core.address import Address, SeqNum
 from ghidra.core.opcodes import OpCode
+from ghidra.arch.userop import UserPcodeOp
+from ghidra.ir.op import PcodeOp
 
 if TYPE_CHECKING:
     from ghidra.analysis.funcdata import Funcdata
-    from ghidra.ir.op import PcodeOp, PcodeOpBank
+    from ghidra.ir.op import PcodeOpBank
     from ghidra.block.block import BlockGraph, BlockBasic, FlowBlock
     from ghidra.fspec.fspec import FuncCallSpecs
     from ghidra.arch.architecture import Architecture
@@ -47,7 +49,7 @@ class FlowInfo:
         """Number of bytes in a machine instruction and the starting p-code op."""
         __slots__ = ('seqnum', 'size')
         def __init__(self):
-            self.seqnum = None
+            self.seqnum = SeqNum()
             self.size: int = 0
 
     # ----------------------------------------------------------------
@@ -78,30 +80,57 @@ class FlowInfo:
         self._inline_base: Set[Address] = set()
         self._emitter = None
 
+        def _copy_address(addr) -> Address:
+            if addr is None:
+                return Address()
+            space = addr.getSpace() if hasattr(addr, 'getSpace') else getattr(addr, 'base', None)
+            offset = addr.getOffset() if hasattr(addr, 'getOffset') else getattr(addr, 'offset', 0)
+            return Address(space, offset)
+
+        def _copy_seqnum(seqnum):
+            if seqnum is None:
+                return None
+            uniq = seqnum.getTime() if hasattr(seqnum, 'getTime') else getattr(seqnum, 'uniq', 0)
+            new_seq = SeqNum(_copy_address(seqnum.getAddr()) if hasattr(seqnum, 'getAddr') else getattr(seqnum, 'pc', None), uniq)
+            if hasattr(seqnum, 'getOrder'):
+                new_seq.setOrder(seqnum.getOrder())
+            elif hasattr(seqnum, 'order'):
+                new_seq.setOrder(seqnum.order)
+            return new_seq
+
+        def _copy_visit_stat(stat: FlowInfo.VisitStat) -> FlowInfo.VisitStat:
+            new_stat = FlowInfo.VisitStat()
+            new_stat.seqnum = _copy_seqnum(stat.seqnum)
+            new_stat.size = stat.size
+            return new_stat
+
         func_addr = fd.getAddress() if hasattr(fd, 'getAddress') else Address()
 
         if op2 is not None:
             # Cloning constructor
-            self._baddr: Address = op2._baddr
-            self._eaddr: Address = op2._eaddr
+            self._baddr = _copy_address(op2._baddr)
+            self._eaddr = _copy_address(op2._eaddr)
             self._flags: int = op2._flags
-            self._unprocessed = list(op2._unprocessed)
-            self._addrlist = list(op2._addrlist)
-            self._visited = dict(op2._visited)
+            self._unprocessed = [_copy_address(addr) for addr in op2._unprocessed]
+            self._addrlist = [_copy_address(addr) for addr in op2._addrlist]
+            self._visited = {
+                _copy_address(addr): _copy_visit_stat(stat)
+                for addr, stat in op2._visited.items()
+            }
             self._insn_count = op2._insn_count
             self._insn_max = op2._insn_max
             self._inline_head = op2._inline_head
-            self._inline_base = set(op2._inline_base)
+            self._inline_base = {_copy_address(addr) for addr in op2._inline_base}
             if op2._inline_head is not None:
                 self._inline_recursion = self._inline_base
         else:
-            spc = func_addr.getSpace() if hasattr(func_addr, 'getSpace') and func_addr.getSpace() is not None else None
-            self._baddr = Address(spc, 0) if spc else Address()
-            self._eaddr = Address(spc, 0xFFFFFFFFFFFFFFFF) if spc else Address()
+            func_space = func_addr.getSpace() if hasattr(func_addr, 'getSpace') else getattr(func_addr, 'base', None)
+            self._baddr = Address(func_space, 0) if func_space is not None else Address()
+            self._eaddr = Address(func_space, 0xFFFFFFFFFFFFFFFF) if func_space is not None else Address()
             self._flags: int = 0
 
-        self._minaddr: Address = func_addr
-        self._maxaddr: Address = func_addr
+        self._minaddr = _copy_address(func_addr)
+        self._maxaddr = _copy_address(func_addr)
 
         if hasattr(fd, 'getOverride') and hasattr(fd.getOverride(), 'hasFlowOverride'):
             self._flowoverride_present = fd.getOverride().hasFlowOverride()
@@ -120,8 +149,12 @@ class FlowInfo:
     # ----------------------------------------------------------------
 
     def setRange(self, b: Address, e: Address) -> None:
-        self._baddr = b
-        self._eaddr = e
+        b_space = b.getSpace() if hasattr(b, 'getSpace') else getattr(b, 'base', None)
+        b_offset = b.getOffset() if hasattr(b, 'getOffset') else getattr(b, 'offset', 0)
+        e_space = e.getSpace() if hasattr(e, 'getSpace') else getattr(e, 'base', None)
+        e_offset = e.getOffset() if hasattr(e, 'getOffset') else getattr(e, 'offset', 0)
+        self._baddr = Address(b_space, b_offset)
+        self._eaddr = Address(e_space, e_offset)
 
     def setMaximumInstructions(self, m: int) -> None:
         self._insn_max = m
@@ -191,21 +224,28 @@ class FlowInfo:
 
     def target(self, addr: Address):
         """Return first p-code op for instruction at given address."""
-        if self._obank is None:
-            return None
-        it = self._visited.get(addr)
-        while it is not None:
-            seq = it.seqnum
-            if seq is not None and hasattr(self._obank, 'findOp'):
-                retop = self._obank.findOp(seq)
+        from ghidra.core.error import LowlevelError
+
+        curaddr = addr
+        stat = self._visited.get(curaddr)
+        while stat is not None:
+            seq = stat.seqnum
+            seq_addr = seq.getAddr() if seq is not None and hasattr(seq, 'getAddr') else None
+            is_invalid = seq_addr is None or (hasattr(seq_addr, 'isInvalid') and seq_addr.isInvalid())
+            if not is_invalid:
+                retop = self._obank.findOp(seq) if self._obank is not None and hasattr(self._obank, 'findOp') else None
                 if retop is not None:
                     return retop
-            nxt = Address(addr.getSpace(), addr.getOffset() + it.size) if addr.getSpace() else None
+                break
+            nxt = Address(curaddr.getSpace(), curaddr.getOffset() + stat.size) if curaddr.getSpace() else None
             if nxt is None:
                 break
-            it = self._visited.get(nxt)
-            addr = nxt
-        return None
+            curaddr = nxt
+            stat = self._visited.get(curaddr)
+
+        space_name = addr.getSpace().getName() if hasattr(addr, 'getSpace') and addr.getSpace() is not None and hasattr(addr.getSpace(), 'getName') else str(addr)
+        raw_addr = addr.printRaw() if hasattr(addr, 'printRaw') else str(addr)
+        raise LowlevelError(f"Could not find op at target address: ({space_name},{raw_addr})")
 
     def branchTarget(self, op):
         """Find the target referred to by a BRANCH or CBRANCH."""
@@ -215,9 +255,7 @@ class FlowInfo:
             retop = self.findRelTarget(op, res)
             if retop is not None:
                 return retop
-            if res[0] is not None:
-                return self.target(res[0])
-            return None
+            return self.target(res[0])
         return self.target(addr)
 
     def findRelTarget(self, op, res_ref):
@@ -226,7 +264,7 @@ class FlowInfo:
             return None
         addr = op.getIn(0).getAddr()
         time_id = (op.getTime() + addr.getOffset()) if hasattr(op, 'getTime') else 0
-        from ghidra.core.pcoderaw import SeqNum
+        from ghidra.core.address import SeqNum
         seq = SeqNum(op.getAddr(), time_id)
         retop = self._obank.findOp(seq)
         if retop is not None:
@@ -235,14 +273,19 @@ class FlowInfo:
         seq1 = SeqNum(op.getAddr(), time_id - 1)
         retop = self._obank.findOp(seq1)
         if retop is not None:
-            miter = self._visited.get(retop.getAddr())
-            if miter is not None:
-                fallthru = Address(retop.getAddr().getSpace(),
-                                   retop.getAddr().getOffset() + miter.size)
-                if isinstance(res_ref, list):
-                    res_ref[0] = fallthru
-                return None
-        return None
+            pred_addr = None
+            for v_addr in self._visited:
+                if v_addr <= retop.getAddr() and (pred_addr is None or pred_addr < v_addr):
+                    pred_addr = v_addr
+            if pred_addr is not None:
+                pred_stat = self._visited[pred_addr]
+                fallthru = Address(pred_addr.getSpace(), pred_addr.getOffset() + pred_stat.size)
+                if op.getAddr() < fallthru:
+                    if isinstance(res_ref, list):
+                        res_ref[0] = fallthru
+                    return None
+        from ghidra.core.error import LowlevelError
+        raise LowlevelError(f"Bad relative branch at instruction : ({op.getAddr().getSpace().getName()},{op.getAddr()})")
 
     def fallthruOp(self, op):
         """Find fallthru pcode-op for given op.
@@ -299,7 +342,12 @@ class FlowInfo:
 
     def handleOutOfBounds(self, fromaddr: Address, toaddr: Address) -> None:
         if (self._flags & FlowInfo.ignore_outofbounds) == 0:
-            msg = f"Function flow out of bounds: {fromaddr} -> {toaddr}"
+            def _format_addr(addr: Address) -> str:
+                if hasattr(addr, "getShortcut") and hasattr(addr, "printRaw"):
+                    return f"{addr.getShortcut()}{addr.printRaw()}"
+                return str(addr)
+
+            msg = f"Function flow out of bounds: {_format_addr(fromaddr)} flows to {_format_addr(toaddr)}"
             if (self._flags & FlowInfo.error_outofbounds) != 0:
                 from ghidra.core.error import LowlevelError
                 raise LowlevelError(msg)
@@ -307,6 +355,8 @@ class FlowInfo:
                 self._data.warning(msg, toaddr)
             if not self.hasOutOfBounds():
                 self._flags |= FlowInfo.outofbounds_present
+                if hasattr(self._data, 'warningHeader'):
+                    self._data.warningHeader("Function flows out of bounds")
 
     # ----------------------------------------------------------------
     # Instruction processing
@@ -417,8 +467,11 @@ class FlowInfo:
             elif opc == OpCode.CPUI_CALLOTHER:
                 if self._glb is not None and hasattr(self._glb, 'userops'):
                     userop = self._glb.userops.getOp(op.getIn(0).getOffset())
-                    if userop is not None and hasattr(userop, 'getType'):
-                        # UserPcodeOp::injected
+                    if (
+                        userop is not None
+                        and hasattr(userop, 'getType')
+                        and userop.getType() == UserPcodeOp.injected
+                    ):
                         self._injectlist.append(op)
 
         # Determine fallthru
@@ -441,6 +494,8 @@ class FlowInfo:
         is examined for control-flow, and annotations are made.
         Returns True if the processed instruction has a fall-thru flow.
         """
+        from ghidra.ir.op import PcodeOp
+
         isfallthru = True
         step = 1
 
@@ -448,14 +503,13 @@ class FlowInfo:
             if (self._flags & FlowInfo.error_toomanyinstructions) != 0:
                 from ghidra.core.error import LowlevelError
                 raise LowlevelError("Flow exceeded maximum allowable instructions")
-            self.artificialHalt(curaddr, 0)
+            self.artificialHalt(curaddr, PcodeOp.badinstruction)
             if hasattr(self._data, 'warning'):
                 self._data.warning("Too many instructions -- Truncating flow here", curaddr)
             if not self.hasTooManyInstructions():
                 self._flags |= FlowInfo.toomanyinstructions_present
                 if hasattr(self._data, 'warningHeader'):
                     self._data.warningHeader("Exceeded maximum allowable instructions: Some flow is truncated")
-            return False
         self._insn_count += 1
 
         # Track where new ops start in the obank
@@ -482,24 +536,30 @@ class FlowInfo:
                         step = getattr(err, 'instruction_length', 1)
                         if not self.hasUnimplemented():
                             self._flags |= FlowInfo.unimplemented_present
+                            if hasattr(self._data, 'warningHeader'):
+                                self._data.warningHeader("Control flow ignored unimplemented instructions")
                     elif (self._flags & FlowInfo.error_unimplemented) != 0:
                         raise
                     else:
                         step = 1
-                        self.artificialHalt(curaddr, 0)
+                        self.artificialHalt(curaddr, PcodeOp.unimplemented)
                         if hasattr(self._data, 'warning'):
                             self._data.warning("Unimplemented instruction - Truncating control flow here", curaddr)
                         if not self.hasUnimplemented():
                             self._flags |= FlowInfo.unimplemented_present
+                            if hasattr(self._data, 'warningHeader'):
+                                self._data.warningHeader("Control flow encountered unimplemented instructions")
                 else:
                     if (self._flags & FlowInfo.error_unimplemented) != 0:
                         raise
                     step = 1
-                    self.artificialHalt(curaddr, 0)
+                    self.artificialHalt(curaddr, PcodeOp.badinstruction)
                     if hasattr(self._data, 'warning'):
                         self._data.warning("Bad instruction - Truncating control flow here", curaddr)
                     if not self.hasBadData():
                         self._flags |= FlowInfo.baddata_present
+                        if hasattr(self._data, 'warningHeader'):
+                            self._data.warningHeader("Control flow encountered bad instruction data")
 
         # Mark that we visited this instruction
         stat = FlowInfo.VisitStat()
@@ -585,34 +645,38 @@ class FlowInfo:
             return False
         addr = self._addrlist[-1]
 
-        # Find the nearest visited address > addr
-        # Check if addr itself was visited
-        if addr in self._visited:
-            # Already visited this address - mark basic block start
-            op = self.target(addr)
-            if op is not None and hasattr(self._data, 'opMarkStartBasic'):
-                self._data.opMarkStartBasic(op)
-            self._addrlist.pop()
-            return False
-
-        # Check if addr falls in the middle of a visited instruction (reinterpretation)
-        for v_addr, v_stat in self._visited.items():
-            if v_addr < addr < Address(v_addr.getSpace(), v_addr.getOffset() + v_stat.size):
-                self.reinterpreted(addr)
-                break
-
-        # Find the minimum visited address that is > addr
-        next_bound = self._eaddr
+        pred_addr = None
+        next_bound = None
         for v_addr in self._visited:
-            if v_addr > addr and v_addr < next_bound:
+            if v_addr <= addr and (pred_addr is None or pred_addr < v_addr):
+                pred_addr = v_addr
+            elif addr < v_addr and (next_bound is None or v_addr < next_bound):
                 next_bound = v_addr
-        bound_ref[0] = next_bound
+
+        if pred_addr is not None:
+            pred_stat = self._visited[pred_addr]
+            if addr == pred_addr:
+                op = self.target(addr)
+                if op is not None and hasattr(self._data, 'opMarkStartBasic'):
+                    self._data.opMarkStartBasic(op)
+                self._addrlist.pop()
+                return False
+            if addr < Address(pred_addr.getSpace(), pred_addr.getOffset() + pred_stat.size):
+                self.reinterpreted(addr)
+
+        bound_ref[0] = next_bound if next_bound is not None else self._eaddr
         return True
 
     def setFallthruBound(self, bound: Address) -> bool:
         """Legacy wrapper for _setFallthruBound."""
         ref = [bound]
         result = self._setFallthruBound(ref)
+        if result and ref[0] is not bound:
+            new_bound = ref[0]
+            if hasattr(bound, "base") and hasattr(new_bound, "base"):
+                bound.base = new_bound.base
+            if hasattr(bound, "offset") and hasattr(new_bound, "offset"):
+                bound.offset = new_bound.offset
         return result
 
     def artificialHalt(self, addr: Address, flag: int = 0):
@@ -628,11 +692,34 @@ class FlowInfo:
 
     def reinterpreted(self, addr: Address) -> None:
         """Generate warning for a reinterpreted address."""
+        pred_addr = None
+        for v_addr in self._visited:
+            if v_addr <= addr and (pred_addr is None or pred_addr < v_addr):
+                pred_addr = v_addr
+        if pred_addr is None:
+            return
+
+        def _space_name(target: Address) -> str:
+            if hasattr(target, "getSpace") and hasattr(target.getSpace(), "getName"):
+                return target.getSpace().getName()
+            return str(target)
+
+        def _raw_addr(target: Address) -> str:
+            if hasattr(target, "printRaw"):
+                return target.printRaw()
+            return str(target)
+
+        msg = (
+            f"Instruction at ({_space_name(addr)},{_raw_addr(addr)}) overlaps instruction at "
+            f"({_space_name(pred_addr)},{_raw_addr(pred_addr)})\n"
+        )
         if (self._flags & FlowInfo.error_reinterpreted) != 0:
             from ghidra.core.error import LowlevelError
-            raise LowlevelError(f"Reinterpreted bytes at {addr}")
+            raise LowlevelError(msg)
         if (self._flags & FlowInfo.reinterpreted_present) == 0:
             self._flags |= FlowInfo.reinterpreted_present
+            if hasattr(self._data, 'warningHeader'):
+                self._data.warningHeader(msg)
 
     # ----------------------------------------------------------------
     # Call site handling
@@ -640,13 +727,17 @@ class FlowInfo:
 
     def checkForFlowModification(self, fspecs) -> bool:
         """Check for modifications to flow at a call site."""
+        from ghidra.ir.op import PcodeOp
+
         if hasattr(fspecs, 'isInline') and fspecs.isInline():
             self._injectlist.append(fspecs.getOp())
         if hasattr(fspecs, 'isNoReturn') and fspecs.isNoReturn():
             op = fspecs.getOp()
-            haltop = self.artificialHalt(op.getAddr(), 0)
+            haltop = self.artificialHalt(op.getAddr(), PcodeOp.noreturn)
             if haltop is not None and hasattr(self._data, 'opDeadInsertAfter'):
                 self._data.opDeadInsertAfter(haltop, op)
+            if (not hasattr(fspecs, 'isInline') or not fspecs.isInline()) and hasattr(self._data, 'warning'):
+                self._data.warning("Subroutine does not return", op.getAddr())
             return True
         return False
 
@@ -746,10 +837,12 @@ class FlowInfo:
 
     def fillinBranchStubs(self) -> None:
         """Fill-in artificial HALT p-code for unprocessed addresses."""
+        from ghidra.ir.op import PcodeOp
+
         self.findUnprocessed()
         self.dedupUnprocessed()
         for addr in self._unprocessed:
-            op = self.artificialHalt(addr, 0)
+            op = self.artificialHalt(addr, PcodeOp.missing)
             if op is not None:
                 if hasattr(self._data, 'opMarkStartBasic'):
                     self._data.opMarkStartBasic(op)
@@ -769,7 +862,9 @@ class FlowInfo:
         if self._obank is None:
             return
         if self._bblocks is not None and self._bblocks.getSize() != 0:
-            return  # Blocks already calculated
+            from ghidra.core.error import RecovError
+
+            raise RecovError("Basic blocks already calculated\n")
 
         ops = []
         if hasattr(self._obank, 'getDeadList'):
@@ -844,7 +939,9 @@ class FlowInfo:
 
         first_op = ops[0]
         if not first_op.isBlockStart():
-            return  # First op not marked as entry point
+            from ghidra.core.error import LowlevelError
+
+            raise LowlevelError("First op not marked as entry point")
 
         cur = self._bblocks.newBlockBasic(self._data) if hasattr(self._bblocks, 'newBlockBasic') else None
         if cur is None:
@@ -942,6 +1039,9 @@ class FlowInfo:
                     newfront = self._bblocks.newBlockBasic(self._data)
                     self._bblocks.addEdge(newfront, startblock)
                     self._bblocks.setStartBlock(newfront)
+                    if hasattr(self._data, 'setBasicBlockRange') and hasattr(self._data, 'getAddress'):
+                        addr = self._data.getAddress()
+                        self._data.setBasicBlockRange(newfront, addr, addr)
         if self.hasPossibleUnreachable() and hasattr(self._data, 'removeUnreachableBlocks'):
             self._data.removeUnreachableBlocks(False, True)
 
@@ -956,12 +1056,16 @@ class FlowInfo:
         elif op.code() == OpCode.CPUI_CALLIND:
             self.setupCallindSpecs(op, None)
         elif op.code() == OpCode.CPUI_BRANCHIND:
-            self._tablelist.append(op)
+            jt = self._data.linkJumpTable(op) if hasattr(self._data, 'linkJumpTable') else None
+            if jt is None:
+                self._tablelist.append(op)
 
     def doInjection(self, payload, icontext, op, fc) -> None:
         """Inject the given payload into this flow, replacing the given op."""
         if self._obank is None:
             return
+        from ghidra.core.error import LowlevelError
+
         # Get pre-injection state
         prev_ops = []
         if hasattr(self._obank, 'getDeadList'):
@@ -981,19 +1085,25 @@ class FlowInfo:
             new_ops = []
 
         if not new_ops:
-            return
+            name = payload.getName() if hasattr(payload, 'getName') else "<unknown>"
+            raise LowlevelError("Empty injection: " + name)
 
         firstop = new_ops[0]
         startbasic_ref = [op.isBlockStart()] if hasattr(op, 'isBlockStart') else [False]
         isfallthru_ref = [True]
         lastop = self.xrefControlFlow(new_ops, startbasic_ref, isfallthru_ref, fc)
 
-        if startbasic_ref[0]:
-            # The inject code does NOT fall thru - mark next op
-            pass  # Would need insert iterator from obank
+        if startbasic_ref[0] and hasattr(self._obank, 'getNextDead'):
+            nextop = self._obank.getNextDead(op)
+            if nextop is not None and hasattr(self._data, 'opMarkStartBasic'):
+                self._data.opMarkStartBasic(nextop)
+
+        if hasattr(payload, 'isIncidentalCopy') and payload.isIncidentalCopy():
+            if hasattr(self._obank, 'markIncidentalCopy') and lastop is not None:
+                self._obank.markIncidentalCopy(firstop, lastop)
 
         # Move injection to right after the call
-        if hasattr(self._obank, 'moveSequenceDead') and lastop is not None:
+        if hasattr(self._obank, 'moveSequenceDead'):
             self._obank.moveSequenceDead(firstop, lastop, op)
 
         self.updateTarget(op, firstop)
@@ -1038,15 +1148,23 @@ class FlowInfo:
             self._inline_head = self._data
             self._inline_recursion = self._inline_base
         func_addr = self._data.getAddress() if hasattr(self._data, 'getAddress') else None
-        if func_addr is not None:
+        if func_addr is not None and self._inline_recursion is not None:
             self._inline_recursion.add(func_addr)
         fd_addr = fd.getAddress() if hasattr(fd, 'getAddress') else None
-        if fd_addr is not None and fd_addr in self._inline_recursion:
+        if fd_addr is not None and self._inline_recursion is not None and fd_addr in self._inline_recursion:
+            if self._inline_head is not None and hasattr(self._inline_head, 'warning'):
+                self._inline_head.warning("Could not inline here", fc.getOp().getAddr())
             return False
-        if hasattr(self._data, 'inlineFlow'):
-            res = self._data.inlineFlow(fd, self, fc.getOp())
-            if res < 0:
-                return False
+        if not hasattr(self._data, 'inlineFlow'):
+            return False
+        res = self._data.inlineFlow(fd, self, fc.getOp())
+        if res < 0:
+            return False
+        if fd_addr is not None and self._inline_recursion is not None:
+            if res == 0:
+                self._inline_recursion.discard(fd_addr)
+            elif res == 1:
+                self._inline_recursion.add(fd_addr)
         self.setPossibleUnreachable()
         return True
 
@@ -1100,7 +1218,16 @@ class FlowInfo:
                         if self.injectSubFunction(fc):
                             if hasattr(self._data, 'warningHeader'):
                                 name = fc.getName() if hasattr(fc, 'getName') else '?'
-                                self._data.warningHeader(f"Function: {name} replaced with injection")
+                                fixup_name = str(fc.getInjectId())
+                                if (
+                                    self._glb is not None
+                                    and hasattr(self._glb, 'pcodeinjectlib')
+                                    and hasattr(self._glb.pcodeinjectlib, 'getCallFixupName')
+                                ):
+                                    fixup_name = self._glb.pcodeinjectlib.getCallFixupName(fc.getInjectId())
+                                self._data.warningHeader(
+                                    f"Function: {name} replaced with injection: {fixup_name}"
+                                )
                             self.deleteCallSpec(fc)
                     elif self.inlineSubFunction(fc):
                         if hasattr(self._data, 'warningHeader'):
@@ -1171,8 +1298,28 @@ class FlowInfo:
         the Funcdata for this flow, preserving their original address.
         Any RETURN op is replaced with jump to first address following the call site.
         """
+        def _copy_address(addr):
+            if addr is None:
+                return Address()
+            space = addr.getSpace() if hasattr(addr, 'getSpace') else getattr(addr, 'base', None)
+            offset = addr.getOffset() if hasattr(addr, 'getOffset') else getattr(addr, 'offset', 0)
+            return Address(space, offset)
+
+        def _copy_seqnum(seqnum):
+            if seqnum is None:
+                return None
+            pc = seqnum.getAddr() if hasattr(seqnum, 'getAddr') else getattr(seqnum, 'pc', None)
+            uniq = seqnum.getTime() if hasattr(seqnum, 'getTime') else getattr(seqnum, 'uniq', 0)
+            new_seq = SeqNum(_copy_address(pc), uniq)
+            if hasattr(seqnum, 'getOrder'):
+                new_seq.setOrder(seqnum.getOrder())
+            elif hasattr(seqnum, 'order'):
+                new_seq.setOrder(seqnum.order)
+            return new_seq
+
         if hasattr(inlineflow._data, 'beginOpDead'):
             for op in inlineflow._data.beginOpDead():
+                cloneop = None
                 if op.code() == OpCode.CPUI_RETURN and not retaddr.isInvalid():
                     if hasattr(self._data, 'newOp'):
                         cloneop = self._data.newOp(1, op.getSeqNum())
@@ -1184,12 +1331,16 @@ class FlowInfo:
                         cloneop = self._data.cloneOp(op, op.getSeqNum())
                     else:
                         continue
-                if hasattr(cloneop, 'isCallOrBranch') and cloneop.isCallOrBranch():
+                if cloneop is not None and hasattr(cloneop, 'isCallOrBranch') and cloneop.isCallOrBranch():
                     self.xrefInlinedBranch(cloneop)
         # Copy cross-referencing
-        self._unprocessed.extend(inlineflow._unprocessed)
-        self._addrlist.extend(inlineflow._addrlist)
-        self._visited.update(inlineflow._visited)
+        self._unprocessed.extend(_copy_address(addr) for addr in inlineflow._unprocessed)
+        self._addrlist.extend(_copy_address(addr) for addr in inlineflow._addrlist)
+        for addr, stat in inlineflow._visited.items():
+            new_stat = FlowInfo.VisitStat()
+            new_stat.size = stat.size
+            new_stat.seqnum = _copy_seqnum(stat.seqnum)
+            self._visited[_copy_address(addr)] = new_stat
 
     def inlineEZClone(self, inlineflow: FlowInfo, calladdr: Address) -> None:
         """Clone the given in-line flow using the EZ model.
@@ -1202,7 +1353,6 @@ class FlowInfo:
                 if op.code() == OpCode.CPUI_RETURN:
                     break
                 if hasattr(self._data, 'cloneOp'):
-                    from ghidra.core.pcoderaw import SeqNum
                     myseq = SeqNum(calladdr, op.getSeqNum().getTime())
                     self._data.cloneOp(op, myseq)
         # Because we process only straightline code and it's all one address,
@@ -1215,39 +1365,69 @@ class FlowInfo:
     def truncateIndirectJump(self, op, mode) -> None:
         """Treat indirect jump as CALLIND/RETURN.
 
-        mode values correspond to JumpTable.RecoveryMode:
-          'fail_return' - convert to RETURN
-          'fail_thunk'  - convert to CALLIND (thunk pattern)
-          'fail_callother' - convert to CALLIND that never returns
-          otherwise - convert to CALLIND (bad jump table)
+        ``mode`` may be either a JumpTable.RecoveryMode value or its string label.
         """
+        def _mode_is(name: str) -> bool:
+            if mode == name:
+                return True
+            try:
+                from ghidra.analysis.jumptable import JumpTable
+            except Exception:
+                return False
+            recovery_mode = getattr(JumpTable, "RecoveryMode", None)
+            return recovery_mode is not None and mode == getattr(recovery_mode, name, object())
+
         if not hasattr(self._data, 'opSetOpcode'):
             return
-        if mode == 'fail_return':
+        if _mode_is('fail_return'):
             self._data.opSetOpcode(op, OpCode.CPUI_RETURN)
             if hasattr(self._data, 'warning'):
                 self._data.warning("Treating indirect jump as return", op.getAddr())
+            return
+
+        self._data.opSetOpcode(op, OpCode.CPUI_CALLIND)
+        self.setupCallindSpecs(op, None)
+        if hasattr(self._data, 'getCallSpecs'):
+            fc = self._data.getCallSpecs(op)
         else:
-            self._data.opSetOpcode(op, OpCode.CPUI_CALLIND)
-            self.setupCallindSpecs(op, None)
-            if hasattr(self._data, 'getCallSpecs'):
-                fc = self._data.getCallSpecs(op)
-            else:
-                fc = None
-            returnType = 0
-            if mode == 'fail_callother':
-                if fc is not None and hasattr(fc, 'setNoReturn'):
-                    fc.setNoReturn(True)
-                if hasattr(self._data, 'warning'):
-                    self._data.warning("Does not return", op.getAddr())
-            elif mode != 'fail_thunk':
-                if fc is not None and hasattr(fc, 'setBadJumpTable'):
-                    fc.setBadJumpTable(True)
-                if hasattr(self._data, 'warning'):
-                    self._data.warning("Treating indirect jump as call", op.getAddr())
-            truncop = self.artificialHalt(op.getAddr(), returnType)
-            if truncop is not None and hasattr(self._data, 'opDeadInsertAfter'):
-                self._data.opDeadInsertAfter(truncop, op)
+            fc = None
+
+        returnType = 0
+        noParams = False
+        if _mode_is('fail_thunk'):
+            pass
+        elif _mode_is('fail_callother'):
+            returnType = PcodeOp.noreturn
+            if fc is not None and hasattr(fc, 'setNoReturn'):
+                fc.setNoReturn(True)
+            if hasattr(self._data, 'warning'):
+                self._data.warning("Does not return", op.getAddr())
+            noParams = True
+        else:
+            if fc is not None and hasattr(fc, 'setBadJumpTable'):
+                fc.setBadJumpTable(True)
+            if hasattr(self._data, 'warning'):
+                self._data.warning("Treating indirect jump as call", op.getAddr())
+
+        if noParams and fc is not None:
+            has_model = fc.hasModel() if hasattr(fc, 'hasModel') else False
+            if not has_model:
+                glb = getattr(self, '_glb', None)
+                defaultfp = getattr(glb, 'defaultfp', None)
+                type_factory = getattr(glb, 'types', None)
+                rettype = None
+                if type_factory is not None and hasattr(type_factory, 'getTypeVoid'):
+                    rettype = type_factory.getTypeVoid()
+                if hasattr(fc, 'setInternal'):
+                    fc.setInternal(defaultfp, rettype)
+                if hasattr(fc, 'setInputLock'):
+                    fc.setInputLock(True)
+                if hasattr(fc, 'setOutputLock'):
+                    fc.setOutputLock(True)
+
+        truncop = self.artificialHalt(op.getAddr(), returnType)
+        if truncop is not None and hasattr(self._data, 'opDeadInsertAfter'):
+            self._data.opDeadInsertAfter(truncop, op)
 
     def checkContainedCall(self) -> None:
         """Check if any of the calls this function makes are to already traced data-flow.
@@ -1274,16 +1454,29 @@ class FlowInfo:
             for v_addr, v_stat in self._visited.items():
                 if v_addr <= addr < Address(v_addr.getSpace(), v_addr.getOffset() + v_stat.size):
                     if v_addr == addr:
+                        msg = None
+                        if hasattr(op, 'getAddr') and hasattr(op.getAddr(), 'printRaw'):
+                            msg = f"Possible PIC construction at {op.getAddr().printRaw()}: Changing call to branch"
+                        else:
+                            msg = "Possible PIC construction at <unknown>: Changing call to branch"
+                        if hasattr(self._data, 'warningHeader'):
+                            self._data.warningHeader(msg)
                         # Change CALL to BRANCH
                         if hasattr(self._data, 'opSetOpcode'):
                             self._data.opSetOpcode(op, OpCode.CPUI_BRANCH)
                         targ = self.target(addr)
                         if targ is not None and hasattr(self._data, 'opMarkStartBasic'):
                             self._data.opMarkStartBasic(targ)
+                        if hasattr(self._obank, 'getNextDead'):
+                            nextop = self._obank.getNextDead(op)
+                            if nextop is not None and hasattr(self._data, 'opMarkStartBasic'):
+                                self._data.opMarkStartBasic(nextop)
                         if hasattr(self._data, 'newCodeRef'):
                             self._data.opSetInput(op, self._data.newCodeRef(addr), 0)
                         del self._qlst[i]
                         found = True
+                    elif hasattr(self._data, 'warning') and hasattr(op, 'getAddr'):
+                        self._data.warning("Call to offcut address within same function", op.getAddr())
                     break
             if not found:
                 i += 1
@@ -1308,10 +1501,11 @@ class FlowInfo:
         if not hasattr(self._data, 'recoverJumpTable'):
             return
         for op in self._tablelist:
-            jt = self._data.recoverJumpTable(op, self)
+            mode_ref = ['success']
+            jt = self._data.recoverJumpTable(op, self, mode_ref)
             if jt is None:
                 if not self.isFlowForInline():
-                    self.truncateIndirectJump(op, 'fail_normal')
+                    self.truncateIndirectJump(op, mode_ref[0])
             else:
                 if hasattr(jt, 'isPartial') and jt.isPartial():
                     if len(self._tablelist) > 1 and not self.isInArray(notreached, op):
@@ -1325,9 +1519,15 @@ class FlowInfo:
         for i in range(len(self._qlst)):
             if self._qlst[i] is fc:
                 del self._qlst[i]
-                break
+                return
+        from ghidra.core.error import LowlevelError
+
+        raise LowlevelError("Misplaced callspec")
 
     @staticmethod
     def isInArray(array: list, op) -> bool:
         """Test if the given op is a member of an array."""
-        return op in array
+        for cur_op in array:
+            if cur_op is op:
+                return True
+        return False

@@ -133,6 +133,7 @@ def _build_full_action_ready_funcdata(
     func_size: int,
     *,
     preserve_unresolved_branchind: bool = False,
+    initial_unique_base: int | None = None,
 ):
     _reset_lifter_analysis_state(lifter)
     # Jump-table recovery can run during followFlow(), so the shim must have
@@ -141,7 +142,13 @@ def _build_full_action_ready_funcdata(
         arch.allacts.universalAction(arch)
         arch.allacts.resetDefaults()
     code_space = arch.getDefaultCodeSpace()
-    initial_unique_base = arch.getUniqueBase() if hasattr(arch, "getUniqueBase") else 0x10000000
+    if initial_unique_base is None:
+        initial_unique_base = arch.getUniqueBase() if hasattr(arch, "getUniqueBase") else 0x10000000
+    # Restart rebuilds must reuse the original unique-space baseline.  If we
+    # keep the high-water mark from the previous action cycle, raw p-code lifted
+    # after restart gets fresh unique offsets that no longer match native Ghidra.
+    if hasattr(arch, "_unique_base"):
+        arch._unique_base = initial_unique_base
     fd = Funcdata(func_name, func_name, None, Address(code_space, entry), None, func_size)
     fd.setArch(arch)
     fd.followFlow(Address(code_space, 0), Address(code_space, code_space.getHighest()))
@@ -209,6 +216,7 @@ def _install_full_action_restart_rebuilder(
     lifter: Lifter,
     target: str,
     func_size: int,
+    initial_unique_base: int,
 ) -> None:
     def _rebuild(target_fd) -> None:
         rebuilt_fd = _build_full_action_ready_funcdata(
@@ -218,6 +226,7 @@ def _install_full_action_restart_rebuilder(
             target=target,
             entry=target_fd.getAddress().getOffset(),
             func_size=func_size,
+            initial_unique_base=initial_unique_base,
         )
         _restore_rebuilt_funcdata(target_fd, rebuilt_fd)
 
@@ -242,6 +251,7 @@ def _prepare_funcdata_for_full_actions(
         if code_space is not None:
             arch.loader = LoadImageBytes(image, Address(code_space, base_addr))
     _install_tracked_context(arch, target, entry)
+    initial_unique_base = arch.getUniqueBase() if hasattr(arch, "getUniqueBase") else 0x10000000
     fd = _build_full_action_ready_funcdata(
         lifter=lifter,
         arch=arch,
@@ -249,8 +259,9 @@ def _prepare_funcdata_for_full_actions(
         target=target,
         entry=entry,
         func_size=func_size,
+        initial_unique_base=initial_unique_base,
     )
-    _install_full_action_restart_rebuilder(fd, arch, lifter, target, func_size)
+    _install_full_action_restart_rebuilder(fd, arch, lifter, target, func_size, initial_unique_base)
     return lifter, arch, fd
 
 

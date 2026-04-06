@@ -6,7 +6,7 @@ The PcodeOp and PcodeOpBank classes.
 
 from __future__ import annotations
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
 from ghidra.core.address import Address, SeqNum
 from ghidra.core.error import LowlevelError
@@ -868,7 +868,7 @@ class PcodeOpBank:
             sq = addr_or_sq
         op = PcodeOp(inputs, sq)
         self._optree[sq] = op
-        self._invalidateOrderedOptreeCache()
+        self._insertOrderedOptreeItem(sq, op)
         self._deadlist[id(op)] = op  # O(1) insert
         op.setFlag(PcodeOp.dead)
         return op
@@ -879,7 +879,7 @@ class PcodeOpBank:
             raise LowlevelError("Deleting integrated op")
         sq = op.getSeqNum()
         self._optree.pop(sq, None)
-        self._invalidateOrderedOptreeCache()
+        self._removeOrderedOptreeItem(sq, op)
         oid = id(op)
         self._deadlist.pop(oid, None)   # O(1)
         if self._alivelist.pop(oid, None) is not None:
@@ -949,6 +949,30 @@ class PcodeOpBank:
     def _invalidateOrderedOptreeCache(self) -> None:
         self._ordered_optree_cache = None
         self._ordered_optree_keys = None
+
+    def _insertOrderedOptreeItem(self, sq: SeqNum, op: PcodeOp) -> None:
+        cache = self._ordered_optree_cache
+        keys = self._ordered_optree_keys
+        if cache is None or keys is None:
+            return
+        idx = bisect_right(keys, sq)
+        keys.insert(idx, sq)
+        cache.insert(idx, (sq, op))
+
+    def _removeOrderedOptreeItem(self, sq: SeqNum, op: PcodeOp) -> None:
+        cache = self._ordered_optree_cache
+        keys = self._ordered_optree_keys
+        if cache is None or keys is None:
+            return
+        idx = bisect_left(keys, sq)
+        while idx < len(keys) and keys[idx] == sq:
+            if cache[idx][1] is op:
+                del keys[idx]
+                del cache[idx]
+                return
+            idx += 1
+        # Cache and backing map drifted; fall back to a full rebuild next time.
+        self._invalidateOrderedOptreeCache()
 
     def _orderedOptreeItems(self) -> List[tuple[SeqNum, PcodeOp]]:
         cache = self._ordered_optree_cache

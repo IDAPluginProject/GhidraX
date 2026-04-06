@@ -18,6 +18,118 @@ _SYNC_DEBUG_ADDRS = os.environ.get("PYGHIDRA_SYNC_DEBUG_ADDRS", "").strip()
 _SYNC_DEBUG_LOG = os.environ.get("PYGHIDRA_SYNC_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_sync_debug.log")
 _PARAMUSE_DEBUG = os.environ.get("PYGHIDRA_PARAMUSE_DEBUG", "").strip()
 _PARAMUSE_DEBUG_LOG = os.environ.get("PYGHIDRA_PARAMUSE_DEBUG_LOG", "D:/BIGAI/pyghidra/temp/python_paramuse_debug.log")
+_UNIQUE_DEBUG_ADDRS = os.environ.get("PYGHIDRA_DEBUG_UNIQUE_ADDRS", "").strip()
+_UNIQUE_DEBUG_SEQS = os.environ.get("PYGHIDRA_DEBUG_UNIQUE_SEQS", "").strip()
+_UNIQUE_DEBUG_LOG = os.environ.get("PYGHIDRA_DEBUG_UNIQUE_LOG", "").strip()
+_RESTART_DEBUG_FUNCS = os.environ.get("PYGHIDRA_DEBUG_RESTART_FUNCS", "").strip()
+_RESTART_DEBUG_LOG = os.environ.get("PYGHIDRA_DEBUG_RESTART_LOG", "").strip()
+
+
+def _parse_debug_int_set(raw: str) -> set[int]:
+    values: set[int] = set()
+    if not raw:
+        return values
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        try:
+            values.add(int(token, 0))
+        except ValueError:
+            continue
+    return values
+
+
+_UNIQUE_DEBUG_ADDR_SET = _parse_debug_int_set(_UNIQUE_DEBUG_ADDRS)
+_UNIQUE_DEBUG_SEQ_SET = _parse_debug_int_set(_UNIQUE_DEBUG_SEQS)
+_RESTART_DEBUG_FUNC_SET = _parse_debug_int_set(_RESTART_DEBUG_FUNCS)
+
+
+def _format_unique_debug_vn(vn: Optional[Varnode]) -> str:
+    if vn is None:
+        return "void"
+    spc = vn.getSpace() if hasattr(vn, "getSpace") else None
+    spc_name = spc.getName() if spc is not None and hasattr(spc, "getName") else "none"
+    return f"{spc_name}[0x{vn.getOffset():x}:{vn.getSize()}]"
+
+
+def _format_unique_debug_op(op: Optional[PcodeOp]) -> str:
+    if op is None:
+        return "op=<none>"
+    addr = op.getAddr().getOffset() if hasattr(op, "getAddr") else -1
+    seq = op.getTime() if hasattr(op, "getTime") else -1
+    opc = op.code() if hasattr(op, "code") else "?"
+    return f"op=@0x{addr:x}#{seq} opc={opc}"
+
+
+def _should_log_unique_debug(op: Optional[PcodeOp]) -> bool:
+    if not _UNIQUE_DEBUG_LOG:
+        return False
+    if not _UNIQUE_DEBUG_ADDR_SET and not _UNIQUE_DEBUG_SEQ_SET:
+        return True
+    if op is None:
+        return False
+    addr = op.getAddr().getOffset() if hasattr(op, "getAddr") else None
+    seq = op.getTime() if hasattr(op, "getTime") else None
+    if _UNIQUE_DEBUG_ADDR_SET and addr not in _UNIQUE_DEBUG_ADDR_SET:
+        return False
+    if _UNIQUE_DEBUG_SEQ_SET and seq not in _UNIQUE_DEBUG_SEQ_SET:
+        return False
+    return True
+
+
+def _append_unique_debug_line(line: str) -> None:
+    if not _UNIQUE_DEBUG_LOG:
+        return
+    try:
+        with open(_UNIQUE_DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
+def _unique_debug_caller(depth: int = 1) -> str:
+    try:
+        frame = sys._getframe(depth)
+    except ValueError:
+        return "caller=<unknown>"
+    module = frame.f_globals.get("__name__", "<module>")
+    return f"caller={module}.{frame.f_code.co_name}"
+
+
+def _should_log_restart_debug(fd: Optional["Funcdata"]) -> bool:
+    if not _RESTART_DEBUG_LOG:
+        return False
+    if not _RESTART_DEBUG_FUNC_SET:
+        return True
+    if fd is None:
+        return False
+    try:
+        func_addr = fd.getAddress().getOffset()
+    except Exception:
+        return False
+    return func_addr in _RESTART_DEBUG_FUNC_SET
+
+
+def _append_restart_debug_line(line: str) -> None:
+    if not _RESTART_DEBUG_LOG:
+        return
+    try:
+        with open(_RESTART_DEBUG_LOG, "a", encoding="utf-8") as fh:
+            fh.write(line)
+            fh.write("\n")
+    except OSError:
+        pass
+
+
+def _restart_debug_caller(depth: int = 1) -> str:
+    try:
+        frame = sys._getframe(depth)
+    except ValueError:
+        return "caller=<unknown>"
+    module = frame.f_globals.get("__name__", "<module>")
+    return f"caller={module}.{frame.f_code.co_name}"
 
 
 def _debug_insert_event(kind: str, op: PcodeOp, anchor: PcodeOp, bl: Optional[BlockBasic]) -> None:
@@ -85,6 +197,30 @@ def _sync_debug_log(vn, message: str) -> None:
         return
 
 
+def _sync_debug_group_log(vnlist, message: str) -> None:
+    if not vnlist:
+        return
+    exemplar = vnlist[0]
+    if not _sync_debug_should_log(exemplar):
+        return
+    parts = []
+    for idx, vn in enumerate(vnlist):
+        try:
+            role = "in" if vn.isInput() else "wr" if vn.isWritten() else "free" if vn.isFree() else "oth"
+        except Exception:
+            role = "?"
+        try:
+            flags = vn.getFlags()
+        except Exception:
+            flags = -1
+        try:
+            mapentry = int(vn.getSymbolEntry() is not None)
+        except Exception:
+            mapentry = -1
+        parts.append(f"{idx}:{role}:flags={flags:#x}:map={mapentry}")
+    _sync_debug_log(exemplar, f"{message} group=[{' ; '.join(parts)}]")
+
+
 def _sync_debug_rangelist(rangelist) -> str:
     try:
         if rangelist is None or rangelist.empty():
@@ -97,6 +233,25 @@ def _sync_debug_rangelist(rangelist) -> str:
         return "[" + ", ".join(parts) + "]"
     except Exception:
         return "<?>"
+
+
+def _is_unknown_datatype(ct) -> bool:
+    if ct is None or not hasattr(ct, "getMetatype"):
+        return False
+    meta = ct.getMetatype()
+    try:
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        if meta == TYPE_UNKNOWN:
+            return True
+    except Exception:
+        pass
+    if isinstance(meta, str):
+        return meta.lower() == "unknown"
+    name = getattr(meta, "name", None)
+    if isinstance(name, str) and name.upper() == "TYPE_UNKNOWN":
+        return True
+    return meta == 15
 
 
 def _paramuse_debug_enabled(opmatch, trial) -> bool:
@@ -257,7 +412,11 @@ class Funcdata:
         return localoverride
 
     def getJumpTable(self, ind):
-        """Get the JumpTable associated with the given BRANCHIND op."""
+        """Get a JumpTable by index, or fall back to BRANCHIND lookup."""
+        if isinstance(ind, int):
+            if 0 <= ind < len(self._jumpvec):
+                return self._jumpvec[ind]
+            return None
         for jt in self._jumpvec:
             if jt.getIndirectOp() is ind:
                 return jt
@@ -405,10 +564,27 @@ class Funcdata:
         return (self._flags & Funcdata.restart_pending) != 0
 
     def setRestartPending(self, val: bool) -> None:
+        old_val = (self._flags & Funcdata.restart_pending) != 0
         if val:
             self._flags |= Funcdata.restart_pending
         else:
             self._flags &= ~Funcdata.restart_pending
+        if _should_log_restart_debug(self):
+            try:
+                from ghidra.transform.action import Action
+                idx = Action.getActiveTraceSerial()
+                perf_iter = Action.getActivePerformIter()
+            except Exception:
+                idx = 0
+                perf_iter = 0
+            try:
+                func_addr = self.getAddress().getOffset()
+            except Exception:
+                func_addr = -1
+            _append_restart_debug_line(
+                f"event=setRestartPending func=0x{func_addr:x} old={int(old_val)} new={int(val)} "
+                f"idx={idx} iter={perf_iter} {_restart_debug_caller(2)}"
+            )
 
     def hasUnimplemented(self) -> bool:
         return (self._flags & Funcdata.unimplemented_present) != 0
@@ -931,6 +1107,10 @@ class Funcdata:
         addr = Address(uniq, base)
         if self._glb is not None and hasattr(self._glb, 'setUniqueBase'):
             self._glb.setUniqueBase(base + s)
+        if _should_log_unique_debug(None):
+            _append_unique_debug_line(
+                f"event=newUnique size={s} base=0x{base:x} next=0x{base + s:x} {_unique_debug_caller(2)}"
+            )
         vn = self._vbank.create(s, addr, ct)
         self.assignHigh(vn)
         if s >= self._minLanedSize:
@@ -970,11 +1150,18 @@ class Funcdata:
             uniq = None
             base = 0x10000000
         addr = Address(uniq, base)
+        old_out = op.getOut()
         if self._glb is not None and hasattr(self._glb, 'setUniqueBase'):
             self._glb.setUniqueBase(base + s)
         ct = self._glb.types.getBase(s, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
         vn = self._vbank.createDef(s, addr, ct, op)
         op.setOutput(vn)
+        if _should_log_unique_debug(op):
+            _append_unique_debug_line(
+                f"event=newUniqueOut {_format_unique_debug_op(op)} size={s} "
+                f"base=0x{base:x} next=0x{base + s:x} old_out={_format_unique_debug_vn(old_out)} "
+                f"new_out={_format_unique_debug_vn(vn)} {_unique_debug_caller(2)}"
+            )
         self.assignHigh(vn)
         if s >= self._minLanedSize:
             self.checkForLanedRegister(s, vn.getAddr())
@@ -1545,6 +1732,12 @@ class Funcdata:
         if vn is op.getOut():
             return
         old_out = op.getOut()
+        if _should_log_unique_debug(op):
+            _append_unique_debug_line(
+                f"event=opSetOutput-begin {_format_unique_debug_op(op)} "
+                f"old_out={_format_unique_debug_vn(old_out)} new_out={_format_unique_debug_vn(vn)} "
+                f"{_unique_debug_caller(2)}"
+            )
         if old_out is not None:
             self.opUnsetOutput(op)
         if vn.getDef() is not None:
@@ -1552,6 +1745,11 @@ class Funcdata:
         vn = self._vbank.setDef(vn, op)
         self.setVarnodeProperties(vn)
         op.setOutput(vn)
+        if _should_log_unique_debug(op):
+            _append_unique_debug_line(
+                f"event=opSetOutput-end {_format_unique_debug_op(op)} new_out={_format_unique_debug_vn(vn)} "
+                f"{_unique_debug_caller(2)}"
+            )
 
     def opSetInput(self, op: PcodeOp, vn: Varnode, slot: int) -> None:
         """Set an input of a PcodeOp.
@@ -1625,6 +1823,11 @@ class Funcdata:
         out = op.getOut()
         if out is None:
             return
+        if _should_log_unique_debug(op):
+            _append_unique_debug_line(
+                f"event=opUnsetOutput {_format_unique_debug_op(op)} old_out={_format_unique_debug_vn(out)} "
+                f"{_unique_debug_caller(2)}"
+            )
         op.setOutput(None)
         self._vbank.makeFree(out)
         if hasattr(out, 'clearCover'):
@@ -2345,10 +2548,10 @@ class Funcdata:
     def splitUses(self, vn) -> None:
         """Duplicate the defining PcodeOp at each read so each becomes a new unique.
 
-        For each descendant except the last, clone the defining op and
-        create a new output Varnode, then redirect the descendant's input
-        to the new clone output. Dead-code actions should remove the
-        original op if it becomes unused.
+        For each descendant, clone the defining op and create a new output
+        Varnode, then redirect the descendant's input to the new clone
+        output. Dead-code actions should remove the original op after all
+        descendants have been rewritten.
 
         C++ ref: ``Funcdata::splitUses``
         """
@@ -2358,8 +2561,7 @@ class Funcdata:
         descs = list(vn.getDescendants())
         if len(descs) <= 1:
             return
-        # Process all descendants except the last one (which keeps the original)
-        for useop in descs[:-1]:
+        for useop in descs:
             slot = useop.getSlot(vn)
             newop = self.newOp(op.numInput(), op.getAddr())
             newvn = self.newVarnode(vn.getSize(), vn.getAddr(), vn.getType() if hasattr(vn, 'getType') else None)
@@ -2443,10 +2645,11 @@ class Funcdata:
             vflags = vflags_ref[0]
             if entry is not None and hasattr(vn, 'setSymbolProperties'):
                 vn.setSymbolProperties(entry)
-            elif vflags != 0:
+            elif hasattr(vn, 'setFlags'):
                 vn.setFlags(vflags & ~Varnode.typelock)
-        if self.isHighOn() and hasattr(vn, 'calcCover'):
-            vn.calcCover()
+        if getattr(vn, '_cover', None) is None:
+            if self.isHighOn() and hasattr(vn, 'calcCover'):
+                vn.calcCover()
 
     def coverVarnodes(self, entry, vnlist: list) -> None:
         """Make sure every Varnode in the given list has a Symbol it will link to.
@@ -2502,24 +2705,50 @@ class Funcdata:
         fl &= mask
 
         vnlist = list(iterobj) if not isinstance(iterobj, list) else iterobj
+        _sync_debug_group_log(vnlist, f"sync_group_enter mask={mask:#x} fl={fl:#x}")
         for vn in vnlist:
             if vn.isFree():
                 continue
             vnflags = vn.getFlags()
-            if hasattr(vn, 'mapentry') and vn.mapentry is not None:
+            mapentry = vn.getSymbolEntry() if hasattr(vn, 'getSymbolEntry') else getattr(vn, '_mapentry', None)
+            if mapentry is not None:
                 localMask = mask & ~VnCls.mapped
                 localFlags = fl & localMask
                 if (vnflags & localMask) != localFlags:
                     updateoccurred = True
+                    _sync_debug_log(
+                        vn,
+                        f"sync_member_update path=mapentry old={vnflags:#x} "
+                        f"mask={localMask:#x} new={localFlags:#x}",
+                    )
                     vn.setFlags(localFlags)
                     vn.clearFlags((~localFlags) & localMask)
             elif (vnflags & mask) != fl:
                 updateoccurred = True
+                _sync_debug_log(
+                    vn,
+                    f"sync_member_update path=nomap old={vnflags:#x} "
+                    f"mask={mask:#x} new={fl:#x}",
+                )
                 vn.setFlags(fl)
                 vn.clearFlags((~fl) & mask)
             if ct is not None and hasattr(vn, 'updateType'):
+                old_type = vn.getType() if hasattr(vn, 'getType') else None
                 if vn.updateType(ct):
                     updateoccurred = True
+                    old_name = old_type.getName() if old_type is not None and hasattr(old_type, 'getName') else str(old_type)
+                    new_name = ct.getName() if hasattr(ct, 'getName') else str(ct)
+                    old_meta = old_type.getMetatype() if old_type is not None and hasattr(old_type, 'getMetatype') else None
+                    new_meta = ct.getMetatype() if hasattr(ct, 'getMetatype') else None
+                    old_size = old_type.getSize() if old_type is not None and hasattr(old_type, 'getSize') else None
+                    new_size = ct.getSize() if hasattr(ct, 'getSize') else None
+                    _sync_debug_log(
+                        vn,
+                        "sync_member_update type=1 "
+                        f"old={old_name}:{old_meta}:{old_size}:id={id(old_type) if old_type is not None else 0} "
+                        f"new={new_name}:{new_meta}:{new_size}:id={id(ct)}",
+                    )
+        _sync_debug_group_log(vnlist, f"sync_group_exit changed={int(updateoccurred)}")
         return updateoccurred
 
     def handleSymbolConflict(self, entry, vn):
@@ -2544,13 +2773,10 @@ class Funcdata:
         # Look for a conflicting HighVariable at same size/addr using O(K) index
         eaddr = entry.getAddr() if hasattr(entry, 'getAddr') else None
         esz = entry.getSize() if hasattr(entry, 'getSize') else None
-        if eaddr is not None and esz is not None:
-            espc = eaddr.base
+        if eaddr is not None and esz is not None and self._vbank is not None and hasattr(self._vbank, 'findLoc'):
             for othervn in self._vbank.findLoc(eaddr, esz):
-                if othervn._loc.base is not espc:
-                    continue
-                tmpHigh = othervn.getHigh()
-                if tmpHigh is not None and tmpHigh is not high:
+                tmpHigh = othervn.getHigh() if hasattr(othervn, 'getHigh') else None
+                if tmpHigh is not high:
                     otherHigh = tmpHigh
                     break
 
@@ -3068,10 +3294,10 @@ class Funcdata:
     def iterDefVarnodes(self, flags: int):
         """Iterate varnodes whose flags include all bits in *flags*.
 
-        Typically used with ``Varnode.input`` (0x1) to iterate input varnodes.
+        Typically used with ``Varnode.input`` (0x08) to iterate input varnodes.
         C++ ref: ``VarnodeDefSet`` iteration filtered by flags.
         """
-        for vn in self._vbank.beginLoc():
+        for vn in self._vbank.beginDef():
             if (vn.getFlags() & flags) == flags:
                 yield vn
 
@@ -3409,7 +3635,14 @@ class Funcdata:
 
         C++ ref: ``Funcdata::opInsertEnd``
         """
-        bl.addOp(op)
+        from ghidra.core.opcodes import OpCode
+
+        ops = bl.getOpList()
+        idx = len(ops)
+        if op.code() != OpCode.CPUI_MULTIEQUAL:
+            while idx > 0 and ops[idx - 1].isBranch():
+                idx -= 1
+        bl.insertOp(op, idx)
         self.opMarkAlive(op)
 
     def opInsertAfter(self, op: PcodeOp, prev: PcodeOp) -> None:
@@ -3518,6 +3751,7 @@ class Funcdata:
         flow.generateOps()
         flow.generateBlocks()
         self._flags |= Funcdata.blocks_generated
+        self.switchOverJumpTables(flow)
         if flow.hasUnimplemented():
             self._flags |= Funcdata.unimplemented_present
         if flow.hasBadData():
@@ -3577,6 +3811,7 @@ class Funcdata:
         partialflow.clearFlags(~FlowInfo.possible_unreachable)
         partialflow.generateBlocks()
         self._flags |= Funcdata.blocks_generated
+        self.switchOverJumpTables(partialflow)
 
     def inlineFlow(self, inlinefd, flow, callop) -> int:
         """In-line the p-code of another function into \b this function.
@@ -4571,7 +4806,16 @@ class Funcdata:
                 if hasattr(entry, 'getSize') and entry.getSize() >= vnexemplar.getSize():
                     if updateDatatypes and hasattr(entry, 'getSizedType'):
                         ct = entry.getSizedType(vnexemplar.getAddr(), vnexemplar.getSize())
-                        if ct is not None and hasattr(ct, 'getMetatype') and ct.getMetatype() == 15:  # TYPE_UNKNOWN
+                        if ct is not None:
+                            ct_meta = ct.getMetatype() if hasattr(ct, 'getMetatype') else None
+                            _sync_debug_log(
+                                vnexemplar,
+                                f"candidate_type name={ct.getName() if hasattr(ct, 'getName') else ct} "
+                                f"meta={ct_meta!r} meta_type={type(ct_meta).__name__ if ct_meta is not None else 'None'} "
+                                f"size={ct.getSize() if hasattr(ct, 'getSize') else '?'}",
+                            )
+                        if _is_unknown_datatype(ct):
+                            _sync_debug_log(vnexemplar, "candidate_type_filtered=unknown")
                             ct = None
                 else:
                     fl &= ~(Varnode.typelock | Varnode.namelock)

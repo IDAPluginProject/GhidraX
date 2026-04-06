@@ -53,9 +53,14 @@ def _build_default_proto_model(spc_mgr, glb, target: str | None = None) -> 'Prot
     model_name = "__fastcall"
     # Determine register space and pointer size
     reg_space = None
+    ram_space = None
     ptr_size = 4
     try:
         reg_space = spc_mgr.getSpaceByName("register")
+    except Exception:
+        pass
+    try:
+        ram_space = spc_mgr.getSpaceByName("ram")
     except Exception:
         pass
     code_space = getattr(spc_mgr, '_defaultCodeSpace', None)
@@ -252,12 +257,24 @@ def _build_default_proto_model(spc_mgr, glb, target: str | None = None) -> 'Prot
             for off, sz in ((0x00, 8), (0x1200, 16)):
                 effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
         else:
-            # x86-32 cdecl effect list (from x86gcc.cspec)
-            # unaffected (callee-saved): ESP=0x10, EBP=0x14, ESI=0x18, EDI=0x1c, EBX=0xc, DF=0x20a
-            for off, sz in ((0x10, 4), (0x14, 4), (0x18, 4), (0x1c, 4), (0x0c, 4), (0x20a, 1)):
+            # x86-32 Windows __stdcall effect list (from x86win.cspec)
+            # unaffected: ram[0:4], ESP=0x10, EBP=0x14, ESI=0x18,
+            # EDI=0x1c, EBX=0xc, DF=0x20a, FS_OFFSET=0x110
+            if ram_space is not None:
+                effects.append(EffectRecord(Address(ram_space, 0), 4, EffectRecord.unaffected))
+            for off, sz in (
+                (0x10, 4),
+                (0x14, 4),
+                (0x18, 4),
+                (0x1c, 4),
+                (0x0c, 4),
+                (0x20a, 1),
+                (0x110, 4),
+            ):
                 effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.unaffected))
-            # killedbycall (volatile): ECX=0x4, EDX=0x8, ST0=0x1100, ST1=0x1110
-            # EAX=0x0 is killedbycall via autoKilledByCall (output killedbycall="true" in cspec)
+            # killedbycall (volatile): ECX=0x4, EDX=0x8, ST0=0x1100, ST1=0x1110.
+            # Keep EAX explicit until the shim derives output killedbycall
+            # directly from ParamListStandard metadata like native does.
             for off, sz in ((0x00, 4), (0x04, 4), (0x08, 4), (0x1100, 10), (0x1110, 10)):
                 effects.append(EffectRecord(Address(reg_space, off), sz, EffectRecord.killedbycall))
         if stack_space is not None:
@@ -331,7 +348,7 @@ class ArchitectureStandalone:
         self.context = None  # No tracked context by default
         self.types = _build_shim_type_factory(spc_mgr)
         self.types.glb = self
-        self.analyze_for_loops = False
+        self.analyze_for_loops = True
         self.nan_ignore_all = False
         self.nan_ignore_compare = True
         self.alias_block_level = 2
@@ -342,7 +359,7 @@ class ArchitectureStandalone:
         self.max_implied_ref = 2
         self.max_term_duplication = 2
         self.max_instructions = 100000
-        self.flowoptions = 0x10
+        self.flowoptions = 0x20
         self.extra_pop = 0
         self.commentdb = None
         self.loader = None

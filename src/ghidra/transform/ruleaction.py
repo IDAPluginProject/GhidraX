@@ -13,6 +13,7 @@ from typing import Optional, List, TYPE_CHECKING
 from ghidra.core.opcodes import OpCode
 from ghidra.core.error import LowlevelError
 from ghidra.core.address import calc_mask, pcode_left, pcode_right, leastsigbit_set, signbit_negative
+from ghidra.core.expression import AddExpression
 from ghidra.transform.action import Rule, ActionGroupList
 
 # Hot-path inline constants (avoids repeated attribute lookups in tight loops)
@@ -28,40 +29,65 @@ _OP_MARKER_FL  = 0x40     # PcodeOp.marker
 _OPC_INDIRECT  = 61       # OpCode.CPUI_INDIRECT
 
 
-def _propcopy_debug_enabled(op) -> bool:
-    spec = os.getenv("PYGHIDRA_PROPCOPY_DEBUG_ADDRS", "").strip()
+def _parse_debug_addr_spec(spec: str) -> tuple[bool, set[int]]:
+    spec = spec.strip()
     if not spec:
-        return False
-    try:
-        off = op.getAddr().getOffset()
-    except Exception:
-        return False
+        return False, set()
     if spec == "*":
-        return True
+        return True, set()
+    addrs: set[int] = set()
     for part in spec.split(","):
         part = part.strip().lower()
         if not part:
             continue
         try:
-            if off == int(part, 0):
-                return True
+            addrs.add(int(part, 0))
         except Exception:
             continue
-    return False
+    return False, addrs
 
 
-def _propcopy_debug_log(op, message: str) -> None:
-    if not _propcopy_debug_enabled(op):
+_EARLYREMOVAL_DEBUG_ALL, _EARLYREMOVAL_DEBUG_ADDRS = _parse_debug_addr_spec(
+    os.getenv("PYGHIDRA_EARLYREMOVAL_DEBUG_ADDRS", "")
+)
+_EARLYREMOVAL_DEBUG_ENABLED = _EARLYREMOVAL_DEBUG_ALL or bool(_EARLYREMOVAL_DEBUG_ADDRS)
+_EARLYREMOVAL_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_EARLYREMOVAL_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_earlyremoval_debug.log",
+)
+
+_PROPCOPY_DEBUG_ALL, _PROPCOPY_DEBUG_ADDRS = _parse_debug_addr_spec(
+    os.getenv("PYGHIDRA_PROPCOPY_DEBUG_ADDRS", "")
+)
+_PROPCOPY_DEBUG_ENABLED = _PROPCOPY_DEBUG_ALL or bool(_PROPCOPY_DEBUG_ADDRS)
+_PROPCOPY_DEBUG_LOG_PATH = os.getenv(
+    "PYGHIDRA_PROPCOPY_DEBUG_LOG",
+    "D:/BIGAI/pyghidra/temp/python_propcopy_debug.log",
+)
+
+
+def _earlyremoval_debug_enabled(op) -> bool:
+    if not _EARLYREMOVAL_DEBUG_ENABLED:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if _EARLYREMOVAL_DEBUG_ALL:
+        return True
+    return off in _EARLYREMOVAL_DEBUG_ADDRS
+
+
+def _earlyremoval_debug_log(op, message: str) -> None:
+    if not _earlyremoval_debug_enabled(op):
         return
-    path = os.getenv(
-        "PYGHIDRA_PROPCOPY_DEBUG_LOG",
-        "D:/BIGAI/pyghidra/temp/python_propcopy_debug.log",
-    )
     try:
         from ghidra.transform.action import Action
         idx = Action.getActiveTraceSerial()
+        perform_iter = Action.getActivePerformIter()
     except Exception:
         idx = 0
+        perform_iter = 0
     try:
         addr = f"{op.getAddr().getOffset():#x}"
     except Exception:
@@ -71,10 +97,83 @@ def _propcopy_debug_log(op, message: str) -> None:
     except Exception:
         seq = "?"
     try:
-        with open(path, "a", encoding="utf-8") as fp:
+        with open(_EARLYREMOVAL_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
+            prefix = "[earlyremoval]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            if perform_iter > 0:
+                prefix += f" iter={perform_iter}"
+            fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
+    except Exception:
+        return
+
+
+def _earlyremoval_desc_summary(vn, op) -> str:
+    try:
+        descend = list(vn._descend)
+    except Exception:
+        return "desc_detail=?"
+    if not descend:
+        return "desc_detail=none"
+    parts = []
+    for idx, desc in enumerate(descend[:4]):
+        try:
+            desc_addr = f"{desc.getAddr().getOffset():#x}"
+        except Exception:
+            desc_addr = "?"
+        try:
+            desc_seq = desc.getSeqNum().getOrder()
+        except Exception:
+            desc_seq = "?"
+        try:
+            desc_opc = desc._opcode_enum
+        except Exception:
+            desc_opc = "?"
+        parts.append(
+            f"{idx}:{desc_addr}#{desc_seq}/opc={desc_opc}/self={int(desc is op)}"
+        )
+    if len(descend) > len(parts):
+        parts.append(f"more={len(descend) - len(parts)}")
+    return "desc_detail=" + ",".join(parts)
+
+
+def _propcopy_debug_enabled(op) -> bool:
+    if not _PROPCOPY_DEBUG_ENABLED:
+        return False
+    try:
+        off = op.getAddr().getOffset()
+    except Exception:
+        return False
+    if _PROPCOPY_DEBUG_ALL:
+        return True
+    return off in _PROPCOPY_DEBUG_ADDRS
+
+
+def _propcopy_debug_log(op, message: str) -> None:
+    if not _propcopy_debug_enabled(op):
+        return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+        perform_iter = Action.getActivePerformIter()
+    except Exception:
+        idx = 0
+        perform_iter = 0
+    try:
+        addr = f"{op.getAddr().getOffset():#x}"
+    except Exception:
+        addr = "?"
+    try:
+        seq = op.getSeqNum().getOrder()
+    except Exception:
+        seq = "?"
+    try:
+        with open(_PROPCOPY_DEBUG_LOG_PATH, "a", encoding="utf-8") as fp:
             prefix = "[propcopy]"
             if idx > 0:
                 prefix += f" idx={idx}"
+            if perform_iter > 0:
+                prefix += f" iter={perform_iter}"
             fp.write(f"{prefix} addr={addr} seq={seq} {message}\n")
     except Exception:
         return
@@ -133,22 +232,37 @@ class RuleEarlyRemoval(Rule):
 
     def applyOp(self, op: PcodeOp, data: Funcdata) -> int:
         if op._flags & self._OP_CALL_OR_INDSRC:
+            _earlyremoval_debug_log(op, f"return=0 reason=call_or_indsrc op_flags={op._flags:#x}")
             return 0
         vn = op._output
         if vn is None:
+            _earlyremoval_debug_log(op, "return=0 reason=no_output")
             return 0
         if vn._descend:
+            _earlyremoval_debug_log(
+                op,
+                f"return=0 reason=has_descend out_flags={vn._flags:#x} desc={len(vn._descend)} "
+                f"{_earlyremoval_desc_summary(vn, op)}",
+            )
             return 0
         if vn._flags & self._VN_AUTOLIVE:
-            if self._isRedundantInputMarker(vn):
+            redundant = self._isRedundantInputMarker(vn)
+            _earlyremoval_debug_log(
+                op,
+                f"state autolive out_flags={vn._flags:#x} redundant_input_marker={int(redundant)}",
+            )
+            if redundant:
                 vn.clearAddrForce()
             else:
+                _earlyremoval_debug_log(op, "return=0 reason=autolive_blocked")
                 return 0
         spc = vn._loc.base
         if spc is not None and spc.doesDeadcode():
             if not data.deadRemovalAllowedSeen(spc):
+                _earlyremoval_debug_log(op, "return=0 reason=deadremoval_disallowed")
                 return 0
         data.opDestroy(op)
+        _earlyremoval_debug_log(op, "return=1 action=destroy")
         return 1
 
 
@@ -748,27 +862,52 @@ class RulePropagateCopy(Rule):
             return 0
         op_is_marker = op._flags & _OP_MARKER_FL
         op_out = op.getOut()
-        if op_is_marker:
+        if _propcopy_debug_enabled(op):
             try:
                 out_flags = 0 if op_out is None else op_out._flags
                 _propcopy_debug_log(
                     op,
-                    f"enter op_flags={op._flags:#x} out_flags={out_flags:#x}",
+                    f"enter op_flags={op._flags:#x} out_flags={out_flags:#x} marker={int(bool(op_is_marker))}",
                 )
             except Exception:
                 pass
         for i, vn in enumerate(op._inrefs):
-            if vn is None or not (vn._flags & _VN_WRITTEN):
+            if vn is None:
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(op, f"skip slot={i} reason=input_none")
+                continue
+            if not (vn._flags & _VN_WRITTEN):
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(op, f"skip slot={i} reason=input_not_written vn_flags={vn._flags:#x}")
                 continue
             copyop = vn._def
+            if copyop is None:
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(op, f"skip slot={i} reason=missing_def vn_flags={vn._flags:#x}")
+                continue
             if copyop._opcode_enum != _CPUI_COPY:
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(
+                        op,
+                        f"skip slot={i} reason=def_not_copy vn_flags={vn._flags:#x} copy_opc={copyop._opcode_enum}",
+                    )
                 continue
             invn = copyop._inrefs[0] if copyop._inrefs else None
             if invn is None:
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(op, f"skip slot={i} reason=copy_missing_input copyop_flags={copyop._flags:#x}")
                 continue
             if not (invn._flags & _VN_HK):  # isHeritageKnown
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(
+                        op,
+                        f"skip slot={i} reason=input_not_heritage_known invn_flags={invn._flags:#x} "
+                        f"copyop_flags={copyop._flags:#x}",
+                    )
                 continue
             if invn is vn:
+                if _propcopy_debug_enabled(op):
+                    _propcopy_debug_log(op, f"skip slot={i} reason=self_defined vn_flags={vn._flags:#x}")
                 continue  # Self-defined
             if op_is_marker:
                 if invn._flags & _VN_CONST:
@@ -804,8 +943,16 @@ class RulePropagateCopy(Rule):
                     f"copyop_flags={copyop._flags:#x} copy_seq={copyop.getSeqNum().getOrder()} "
                     f"copy_out_flags={(copyop.getOut()._flags if copyop.getOut() is not None else 0):#x}",
                 )
+            elif _propcopy_debug_enabled(op):
+                _propcopy_debug_log(
+                    op,
+                    f"fire slot={i} vn_flags={vn._flags:#x} invn_flags={invn._flags:#x} "
+                    f"copyop_flags={copyop._flags:#x} copy_seq={copyop.getSeqNum().getOrder()}",
+                )
             data.opSetInput(op, invn, i)
             return 1
+        if _propcopy_debug_enabled(op):
+            _propcopy_debug_log(op, "return=0 reason=no_propagation")
         return 0
 
 
@@ -1208,11 +1355,11 @@ class RuleCarryElim(Rule):
 
 # =========================================================================
 # RuleSborrow
-# sborrow(V, 0) => false
+# Simplify signed comparisons using INT_SBORROW
 # =========================================================================
 
 class RuleSborrow(Rule):
-    """Transform sborrow with zero: sborrow(V, 0) => false."""
+    """Simplify signed comparisons expressed via INT_SBORROW."""
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "sborrow")
@@ -1225,13 +1372,58 @@ class RuleSborrow(Rule):
         return [int(OpCode.CPUI_INT_SBORROW)]
 
     def applyOp(self, op, data) -> int:
-        vn2 = op.getIn(1)
-        if not vn2.isConstant(): return 0
-        if vn2.getOffset() != 0: return 0
-        data.opRemoveInput(op, 1)
-        data.opSetInput(op, data.newConstant(1, 0), 0)
-        data.opSetOpcode(op, OpCode.CPUI_COPY)
-        return 1
+        svn = op.getOut()
+        avn = op.getIn(0)
+        bvn = op.getIn(1)
+
+        # sborrow(V, 0) => false
+        if bvn.isConstant() and bvn.getOffset() == 0:
+            data.opSetOpcode(op, OpCode.CPUI_COPY)
+            data.opSetInput(op, data.newConstant(1, 0), 0)
+            data.opRemoveInput(op, 1)
+            return 1
+
+        for compop in list(svn.beginDescend()):
+            compopc = compop.code()
+            if compopc != OpCode.CPUI_INT_EQUAL and compopc != OpCode.CPUI_INT_NOTEQUAL:
+                continue
+
+            cvn = compop.getIn(1) if compop.getIn(0) == svn else compop.getIn(0)
+            if not cvn.isWritten():
+                continue
+            signop = cvn.getDef()
+            if signop.code() != OpCode.CPUI_INT_SLESS:
+                continue
+
+            if not signop.getIn(0).constantMatch(0):
+                if not signop.getIn(1).constantMatch(0):
+                    continue
+                zside = 1
+            else:
+                zside = 0
+
+            xvn = signop.getIn(1 - zside)
+            if not xvn.isWritten():
+                continue
+
+            expr1 = AddExpression()
+            expr1.gatherTwoTermsSubtract(avn, bvn)
+            expr2 = AddExpression()
+            expr2.gatherTwoTermsRoot(xvn)
+            if not expr1.isEquivalent(expr2):
+                continue
+
+            if compopc == OpCode.CPUI_INT_NOTEQUAL:
+                data.opSetOpcode(compop, OpCode.CPUI_INT_SLESS)
+                data.opSetInput(compop, avn, 1 - zside)
+                data.opSetInput(compop, bvn, zside)
+            else:
+                data.opSetOpcode(compop, OpCode.CPUI_INT_SLESSEQUAL)
+                data.opSetInput(compop, avn, zside)
+                data.opSetInput(compop, bvn, 1 - zside)
+            return 1
+
+        return 0
 
 
 # =========================================================================
@@ -1590,7 +1782,7 @@ class RuleHighOrderAnd(Rule):
 # =========================================================================
 
 class RuleBoolZext(Rule):
-    """Simplify ZEXT of boolean value when used as boolean."""
+    """Simplify boolean expressions involving zext(V) * -1."""
 
     def __init__(self, g: str) -> None:
         super().__init__(g, 0, "boolzext")
@@ -1603,18 +1795,110 @@ class RuleBoolZext(Rule):
         return [int(OpCode.CPUI_INT_ZEXT)]
 
     def applyOp(self, op, data) -> int:
-        invn = op.getIn(0)
-        if invn is None: return 0
-        if invn.getSize() != 1: return 0
+        boolVn1 = op.getIn(0)
+        if boolVn1 is None or not boolVn1.isBooleanValue(data.isTypeRecoveryOn()):
+            return 0
+
         outvn = op.getOut()
-        if outvn is None: return 0
-        # Check if output is only used in boolean context
-        if outvn.getNZMask() > 1: return 0
-        # All uses must treat it as boolean
-        for desc in outvn.getDescendants():
-            if not desc.isBoolOutput() and desc.code() != OpCode.CPUI_CBRANCH:
+        if outvn is None:
+            return 0
+        multop1 = outvn.loneDescend()
+        if multop1 is None or multop1.code() != OpCode.CPUI_INT_MULT:
+            return 0
+
+        coeffVn = multop1.getIn(1)
+        if coeffVn is None or not coeffVn.isConstant():
+            return 0
+        coeff = coeffVn.getOffset()
+        if coeff != calc_mask(coeffVn.getSize()):
+            return 0
+        multOut = multop1.getOut()
+        if multOut is None:
+            return 0
+        size = multOut.getSize()
+
+        actionop = multOut.loneDescend()
+        if actionop is None:
+            return 0
+
+        actionopc = actionop.code()
+        if actionopc == OpCode.CPUI_INT_ADD:
+            addConst = actionop.getIn(1)
+            if addConst is None or not addConst.isConstant() or addConst.getOffset() != 1:
                 return 0
-        data.opSetOpcode(op, OpCode.CPUI_COPY)
+            newop = data.newOp(1, op.getAddr())
+            data.opSetOpcode(newop, OpCode.CPUI_BOOL_NEGATE)
+            newvn = data.newUniqueOut(1, newop)
+            data.opSetInput(newop, boolVn1, 0)
+            data.opInsertBefore(newop, op)
+            data.opSetInput(op, newvn, 0)
+            data.opRemoveInput(actionop, 1)
+            data.opSetOpcode(actionop, OpCode.CPUI_COPY)
+            data.opSetInput(actionop, op.getOut(), 0)
+            return 1
+
+        if actionopc in (OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL):
+            compConst = actionop.getIn(1)
+            if compConst is None or not compConst.isConstant():
+                return 0
+            val = compConst.getOffset()
+            if val == coeff:
+                val = 1
+            elif val != 0:
+                return 0
+            data.opSetInput(actionop, boolVn1, 0)
+            data.opSetInput(actionop, data.newConstant(1, val), 1)
+            return 1
+
+        if actionopc == OpCode.CPUI_INT_AND:
+            boolopc = OpCode.CPUI_BOOL_AND
+        elif actionopc == OpCode.CPUI_INT_OR:
+            boolopc = OpCode.CPUI_BOOL_OR
+        elif actionopc == OpCode.CPUI_INT_XOR:
+            boolopc = OpCode.CPUI_BOOL_XOR
+        else:
+            return 0
+
+        in0 = actionop.getIn(0)
+        in1 = actionop.getIn(1)
+        in0def = None if in0 is None else in0.getDef()
+        in1def = None if in1 is None else in1.getDef()
+        multop2 = in1def if multop1 is in0def else in0def
+        if multop2 is None or multop2.code() != OpCode.CPUI_INT_MULT:
+            return 0
+
+        coeffVn2 = multop2.getIn(1)
+        if coeffVn2 is None or not coeffVn2.isConstant():
+            return 0
+        coeff = coeffVn2.getOffset()
+        if coeff != calc_mask(size):
+            return 0
+
+        zextIn = multop2.getIn(0)
+        zextop2 = None if zextIn is None else zextIn.getDef()
+        if zextop2 is None or zextop2.code() != OpCode.CPUI_INT_ZEXT:
+            return 0
+
+        boolVn2 = zextop2.getIn(0)
+        if boolVn2 is None or not boolVn2.isBooleanValue(data.isTypeRecoveryOn()):
+            return 0
+
+        newop = data.newOp(2, actionop.getAddr())
+        newres = data.newUniqueOut(1, newop)
+        data.opSetOpcode(newop, boolopc)
+        data.opSetInput(newop, boolVn1, 0)
+        data.opSetInput(newop, boolVn2, 1)
+        data.opInsertBefore(newop, actionop)
+
+        newzext = data.newOp(1, actionop.getAddr())
+        newzout = data.newUniqueOut(size, newzext)
+        data.opSetOpcode(newzext, OpCode.CPUI_INT_ZEXT)
+        data.opSetInput(newzext, newres, 0)
+        data.opInsertBefore(newzext, actionop)
+
+        data.opSetOpcode(actionop, OpCode.CPUI_INT_MULT)
+        data.opSetInput(actionop, newzout, 0)
+        data.opSetInput(actionop, data.newConstant(size, coeff), 1)
         return 1
 
 

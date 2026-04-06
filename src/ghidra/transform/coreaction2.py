@@ -763,11 +763,29 @@ class ActionSwitchNorm(Action):
     def clone(self, gl):
         return ActionSwitchNorm(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
+        import os
+        import sys
+
+        debug_enabled = os.getenv("PYGHIDRA_SWITCHNORM_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
         numjt = data.numJumpTables() if hasattr(data, 'numJumpTables') else 0
+        if debug_enabled:
+            sys.stderr.write(f"[switchnorm] enter numjt={numjt} func={data.getName() if hasattr(data, 'getName') else '<unknown>'}\n")
         for i in range(numjt):
             jt = data.getJumpTable(i)
             if jt is None:
+                if debug_enabled:
+                    sys.stderr.write(f"[switchnorm] jt[{i}] missing\n")
                 continue
+            if debug_enabled:
+                jmodel = getattr(jt, 'jmodel', None)
+                sys.stderr.write(
+                    "[switchnorm] "
+                    f"jt[{i}] pre recovered={jt.isRecovered() if hasattr(jt, 'isRecovered') else '?'} "
+                    f"labelled={jt.isLabelled() if hasattr(jt, 'isLabelled') else '?'} "
+                    f"labels={len(getattr(jt, 'label', []))} "
+                    f"addrs={len(getattr(jt, 'addresstable', []))} "
+                    f"jmodel={type(jmodel).__name__ if jmodel is not None else 'None'}\n"
+                )
             if not (hasattr(jt, 'isLabelled') and jt.isLabelled()):
                 if hasattr(jt, 'matchModel'):
                     jt.matchModel(data)
@@ -776,11 +794,21 @@ class ActionSwitchNorm(Action):
                 if hasattr(jt, 'foldInNormalization'):
                     jt.foldInNormalization(data)
                 self._count += 1
+                if debug_enabled:
+                    jmodel = getattr(jt, 'jmodel', None)
+                    sys.stderr.write(
+                        "[switchnorm] "
+                        f"jt[{i}] post-label labels={len(getattr(jt, 'label', []))} "
+                        f"jmodel={type(jmodel).__name__ if jmodel is not None else 'None'} "
+                        f"switchVarConsume={getattr(jt, 'switchVarConsume', None)}\n"
+                    )
             if hasattr(jt, 'foldInGuards') and jt.foldInGuards(data):
                 graph = data.getStructure() if hasattr(data, 'getStructure') else None
                 if graph is not None and hasattr(graph, 'clear'):
                     graph.clear()
                 self._count += 1
+                if debug_enabled:
+                    sys.stderr.write(f"[switchnorm] jt[{i}] folded guard\n")
         return 0
 
 class ActionUnjustifiedParams(Action):

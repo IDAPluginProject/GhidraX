@@ -14,6 +14,7 @@ from ghidra.types.datatype import (
     Datatype, TypeFactory, MetaType,
     TYPE_VOID, TYPE_UNKNOWN, TYPE_INT, TYPE_UINT, TYPE_BOOL, TYPE_FLOAT,
     TYPE_PTR, TYPE_PTRREL, TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION, TYPE_CODE,
+    TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION,
 )
 
 if TYPE_CHECKING:
@@ -28,6 +29,42 @@ class IntPromotionCode(IntEnum):
     UNSIGNED_EXTENSION = 1
     SIGNED_EXTENSION = 2
     EITHER_EXTENSION = 3
+
+
+_METATYPE_NAME_MAP = {
+    "void": TYPE_VOID,
+    "unknown": TYPE_UNKNOWN,
+    "int": TYPE_INT,
+    "uint": TYPE_UINT,
+    "bool": TYPE_BOOL,
+    "float": TYPE_FLOAT,
+    "ptr": TYPE_PTR,
+    "ptrrel": TYPE_PTRREL,
+    "array": TYPE_ARRAY,
+    "struct": TYPE_STRUCT,
+    "union": TYPE_UNION,
+    "code": TYPE_CODE,
+    "partialstruct": TYPE_PARTIALSTRUCT,
+    "partialunion": TYPE_PARTIALUNION,
+}
+
+
+def _normalize_metatype(meta) -> Optional[MetaType]:
+    if meta is None:
+        return None
+    if isinstance(meta, MetaType):
+        return meta
+    if isinstance(meta, str):
+        return _METATYPE_NAME_MAP.get(meta.lower())
+    name = getattr(meta, "name", None)
+    if isinstance(name, str):
+        normalized = _METATYPE_NAME_MAP.get(name.lower())
+        if normalized is not None:
+            return normalized
+    try:
+        return MetaType(int(meta))
+    except Exception:
+        return None
 
 
 class CastStrategy(ABC):
@@ -362,7 +399,8 @@ class CastStrategyC(CastStrategy):
     def castStandard(self, reqtype, curtype, care_uint_int, care_ptr_uint):
         if curtype is reqtype:
             return None
-        if curtype.getMetatype() == TYPE_VOID:
+        curmeta = _normalize_metatype(curtype.getMetatype())
+        if curmeta == TYPE_VOID:
             return reqtype  # Coming from void (dereferenced pointer) needs cast
 
         reqbase = reqtype
@@ -370,7 +408,9 @@ class CastStrategyC(CastStrategy):
         isptr = False
 
         # Unwrap matching pointer chains
-        while reqbase.getMetatype() == TYPE_PTR and curbase.getMetatype() == TYPE_PTR:
+        reqmeta = _normalize_metatype(reqbase.getMetatype())
+        curmeta = _normalize_metatype(curbase.getMetatype())
+        while reqmeta == TYPE_PTR and curmeta == TYPE_PTR:
             reqword = reqbase.getWordSize() if hasattr(reqbase, 'getWordSize') else 0
             curword = curbase.getWordSize() if hasattr(curbase, 'getWordSize') else 0
             if reqword != curword:
@@ -384,6 +424,8 @@ class CastStrategyC(CastStrategy):
             curbase = curbase.getPtrTo() if hasattr(curbase, 'getPtrTo') else curbase
             care_uint_int = True
             isptr = True
+            reqmeta = _normalize_metatype(reqbase.getMetatype())
+            curmeta = _normalize_metatype(curbase.getMetatype())
 
         # Unwrap typedefs
         while hasattr(reqbase, 'getTypedef') and reqbase.getTypedef() is not None:
@@ -394,8 +436,8 @@ class CastStrategyC(CastStrategy):
         if curbase is reqbase:
             return None  # Different typedefs pointing to the same type
 
-        reqmeta = reqbase.getMetatype()
-        curmeta = curbase.getMetatype()
+        reqmeta = _normalize_metatype(reqbase.getMetatype())
+        curmeta = _normalize_metatype(curbase.getMetatype())
 
         if reqmeta == TYPE_VOID or curmeta == TYPE_VOID:
             return None  # Don't cast to/from void pointer
@@ -406,27 +448,27 @@ class CastStrategyC(CastStrategy):
                     return None
             return reqtype  # Always cast change in size
 
-        if reqmeta == TYPE_UNKNOWN:
+        if reqmeta in (TYPE_UNKNOWN, TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION):
             return None
         elif reqmeta == TYPE_UINT:
             if not care_uint_int:
-                if curmeta in (TYPE_UNKNOWN, TYPE_INT, TYPE_UINT, TYPE_BOOL):
+                if curmeta in (TYPE_UNKNOWN, TYPE_INT, TYPE_UINT, TYPE_BOOL, TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION):
                     return None
             else:
                 if curmeta in (TYPE_UINT, TYPE_BOOL):
                     return None
-                if isptr and curmeta == TYPE_UNKNOWN:
+                if isptr and curmeta in (TYPE_UNKNOWN, TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION):
                     return None  # Don't cast pointers to unknown
             if not care_ptr_uint and curmeta == TYPE_PTR:
                 return None
         elif reqmeta == TYPE_INT:
             if not care_uint_int:
-                if curmeta in (TYPE_UNKNOWN, TYPE_INT, TYPE_UINT, TYPE_BOOL):
+                if curmeta in (TYPE_UNKNOWN, TYPE_INT, TYPE_UINT, TYPE_BOOL, TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION):
                     return None
             else:
                 if curmeta in (TYPE_INT, TYPE_BOOL):
                     return None
-                if isptr and curmeta == TYPE_UNKNOWN:
+                if isptr and curmeta in (TYPE_UNKNOWN, TYPE_PARTIALSTRUCT, TYPE_PARTIALUNION):
                     return None
         elif reqmeta == TYPE_CODE:
             if curmeta == TYPE_CODE:

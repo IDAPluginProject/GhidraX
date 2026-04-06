@@ -40,6 +40,15 @@ _MAPSTATE_DEBUG_LOG = os.environ.get(
     "PYGHIDRA_MAPSTATE_DEBUG_LOG",
     "D:/BIGAI/pyghidra/temp/python_mapstate_debug.log",
 )
+_FAKE_INPUT_DEBUG_ADDRS = {
+    int(tok, 0) & ((1 << 64) - 1)
+    for tok in os.environ.get("PYGHIDRA_FAKE_INPUT_DEBUG_ADDRS", "").split(",")
+    if tok.strip()
+}
+_FAKE_INPUT_DEBUG_LOG = os.environ.get(
+    "PYGHIDRA_FAKE_INPUT_DEBUG_LOG",
+    "",
+).strip()
 
 
 def _mark_not_mapped_debug_log(spc, first: int, sz: int, parameter: bool,
@@ -172,6 +181,28 @@ def _mapstate_debug_log(message: str) -> None:
     try:
         with open(_MAPSTATE_DEBUG_LOG, "a", encoding="utf-8") as fp:
             fp.write(f"[mapstate] idx={idx} {message}\n")
+    except Exception:
+        return
+
+
+def _fake_input_debug_log(addr: int, size: int, message: str) -> None:
+    if not _FAKE_INPUT_DEBUG_LOG:
+        return
+    if _FAKE_INPUT_DEBUG_ADDRS:
+        end = (addr + size - 1) & ((1 << 64) - 1)
+        if not any(addr <= target <= end for target in _FAKE_INPUT_DEBUG_ADDRS):
+            return
+    try:
+        from ghidra.transform.action import Action
+        idx = Action.getActiveTraceSerial()
+    except Exception:
+        idx = 0
+    try:
+        with open(_FAKE_INPUT_DEBUG_LOG, "a", encoding="utf-8") as fp:
+            prefix = "[fakeinput]"
+            if idx > 0:
+                prefix += f" idx={idx}"
+            fp.write(f"{prefix} addr={addr:#x}:{size} {message}\n")
     except Exception:
         return
 
@@ -1364,8 +1395,19 @@ class ScopeLocal(ScopeInternal):
                         aliason = False
 
     def _fakeInputSymbols(self) -> None:
+        from ghidra.ir.varnode import Varnode
+
         lockedinputs = self.getCategorySize(0)  # Symbol.function_parameter
-        for vn in self._fd.iterDefVarnodes(0x1):  # Varnode.input
+        input_vns = list(self._fd.iterDefVarnodes(Varnode.input))
+        _fake_input_debug_log(
+            0,
+            1,
+            f"start total_inputs={len(input_vns)} lockedinputs={lockedinputs}",
+        )
+        i = 0
+        while i < len(input_vns):
+            vn = input_vns[i]
+            i += 1
             locked = vn.isTypeLock()
             addr = vn.getAddr()
             if addr.getSpace() != self._space:
@@ -1373,21 +1415,82 @@ class ScopeLocal(ScopeInternal):
             if not self._fd.getFuncProto().getParamRange().inRange(addr, 1):
                 continue
             endpoint = addr.getOffset() + vn.getSize() - 1
+            _fake_input_debug_log(
+                addr.getOffset(),
+                vn.getSize(),
+                f"candidate locked={int(locked)} endpoint={endpoint:#x} lockedinputs={lockedinputs}",
+            )
+            while i < len(input_vns):
+                next_vn = input_vns[i]
+                next_addr = next_vn.getAddr()
+                if next_addr.getSpace() != self._space:
+                    break
+                if endpoint < next_vn.getOffset():
+                    break
+                newendpoint = next_vn.getOffset() + next_vn.getSize() - 1
+                if endpoint < newendpoint:
+                    endpoint = newendpoint
+                if next_vn.isTypeLock():
+                    locked = True
+                _fake_input_debug_log(
+                    addr.getOffset(),
+                    next_vn.getSize(),
+                    "merge_overlap "
+                    f"next={next_vn.getOffset():#x}:{next_vn.getSize()} "
+                    f"next_locked={int(next_vn.isTypeLock())} endpoint={endpoint:#x} "
+                    f"locked={int(locked)}",
+                )
+                i += 1
             if not locked:
                 usepoint = Address()
                 if lockedinputs != 0:
                     vflags = [0]
                     entry = self.queryProperties(vn.getAddr(), vn.getSize(), usepoint, vflags)
                     if entry is not None:
+                        try:
+                            entry_cat = entry.getSymbol().getCategory()
+                        except Exception:
+                            entry_cat = None
+                    else:
+                        entry_cat = None
+                    _fake_input_debug_log(
+                        addr.getOffset(),
+                        endpoint - addr.getOffset() + 1,
+                        "query "
+                        f"entry={int(entry is not None)} category={entry_cat} "
+                        f"flags={vflags[0]:#x} usepoint={usepoint}",
+                    )
+                    if entry is not None:
                         if entry.getSymbol().getCategory() == 0:  # function_parameter
+                            _fake_input_debug_log(
+                                addr.getOffset(),
+                                endpoint - addr.getOffset() + 1,
+                                "skip_existing_parameter",
+                            )
                             continue
                 size = endpoint - addr.getOffset() + 1
                 ct = self._fd.getArch().types.getBase(size, 'unknown')
                 try:
                     sym = self.addSymbol("", ct, addr, usepoint).getSymbol()
                     self.setCategory(sym, Symbol.fake_input, -1)
+                    _fake_input_debug_log(
+                        addr.getOffset(),
+                        size,
+                        f"created sym={sym.getName()} category={sym.getCategory()}",
+                    )
                 except RuntimeError as err:
+                    _fake_input_debug_log(
+                        addr.getOffset(),
+                        size,
+                        f"addSymbol_error={err}",
+                    )
                     self._fd.warningHeader(str(err))
+            else:
+                _fake_input_debug_log(
+                    addr.getOffset(),
+                    endpoint - addr.getOffset() + 1,
+                    "skip_locked",
+                )
 
     def remapSymbol(self, sym, addr, usepoint):
         entry = sym.getFirstWholeMap()

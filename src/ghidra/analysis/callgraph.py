@@ -155,6 +155,9 @@ class _LeafIterator:
         self.outslot: int = 0
 
 
+LeafIterator = _LeafIterator
+
+
 class CallGraph:
     """Directed graph of function calls with cycle detection and leaf-first ordering."""
 
@@ -167,26 +170,32 @@ class CallGraph:
     # Node management
     # ------------------------------------------------------------------
 
-    def addNode(self, f: Funcdata) -> CallGraphNode:
-        """Add a node for an existing Funcdata, or return the existing one."""
-        addr = f.getAddress()
-        node = self._graph.get(addr)
-        if node is None:
-            node = CallGraphNode()
-            node.entryaddr = addr
-            self._graph[addr] = node
-        if node.fd is not None and node.fd is not f:
-            raise LowlevelError(
-                "Functions with duplicate entry points: "
-                + f.getName() + " " + node.fd.getName()
-            )
-        node.entryaddr = addr
-        node.name = f.getDisplayName() if hasattr(f, 'getDisplayName') else f.getName()
-        node.fd = f
-        return node
+    def addNode(self, f_or_addr, nm: str = "") -> CallGraphNode:
+        """Add a node by Funcdata or by address/name.
 
-    def addNodeByAddr(self, addr: Address, nm: str) -> CallGraphNode:
-        """Add a node by address and name."""
+        This preserves the C++ overload pair:
+        - addNode(Funcdata *f)
+        - addNode(const Address &addr,const string &nm)
+        """
+        if hasattr(f_or_addr, "getAddress"):
+            f = f_or_addr
+            addr = f.getAddress()
+            node = self._graph.get(addr)
+            if node is None:
+                node = CallGraphNode()
+                node.entryaddr = addr
+                self._graph[addr] = node
+            if node.fd is not None and node.fd is not f:
+                raise LowlevelError(
+                    "Functions with duplicate entry points: "
+                    + f.getName() + " " + node.fd.getName()
+                )
+            node.entryaddr = addr
+            node.name = f.getDisplayName() if hasattr(f, 'getDisplayName') else f.getName()
+            node.fd = f
+            return node
+
+        addr = f_or_addr
         node = self._graph.get(addr)
         if node is None:
             node = CallGraphNode()
@@ -194,6 +203,9 @@ class CallGraph:
         node.entryaddr = addr
         node.name = nm
         return node
+
+    def addNodeByAddr(self, addr: Address, nm: str) -> CallGraphNode:
+        return self.addNode(addr, nm)
 
     def findNode(self, addr: Address) -> Optional[CallGraphNode]:
         """Find the node at the given address, or return None."""
@@ -213,6 +225,9 @@ class CallGraph:
             if e.to_node is not None:
                 e.to_node.inedge[e.complement].complement = i
         return node.outedge[slot]
+
+    def insertBlankEdge(self, node: CallGraphNode, slot: int) -> CallGraphEdge:
+        return self._insertBlankEdge(node, slot)
 
     def addEdge(self, from_node: CallGraphNode, to_node: CallGraphNode,
                 addr: Address) -> None:
@@ -281,6 +296,9 @@ class CallGraph:
         if only_cycle:
             to.flags |= CallGraphNode.onlycyclein
 
+    def snipEdge(self, node: CallGraphNode, i: int) -> None:
+        self._snipEdge(node, i)
+
     def _snipCycles(self, root: CallGraphNode) -> None:
         """Snip any cycles reachable from root using DFS."""
         root.flags |= CallGraphNode.currentcycle
@@ -307,9 +325,15 @@ class CallGraph:
                 nxt.flags |= CallGraphNode.currentcycle | CallGraphNode.mark
                 stack.append(_LeafIterator(nxt))
 
+    def snipCycles(self, node: CallGraphNode) -> None:
+        self._snipCycles(node)
+
     def _clearMarks(self) -> None:
         for node in self._graph.values():
             node.clearMark()
+
+    def clearMarks(self) -> None:
+        self._clearMarks()
 
     def _findNoEntry(self, seeds: List[CallGraphNode]) -> bool:
         """Find root nodes with no non-cycle in-edges. Return True if all covered."""
@@ -336,6 +360,9 @@ class CallGraph:
             lownode.flags |= CallGraphNode.mark | CallGraphNode.entrynode
 
         return allcovered
+
+    def findNoEntry(self, seeds: List[CallGraphNode]) -> bool:
+        return self._findNoEntry(seeds)
 
     def cycleStructure(self) -> None:
         """Build spanning tree and snip cycles to produce seed list."""
@@ -364,6 +391,9 @@ class CallGraph:
         outslot = node.inedge[node.parentedge].complement
         return node.inedge[node.parentedge].from_node, outslot
 
+    def popPossible(self, node: CallGraphNode) -> tuple[Optional[CallGraphNode], int]:
+        return self._popPossible(node)
+
     def _pushPossible(self, node: Optional[CallGraphNode],
                       outslot: int) -> Optional[CallGraphNode]:
         """Push down to the next child in the spanning tree."""
@@ -377,6 +407,10 @@ class CallGraph:
             else:
                 return node.outedge[outslot].to_node
         return None
+
+    def pushPossible(self, node: Optional[CallGraphNode],
+                     outslot: int) -> Optional[CallGraphNode]:
+        return self._pushPossible(node, outslot)
 
     def initLeafWalk(self) -> Optional[CallGraphNode]:
         """Initialize leaf-first traversal. Returns the first leaf node."""
@@ -410,8 +444,66 @@ class CallGraph:
     def __iter__(self) -> Iterator[CallGraphNode]:
         return iter(self._graph.values())
 
+    def begin(self):
+        return iter(self._graph.items())
+
+    def end(self):
+        return None
+
     def numNodes(self) -> int:
         return len(self._graph)
+
+    def iterateFunctionsAddrOrder(self, scope) -> None:
+        iterator = scope.begin() if hasattr(scope, "begin") else iter(scope)
+        for entry in iterator:
+            sym = entry.getSymbol() if hasattr(entry, "getSymbol") else entry
+            if sym is None:
+                continue
+            fsym = sym if hasattr(sym, "getFunction") else None
+            if fsym is not None:
+                func = fsym.getFunction()
+                if func is not None:
+                    self.addNode(func)
+
+    def iterateScopesRecursive(self, scope) -> None:
+        if scope is None or not scope.isGlobal():
+            return
+        self.iterateFunctionsAddrOrder(scope)
+        if hasattr(scope, "childrenBegin"):
+            child_iter = scope.childrenBegin()
+        else:
+            child_iter = iter(getattr(scope, "children", {}).values())
+        for child in child_iter:
+            self.iterateScopesRecursive(child)
+
+    def buildAllNodes(self) -> None:
+        if self.glb is None or getattr(self.glb, "symboltab", None) is None:
+            return
+        scope = self.glb.symboltab.getGlobalScope()
+        self.iterateScopesRecursive(scope)
+
+    def buildEdges(self, fd: Funcdata) -> None:
+        from ghidra.fspec.fspec import ProtoModel
+
+        fdnode = self.findNode(fd.getAddress())
+        if fdnode is None:
+            raise LowlevelError("Function is missing from callgraph")
+        if fd.getFuncProto().getModelExtraPop() == ProtoModel.extrapop_unknown:
+            fd.fillinExtrapop()
+
+        numcalls = fd.numCalls()
+        for i in range(numcalls):
+            fs = fd.getCallSpecs(i)
+            if fs is None:
+                continue
+            addr = fs.getEntryAddress()
+            if addr.isInvalid():
+                continue
+            tonode = self.findNode(addr)
+            if tonode is None:
+                name = self.glb.nameFunction(addr) if self.glb is not None else ""
+                tonode = self.addNode(addr, name)
+            self.addEdge(fdnode, tonode, fs.getOp().getAddr())
 
     # ------------------------------------------------------------------
     # Serialization
@@ -437,3 +529,6 @@ class CallGraph:
             else:
                 CallGraphNode.decode(decoder, self)
         decoder.closeElement(elemId)
+
+    def decoder(self, decoder: Decoder) -> None:
+        self.decode(decoder)

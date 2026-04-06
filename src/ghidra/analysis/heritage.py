@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 
 _HERITAGE_DEBUG = os.environ.get("PYGHIDRA_DEBUG_HERITAGE_ORDER", "")
+_HERITAGE_DEBUG_RANGE = os.environ.get("PYGHIDRA_DEBUG_HERITAGE_RANGE", "")
 
 
 def _heritage_debug_enabled() -> bool:
@@ -37,11 +38,29 @@ def _debug_heritage(msg: str) -> None:
         print(msg, file=sys.stderr)
 
 
+def _format_range_debug(addr: Address, size: int) -> str:
+    space = addr.getSpace()
+    space_name = space.getName() if space is not None else "none"
+    return f"{space_name}[{addr.getOffset():#x}:{size}]"
+
+
+def _heritage_debug_range_matches(addr: Address, size: int) -> bool:
+    if not _HERITAGE_DEBUG:
+        return False
+    if not _HERITAGE_DEBUG_RANGE:
+        return True
+    return _HERITAGE_DEBUG_RANGE in _format_range_debug(addr, size)
+
+
 def _format_vn_debug(vn: "Varnode") -> str:
     space = vn.getSpace()
     space_name = space.getName() if space is not None else "none"
     state = "written" if vn.isWritten() else ("input" if vn.isInput() else "free")
     return f"{space_name}[{vn.getOffset():#x}:{vn.getSize()}:{state}]"
+
+
+def _format_vn_list_debug(vns: list["Varnode"]) -> str:
+    return "[" + ", ".join(_format_vn_debug(vn) for vn in vns) + "]"
 
 
 def _sort_space_key(space: Optional[AddrSpace]) -> int:
@@ -1359,6 +1378,16 @@ class Heritage:
                         read.append(vn)
                     elif vn_flags & _IP:
                         inputvars.append(vn)
+                if _heritage_debug_range_matches(memrange.addr, memrange.size):
+                    _debug_heritage(
+                        "collect "
+                        f"range={_format_range_debug(memrange.addr, memrange.size)} "
+                        f"maxsize={maxsize} "
+                        f"read={_format_vn_list_debug(read)} "
+                        f"write={_format_vn_list_debug(write)} "
+                        f"input={_format_vn_list_debug(inputvars)} "
+                        f"remove={_format_vn_list_debug(remove)}"
+                    )
                 return maxsize
         # Fallback: linear scan via space index (vn objects stored directly)
         vbank = self._fd._vbank
@@ -1386,6 +1415,16 @@ class Heritage:
                 read.append(vn)
             elif vn_flags & _IP:
                 inputvars.append(vn)
+        if _heritage_debug_range_matches(memrange.addr, memrange.size):
+            _debug_heritage(
+                "collect "
+                f"range={_format_range_debug(memrange.addr, memrange.size)} "
+                f"maxsize={maxsize} "
+                f"read={_format_vn_list_debug(read)} "
+                f"write={_format_vn_list_debug(write)} "
+                f"input={_format_vn_list_debug(inputvars)} "
+                f"remove={_format_vn_list_debug(remove)}"
+            )
         return maxsize
 
     def normalizeReadSize(self, vn, op, addr: Address, size: int):
@@ -1567,6 +1606,7 @@ class Heritage:
         baseoff = addr.getOffset() + size if bigendian else addr.getOffset()
         opaddr = self._fd.getAddress() if insertop is None else insertop.getAddr()
         bl = self._fd.getBasicBlocks().getStartBlock() if insertop is None else insertop.getParent()
+        insert_anchor = insertop
         for vn in vnlist:
             newop = self._fd.newOp(2, opaddr)
             self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
@@ -1577,10 +1617,13 @@ class Heritage:
             self._fd.opSetInput(newop, startvn, 0)
             self._fd.opSetInput(newop, self._fd.newConstant(4, diff), 1)
             self._fd.opSetOutput(newop, vn)
-            if insertop is None and bl is not None:
+            if bl is None:
+                continue
+            if insert_anchor is None:
                 self._fd.opInsertBegin(newop, bl)
-            elif insertop is not None:
-                self._fd.opInsertAfter(newop, insertop)
+            else:
+                self._fd.opInsertAfter(newop, insert_anchor)
+            insert_anchor = newop
 
     @staticmethod
     def buildRefinement(refine: list, addr: Address, vnlist: list) -> None:
@@ -1740,9 +1783,27 @@ class Heritage:
                 refine[lastpos] = curpos - lastpos
                 lastpos = curpos
         if lastpos == 0:
+            if _heritage_debug_range_matches(addr, size):
+                _debug_heritage(
+                    "refinement.skip "
+                    f"range={_format_range_debug(addr, size)} "
+                    f"refine={refine} "
+                    f"read={_format_vn_list_debug(readvars)} "
+                    f"write={_format_vn_list_debug(writevars)} "
+                    f"input={_format_vn_list_debug(inputvars)}"
+                )
             return -1  # No non-trivial refinements
         refine[lastpos] = size - lastpos
         self.remove13Refinement(refine)
+        if _heritage_debug_range_matches(addr, size):
+            _debug_heritage(
+                "refinement "
+                f"range={_format_range_debug(addr, size)} "
+                f"refine={refine} "
+                f"read={_format_vn_list_debug(readvars)} "
+                f"write={_format_vn_list_debug(writevars)} "
+                f"input={_format_vn_list_debug(inputvars)}"
+            )
         for vn in readvars:
             self.refineRead(vn, addr, refine)
         for vn in writevars:
@@ -1763,6 +1824,7 @@ class Heritage:
         cut = 0
         sz = refine[cut]
         curaddr = addr
+        new_ranges = [_format_range_debug(curaddr, sz)] if _heritage_debug_range_matches(addr, size) else None
         res_idx = self._disjoint.insert(idx, curaddr, sz, flags)
         if hasattr(self._globaldisjoint, 'add'):
             self._globaldisjoint.add(curaddr, sz, curPass, [0])
@@ -1774,9 +1836,17 @@ class Heritage:
             self._disjoint.insert(insert_pos, curaddr, sz, flags)
             if hasattr(self._globaldisjoint, 'add'):
                 self._globaldisjoint.add(curaddr, sz, curPass, [0])
+            if new_ranges is not None:
+                new_ranges.append(_format_range_debug(curaddr, sz))
             cut += sz
             curaddr = Address(addr.getSpace(), addr.getOffset() + cut)
             insert_pos += 1
+        if new_ranges is not None:
+            _debug_heritage(
+                "refinement.result "
+                f"range={_format_range_debug(addr, size)} "
+                f"split={new_ranges}"
+            )
         return res_idx
 
     def callOpIndirectEffect(self, addr: Address, size: int, op) -> bool:
@@ -1882,11 +1952,7 @@ class Heritage:
             newInputs.append(self._fd.newConstant(4, offset))
 
             self._fd.opSetOpcode(op, OpCode.CPUI_SUBPIECE)
-            if hasattr(op, 'setAllInput'):
-                op.setAllInput(newInputs)
-            else:
-                self._fd.opSetInput(op, newInputs[0], 0)
-                self._fd.opSetInput(op, newInputs[1], 1)
+            self._fd.opSetAllInput(op, newInputs)
 
             # Insert at the correct position
             if bl is not None and insertAfterOp is not None:
@@ -2667,20 +2733,26 @@ class Heritage:
         writevars: list = []
         inputvars: list = []
         removevars: list = []
-        # Build sorted-by-offset index for collect() binary search (one build, N binary searches)
-        # Format: {spc_id: (sorted_offsets_list, sorted_entries_list)} for Python 3.9 compatible bisect
-        _sorted_idx: dict = {}
-        if self._fd is not None:
+
+        def build_collect_index() -> dict:
+            # collect() must see varnodes created earlier in the same heritage pass,
+            # especially after refinement() splits overlapping reads/writes/inputs.
+            sorted_idx: dict = {}
+            if self._fd is None:
+                return sorted_idx
             vbank = self._fd._vbank
             for spc_id, vn_set in vbank._space_varnodes.items():
                 entries = [(vn._loc.offset, _sort_varnode_loc_def_key(vn), vn) for vn in vn_set]
                 if entries:
                     entries.sort(key=lambda x: (x[0], x[1]))
                     sorted_offsets = [e[0] for e in entries]
-                    _sorted_idx[spc_id] = (sorted_offsets, entries)
+                    sorted_idx[spc_id] = (sorted_offsets, entries)
+            return sorted_idx
+
         # Use index-based iteration because refinement can modify the list
         idx = 0
         while idx < len(self._disjoint):
+            _sorted_idx = build_collect_index()
             memrange = self._disjoint[idx]
             if _heritage_debug_enabled():
                 _debug_heritage(
@@ -2696,6 +2768,7 @@ class Heritage:
                 if ref_idx >= 0:
                     idx = ref_idx
                     memrange = self._disjoint[idx]
+                    _sorted_idx = build_collect_index()
                     self.collect(memrange, readvars, writevars, inputvars, removevars, _sorted_idx)
                     size = memrange.size
             if not readvars:

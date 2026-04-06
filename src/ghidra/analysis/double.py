@@ -10,7 +10,9 @@ them into single logical operations.
 from __future__ import annotations
 from typing import Optional, List
 from ghidra.core.address import calc_mask
+from ghidra.core.error import LowlevelError
 from ghidra.core.opcodes import OpCode
+from ghidra.core.space import IPTR_INTERNAL, IPTR_IOP
 
 
 class SplitVarnode:
@@ -21,55 +23,79 @@ class SplitVarnode:
     Varnode that represents the combined value.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *args) -> None:
         self.lo = None       # Varnode: low part
         self.hi = None       # Varnode: high part
         self.whole = None    # Varnode: combined (if exists)
         self.defpoint = None # PcodeOp defining the pair
         self.defblock = None # BlockBasic where pair is defined
+        self.val: int = 0    # Constant value for constant SplitVarnodes
         self.wholesize: int = 0
 
-    def initAll(self, whole_or_lo, lo_or_hi=None, hi=None) -> None:
-        """Initialize from whole + lo + hi (3-arg C++ form) or lo + hi (2-arg legacy)."""
-        if hi is not None or lo_or_hi is not None:
-            # 3-arg form: initAll(whole, lo, hi)
-            if lo_or_hi is not None and hi is None:
-                # 2-arg legacy: initAll(lo, hi) — treat as lo=whole_or_lo, hi=lo_or_hi
-                self.lo = whole_or_lo
-                self.hi = lo_or_hi
-            else:
-                self.whole = whole_or_lo
-                self.lo = lo_or_hi
-                self.hi = hi
-        else:
-            self.lo = whole_or_lo
-            self.hi = None
-        if self.lo is not None and self.hi is not None:
-            self.wholesize = self.lo.getSize() + self.hi.getSize()
-        elif self.whole is not None:
-            self.wholesize = self.whole.getSize()
+        if len(args) == 0:
+            return
+        if len(args) != 2:
+            raise TypeError("SplitVarnode expects 0 or 2 constructor arguments")
+        if isinstance(args[0], int):
+            self.initPartialConst(args[0], args[1])
+            return
+        lo, hi = args
+        self.initPartial(lo.getSize() + hi.getSize(), lo, hi)
 
-    def initPartial(self, sz: int, lo_or_vn, hi=None) -> None:
-        """Initialize from lo+hi pieces or a single whole Varnode.
-        2-arg: initPartial(sz, whole_vn)
-        3-arg: initPartial(sz, lo, hi)
-        Corresponds to SplitVarnode::initPartial in double.cc."""
-        if hi is not None:
-            self.lo = lo_or_vn
-            self.hi = hi
-            self.wholesize = sz
+    def initAll(self, w, l, h) -> None:
+        """Construct given Varnode pieces and a known whole Varnode."""
+        self.wholesize = w.getSize()
+        self.lo = l
+        self.hi = h
+        self.whole = w
+        self.val = 0
+        self.defpoint = None
+        self.defblock = None
+
+    def initPartial(self, sz: int, lo_or_val, hi=None) -> None:
+        """Initialize from a constant or from piece Varnodes."""
+        self.wholesize = sz
+        self.whole = None
+        self.defpoint = None
+        self.defblock = None
+
+        if hi is None and not hasattr(lo_or_val, "isConstant"):
+            self.val = int(lo_or_val)
+            self.lo = None
+            self.hi = None
+            return
+
+        if hi is None:
+            self.hi = None
+            if lo_or_val.isConstant():
+                self.val = lo_or_val.getOffset()
+                self.lo = None
+            else:
+                self.val = 0
+                self.lo = lo_or_val
+            return
+
+        if lo_or_val.isConstant() and hi.isConstant():
+            self.val = hi.getOffset()
+            self.val <<= lo_or_val.getSize() * 8
+            self.val |= lo_or_val.getOffset()
+            self.lo = None
+            self.hi = None
         else:
-            self.whole = lo_or_vn
-            self.wholesize = sz
+            self.val = 0
+            self.lo = lo_or_val
+            self.hi = hi
 
     def initPartialConst(self, sz: int, val: int) -> None:
         """Initialize as a constant value.
         Corresponds to SplitVarnode::initPartial(int4,uintb) in double.cc."""
-        self._val = val
+        self.val = val
         self.wholesize = sz
         self.lo = None
         self.hi = None
         self.whole = None
+        self.defpoint = None
+        self.defblock = None
 
     def getLo(self):
         return self.lo
@@ -84,22 +110,10 @@ class SplitVarnode:
         return self.wholesize
 
     def isConstant(self) -> bool:
-        if self.whole is not None:
-            return self.whole.isConstant() if hasattr(self.whole, 'isConstant') else False
-        if self.lo is not None and self.hi is not None:
-            lo_const = self.lo.isConstant() if hasattr(self.lo, 'isConstant') else False
-            hi_const = self.hi.isConstant() if hasattr(self.hi, 'isConstant') else False
-            return lo_const and hi_const
-        return False
+        return self.lo is None
 
     def getConstValue(self) -> int:
-        if self.whole is not None:
-            return self.whole.getOffset()
-        if self.lo is not None and self.hi is not None:
-            loval = self.lo.getOffset()
-            hival = self.hi.getOffset()
-            return (hival << (self.lo.getSize() * 8)) | loval
-        return 0
+        return self.val
 
     def hasBothPieces(self) -> bool:
         return self.lo is not None and self.hi is not None
@@ -114,7 +128,7 @@ class SplitVarnode:
         return self.defblock
 
     def getValue(self) -> int:
-        return self.getConstValue()
+        return self.val
 
     def inHandHi(self, h) -> bool:
         """Try to initialize given just the most significant piece split from whole.
@@ -286,8 +300,7 @@ class SplitVarnode:
         """Create a whole Varnode for this, if it doesn't already exist.
         Corresponds to SplitVarnode::findCreateWhole in double.cc."""
         if self.isConstant():
-            val = getattr(self, '_val', self.getConstValue())
-            self.whole = data.newConstant(self.wholesize, val)
+            self.whole = data.newConstant(self.wholesize, self.val)
             return
         if self.lo is not None:
             if hasattr(self.lo, 'setPrecisLo'):
@@ -345,8 +358,17 @@ class SplitVarnode:
             return
         ok, newaddr = SplitVarnode.isAddrTiedContiguous(self.lo, self.hi)
         if not ok:
-            # Use lo addr as fallback (join address not available in pure Python)
-            newaddr = self.lo.getAddr()
+            arch = data.getArch() if hasattr(data, 'getArch') else None
+            if arch is not None and hasattr(arch, 'constructJoinAddress'):
+                newaddr = arch.constructJoinAddress(
+                    arch.translate,
+                    self.hi.getAddr(),
+                    self.hi.getSize(),
+                    self.lo.getAddr(),
+                    self.lo.getSize(),
+                )
+            else:
+                newaddr = self.lo.getAddr()
         self.whole = data.newVarnode(self.wholesize, newaddr)
         if hasattr(self.whole, 'setWriteMask'):
             self.whole.setWriteMask()
@@ -356,7 +378,7 @@ class SplitVarnode:
         Corresponds to SplitVarnode::buildLoFromWhole in double.cc."""
         loop = self.lo.getDef() if self.lo is not None and self.lo.isWritten() else None
         if loop is None:
-            return
+            raise LowlevelError("Building low piece that was originally undefined")
         inlist = [self.whole, data.newConstant(4, 0)]
         if loop.code() == OpCode.CPUI_MULTIEQUAL:
             bl = loop.getParent()
@@ -365,8 +387,17 @@ class SplitVarnode:
             data.opSetAllInput(loop, inlist)
             data.opInsertBegin(loop, bl)
         elif loop.code() == OpCode.CPUI_INDIRECT:
+            from ghidra.ir.op import PcodeOp as PcodeOpCls
+
+            affector = None
+            if hasattr(PcodeOpCls, 'getOpFromConst'):
+                affector = PcodeOpCls.getOpFromConst(loop.getIn(1).getAddr())
+            if affector is not None and hasattr(affector, 'isDead') and not affector.isDead():
+                data.opUninsert(loop)
             data.opSetOpcode(loop, OpCode.CPUI_SUBPIECE)
             data.opSetAllInput(loop, inlist)
+            if affector is not None and hasattr(affector, 'isDead') and not affector.isDead():
+                data.opInsertAfter(loop, affector)
         else:
             data.opSetOpcode(loop, OpCode.CPUI_SUBPIECE)
             data.opSetAllInput(loop, inlist)
@@ -376,7 +407,7 @@ class SplitVarnode:
         Corresponds to SplitVarnode::buildHiFromWhole in double.cc."""
         hiop = self.hi.getDef() if self.hi is not None and self.hi.isWritten() else None
         if hiop is None:
-            return
+            raise LowlevelError("Building low piece that was originally undefined")
         lo_size = self.lo.getSize() if self.lo is not None else 0
         inlist = [self.whole, data.newConstant(4, lo_size)]
         if hiop.code() == OpCode.CPUI_MULTIEQUAL:
@@ -386,8 +417,17 @@ class SplitVarnode:
             data.opSetAllInput(hiop, inlist)
             data.opInsertBegin(hiop, bl)
         elif hiop.code() == OpCode.CPUI_INDIRECT:
+            from ghidra.ir.op import PcodeOp as PcodeOpCls
+
+            affector = None
+            if hasattr(PcodeOpCls, 'getOpFromConst'):
+                affector = PcodeOpCls.getOpFromConst(hiop.getIn(1).getAddr())
+            if affector is not None and hasattr(affector, 'isDead') and not affector.isDead():
+                data.opUninsert(hiop)
             data.opSetOpcode(hiop, OpCode.CPUI_SUBPIECE)
             data.opSetAllInput(hiop, inlist)
+            if affector is not None and hasattr(affector, 'isDead') and not affector.isDead():
+                data.opInsertAfter(hiop, affector)
         else:
             data.opSetOpcode(hiop, OpCode.CPUI_SUBPIECE)
             data.opSetAllInput(hiop, inlist)
@@ -415,7 +455,7 @@ class SplitVarnode:
         return self.findEarliestSplitPoint()
 
     def exceedsConstPrecision(self) -> bool:
-        return self.wholesize > 8
+        return self.isConstant() and self.wholesize > 8
 
     def findWholeSplitToPieces(self) -> bool:
         """Look for CPUI_SUBPIECE operations off of a common whole Varnode.
@@ -521,7 +561,7 @@ class SplitVarnode:
         elif self.lo.isInput():
             bb = None
         else:
-            return False
+            raise LowlevelError("Trying to find whole on free varnode")
         for desc in self.lo.getDescendants():
             if desc.code() != OpCode.CPUI_PIECE:
                 continue
@@ -617,22 +657,27 @@ class SplitVarnode:
                 continue
             locpy = loop.getOut()
             addr = locpy.getAddr()
+            hi_size = inv.getHi().getSize()
             lo_size = locpy.getSize()
             for hiop in inv.getHi().getDescendants():
                 if hiop.code() != OpCode.CPUI_COPY:
                     continue
                 hicpy = hiop.getOut()
-                # Check adjacency: in big-endian, hi comes before lo; in little-endian, lo before hi
                 hi_addr = hicpy.getAddr()
                 if hiop.getParent() is not loop.getParent():
                     continue
-                # Simple adjacency check
-                if hi_addr.getSpace() is addr.getSpace():
-                    if addr.getOffset() + lo_size == hi_addr.getOffset() or \
-                       hi_addr.getOffset() + hicpy.getSize() == addr.getOffset():
-                        newsplit = SplitVarnode()
-                        newsplit.initAll(inv.getWhole(), locpy, hicpy)
-                        splitvec.append(newsplit)
+                if hasattr(addr, 'getSpace') and hasattr(hi_addr, 'getSpace'):
+                    if hi_addr.getSpace() is not addr.getSpace():
+                        continue
+                if hasattr(addr, 'isBigEndian') and addr.isBigEndian():
+                    expected = addr.getOffset() - hi_size
+                else:
+                    expected = addr.getOffset() + lo_size
+                if hi_addr.getOffset() != expected:
+                    continue
+                newsplit = SplitVarnode()
+                newsplit.initAll(inv.getWhole(), locpy, hicpy)
+                splitvec.append(newsplit)
 
     @staticmethod
     def getTrueFalse(boolop, flip: bool):
@@ -790,7 +835,7 @@ class SplitVarnode:
         if existop is None:
             return None
         if existop.code() != OpCode.CPUI_MULTIEQUAL:
-            return None
+            raise LowlevelError("Trying to create phi-node double precision op with phi-node pieces")
         bl = existop.getParent()
         for i, inv in enumerate(inlist):
             inbl = bl.getIn(i) if hasattr(bl, 'getIn') else None
@@ -834,8 +879,7 @@ class SplitVarnode:
         data.opSetOpcode(newop, OpCode.CPUI_INDIRECT)
         data.opSetOutput(newop, out.getWhole())
         data.opSetInput(newop, inv.getWhole(), 0)
-        iop_vn = data.newVarnodeIop(affector) if hasattr(data, 'newVarnodeIop') else data.newConstant(4, 0)
-        data.opSetInput(newop, iop_vn, 1)
+        data.opSetInput(newop, data.newVarnodeIop(affector), 1)
         data.opInsertBefore(newop, affector)
         out.buildLoFromWhole(data)
         out.buildHiFromWhole(data)
@@ -845,11 +889,25 @@ class SplitVarnode:
         """Rewrite the double precision version of a COPY to an address forced Varnode.
         Corresponds to SplitVarnode::replaceCopyForce in double.cc."""
         inVn = inv.getWhole()
+        returnForm = copyhi.isReturnCopy()
+        if returnForm and inVn.getAddr() != addr:
+            otherPoint1 = copyhi.getIn(0).getDef()
+            otherPoint2 = copylo.getIn(0).getDef()
+            if otherPoint1.getSeqNum().getOrder() < otherPoint2.getSeqNum().getOrder():
+                otherPoint1 = otherPoint2
+            otherCopy = data.newOp(1, otherPoint1.getAddr())
+            data.opSetOpcode(otherCopy, OpCode.CPUI_COPY)
+            vn = data.newVarnodeOut(inv.getSize(), addr, otherCopy)
+            data.opSetInput(otherCopy, inVn, 0)
+            data.opInsertBefore(otherCopy, otherPoint1)
+            inVn = vn
         wholeCopy = data.newOp(1, copyhi.getAddr())
         data.opSetOpcode(wholeCopy, OpCode.CPUI_COPY)
         outVn = data.newVarnodeOut(inv.getSize(), addr, wholeCopy)
         if hasattr(outVn, 'setAddrForce'):
             outVn.setAddrForce()
+        if returnForm and hasattr(data, 'markReturnCopy'):
+            data.markReturnCopy(wholeCopy)
         data.opSetInput(wholeCopy, inVn, 0)
         data.opInsertBefore(wholeCopy, copyhi)
         data.opDestroy(copyhi)
@@ -1927,12 +1985,7 @@ class MultForm:
     def replace(self, data) -> bool:
         """Transform matched multiply to logical variables."""
         self.outdoub.initPartial(self.inv.getSize(), self.reslo, self.reshi)
-        if self.hi2 is None:
-            losize = self.lo1.getSize()
-            val = self.lo2.getOffset() & calc_mask(losize)
-            self.in2.initPartialConst(self.inv.getSize(), val)
-        else:
-            self.in2.initPartial(self.inv.getSize(), self.lo2, self.hi2)
+        self.in2.initPartial(self.inv.getSize(), self.lo2, self.hi2)
         if self.in2.exceedsConstPrecision():
             return False
         self.existop = SplitVarnode.prepareBinaryOp(self.outdoub, self.inv, self.in2)
@@ -2068,7 +2121,7 @@ class Equal3Form:
             return False
         if self.compareop.code() not in (OpCode.CPUI_INT_EQUAL, OpCode.CPUI_INT_NOTEQUAL):
             return False
-        mask = (1 << (self.lo.getSize() * 8)) - 1
+        mask = calc_mask(self.lo.getSize())
         self.smallc = self.compareop.getIn(1)
         if not self.smallc.isConstant():
             return False
@@ -2086,7 +2139,7 @@ class Equal3Form:
         self.inv = i
         if not self.verify(self.inv.getHi(), self.inv.getLo(), op):
             return False
-        mask = (1 << (self.inv.getSize() * 8)) - 1
+        mask = calc_mask(self.inv.getSize())
         in2 = SplitVarnode()
         in2.initPartialConst(self.inv.getSize(), mask)
         if in2.exceedsConstPrecision():
@@ -2587,7 +2640,38 @@ class PhiForm:
     def __init__(self) -> None:
         self.inv = SplitVarnode()
         self.outvn = SplitVarnode()
+        self.inslot = 0
+        self.hibase = None
+        self.lobase = None
+        self.blbase = None
+        self.lophi = None
+        self.hiphi = None
+        self.existop = None
         self.inlist = []
+
+    def verify(self, h, l, hphi) -> bool:
+        """Verify the double-precision phi form.
+        Corresponds to PhiForm::verify in double.cc."""
+        self.hibase = h
+        self.lobase = l
+        self.hiphi = hphi
+
+        self.inslot = self.hiphi.getSlot(self.hibase)
+        outvn = self.hiphi.getOut()
+        if outvn is None or outvn.hasNoDescend():
+            return False
+        self.blbase = self.hiphi.getParent()
+
+        for desc in list(self.lobase.getDescendants()):
+            self.lophi = desc
+            if self.lophi.code() != OpCode.CPUI_MULTIEQUAL:
+                continue
+            if self.lophi.getParent() is not self.blbase:
+                continue
+            if self.lophi.getIn(self.inslot) is not self.lobase:
+                continue
+            return True
+        return False
 
     def applyRule(self, i, hphi, workishi: bool, data) -> bool:
         """Apply the phi form rule.
@@ -2596,43 +2680,23 @@ class PhiForm:
             return False
         if not i.hasBothPieces():
             return False
-        if hphi.code() != OpCode.CPUI_MULTIEQUAL:
-            return False
         self.inv = i
-        hibase = self.inv.getHi()
-        lobase = self.inv.getLo()
-        hiphi = hphi
-        inslot = hiphi.getSlot(hibase)
-        outvn = hiphi.getOut()
-        if outvn is None or outvn.hasNoDescend():
+        if not self.verify(self.inv.getHi(), self.inv.getLo(), hphi):
             return False
-        blbase = hiphi.getParent()
-        lophi = None
-        for desc in list(lobase.getDescendants()):
-            if desc.code() != OpCode.CPUI_MULTIEQUAL:
-                continue
-            if desc.getParent() is not blbase:
-                continue
-            if desc.getIn(inslot) is not lobase:
-                continue
-            lophi = desc
-            break
-        if lophi is None:
-            return False
-        numin = hiphi.numInput()
+        numin = self.hiphi.numInput()
         self.inlist = []
         for j in range(numin):
             sv = SplitVarnode()
-            vhi = hiphi.getIn(j)
-            vlo = lophi.getIn(j)
+            vhi = self.hiphi.getIn(j)
+            vlo = self.lophi.getIn(j)
             sv.initPartial(self.inv.getSize(), vlo, vhi)
             self.inlist.append(sv)
         self.outvn = SplitVarnode()
-        self.outvn.initPartial(self.inv.getSize(), lophi.getOut(), hiphi.getOut())
-        existop = SplitVarnode.preparePhiOp(self.outvn, self.inlist)
-        if existop is None:
+        self.outvn.initPartial(self.inv.getSize(), self.lophi.getOut(), self.hiphi.getOut())
+        self.existop = SplitVarnode.preparePhiOp(self.outvn, self.inlist)
+        if self.existop is None:
             return False
-        SplitVarnode.createPhiOp(data, self.outvn, self.inlist, existop)
+        SplitVarnode.createPhiOp(data, self.outvn, self.inlist, self.existop)
         return True
 
 
@@ -2642,6 +2706,56 @@ class IndirectForm:
     def __init__(self) -> None:
         self.inv = SplitVarnode()
         self.outvn = SplitVarnode()
+        self.lo = None
+        self.hi = None
+        self.reslo = None
+        self.reshi = None
+        self.affector = None
+        self.indhi = None
+        self.indlo = None
+
+    def verify(self, h, l, ind) -> bool:
+        """Verify the basic double precision indirect form and fill out the pieces.
+        Corresponds to IndirectForm::verify in double.cc."""
+        from ghidra.ir.op import PcodeOp
+
+        self.hi = h
+        self.lo = l
+        self.reslo = None
+        self.reshi = None
+        self.affector = None
+        self.indhi = ind
+        self.indlo = None
+
+        affector_vn = self.indhi.getIn(1) if self.indhi.numInput() > 1 else None
+        if affector_vn is None or affector_vn.getSpace().getType() != IPTR_IOP:
+            return False
+        self.affector = PcodeOp.getOpFromConst(affector_vn.getAddr()) if hasattr(PcodeOp, "getOpFromConst") else None
+        if self.affector is None or self.affector.isDead():
+            return False
+        self.reshi = self.indhi.getOut()
+        if self.reshi is None or self.reshi.getSpace().getType() == IPTR_INTERNAL:
+            return False
+
+        for desc in list(self.lo.getDescendants()):
+            self.indlo = desc
+            if self.indlo.code() != OpCode.CPUI_INDIRECT:
+                continue
+            affector_lo_vn = self.indlo.getIn(1) if self.indlo.numInput() > 1 else None
+            if affector_lo_vn is None or affector_lo_vn.getSpace().getType() != IPTR_IOP:
+                continue
+            affector_lo = PcodeOp.getOpFromConst(affector_lo_vn.getAddr()) if hasattr(PcodeOp, "getOpFromConst") else None
+            if self.affector is not affector_lo:
+                continue
+            self.reslo = self.indlo.getOut()
+            if self.reslo is None or self.reslo.getSpace().getType() == IPTR_INTERNAL:
+                return False
+            if self.reslo.isAddrTied() or self.reshi.isAddrTied():
+                ok, _addr = SplitVarnode.isAddrTiedContiguous(self.reslo, self.reshi)
+                if not ok:
+                    return False
+            return True
+        return False
 
     def applyRule(self, i, ind, workishi: bool, data) -> bool:
         """Apply the indirect form rule.
@@ -2651,37 +2765,13 @@ class IndirectForm:
         if not i.hasBothPieces():
             return False
         self.inv = i
-        hi = self.inv.getHi()
-        lo = self.inv.getLo()
-        if ind.code() != OpCode.CPUI_INDIRECT:
+        if not self.verify(self.inv.getHi(), self.inv.getLo(), ind):
             return False
-        if ind.getOut() is not hi:
-            return False
-        # Find matching lo INDIRECT
-        loind = None
-        if lo.isWritten():
-            lodef = lo.getDef()
-            if lodef.code() == OpCode.CPUI_INDIRECT:
-                loind = lodef
-        if loind is None:
-            return False
-        # Both must be affected by the same op
-        # Get affector from the INDIRECT
-        affector_hi = ind.getIn(1) if ind.numInput() > 1 else None
-        affector_lo = loind.getIn(1) if loind.numInput() > 1 else None
-        if affector_hi is None or affector_lo is None:
-            return False
-        # Input pieces
-        in_hi = ind.getIn(0)
-        in_lo = loind.getIn(0)
-        inv2 = SplitVarnode()
-        inv2.initPartial(self.inv.getSize(), in_lo, in_hi)
         self.outvn = SplitVarnode()
-        self.outvn.initPartial(self.inv.getSize(), lo, hi)
-        # Use hi affector for the indirect affect point
-        if not SplitVarnode.prepareIndirectOp(inv2, ind):
+        self.outvn.initPartial(self.inv.getSize(), self.reslo, self.reshi)
+        if not SplitVarnode.prepareIndirectOp(self.inv, self.affector):
             return False
-        SplitVarnode.replaceIndirectOp(data, self.outvn, inv2, ind)
+        SplitVarnode.replaceIndirectOp(data, self.outvn, self.inv, self.affector)
         return True
 
 
@@ -2690,59 +2780,62 @@ class CopyForceForm:
     Corresponds to CopyForceForm in double.cc."""
     def __init__(self) -> None:
         self.inv = SplitVarnode()
+        self.reslo = None
+        self.reshi = None
+        self.copylo = None
+        self.copyhi = None
+        self.addrOut = None
+
+    def verify(self, h, l, w, cpy) -> bool:
+        """Make sure the COPYs have the correct form.
+        Corresponds to CopyForceForm::verify in double.cc."""
+        if w is None:
+            return False
+        self.copyhi = cpy
+        if self.copyhi.getIn(0) is not h:
+            return False
+        self.reshi = self.copyhi.getOut()
+        if self.reshi is None or not self.reshi.isAddrForce() or not self.reshi.hasNoDescend():
+            return False
+
+        for desc in list(l.getDescendants()):
+            self.copylo = desc
+            if self.copylo.code() != OpCode.CPUI_COPY or self.copylo.getParent() is not self.copyhi.getParent():
+                continue
+            self.reslo = self.copylo.getOut()
+            if self.reslo is None or not self.reslo.isAddrForce() or not self.reslo.hasNoDescend():
+                continue
+            ok, self.addrOut = SplitVarnode.isAddrTiedContiguous(self.reslo, self.reshi)
+            if not ok:
+                continue
+            if self.copyhi.isReturnCopy():
+                if h.loneDescend() is None:
+                    continue
+                if l.loneDescend() is None:
+                    continue
+                if w.getAddr() is not self.addrOut:
+                    if not h.isWritten() or not l.isWritten():
+                        continue
+                    otherLo = l.getDef()
+                    otherHi = h.getDef()
+                    if otherLo.code() != OpCode.CPUI_COPY or otherHi.code() != OpCode.CPUI_COPY:
+                        continue
+                    if otherLo.getParent() is not otherHi.getParent():
+                        continue
+            return True
+        return False
 
     def applyRule(self, i, cpy, workishi: bool, data) -> bool:
         """Apply the copy-force form rule.
         Corresponds to CopyForceForm::applyRule in double.cc."""
+        if not workishi:
+            return False
         if not i.hasBothPieces():
             return False
         self.inv = i
-        # The copy output must be address forced
-        outvn = cpy.getOut()
-        if outvn is None:
+        if not self.verify(self.inv.getHi(), self.inv.getLo(), self.inv.getWhole(), cpy):
             return False
-        if not hasattr(outvn, 'isAddrForce') or not outvn.isAddrForce():
-            return False
-        # Find the matching copy for the other piece
-        if workishi:
-            lo = self.inv.getLo()
-            hi_piece = cpy
-            # Find lo copy
-            lo_copy = None
-            for desc in lo.getDescendants():
-                if desc.code() == OpCode.CPUI_COPY:
-                    lo_out = desc.getOut()
-                    if lo_out is not None and hasattr(lo_out, 'isAddrForce') and lo_out.isAddrForce():
-                        lo_copy = desc
-                        break
-            if lo_copy is None:
-                return False
-            copyhi = hi_piece
-            copylo = lo_copy
-        else:
-            hi = self.inv.getHi()
-            lo_piece = cpy
-            # Find hi copy
-            hi_copy = None
-            for desc in hi.getDescendants():
-                if desc.code() == OpCode.CPUI_COPY:
-                    hi_out = desc.getOut()
-                    if hi_out is not None and hasattr(hi_out, 'isAddrForce') and hi_out.isAddrForce():
-                        hi_copy = desc
-                        break
-            if hi_copy is None:
-                return False
-            copyhi = hi_copy
-            copylo = lo_piece
-        # Check contiguity
-        ok, addr = SplitVarnode.isAddrTiedContiguous(copylo.getOut(), copyhi.getOut())
-        if not ok:
-            return False
-        # Need the whole input
-        if not self.inv.isWholeFeasible(copyhi):
-            return False
-        self.inv.findCreateWhole(data)
-        SplitVarnode.replaceCopyForce(data, addr, self.inv, copylo, copyhi)
+        SplitVarnode.replaceCopyForce(data, self.addrOut, self.inv, self.copylo, self.copyhi)
         return True
 
 
@@ -2763,10 +2856,51 @@ class RuleDoubleIn:
         return self._group
 
     def clone(self, grouplist=None):
-        return RuleDoubleIn(self._group)
+        if grouplist is not None and hasattr(grouplist, 'contains') and not grouplist.contains(self.getGroup()):
+            return None
+        return RuleDoubleIn(self.getGroup())
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_SUBPIECE)]
+
+    def attemptMarking(self, vn, subpieceOp) -> int:
+        """Mark a SUBPIECE pair as double precision pieces when it matches the native gate."""
+        whole = subpieceOp.getIn(0)
+        if hasattr(whole, 'isTypeLock') and whole.isTypeLock():
+            whole_type = whole.getType() if hasattr(whole, 'getType') else None
+            if whole_type is None or not whole_type.isPrimitiveWhole():
+                return 0
+        offset = subpieceOp.getIn(1).getOffset()
+        if offset != vn.getSize():
+            return 0
+        if offset * 2 != whole.getSize():
+            return 0
+        if whole.isInput():
+            if not hasattr(whole, 'isTypeLock') or not whole.isTypeLock():
+                return 0
+        elif not whole.isWritten():
+            return 0
+        else:
+            typeop = whole.getDef().getOpcode() if hasattr(whole.getDef(), 'getOpcode') else None
+            if typeop is None or (
+                not typeop.isArithmeticOp() and not typeop.isFloatingPointOp()
+            ):
+                return 0
+        vnLo = None
+        for op in whole.getDescendants():
+            if op.code() != OpCode.CPUI_SUBPIECE:
+                continue
+            if op.getIn(1).getOffset() != 0:
+                continue
+            outvn = op.getOut()
+            if outvn is not None and outvn.getSize() == vn.getSize():
+                vnLo = outvn
+                break
+        if vnLo is None:
+            return 0
+        vnLo.setPrecisLo()
+        vn.setPrecisHi()
+        return 1
 
     def applyOp(self, op, data) -> int:
         """Try to simplify a double-precision operation starting from a SUBPIECE.
@@ -2776,17 +2910,21 @@ class RuleDoubleIn:
             return 0
         if not hasattr(outvn, 'isPrecisHi') or not hasattr(outvn, 'isPrecisLo'):
             return 0
-        if not outvn.isPrecisHi() and not outvn.isPrecisLo():
-            return 0
-        inv = SplitVarnode()
-        if outvn.isPrecisHi():
-            if not inv.inHandHi(outvn):
+        if not outvn.isPrecisLo():
+            if outvn.isPrecisHi():
                 return 0
-        else:
-            if not inv.inHandLo(outvn):
-                if not inv.inHandLoNoHi(outvn):
-                    return 0
-        return SplitVarnode.applyRuleIn(inv, data)
+            return self.attemptMarking(outvn, op)
+        if hasattr(data, 'hasUnreachableBlocks') and data.hasUnreachableBlocks():
+            return 0
+        splitvec = []
+        SplitVarnode.wholeList(op.getIn(0), splitvec)
+        if len(splitvec) == 0:
+            return 0
+        for inv in splitvec:
+            res = SplitVarnode.applyRuleIn(inv, data)
+            if res != 0:
+                return res
+        return 0
 
     def reset(self, data) -> None:
         """C++ ref: ``RuleDoubleIn::reset``"""
@@ -2807,26 +2945,63 @@ class RuleDoubleOut:
         return self._group
 
     def clone(self, grouplist=None):
-        return RuleDoubleOut(self._group)
+        if grouplist is not None and hasattr(grouplist, 'contains') and not grouplist.contains(self.getGroup()):
+            return None
+        return RuleDoubleOut(self.getGroup())
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_PIECE)]
 
+    def attemptMarking(self, vnhi, vnlo, pieceOp) -> int:
+        """Mark PIECE inputs as double precision pieces when the result is used as a logical whole."""
+        whole = pieceOp.getOut()
+        if whole is None:
+            return 0
+        if hasattr(whole, 'isTypeLock') and whole.isTypeLock():
+            whole_type = whole.getType() if hasattr(whole, 'getType') else None
+            if whole_type is None or not whole_type.isPrimitiveWhole():
+                return 0
+        if vnhi.getSize() != vnlo.getSize():
+            return 0
+
+        entryhi = vnhi.getSymbolEntry() if hasattr(vnhi, 'getSymbolEntry') else None
+        entrylo = vnlo.getSymbolEntry() if hasattr(vnlo, 'getSymbolEntry') else None
+        if entryhi is not None or entrylo is not None:
+            if entryhi is None or entrylo is None:
+                return 0
+            if entryhi.getSymbol() != entrylo.getSymbol():
+                return 0
+
+        isWhole = False
+        for op in whole.getDescendants():
+            typeop = op.getOpcode() if hasattr(op, 'getOpcode') else None
+            if typeop is not None and (typeop.isArithmeticOp() or typeop.isFloatingPointOp()):
+                isWhole = True
+                break
+        if not isWhole:
+            return 0
+        vnhi.setPrecisHi()
+        vnlo.setPrecisLo()
+        return 1
+
     def applyOp(self, op, data) -> int:
         """Try to simplify a double-precision operation starting from a PIECE.
         Corresponds to RuleDoubleOut::applyOp in double.cc."""
-        outvn = op.getOut()
-        if outvn is None:
+        vnhi = op.getIn(0)
+        vnlo = op.getIn(1)
+        if not vnhi.isInput() or not vnlo.isInput():
             return 0
-        splitvec = []
-        SplitVarnode.wholeList(outvn, splitvec)
-        if len(splitvec) == 0:
+        if not vnhi.isPersist() or not vnlo.isPersist():
             return 0
-        for sv in splitvec:
-            ret = SplitVarnode.applyRuleIn(sv, data)
-            if ret != 0:
-                return ret
-        return 0
+        if not vnhi.isPrecisHi() or not vnlo.isPrecisLo():
+            return self.attemptMarking(vnhi, vnlo, op)
+        if hasattr(data, 'hasUnreachableBlocks') and data.hasUnreachableBlocks():
+            return 0
+        ok, _addr = SplitVarnode.isAddrTiedContiguous(vnlo, vnhi)
+        if not ok:
+            return 0
+        data.combineInputVarnodes(vnhi, vnlo)
+        return 1
 
 
 class RuleDoubleLoad:
@@ -2842,7 +3017,9 @@ class RuleDoubleLoad:
         return self._group
 
     def clone(self, grouplist=None):
-        return RuleDoubleLoad(self._group)
+        if grouplist is not None and hasattr(grouplist, 'contains') and not grouplist.contains(self.getGroup()):
+            return None
+        return RuleDoubleLoad(self.getGroup())
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_PIECE)]
@@ -2965,7 +3142,9 @@ class RuleDoubleStore:
         return self._group
 
     def clone(self, grouplist=None):
-        return RuleDoubleStore(self._group)
+        if grouplist is not None and hasattr(grouplist, 'contains') and not grouplist.contains(self.getGroup()):
+            return None
+        return RuleDoubleStore(self.getGroup())
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_STORE)]
