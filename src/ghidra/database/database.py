@@ -1405,10 +1405,12 @@ class Scope(ABC):
     def decode(self, decoder) -> None:
         pass
 
-    def encodeRecursive(self, encoder) -> None:
+    def encodeRecursive(self, encoder, onlyGlobal: bool = False) -> None:
+        if onlyGlobal and not self.isGlobal():
+            return
         self.encode(encoder)
         for child in self.children.values():
-            child.encodeRecursive(encoder)
+            child.encodeRecursive(encoder, onlyGlobal)
 
     def decodeWrappingAttributes(self, decoder) -> None:
         pass
@@ -2152,6 +2154,26 @@ class Database:
         parent.attachScope(scope)
         return scope
 
+    def attachScope(self, newscope: Scope, parent: Optional[Scope]) -> None:
+        """Register a scope and attach it to its parent.
+
+        C++ ref: ``Database::attachScope``
+        """
+        if parent is None:
+            if self._globalScope is not None:
+                raise LowlevelError("Multiple global scopes")
+            if getattr(newscope, "name", "") != "":
+                raise LowlevelError("Global scope does not have empty name")
+            self._globalScope = newscope
+            self._scopeMap[newscope.uniqueId] = newscope
+            return
+        if getattr(newscope, "name", "") == "":
+            raise LowlevelError("Non-global scope has empty name")
+        if newscope.uniqueId in self._scopeMap:
+            raise RecovError(f"Duplicate scope id: {newscope.uniqueId}")
+        self._scopeMap[newscope.uniqueId] = newscope
+        parent.attachScope(newscope)
+
     def findScope(self, id_: int) -> Optional[Scope]:
         return self._scopeMap.get(id_)
 
@@ -2184,6 +2206,15 @@ class Database:
         self._scopeMap.pop(scope.uniqueId, None)
         if scope.parent is not None:
             scope.parent.detachScope(scope.uniqueId)
+
+    def deleteScope(self, scope: Scope) -> None:
+        """Delete a scope and all descendants.
+
+        C++ ref: ``Database::deleteScope``
+        """
+        if scope is None:
+            return
+        self.removeScope(scope)
 
     def renameScope(self, scope: Scope, newname: str) -> None:
         scope.name = newname
@@ -2223,6 +2254,38 @@ class Database:
         if self._globalScope is not None:
             self._globalScope.encodeRecursive(encoder)
         encoder.closeElement(ELEM_DB)
+
+    def _parseParentTag(self, decoder) -> Scope:
+        from ghidra.core.marshal import ELEM_PARENT, ATTRIB_ID
+
+        elemId = decoder.openElement(ELEM_PARENT)
+        parentId = decoder.readUnsignedInteger(ATTRIB_ID)
+        parentScope = self.resolveScope(parentId)
+        if parentScope is None:
+            raise LowlevelError("Could not find scope matching id")
+        decoder.closeElement(elemId)
+        return parentScope
+
+    def decodeScope(self, decoder, newScope: Scope) -> None:
+        """Register and fill out a single Scope from a wrapped scope tag.
+
+        C++ ref: ``Database::decodeScope``
+        """
+        from ghidra.core.marshal import ELEM_SCOPE
+
+        elemId = decoder.openElement()
+        if elemId == ELEM_SCOPE:
+            parentScope = self._parseParentTag(decoder)
+            self.attachScope(newScope, parentScope)
+            newScope.decode(decoder)
+        else:
+            newScope.decodeWrappingAttributes(decoder)
+            subId = decoder.openElement(ELEM_SCOPE)
+            parentScope = self._parseParentTag(decoder)
+            self.attachScope(newScope, parentScope)
+            newScope.decode(decoder)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     def decode(self, decoder) -> None:
         """Decode the Database from a stream.

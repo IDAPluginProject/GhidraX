@@ -4909,6 +4909,13 @@ class FuncCallSpecs:
             return
         _FSPEC_REF_LOOKUP[id(fc)] = fc
 
+    @staticmethod
+    def unregisterFspecRef(fc) -> None:
+        """Remove a FuncCallSpecs from FSPEC-space lookups."""
+        if fc is None:
+            return
+        _FSPEC_REF_LOOKUP.pop(id(fc), None)
+
     def getProtoModel(self):
         return self.proto.getModel()
 

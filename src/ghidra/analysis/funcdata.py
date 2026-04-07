@@ -284,7 +284,7 @@ from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_INTERNAL
 from ghidra.ir.varnode import Varnode, VarnodeBank
 from ghidra.ir.op import PcodeOp, PcodeOpBank
 from ghidra.ir.variable import HighVariable
-from ghidra.block.block import BlockBasic, BlockGraph
+from ghidra.block.block import BlockBasic, BlockGraph, FlowBlock
 from ghidra.fspec.fspec import FuncProto, FuncCallSpecs
 
 if TYPE_CHECKING:
@@ -320,19 +320,26 @@ class Funcdata:
     def __init__(self, nm: str, disp: str, scope: Optional[Scope],
                  addr: Address, sym: Optional[FunctionSymbol] = None,
                  sz: int = 0) -> None:
+        parent_scope = scope
+        glb = parent_scope.getArch() if parent_scope is not None and hasattr(parent_scope, 'getArch') else None
+
         self._flags: int = 0
         self._clean_up_index: int = 0
         self._high_level_index: int = 0
         self._cast_phase_index: int = 0
-        self._minLanedSize: int = 0
+        self._minLanedSize: int = (
+            glb.getMinimumLanedRegisterSize()
+            if glb is not None and hasattr(glb, 'getMinimumLanedRegisterSize')
+            else 0
+        )
         self._size: int = sz
-        self._glb = None  # Architecture (set externally)
+        self._glb = glb
         self._functionSymbol = sym
         self._name: str = nm
         self._displayName: str = disp
         self._baseaddr: Address = addr
         self._funcp: FuncProto = FuncProto()
-        self._localmap: Optional[Scope] = scope  # ScopeLocal
+        self._localmap: Optional[Scope] = None
 
         self._qlst: List[FuncCallSpecs] = []
         self._qlst_map: dict = {}  # PcodeOp id -> FuncCallSpecs
@@ -341,12 +348,67 @@ class Funcdata:
         self._localoverride = None  # Override
         self._override = None  # Backward-compatible alias of _localoverride
         self._unionMap = None  # UnionResolveMap
-        self._heritage = None
+        from ghidra.analysis.heritage import Heritage
+        self._heritage = Heritage(self)
+        self._jtcallback = None
+        self._activeoutput = None
 
-        self._vbank: VarnodeBank = VarnodeBank()
+        self._vbank: VarnodeBank = VarnodeBank(glb)
         self._obank: PcodeOpBank = PcodeOpBank()
         self._bblocks: BlockGraph = BlockGraph()
         self._sblocks: BlockGraph = BlockGraph()
+        from ghidra.analysis.merge import Merge
+        self._covermerge = Merge(self)
+
+        if nm == "":
+            self._localmap = None
+        elif parent_scope is not None and glb is not None:
+            stack_spc = glb.getStackSpace() if hasattr(glb, 'getStackSpace') else None
+            if stack_spc is not None:
+                if sym is not None and hasattr(sym, 'getId'):
+                    scope_id = sym.getId()
+                else:
+                    scope_id = (0x57AB12CD << 32) | (addr.getOffset() & 0xFFFFFFFF)
+                from ghidra.database.varmap import ScopeLocal
+                localmap = ScopeLocal(scope_id, stack_spc, self, glb)
+                if hasattr(parent_scope, 'attachScope'):
+                    parent_scope.attachScope(localmap)
+                db = getattr(glb, 'symboltab', None)
+                if db is not None and hasattr(db, '_scopeMap'):
+                    db._scopeMap[localmap.getId() if hasattr(localmap, 'getId') else localmap.uniqueId] = localmap
+                self._localmap = localmap
+                if hasattr(self._funcp, 'setScope'):
+                    self._funcp.setScope(self._localmap, self._baseaddr + -1)
+                if hasattr(self._localmap, 'resetLocalWindow'):
+                    self._localmap.resetLocalWindow()
+            else:
+                self._localmap = parent_scope
+        else:
+            self._localmap = parent_scope
+
+    def __del__(self) -> None:
+        try:
+            localmap = getattr(self, "_localmap", None)
+            glb = getattr(self, "_glb", None)
+            if localmap is not None and glb is not None:
+                symboltab = getattr(glb, "symboltab", None)
+                if symboltab is not None:
+                    if hasattr(symboltab, "deleteScope"):
+                        symboltab.deleteScope(localmap)
+                    elif hasattr(symboltab, "removeScope"):
+                        symboltab.removeScope(localmap)
+
+            if hasattr(self, "clearCallSpecs"):
+                self.clearCallSpecs()
+
+            jumpvec = getattr(self, "_jumpvec", None)
+            if jumpvec is not None:
+                jumpvec.clear()
+
+            self._glb = None
+        except Exception:
+            # Python finalizers should not leak exceptions during GC shutdown.
+            pass
 
     # --- Basic accessors ---
 
@@ -367,6 +429,15 @@ class Funcdata:
 
     def setArch(self, glb) -> None:
         self._glb = glb
+        if getattr(self, "_vbank", None) is not None:
+            self._vbank._manage = glb
+            if glb is not None and hasattr(glb, "getUniqueSpace"):
+                self._vbank._uniq_space = glb.getUniqueSpace()
+            if glb is not None and hasattr(glb, "getUniqueBase"):
+                uniq_base = glb.getUniqueBase()
+                self._vbank._uniqbase = uniq_base
+                if getattr(self._vbank, "_uniq_id", 0) == 0:
+                    self._vbank._uniq_id = uniq_base
         # Auto-create a ScopeLocal if none exists yet
         if self._localmap is None and glb is not None:
             stack_spc = glb.getStackSpace() if hasattr(glb, 'getStackSpace') else None
@@ -403,7 +474,7 @@ class Funcdata:
     def getOverride(self):
         localoverride = getattr(self, '_localoverride', None)
         if localoverride is None:
-            localoverride = self._override
+            localoverride = getattr(self, '_override', None)
         if localoverride is None:
             from ghidra.arch.override import Override
             localoverride = Override()
@@ -439,14 +510,14 @@ class Funcdata:
           FuncCallSpecs *getCallSpecs(int4 i)
         """
         if isinstance(op_or_index, int):
-            return self._qlst[op_or_index] if 0 <= op_or_index < len(self._qlst) else None
+            return self._qlst[op_or_index]
+        from ghidra.core.space import IPTR_FSPEC
         op = op_or_index
-        opid = id(op)
-        if opid in self._qlst_map:
-            return self._qlst_map[opid]
+        vn = op.getIn(0)
+        if vn.getSpace().getType() == IPTR_FSPEC:
+            return FuncCallSpecs.getFspecFromConst(vn.getAddr())
         for fc in self._qlst:
-            if hasattr(fc, 'getOp') and fc.getOp() is op:
-                self._qlst_map[opid] = fc
+            if fc.getOp() is op:
                 return fc
         return None
 
@@ -564,27 +635,10 @@ class Funcdata:
         return (self._flags & Funcdata.restart_pending) != 0
 
     def setRestartPending(self, val: bool) -> None:
-        old_val = (self._flags & Funcdata.restart_pending) != 0
         if val:
             self._flags |= Funcdata.restart_pending
         else:
             self._flags &= ~Funcdata.restart_pending
-        if _should_log_restart_debug(self):
-            try:
-                from ghidra.transform.action import Action
-                idx = Action.getActiveTraceSerial()
-                perf_iter = Action.getActivePerformIter()
-            except Exception:
-                idx = 0
-                perf_iter = 0
-            try:
-                func_addr = self.getAddress().getOffset()
-            except Exception:
-                func_addr = -1
-            _append_restart_debug_line(
-                f"event=setRestartPending func=0x{func_addr:x} old={int(old_val)} new={int(val)} "
-                f"idx={idx} iter={perf_iter} {_restart_debug_caller(2)}"
-            )
 
     def hasUnimplemented(self) -> bool:
         return (self._flags & Funcdata.unimplemented_present) != 0
@@ -598,12 +652,8 @@ class Funcdata:
     def setTypeRecovery(self, val: bool) -> None:
         if val:
             self._flags |= Funcdata.typerecovery_on
-            self._flags &= ~Funcdata.typerecovery_start
-            self._flags &= ~Funcdata.typerecovery_exceeded
         else:
             self._flags &= ~Funcdata.typerecovery_on
-            self._flags &= ~Funcdata.typerecovery_start
-            self._flags &= ~Funcdata.typerecovery_exceeded
 
     def hasNoStructBlocks(self) -> bool:
         return self._sblocks.getSize() == 0
@@ -615,8 +665,11 @@ class Funcdata:
 
         C++ ref: ``Funcdata::startProcessing``
         """
+        from ghidra.core.address import Address
+        from ghidra.core.error import LowlevelError
+
         if (self._flags & Funcdata.processing_started) != 0:
-            raise Exception("Function processing already started")
+            raise LowlevelError("Function processing already started")
         self._flags |= Funcdata.processing_started
 
         if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'isInline') and self._funcp.isInline():
@@ -625,11 +678,9 @@ class Funcdata:
             self._localmap.clearUnlocked()
         if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'clearUnlockedOutput'):
             self._funcp.clearUnlockedOutput()
-        # followFlow + structureReset only if blocks haven't been built externally
-        if self._bblocks.getSize() == 0 and hasattr(self, 'followFlow'):
-            from ghidra.core.address import Address as Addr
-            baddr = Addr(self._baseaddr.getSpace(), 0)
-            eaddr = Addr(self._baseaddr.getSpace(), 0xFFFFFFFFFFFFFFFF)
+        if self._bblocks.getSize() == 0:
+            baddr = Address(self._baseaddr.getSpace(), 0)
+            eaddr = Address(self._baseaddr.getSpace(), 0xFFFFFFFFFFFFFFFF)
             self.followFlow(baddr, eaddr)
         self.structureReset()
         self.sortCallSpecs()
@@ -650,8 +701,6 @@ class Funcdata:
             self.issueDatatypeWarnings()
 
     def startTypeRecovery(self) -> bool:
-        if (self._flags & Funcdata.typerecovery_on) == 0:
-            return False
         if (self._flags & Funcdata.typerecovery_start) != 0:
             return False
         self._flags |= Funcdata.typerecovery_start
@@ -674,9 +723,7 @@ class Funcdata:
 
     def getHeritagePass(self) -> int:
         """Get the current heritage pass number."""
-        if self._heritage is not None:
-            return self._heritage.getPass()
-        return 0
+        return self._heritage.getPass()
 
     def setHighLevel(self) -> None:
         """Turn on HighVariable objects for all existing Varnodes.
@@ -741,8 +788,7 @@ class Funcdata:
 
     def seenDeadcode(self, spc) -> None:
         """Record that dead code has been seen for a given space."""
-        if self._heritage is not None:
-            self._heritage.seenDeadCode(spc)
+        self._heritage.seenDeadCode(spc)
 
     def spacebase(self) -> None:
         """Mark Varnode objects that hold stack-pointer values as spacebase.
@@ -768,6 +814,14 @@ class Funcdata:
             for i in range(numspace):
                 point = spc.getSpacebase(i)
                 addr = Address(point.space, point.offset)
+                if hasattr(self._vbank, "beginLocSize"):
+                    get_varnodes = lambda: list(self._vbank.beginLocSize(point.size, addr))
+                else:
+                    get_varnodes = lambda: [
+                        vn
+                        for vn in self._vbank.beginLoc()
+                        if vn.getAddr() == addr and vn.getSize() == point.size
+                    ]
                 # Build pointer-to-spacebase type
                 ptr = None
                 if hasattr(glb, 'types') and glb.types is not None:
@@ -775,17 +829,25 @@ class Funcdata:
                     if ct is not None and hasattr(glb.types, 'getTypePointer'):
                         wordSize = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
                         ptr = glb.types.getTypePointer(point.size, ct, wordSize)
-                # Iterate over varnodes at this location
-                for vn in list(self._vbank.beginLoc()):
-                    if vn.getAddr() != addr or vn.getSize() != point.size:
-                        continue
+                # Iterate over the current loc/size range.  If splitUses()
+                # materializes additional varnodes in the same range, refresh
+                # the range so they are handled in this pass like native.
+                varnodes = get_varnodes()
+                idx = 0
+                while idx < len(varnodes):
+                    vn = varnodes[idx]
+                    idx += 1
                     if vn.isFree():
                         continue
                     if vn.isSpacebase():
                         # Already marked -- split uses if def is INT_ADD
-                        defop = vn.getDef() if vn.isWritten() else None
+                        defop = vn.getDef()
                         if defop is not None and defop.code() == OpCode.CPUI_INT_ADD:
-                            self.splitUses(vn)
+                            descendants = list(vn.getDescendants())
+                            if len(descendants) > 1:
+                                self.splitUses(vn)
+                                varnodes = get_varnodes()
+                                idx = 0
                     else:
                         vn.setFlags(Varnode.spacebase)
                         if vn.isInput() and ptr is not None:
@@ -801,24 +863,25 @@ class Funcdata:
         """
         self._flags &= ~Funcdata.blocks_unreachable
         rootlist = []
-        if hasattr(self._bblocks, 'structureLoops'):
-            self._bblocks.structureLoops(rootlist)
-        if hasattr(self._bblocks, 'calcForwardDominator'):
-            self._bblocks.calcForwardDominator(rootlist)
+        self._bblocks.structureLoops(rootlist)
+        self._bblocks.calcForwardDominator(rootlist)
         if len(rootlist) > 1:
             self._flags |= Funcdata.blocks_unreachable
         # Check for dead jumptables
         alivejumps = []
         for jt in self._jumpvec:
-            indop = jt.getIndirectOp() if hasattr(jt, 'getIndirectOp') else None
-            if indop is not None and indop.isDead():
+            indop = jt.getIndirectOp()
+            if indop.isDead():
                 self.warningHeader("Recovered jumptable eliminated as dead code")
                 continue
             alivejumps.append(jt)
         self._jumpvec = alivejumps
         self._sblocks.clear()
-        if self._heritage is not None:
-            self._heritage.forceRestructure()
+        if self._heritage is None:
+            from ghidra.analysis.heritage import Heritage
+
+            self._heritage = Heritage(self)
+        self._heritage.forceRestructure()
 
     def opZeroMulti(self, op) -> None:
         """Handle MULTIEQUAL with 0 or 1 inputs after edge removal."""
@@ -836,13 +899,11 @@ class Funcdata:
         bbout = bb.getOut(num)
         blocknum = bbout.getInIndex(bb)
         self._bblocks.removeEdge(bb, bbout)
-        if hasattr(bbout, 'getOpList'):
-            for op in list(bbout.getOpList()):
-                if op.code() != OpCode.CPUI_MULTIEQUAL:
-                    continue
-                if blocknum < op.numInput():
-                    self.opRemoveInput(op, blocknum)
-                self.opZeroMulti(op)
+        for op in list(bbout.getOpList()):
+            if op.code() != OpCode.CPUI_MULTIEQUAL:
+                continue
+            self.opRemoveInput(op, blocknum)
+            self.opZeroMulti(op)
 
     def removeUnreachableBlocks(self, issuewarning: bool, checkexistence: bool) -> bool:
         """Remove unreachable blocks from the control flow graph."""
@@ -934,7 +995,9 @@ class Funcdata:
                                 self.warningHeader("Creating undefined varnodes in (possibly) reachable block")
                                 desc_warning = True
                         if self.descendantsOutside(deadvn):
-                            raise Exception("Deleting op with descendants")
+                            from ghidra.core.error import LowlevelError
+
+                            raise LowlevelError("Deleting op with descendants\n")
                 if op.isCall():
                     self.deleteCallSpecs(op)
                 self.opDestroy(op)
@@ -1004,7 +1067,10 @@ class Funcdata:
 
     def deleteCallSpecs(self, op) -> None:
         """Remove call specs associated with the given op."""
-        self._qlst = [cs for cs in self._qlst if cs.getOp() is not op]
+        for i, cs in enumerate(self._qlst):
+            if cs.getOp() is op:
+                del self._qlst[i]
+                return
 
     def clear(self) -> None:
         """Clear everything associated with decompilation (analysis).
@@ -1029,14 +1095,16 @@ class Funcdata:
         self.clearActiveOutput()
         if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'clearUnlockedOutput'):
             self._funcp.clearUnlockedOutput()
-        self._unionMap = None
-        self._bblocks.clear()
-        self._sblocks.clear()
+        if self._unionMap is not None:
+            if hasattr(self._unionMap, 'clear'):
+                self._unionMap.clear()
+            else:
+                self._unionMap = None
+        self.clearBlocks()
         self._obank.clear()
         self._vbank.clear()
-        self._qlst.clear()
-        self._qlst_map.clear()
-        self._jumpvec.clear()
+        self.clearCallSpecs()
+        self.clearJumpTables()
         # Do not clear overrides
         if self._heritage is not None:
             self._heritage.clear()
@@ -1053,25 +1121,29 @@ class Funcdata:
 
     # --- Varnode creation routines ---
 
-    def newVarnode(self, s: int, addr: Address, ct: Optional[Datatype] = None) -> Varnode:
+    def newVarnode(self, s: int, addr: Address | AddrSpace, ct: Optional[Datatype | int] = None) -> Varnode:
         """Create a new unattached Varnode.
 
         C++ ref: ``Funcdata::newVarnode``
         """
-        if ct is None and self._glb is not None and hasattr(self._glb, 'types'):
-            ct = self._glb.types.getBase(s, 'unknown')
+        if not isinstance(addr, Address) and ct is not None and not hasattr(ct, 'getMetatype'):
+            return self.newVarnode(s, Address(addr, int(ct)))
+
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        if ct is None:
+            ct = self._glb.types.getBase(s, TYPE_UNKNOWN)
         vn = self._vbank.create(s, addr, ct)
         self.assignHigh(vn)
         if s >= self._minLanedSize:
             self.checkForLanedRegister(s, addr)
-        if self._localmap is not None and hasattr(self._localmap, 'queryProperties'):
-            vflags_ref = [0]
-            entry = self._localmap.queryProperties(vn.getAddr(), vn.getSize(), Address(), vflags_ref)
-            vflags = vflags_ref[0]
-            if entry is not None and hasattr(vn, 'setSymbolProperties'):
-                vn.setSymbolProperties(entry)
-            elif vflags != 0:
-                vn.setFlags(vflags & ~Varnode.typelock)
+        vflags_ref = [0]
+        entry = self._localmap.queryProperties(vn.getAddr(), vn.getSize(), Address(), vflags_ref)
+        vflags = vflags_ref[0]
+        if entry is not None:
+            vn.setSymbolProperties(entry)
+        else:
+            vn.setFlags(vflags & ~Varnode.typelock)
         return vn
 
     def newConstant(self, s: int, val: int) -> Varnode:
@@ -1079,14 +1151,10 @@ class Funcdata:
 
         C++ ref: ``Funcdata::newConstant``
         """
-        cs = None
-        if self._glb is not None:
-            cs = self._glb.getConstantSpace()
-        if cs is None:
-            from ghidra.core.space import ConstantSpace
-            cs = ConstantSpace()
-        addr = Address(cs, val)
-        ct = self._glb.types.getBase(s, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        addr = Address(self._glb.getConstantSpace(), val)
+        ct = self._glb.types.getBase(s, TYPE_UNKNOWN)
         vn = self._vbank.create(s, addr, ct)
         self.assignHigh(vn)
         return vn
@@ -1122,7 +1190,9 @@ class Funcdata:
 
         C++ ref: ``Funcdata::newVarnodeOut``
         """
-        ct = self._glb.types.getBase(s, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        ct = self._glb.types.getBase(s, TYPE_UNKNOWN) if self._glb is not None and hasattr(self._glb, 'types') else None
         vn = self._vbank.createDef(s, addr, ct, op)
         op.setOutput(vn)
         self.assignHigh(vn)
@@ -1143,25 +1213,11 @@ class Funcdata:
 
         C++ ref: ``Funcdata::newUniqueOut``
         """
-        if self._glb is not None:
-            uniq = self._glb.getUniqueSpace()
-            base = self._glb.getUniqueBase()
-        else:
-            uniq = None
-            base = 0x10000000
-        addr = Address(uniq, base)
-        old_out = op.getOut()
-        if self._glb is not None and hasattr(self._glb, 'setUniqueBase'):
-            self._glb.setUniqueBase(base + s)
-        ct = self._glb.types.getBase(s, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
-        vn = self._vbank.createDef(s, addr, ct, op)
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        ct = self._glb.types.getBase(s, TYPE_UNKNOWN) if self._glb is not None and hasattr(self._glb, 'types') else None
+        vn = self._vbank.createDefUnique(s, ct, op)
         op.setOutput(vn)
-        if _should_log_unique_debug(op):
-            _append_unique_debug_line(
-                f"event=newUniqueOut {_format_unique_debug_op(op)} size={s} "
-                f"base=0x{base:x} next=0x{base + s:x} old_out={_format_unique_debug_vn(old_out)} "
-                f"new_out={_format_unique_debug_vn(vn)} {_unique_debug_caller(2)}"
-            )
         self.assignHigh(vn)
         if s >= self._minLanedSize:
             self.checkForLanedRegister(s, vn.getAddr())
@@ -1212,7 +1268,7 @@ class Funcdata:
         return self._vbank.findCoveredInput(s, loc)
 
     def numVarnodes(self) -> int:
-        return self._vbank.size()
+        return self._vbank.numVarnodes()
 
     def findVarnodeWritten(self, s, loc, pc, uniq=-1):
         for vn in self._vbank.beginLoc():
@@ -1260,17 +1316,14 @@ class Funcdata:
 
         C++ ref: ``Funcdata::newVarnodeIop``
         """
-        iopSpc = None
-        if self._glb is not None and hasattr(self._glb, 'getIopSpace'):
-            iopSpc = self._glb.getIopSpace()
-        opaddr = op.getAddr() if hasattr(op, 'getAddr') else Address()
-        addr = Address(iopSpc, id(op)) if iopSpc is not None else opaddr
-        ct = self._glb.types.getBase(_PTR_SIZE, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        addr = Address(self._glb.getIopSpace(), id(op))
+        ct = self._glb.types.getBase(_PTR_SIZE, TYPE_UNKNOWN)
         vn = self._vbank.create(_PTR_SIZE, addr, ct)
         vn._iop_ref = op  # Store direct reference for Python resolution
         self._iop_lookup[id(op)] = op  # Register for getOpFromConst
-        if hasattr(PcodeOp, 'registerOpRef'):
-            PcodeOp.registerOpRef(op)
+        PcodeOp.registerOpRef(op)
         self.assignHigh(vn)
         return vn
 
@@ -1285,17 +1338,16 @@ class Funcdata:
         """Create a constant varnode encoding an address space identifier.
 
         C++ encodes the AddrSpace* pointer as a sizeof(void*)-byte constant.
-        We use 8 bytes to match the C++ 64-bit build output.
         The varnode is tagged with ``setSpaceFromConst`` so that
         ``getSpaceFromConst`` returns the actual target space.
 
         C++ ref: ``Funcdata::newVarnodeSpace``  (funcdata_varnode.cc:190-198)
         """
-        cs = self._glb.getConstantSpace() if self._glb else None
-        idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
-        size = 8
-        ct = self._glb.types.getBase(size, 'unknown') if self._glb is not None and hasattr(self._glb, 'types') else None
-        vn = self._vbank.create(size, Address(cs, idx) if cs else Address(), ct)
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        size = _PTR_SIZE
+        ct = self._glb.types.getBase(size, TYPE_UNKNOWN)
+        vn = self._vbank.create(size, Address(self._glb.getConstantSpace(), id(spc)), ct)
         vn.setSpaceFromConst(spc)
         self.assignHigh(vn)
         return vn
@@ -1334,20 +1386,19 @@ class Funcdata:
         return vn
 
     def numHeritagePasses(self, spc):
-        return self._heritage.numHeritagePasses(spc) if self._heritage is not None else 0
+        return self._heritage.numHeritagePasses(spc)
 
     def deadRemovalAllowed(self, spc):
-        return self._heritage.deadRemovalAllowed(spc) if self._heritage is not None else True
+        return self._heritage.deadRemovalAllowed(spc)
 
     def deadRemovalAllowedSeen(self, spc):
-        return self._heritage.deadRemovalAllowedSeen(spc) if self._heritage is not None else False
+        return self._heritage.deadRemovalAllowedSeen(spc)
 
     def isHeritaged(self, vn):
-        return self._heritage.heritagePass(vn.getAddr()) >= 0 if self._heritage is not None else False
+        return self._heritage.heritagePass(vn.getAddr()) >= 0
 
     def setDeadCodeDelay(self, spc, delay):
-        if self._heritage is not None:
-            self._heritage.setDeadCodeDelay(spc, delay)
+        self._heritage.setDeadCodeDelay(spc, delay)
 
     def getMerge(self):
         if not hasattr(self, '_covermerge'):
@@ -1364,39 +1415,30 @@ class Funcdata:
 
         C++ ref: ``Funcdata::fillinExtrapop``
         """
-        EXTRAPOP_UNKNOWN = 0x7FFFFFFF  # ProtoModel::extrapop_unknown
+        from ghidra.fspec.fspec import ProtoModel
+
         if self.hasNoCode():
-            if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'getExtraPop'):
-                return self._funcp.getExtraPop()
-            return self._glb.extra_pop if self._glb and hasattr(self._glb, 'extra_pop') else 0
+            return self._funcp.getExtraPop()
 
-        if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'getExtraPop'):
-            ep = self._funcp.getExtraPop()
-            if ep != EXTRAPOP_UNKNOWN:
-                return ep
+        ep = self._funcp.getExtraPop()
+        if ep != ProtoModel.extrapop_unknown:
+            return ep
 
-        # Find first RETURN op
-        retop = None
-        for op in self._obank.getAliveList() if hasattr(self._obank, 'getAliveList') else []:
-            if op.code() == OpCode.CPUI_RETURN:
-                retop = op
-                break
+        retop = next(self.beginOp(OpCode.CPUI_RETURN), None)
         if retop is None:
             return 0
 
-        # Try to read bytes at return address (x86 specific)
-        extrapop = 4  # default
-        if self._glb is not None and hasattr(self._glb, 'loader') and self._glb.loader is not None:
-            try:
-                buf = self._glb.loader.loadFill(4, retop.getAddr())
-                if buf is not None and len(buf) >= 3:
-                    if buf[0] == 0xc2:  # ret imm16
-                        extrapop = (buf[2] << 8) + buf[1] + 4
-            except Exception:
-                pass
+        buf = bytearray(4)
+        self._glb.loader.loadFill(buf, 4, retop.getAddr())
 
-        if hasattr(self, '_funcp') and self._funcp is not None and hasattr(self._funcp, 'setExtraPop'):
-            self._funcp.setExtraPop(extrapop)
+        extrapop = 4
+        if buf[0] == 0xC2:
+            extrapop = buf[2]
+            extrapop <<= 8
+            extrapop += buf[1]
+            extrapop += 4
+
+        self._funcp.setExtraPop(extrapop)
         return extrapop
 
     def isJumptableRecoveryOn(self):
@@ -1648,11 +1690,19 @@ class Funcdata:
         self._sblocks.clear()
 
     def clearCallSpecs(self):
+        if hasattr(FuncCallSpecs, 'unregisterFspecRef'):
+            for fc in self._qlst:
+                FuncCallSpecs.unregisterFspecRef(fc)
         self._qlst.clear()
         self._qlst_map.clear()
 
     def clearJumpTables(self):
-        self._jumpvec.clear()
+        remain = []
+        for jt in self._jumpvec:
+            if jt.isOverride():
+                jt.clear()
+                remain.append(jt)
+        self._jumpvec = remain
 
     @staticmethod
     def compareCallspecs(a, b) -> bool:
@@ -2149,6 +2199,10 @@ class Funcdata:
         if val >= half:
             val = val - (mask + 1)
         if op.code() == OpCode.CPUI_INT_SLESSEQUAL:
+            if diff == -1 and val == -(1 << 63):
+                return False
+            if diff == 1 and val == ((1 << 63) - 1):
+                return False
             if val < 0 and val + diff > 0:
                 return False
             if val > 0 and val + diff < 0:
@@ -2162,6 +2216,8 @@ class Funcdata:
             self.opSetOpcode(op, OpCode.CPUI_INT_LESS)
         res = (val + diff) & mask
         newvn = self.newConstant(vn.getSize(), res)
+        if hasattr(newvn, "copySymbol"):
+            newvn.copySymbol(vn)
         self.opSetInput(op, newvn, i)
         return True
 
@@ -2277,13 +2333,15 @@ class Funcdata:
         """Push MULTIEQUAL Varnodes from bb into its output block."""
         if bb.sizeOut() == 0:
             return
+        if bb.sizeOut() > 1:
+            self.warningHeader("push_multiequal on block with multiple outputs")
         outblock = bb.getOut(0)
         outblock_ind = bb.getOutRevIndex(0)
-        for op in list(bb.getOpList()) if hasattr(bb, 'getOpList') else []:
+        for op in list(bb.getOpList()):
             if op.code() != OpCode.CPUI_MULTIEQUAL:
                 continue
             origvn = op.getOut()
-            if origvn is None or origvn.hasNoDescend():
+            if origvn.hasNoDescend():
                 continue
             needreplace = False
             neednewunique = False
@@ -2332,13 +2390,13 @@ class Funcdata:
         """Split a basic block along an in edge, returning the new copy."""
         a = b.getIn(inedge)
         bprime = self._bblocks.newBlockBasic(self)
-        from ghidra.block.block import FlowBlock
         bprime.setFlag(FlowBlock.f_duplicate_block)
-        if hasattr(bprime, 'copyRange'):
-            bprime.copyRange(b)
+        bprime.copyRange(b)
         self._bblocks.switchEdge(a, b, bprime)
-        for i in range(b.sizeOut()):
+        i = 0
+        while i < b.sizeOut():
             self._bblocks.addEdge(bprime, b.getOut(i))
+            i += 1
         return bprime
 
     def nodeSplit(self, b, inedge: int) -> None:
@@ -2444,7 +2502,7 @@ class Funcdata:
     @staticmethod
     def descendantsOutside(vn) -> bool:
         """Return True if any PcodeOp reading vn is in a non-dead block."""
-        for desc in vn.getDescendants():
+        for desc in vn.beginDescend():
             if not desc.getParent().isDead():
                 return True
         return False
@@ -2478,28 +2536,30 @@ class Funcdata:
         C++ ref: ``Funcdata::checkIndirectUse``
         """
         vlist = [vn]
-        marked = {id(vn)}
+        vn.setMark()
         result = True
         i = 0
         while i < len(vlist) and result:
             cur = vlist[i]
             i += 1
-            for op in cur.getDescendants():
+            for op in cur.beginDescend():
                 opc = op.code()
                 if opc == OpCode.CPUI_INDIRECT:
-                    if hasattr(op, 'isIndirectStore') and op.isIndirectStore():
+                    if op.isIndirectStore():
                         outvn = op.getOut()
-                        if outvn is not None and id(outvn) not in marked:
+                        if not outvn.isMark():
                             vlist.append(outvn)
-                            marked.add(id(outvn))
+                            outvn.setMark()
                 elif opc == OpCode.CPUI_MULTIEQUAL:
                     outvn = op.getOut()
-                    if outvn is not None and id(outvn) not in marked:
+                    if not outvn.isMark():
                         vlist.append(outvn)
-                        marked.add(id(outvn))
+                        outvn.setMark()
                 else:
                     result = False
                     break
+        for marked_vn in vlist:
+            marked_vn.clearMark()
         return result
 
     # --- Varnode manipulation helpers ---
@@ -2512,16 +2572,14 @@ class Funcdata:
 
         C++ ref: ``Funcdata::destroyVarnode``
         """
-        for op in list(vn.getDescendants()):
+        for op in vn.getDescendants():
             slot = op.getSlot(vn)
             op.clearInput(slot)
-        defop = vn.getDef() if vn.isWritten() else None
+        defop = vn.getDef()
         if defop is not None:
             defop.setOutput(None)
             vn._def = None
-            vn.clearFlags(Varnode.written)
-        if hasattr(vn, 'destroyDescend'):
-            vn.destroyDescend()
+        vn.destroyDescend()
         self._vbank.destroy(vn)
 
     def cloneVarnode(self, vn):
@@ -2662,29 +2720,21 @@ class Funcdata:
 
         C++ ref: ``Funcdata::coverVarnodes``
         """
-        if entry is None or not vnlist:
-            return
-        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
-        if sym is None:
-            return
-        scope = sym.getScope() if hasattr(sym, 'getScope') else None
-        if scope is None:
-            return
+        sym = entry.getSymbol()
+        scope = sym.getScope()
         for i, vn in enumerate(vnlist):
             # We only need to check once for all Varnodes at the same Address
             # Of these, pick the biggest Varnode (last one in the list at same addr)
             if i + 1 < len(vnlist) and vnlist[i + 1].getAddr() == vn.getAddr():
                 continue
-            usepoint = vn.getUsePoint(self) if hasattr(vn, 'getUsePoint') else Address()
-            overlapEntry = scope.findContainer(vn.getAddr(), vn.getSize(), usepoint) if hasattr(scope, 'findContainer') else None
-            if overlapEntry is None:
+            usepoint = vn.getUsePoint(self)
+            overlap_entry = scope.findContainer(vn.getAddr(), vn.getSize(), usepoint)
+            if overlap_entry is None:
                 diff = vn.getOffset() - entry.getAddr().getOffset()
                 name = f"{sym.getName()}_{diff}"
-                if vn.isAddrTied() if hasattr(vn, 'isAddrTied') else False:
+                if vn.isAddrTied():
                     usepoint = Address()
-                if hasattr(scope, 'addSymbol'):
-                    tp = vn.getHigh().getType() if hasattr(vn, 'getHigh') and vn.getHigh() is not None else None
-                    scope.addSymbol(name, tp, vn.getAddr(), usepoint)
+                scope.addSymbol(name, vn.getHigh().getType(), vn.getAddr(), usepoint)
 
     def syncVarnodesWithSymbol(self, iterobj, fl: int, ct) -> bool:
         """Update boolean properties and data-type on a set of Varnodes.
@@ -2797,29 +2847,18 @@ class Funcdata:
 
         C++ ref: ``Funcdata::applyUnionFacet``
         """
-        if entry is None:
-            return False
-        sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
-        if sym is None:
-            return False
-        if not hasattr(dhash, 'findOp'):
-            return False
+        sym = entry.getSymbol()
         op = dhash.findOp(self, entry.getFirstUseAddress(), entry.getHash())
         if op is None:
             return False
-        slot = dhash.getSlotFromHash(entry.getHash()) if hasattr(dhash, 'getSlotFromHash') else 0
-        fldNum = sym.getFieldNumber() if hasattr(sym, 'getFieldNumber') else -1
-        if fldNum < 0:
-            return False
-        try:
-            from ghidra.types.type_base import ResolvedUnion
-            resolve = ResolvedUnion(sym.getType(), fldNum, self._glb.types)
-            resolve.setLock(True)
-            if hasattr(self, 'setUnionField'):
-                return self.setUnionField(sym.getType(), op, slot, resolve)
-        except (ImportError, Exception):
-            pass
-        return False
+        from ghidra.analysis.dynamic import DynamicHash
+        from ghidra.types.resolve import ResolvedUnion
+
+        slot = DynamicHash.getSlotFromHash(entry.getHash())
+        fldNum = sym.getFieldNumber()
+        resolve = ResolvedUnion(sym.getType(), fldNum, self._glb.types)
+        resolve.setLock(True)
+        return self.setUnionField(sym.getType(), op, slot, resolve)
 
     def onlyOpUse(self, invn, opmatch, trial, mainFlags) -> bool:
         """Check if a Varnode is only used as a parameter to a given op.
@@ -3316,34 +3355,51 @@ class Funcdata:
 
     # --- Print / debug helpers ---
 
-    def printBlockTree(self) -> str:
+    def printBlockTree(self, s=None):
         """Print a description of control-flow structuring."""
+        import io
+
+        owns_stream = s is None
+        out = io.StringIO() if owns_stream else s
         if self._sblocks.getSize() != 0:
-            return str(self._sblocks)
-        return ""
+            self._sblocks.printTree(out, 0)
+        if owns_stream:
+            return out.getvalue()
+        return None
 
-    def printVarnodeTree(self) -> str:
+    def printVarnodeTree(self, s=None):
         """Print a description of all Varnodes."""
-        lines = []
-        for vn in self._vbank.beginLoc():
-            lines.append(str(vn))
-        return "\n".join(lines)
+        import io
 
-    def printLocalRange(self) -> str:
+        owns_stream = s is None
+        out = io.StringIO() if owns_stream else s
+        for vn in self._vbank.beginDef():
+            if hasattr(vn, "printInfo"):
+                vn.printInfo(out)
+            else:
+                out.write(f"{vn}\n")
+        if owns_stream:
+            return out.getvalue()
+        return None
+
+    def printLocalRange(self, s=None):
         """Print description of memory ranges associated with local scopes.
 
         C++ ref: ``Funcdata::printLocalRange``
         """
         import io
-        s = io.StringIO()
+        owns_stream = s is None
+        out = io.StringIO() if owns_stream else s
         if self._localmap is not None:
             if hasattr(self._localmap, 'printBounds'):
-                s.write(self._localmap.printBounds())
+                self._localmap.printBounds(out)
             if hasattr(self._localmap, 'childrenBegin'):
                 for child in self._localmap.childrenBegin():
                     if hasattr(child, 'printBounds'):
-                        s.write(child.printBounds())
-        return s.getvalue()
+                        child.printBounds(out)
+        if owns_stream:
+            return out.getvalue()
+        return None
 
     # --- Misc helpers ---
 
@@ -3355,14 +3411,11 @@ class Funcdata:
         C++ ref: ``Funcdata::constructConstSpacebase``
         """
         from ghidra.ir.varnode import Varnode as VnCls
-        addrSize = spc.getAddrSize() if hasattr(spc, 'getAddrSize') else 4
+        addrSize = spc.getAddrSize()
+        ct = self._glb.types.getTypeSpacebase(spc, Address())
+        ptr = self._glb.types.getTypePointer(addrSize, ct, spc.getWordSize())
         spacePtr = self.newConstant(addrSize, 0)
-        if self._glb is not None and hasattr(self._glb, 'types') and self._glb.types is not None:
-            ct = self._glb.types.getTypeSpacebase(spc, Address()) if hasattr(self._glb.types, 'getTypeSpacebase') else None
-            if ct is not None and hasattr(self._glb.types, 'getTypePointer'):
-                wordSize = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
-                ptr = self._glb.types.getTypePointer(addrSize, ct, wordSize)
-                spacePtr.updateType(ptr, True, True)
+        spacePtr.updateType(ptr, True, True)
         spacePtr.setFlags(VnCls.spacebase)
         return spacePtr
 
@@ -3377,24 +3430,17 @@ class Funcdata:
 
         C++ ref: ``Funcdata::spacebaseConstant``
         """
-        if rampoint is None or self._glb is None:
-            return
-        sz = rampoint.getAddrSize() if hasattr(rampoint, 'getAddrSize') else 4
-        spaceid = rampoint.getSpace() if hasattr(rampoint, 'getSpace') else None
+        from ghidra.core.space import AddrSpace
+        from ghidra.types.datatype import TYPE_UNKNOWN
 
-        # Build spacebase pointer type
-        sb_type = None
-        if hasattr(self._glb, 'types') and self._glb.types is not None:
-            if hasattr(self._glb.types, 'getTypeSpacebase'):
-                sb_type = self._glb.types.getTypeSpacebase(spaceid, Address())
-                wordSize = spaceid.getWordSize() if spaceid is not None and hasattr(spaceid, 'getWordSize') else 1
-                sb_type = self._glb.types.getTypePointer(sz, sb_type, wordSize)
+        sz = rampoint.getAddrSize()
+        spaceid = rampoint.getSpace()
+        sb_type = self._glb.types.getTypeSpacebase(spaceid, Address())
+        sb_type = self._glb.types.getTypePointer(sz, sb_type, spaceid.getWordSize())
 
-        # Calculate extra offset from entry start (in address units)
-        entry_off = entry.getAddr().getOffset() if hasattr(entry, 'getAddr') else 0
+        entry_off = entry.getAddr().getOffset()
         extra = rampoint.getOffset() - entry_off
-        if spaceid is not None and hasattr(spaceid, 'getWordSize') and spaceid.getWordSize() > 1:
-            extra = extra // spaceid.getWordSize()
+        extra = AddrSpace.byteToAddress(extra, rampoint.getSpace().getWordSize())
 
         isCopy = (op.code() == OpCode.CPUI_COPY)
         addOp = None
@@ -3406,10 +3452,7 @@ class Funcdata:
             if sz < origsize:
                 zextOp = op
             else:
-                if hasattr(op, 'insertInput'):
-                    op.insertInput(1)
-                else:
-                    self.opInsertInput(op, self.newConstant(1, 0), 1)
+                op.insertInput(1)
                 if origsize < sz:
                     subOp = op
                 elif extra != 0:
@@ -3419,8 +3462,7 @@ class Funcdata:
 
         # Create spacebase constant varnode
         spacebase_vn = self.newConstant(sz, 0)
-        if sb_type is not None:
-            spacebase_vn.updateType(sb_type, True, True)
+        spacebase_vn.updateType(sb_type, True, True)
         spacebase_vn.setFlags(Varnode.spacebase)
 
         if addOp is None:
@@ -3434,29 +3476,24 @@ class Funcdata:
         outvn = addOp.getOut()
 
         # newconstoff preserves origval in address units
-        mask = (1 << (sz * 8)) - 1
-        newconstoff = (origval - extra) & mask
+        newconstoff = origval - extra
         newconst = self.newConstant(sz, newconstoff)
         if hasattr(newconst, 'setPtrCheck'):
             newconst.setPtrCheck()
-        if spaceid is not None and hasattr(spaceid, 'isTruncated') and spaceid.isTruncated():
+        if spaceid.isTruncated():
             if hasattr(addOp, 'setPtrFlow'):
                 addOp.setPtrFlow()
         self.opSetInput(addOp, spacebase_vn, 0)
         self.opSetInput(addOp, newconst, 1)
 
         # Assign pointer type to output
-        if entry is not None and outvn is not None:
-            sym = entry.getSymbol() if hasattr(entry, 'getSymbol') else None
-            if sym is not None and hasattr(self._glb, 'types') and self._glb.types is not None:
-                entrytype = sym.getType() if hasattr(sym, 'getType') else None
-                if entrytype is not None and hasattr(self._glb.types, 'getTypePointerStripArray'):
-                    wordSize = spaceid.getWordSize() if spaceid is not None and hasattr(spaceid, 'getWordSize') else 1
-                    ptrentrytype = self._glb.types.getTypePointerStripArray(sz, entrytype, wordSize)
-                    typelock = sym.isTypeLocked() if hasattr(sym, 'isTypeLocked') else False
-                    if typelock and hasattr(entrytype, 'getMetatype') and entrytype.getMetatype() == 10:  # TYPE_UNKNOWN
-                        typelock = False
-                    outvn.updateType(ptrentrytype, typelock, False)
+        sym = entry.getSymbol()
+        entrytype = sym.getType()
+        ptrentrytype = self._glb.types.getTypePointerStripArray(sz, entrytype, spaceid.getWordSize())
+        typelock = sym.isTypeLocked()
+        if typelock and entrytype.getMetatype() == TYPE_UNKNOWN:
+            typelock = False
+        outvn.updateType(ptrentrytype, typelock, False)
 
         if extra != 0:
             if extraOp is None:
@@ -3466,7 +3503,7 @@ class Funcdata:
                 self.opInsertBefore(extraOp, op)
             else:
                 self.opSetOpcode(extraOp, OpCode.CPUI_INT_ADD)
-            extconst = self.newConstant(sz, extra & mask)
+            extconst = self.newConstant(sz, extra)
             if hasattr(extconst, 'setPtrCheck'):
                 extconst.setPtrCheck()
             self.opSetInput(extraOp, outvn, 0)
@@ -3501,8 +3538,7 @@ class Funcdata:
     def switchOverJumpTables(self, flow) -> None:
         """Convert jump-table addresses to basic block indices."""
         for jt in self._jumpvec:
-            if hasattr(jt, 'switchOver'):
-                jt.switchOver(flow)
+            jt.switchOver(flow)
 
     def issueDatatypeWarnings(self) -> None:
         """Add warning headers for any data-types that have been modified.
@@ -3512,14 +3548,8 @@ class Funcdata:
         if self._glb is None:
             return
         if hasattr(self._glb, 'types') and self._glb.types is not None:
-            tf = self._glb.types
-            if hasattr(tf, 'beginWarnings') and hasattr(tf, 'endWarnings'):
-                for w in tf.beginWarnings():
-                    msg = w.getWarning() if hasattr(w, 'getWarning') else str(w)
-                    self.warningHeader(msg)
-            elif hasattr(tf, 'getDirtyTypes'):
-                for dt in tf.getDirtyTypes():
-                    self.warningHeader("Data-type '%s' has been modified" % dt.getName())
+            for warning in self._glb.types.beginWarnings():
+                self.warningHeader(warning.getWarning())
 
     def enableJTCallback(self, cb) -> None:
         """Enable a jump-table callback."""
@@ -3550,34 +3580,32 @@ class Funcdata:
             A recovery mode string: 'success', 'fail_normal', 'fail_return',
             'fail_thunk', or None on error.
         """
+        from ghidra.analysis.jumptable import JumptableThunkError
+        from ghidra.core.error import LowlevelError
+
         if not partial.isJumptableRecoveryOn():
             partial._flags |= Funcdata.jumptablerecovery_on
             partial.truncatedFlow(self, flow)
 
-            if self._glb is not None and hasattr(self._glb, 'allacts'):
-                oldactname = self._glb.allacts.getCurrentName() if hasattr(self._glb.allacts, 'getCurrentName') else None
-                try:
-                    if hasattr(self._glb.allacts, 'setCurrent'):
-                        self._glb.allacts.setCurrent('jumptable')
-                    if hasattr(self, '_jtcallback') and self._jtcallback is not None:
-                        self._jtcallback(self, partial)
-                    else:
-                        cur = self._glb.allacts.getCurrent() if hasattr(self._glb.allacts, 'getCurrent') else None
-                        if cur is not None:
-                            cur.reset(partial)
-                            cur.perform(partial)
-                    if oldactname and hasattr(self._glb.allacts, 'setCurrent'):
-                        self._glb.allacts.setCurrent(oldactname)
-                except Exception as err:
-                    if oldactname and hasattr(self._glb.allacts, 'setCurrent'):
-                        self._glb.allacts.setCurrent(oldactname)
-                    self.warning(str(err), op.getAddr())
-                    return 'fail_normal'
+            oldactname = self._glb.allacts.getCurrentName()
+            try:
+                self._glb.allacts.setCurrent("jumptable")
+                jtcallback = getattr(self, "_jtcallback", None)
+                if jtcallback is not None:
+                    jtcallback(self, partial)
+                else:
+                    cur = self._glb.allacts.getCurrent()
+                    cur.reset(partial)
+                    cur.perform(partial)
+                self._glb.allacts.setCurrent(oldactname)
+            except LowlevelError as err:
+                self._glb.allacts.setCurrent(oldactname)
+                self.warning(err.explain, op.getAddr())
+                return 'fail_normal'
 
-        partop = partial.findOp(op.getSeqNum()) if hasattr(partial, 'findOp') else None
+        partop = partial.findOp(op.getSeqNum())
 
         if partop is None or partop.code() != OpCode.CPUI_BRANCHIND or partop.getAddr() != op.getAddr():
-            from ghidra.core.error import LowlevelError
             raise LowlevelError("Error recovering jumptable: Bad partial clone")
         if partop.isDead():
             return 'success'
@@ -3587,21 +3615,16 @@ class Funcdata:
             return 'fail_return'
 
         try:
-            if flow is not None and hasattr(jt, 'setLoadCollect'):
-                jt.setLoadCollect(flow.doesJumpRecord())
-            if hasattr(jt, 'setIndirectOp'):
-                jt.setIndirectOp(partop)
-            if hasattr(jt, 'isPartial') and jt.isPartial():
-                if hasattr(jt, 'recoverMultistage'):
-                    jt.recoverMultistage(partial)
+            jt.setLoadCollect(flow.doesJumpRecord())
+            jt.setIndirectOp(partop)
+            if jt.isPartial():
+                jt.recoverMultistage(partial)
             else:
-                if hasattr(jt, 'recoverAddresses'):
-                    jt.recoverAddresses(partial)
-        except Exception as err:
-            err_str = str(err)
-            if 'thunk' in err_str.lower():
-                return 'fail_thunk'
-            self.warning(err_str, op.getAddr())
+                jt.recoverAddresses(partial)
+        except JumptableThunkError:
+            return 'fail_thunk'
+        except LowlevelError as err:
+            self.warning(err.explain, op.getAddr())
             return 'fail_normal'
         return 'success'
 
@@ -3714,13 +3737,15 @@ class Funcdata:
 
         C++ ref: ``Funcdata::warning``
         """
+        from ghidra.database.comment import Comment
+
         if (self._flags & Funcdata.jumptablerecovery_on) != 0:
             msg = "WARNING (jumptable): "
         else:
             msg = "WARNING: "
         msg += txt
         if self._glb is not None and hasattr(self._glb, 'commentdb') and self._glb.commentdb is not None:
-            self._glb.commentdb.addCommentNoDuplicate(0x4, self._baseaddr, ad, msg)
+            self._glb.commentdb.addCommentNoDuplicate(Comment.CommentType.warning, self._baseaddr, ad, msg)
         elif self._glb is not None and hasattr(self._glb, 'printMessage'):
             self._glb.printMessage(msg)
 
@@ -3729,26 +3754,44 @@ class Funcdata:
 
         C++ ref: ``Funcdata::warningHeader``
         """
+        from ghidra.database.comment import Comment
+
         if (self._flags & Funcdata.jumptablerecovery_on) != 0:
             msg = "WARNING (jumptable): "
         else:
             msg = "WARNING: "
         msg += txt
         if self._glb is not None and hasattr(self._glb, 'commentdb') and self._glb.commentdb is not None:
-            self._glb.commentdb.addCommentNoDuplicate(0x8, self._baseaddr, self._baseaddr, msg)
+            self._glb.commentdb.addCommentNoDuplicate(
+                Comment.CommentType.warningheader,
+                self._baseaddr,
+                self._baseaddr,
+                msg,
+            )
         elif self._glb is not None and hasattr(self._glb, 'printMessage'):
             self._glb.printMessage(msg)
 
     # --- Flow and inline ---
 
     def followFlow(self, baddr, eaddr) -> None:
-        """Generate raw p-code and basic blocks for the function body."""
+        """Generate raw p-code and basic blocks for the function body.
+
+        C++ ref: ``Funcdata::followFlow``
+        """
         from ghidra.analysis.flow import FlowInfo
+        from ghidra.core.error import LowlevelError
+
+        if not self._obank.empty():
+            if (self._flags & Funcdata.blocks_generated) == 0:
+                raise LowlevelError("Function loaded for inlining")
+            return
+
         flow = FlowInfo(self, self._obank, self._bblocks, self._qlst)
         flow.setRange(baddr, eaddr)
         flow.setFlags(self._glb.flowoptions if self._glb else 0)
         flow.setMaximumInstructions(self._glb.max_instructions if self._glb else 100000)
         flow.generateOps()
+        self._size = flow.getSize()
         flow.generateBlocks()
         self._flags |= Funcdata.blocks_generated
         self.switchOverJumpTables(flow)
@@ -3762,9 +3805,8 @@ class Funcdata:
 
         C++ ref: ``Funcdata::truncatedFlow``
         """
-        from copy import copy
-
         from ghidra.analysis.flow import FlowInfo
+        from ghidra.analysis.jumptable import JumpTable
         from ghidra.core.error import LowlevelError
         from ghidra.core.space import IPTR_FSPEC
 
@@ -3793,15 +3835,7 @@ class Funcdata:
             if newop is None:
                 raise LowlevelError("Could not trace jumptable across partial clone")
 
-            jtclone = copy(oldjt)
-            jtclone.addresstable = list(oldjt.addresstable)
-            jtclone.label = list(oldjt.label)
-            jtclone.loadpoints = list(oldjt.loadpoints)
-            jtclone.block2addr = list(oldjt.block2addr)
-            if oldjt.jmodel is not None and hasattr(oldjt.jmodel, "clone"):
-                jtclone.jmodel = oldjt.jmodel.clone(jtclone)
-            if oldjt.origmodel is not None and hasattr(oldjt.origmodel, "clone"):
-                jtclone.origmodel = oldjt.origmodel.clone(jtclone)
+            jtclone = JumpTable(oldjt)
             jtclone.setIndirectOp(newop)
             self._jumpvec.append(jtclone)
 
@@ -3811,7 +3845,6 @@ class Funcdata:
         partialflow.clearFlags(~FlowInfo.possible_unreachable)
         partialflow.generateBlocks()
         self._flags |= Funcdata.blocks_generated
-        self.switchOverJumpTables(partialflow)
 
     def inlineFlow(self, inlinefd, flow, callop) -> int:
         """In-line the p-code of another function into \b this function.
@@ -3917,12 +3950,10 @@ class Funcdata:
         OVERRIDE_CALL_RETURN = 3
         OVERRIDE_RETURN = 4
 
-        # Get iterator range for ops at this address
+        # Match the native beginOp(addr)/endOp(addr) walk over the ordered op-tree.
         ops_at_addr = []
-        if hasattr(self._obank, 'beginDead'):
-            for op in self._obank.beginDead():
-                if op.getAddr() == addr:
-                    ops_at_addr.append(op)
+        if hasattr(self._obank, 'beginByAddr'):
+            ops_at_addr = list(self._obank.beginByAddr(addr))
 
         op = None
         if flowtype == OVERRIDE_BRANCH:
@@ -3980,40 +4011,33 @@ class Funcdata:
 
         C++ ref: ``Funcdata::doLiveInject``
         """
-        if payload is None or self._glb is None:
-            return
-        if not hasattr(self._glb, 'pcodeinjectlib'):
-            return
-        injectlib = self._glb.pcodeinjectlib
-        if injectlib is None:
-            return
+        from ghidra.sleigh.pcodeemit import PcodeEmitFd
 
-        # Set up emitter and context
-        try:
-            from ghidra.sleigh.pcodeemit import PcodeEmitFd
-        except ImportError:
-            return
+        injectlib = self._glb.pcodeinjectlib
         emitter = PcodeEmitFd()
         emitter.setFuncdata(self)
 
-        context = None
-        if hasattr(injectlib, 'getCachedContext'):
-            context = injectlib.getCachedContext()
-            if hasattr(context, 'clear'):
-                context.clear()
-            context.baseaddr = addr
-            context.nextaddr = addr
+        context = injectlib.getCachedContext()
+        context.clear()
+        context.baseaddr = addr
+        context.nextaddr = addr
 
-        # Snapshot dead list boundary
-        dead_before = list(self._obank.getDeadList()) if hasattr(self._obank, 'getDeadList') else []
+        dead_before = list(self._obank.getDeadList())
+        deadempty = len(dead_before) == 0
+        old_last = None if deadempty else dead_before[-1]
 
-        if hasattr(payload, 'inject') and context is not None:
-            payload.inject(context, emitter)
+        payload.inject(context, emitter)
 
-        # Collect newly injected ops (appeared in dead list after inject)
-        dead_after = list(self._obank.getDeadList()) if hasattr(self._obank, 'getDeadList') else []
-        before_set = set(id(o) for o in dead_before)
-        injected = [o for o in dead_after if id(o) not in before_set]
+        dead_after = list(self._obank.getDeadList())
+        if deadempty:
+            injected = dead_after
+        else:
+            start_index = -1
+            for idx, op in enumerate(dead_after):
+                if op is old_last:
+                    start_index = idx
+                    break
+            injected = dead_after[start_index + 1:] if start_index >= 0 else []
 
         # Insert each injected op into the basic block
         for op in injected:
@@ -4497,19 +4521,9 @@ class Funcdata:
 
         C++ ref: ``Funcdata::findSpacebaseInput``
         """
-        if spc is None or not hasattr(spc, 'numSpacebase'):
-            return None
-        if spc.numSpacebase() == 0:
-            return None
         base = spc.getSpacebase(0)
-        addr = base.getAddr() if hasattr(base, 'getAddr') else Address(base.space, base.offset)
-        if hasattr(self._vbank, 'findInput'):
-            return self._vbank.findInput(base.size, addr)
-        # Fallback: scan
-        for vn in self._vbank.beginLoc():
-            if vn.isInput() and vn.getAddr() == addr and vn.getSize() == base.size:
-                return vn
-        return None
+        addr = Address(base.space, base.offset)
+        return self._vbank.findInput(base.size, addr)
 
     def constructSpacebaseInput(self, spc):
         """If it doesn't exist, create an input Varnode of the base register for the given space.
@@ -4520,26 +4534,21 @@ class Funcdata:
 
         C++ ref: ``Funcdata::constructSpacebaseInput``
         """
+        from ghidra.core.error import LowlevelError
         from ghidra.ir.varnode import Varnode as VnCls
         spacePtr = self.findSpacebaseInput(spc)
         if spacePtr is not None:
             return spacePtr
-        if spc is None or not hasattr(spc, 'numSpacebase') or spc.numSpacebase() == 0:
-            raise Exception("Unable to construct pointer into space: " + (spc.getName() if spc else "<null>"))
+        if spc.numSpacebase() == 0:
+            raise LowlevelError("Unable to construct pointer into space: " + spc.getName())
         base = spc.getSpacebase(0)
-        addr = base.getAddr() if hasattr(base, 'getAddr') else Address(base.space, base.offset)
-        # Build pointer type
-        ptr = None
-        if self._glb is not None and hasattr(self._glb, 'types') and self._glb.types is not None:
-            ct = self._glb.types.getTypeSpacebase(spc, self.getAddress()) if hasattr(self._glb.types, 'getTypeSpacebase') else None
-            if ct is not None and hasattr(self._glb.types, 'getTypePointer'):
-                wordSize = spc.getWordSize() if hasattr(spc, 'getWordSize') else 1
-                ptr = self._glb.types.getTypePointer(base.size, ct, wordSize)
+        addr = Address(base.space, base.offset)
+        ct = self._glb.types.getTypeSpacebase(spc, self.getAddress())
+        ptr = self._glb.types.getTypePointer(base.size, ct, spc.getWordSize())
         spacePtr = self.newVarnode(base.size, addr, ptr)
         spacePtr = self.setInputVarnode(spacePtr)
         spacePtr.setFlags(VnCls.spacebase)
-        if ptr is not None:
-            spacePtr.updateType(ptr, True, True)
+        spacePtr.updateType(ptr, True, True)
         return spacePtr
 
     def newSpacebasePtr(self, spc):
@@ -4563,17 +4572,18 @@ class Funcdata:
         return []
 
     def getStoreGuards(self):
-        return self._heritage.getStoreGuards() if self._heritage else []
+        return self._heritage.getStoreGuards()
 
     def getLoadGuards(self):
-        return self._heritage.getLoadGuards() if self._heritage else []
+        return self._heritage.getLoadGuards()
 
     def getStoreGuard(self, op):
-        return self._heritage.getStoreGuard(op) if self._heritage else None
+        return self._heritage.getStoreGuard(op)
 
     # --- Encode / decode ---
 
-    def encodeVarnode(self, encoder, iter_vns) -> None:
+    @staticmethod
+    def encodeVarnode(encoder, iter_vns, enditer=None) -> None:
         """Encode a set of Varnodes to stream.
 
         C++ ref: ``Funcdata::encodeVarnode``
@@ -4592,21 +4602,21 @@ class Funcdata:
         encoder.openElement(ELEM_FUNCTION)
         if uid != 0:
             encoder.writeUnsignedInteger(ATTRIB_ID, uid)
-        encoder.writeString(ATTRIB_NAME, self.name)
-        encoder.writeSignedInteger(ATTRIB_SIZE, self.size)
+        encoder.writeString(ATTRIB_NAME, self._name)
+        encoder.writeSignedInteger(ATTRIB_SIZE, self._size)
         if self.hasNoCode():
             encoder.writeBool(ATTRIB_NOCODE, True)
-        self.baseaddr.encode(encoder)
+        self._baseaddr.encode(encoder)
 
         if not self.hasNoCode():
-            if self._localmap is not None and hasattr(self._localmap, 'encodeRecursive'):
+            if self._localmap is not None:
                 self._localmap.encodeRecursive(encoder, False)
 
         if savetree:
             self.encodeTree(encoder)
             self.encodeHigh(encoder)
         self.encodeJumpTable(encoder)
-        self.funcp.encode(encoder)
+        self._funcp.encode(encoder)
         if hasattr(self, '_localoverride') and self._localoverride is not None:
             self._localoverride.encode(encoder, self._glb)
         encoder.closeElement(ELEM_FUNCTION)
@@ -4616,63 +4626,84 @@ class Funcdata:
 
         C++ ref: ``Funcdata::decode``
         """
+        from ghidra.core.error import LowlevelError
         from ghidra.core.marshal import (
             ELEM_FUNCTION, ELEM_LOCALDB, ELEM_OVERRIDE, ELEM_PROTOTYPE,
             ELEM_JUMPTABLELIST, ATTRIB_NAME, ATTRIB_SIZE, ATTRIB_ID,
             ATTRIB_NOCODE, ATTRIB_LABEL,
         )
+        from ghidra.database.varmap import ScopeLocal
+
         self._name = ""
+        self._displayName = ""
         self._size = -1
         uid = 0
+        stackid = self._glb.getStackSpace() if self._glb is not None and hasattr(self._glb, "getStackSpace") else None
+        symboltab = getattr(self._glb, "symboltab", None)
         elemId = decoder.openElement(ELEM_FUNCTION)
-        for _ in range(100):
+        while True:
             attribId = decoder.getNextAttributeId()
             if attribId == 0:
                 break
-            if attribId == ATTRIB_NAME.id:
+            if attribId == ATTRIB_NAME:
                 self._name = decoder.readString()
-            elif attribId == ATTRIB_SIZE.id:
+            elif attribId == ATTRIB_SIZE:
                 self._size = decoder.readSignedInteger()
-            elif attribId == ATTRIB_ID.id:
+            elif attribId == ATTRIB_ID:
                 uid = decoder.readUnsignedInteger()
-            elif attribId == ATTRIB_NOCODE.id:
+            elif attribId == ATTRIB_NOCODE:
                 if decoder.readBool():
                     self._flags |= Funcdata.no_code
-            elif attribId == ATTRIB_LABEL.id:
+            elif attribId == ATTRIB_LABEL:
                 self._displayName = decoder.readString()
         if not self._name:
-            raise RuntimeError("Missing function name")
+            raise LowlevelError("Missing function name")
         if not self._displayName:
             self._displayName = self._name
         if self._size == -1:
-            raise RuntimeError("Missing function size")
-        # Decode base address
-        if hasattr(Address, 'decode'):
-            self._baseaddr = Address.decode(decoder)
-        # Decode child elements
+            raise LowlevelError("Missing function size")
+        self._baseaddr = Address.decode(decoder)
         while True:
             subId = decoder.peekElement()
             if subId == 0:
                 break
-            if subId == ELEM_LOCALDB.id:
-                # Decode local scope
-                if self._glb is not None and hasattr(self._glb, 'symboltab'):
-                    self._glb.symboltab.decodeScope(decoder, None)
-            elif subId == ELEM_OVERRIDE.id:
-                if hasattr(self, '_localoverride') and self._localoverride is not None:
-                    self._localoverride.decode(decoder, self._glb)
-                else:
-                    decoder.skipElement()
-            elif subId == ELEM_PROTOTYPE.id:
+            if subId == ELEM_LOCALDB:
                 if self._localmap is not None:
-                    self._funcp.setScope(self._localmap, Address(self._baseaddr.getSpace(),
-                                                                 self._baseaddr.getOffset() - 1))
+                    raise LowlevelError("Pre-existing local scope when restoring: " + self._name)
+                newMap = ScopeLocal(uid, stackid, self, self._glb)
+                if symboltab is None or not hasattr(symboltab, "decodeScope"):
+                    raise LowlevelError("Missing symbol table scope decoder")
+                symboltab.decodeScope(decoder, newMap)
+                self._localmap = newMap
+            elif subId == ELEM_OVERRIDE:
+                self.getOverride().decode(decoder, self._glb)
+            elif subId == ELEM_PROTOTYPE:
+                if self._localmap is None:
+                    newMap = ScopeLocal(uid, stackid, self, self._glb)
+                    if symboltab is not None and hasattr(symboltab, "attachScope"):
+                        symboltab.attachScope(
+                            newMap,
+                            symboltab.getGlobalScope() if hasattr(symboltab, "getGlobalScope") else None,
+                        )
+                    self._localmap = newMap
+                self._funcp.setScope(self._localmap, self._baseaddr + -1)
                 self._funcp.decode(decoder, self._glb)
-            elif subId == ELEM_JUMPTABLELIST.id:
+            elif subId == ELEM_JUMPTABLELIST:
                 self.decodeJumpTable(decoder)
             else:
                 decoder.skipElement()
         decoder.closeElement(elemId)
+
+        if self._localmap is None:
+            newMap = ScopeLocal(uid, stackid, self, self._glb)
+            if symboltab is not None and hasattr(symboltab, "attachScope"):
+                symboltab.attachScope(
+                    newMap,
+                    symboltab.getGlobalScope() if hasattr(symboltab, "getGlobalScope") else None,
+                )
+            self._localmap = newMap
+            self._funcp.setScope(self._localmap, self._baseaddr + -1)
+        self._localmap.resetLocalWindow()
         return uid
 
     def encodeTree(self, encoder) -> None:
@@ -4693,8 +4724,9 @@ class Funcdata:
             base = self._glb.getSpace(i)
             if base is None or base.getType() == IPTR_IOP:
                 continue
-            vns = self._vbank.beginLocSpace(base)
-            self.encodeVarnode(encoder, vns)
+            beginiter = self._vbank.beginLocSpace(base)
+            enditer = self._vbank.endLocSpace(base)
+            self.encodeVarnode(encoder, beginiter, enditer)
         encoder.closeElement(ELEM_VARNODES)
 
         # Encode each basic block with its ops
@@ -4728,18 +4760,17 @@ class Funcdata:
         if not self.isHighOn():
             return
         encoder.openElement(ELEM_HIGHLIST)
-        seen = set()
-        for vn in self._vbank.allVarnodes():
+        for vn in self._vbank.beginLoc():
             if vn.isAnnotation():
                 continue
             high = vn.getHigh()
-            if high is None:
+            if high.isMark():
                 continue
-            hid = id(high)
-            if hid in seen:
-                continue
-            seen.add(hid)
+            high.setMark()
             high.encode(encoder)
+        for vn in self._vbank.beginLoc():
+            if not vn.isAnnotation():
+                vn.getHigh().clearMark()
         encoder.closeElement(ELEM_HIGHLIST)
 
     def encodeJumpTable(self, encoder) -> None:
@@ -5587,7 +5618,7 @@ class Funcdata:
 
     # --- Print / debug ---
 
-    def printRaw(self) -> str:
+    def printRaw(self, s=None):
         """Print raw p-code op descriptions.
 
         If no basic blocks exist, prints all raw ops from the op bank.
@@ -5597,26 +5628,32 @@ class Funcdata:
         C++ ref: ``Funcdata::printRaw``
         """
         import io
-        s = io.StringIO()
+
+        from ghidra.core.error import RecovError
+
+        owns_stream = s is None
+        out = io.StringIO() if owns_stream else s
         if self._bblocks.getSize() == 0:
             if self._obank.empty() if hasattr(self._obank, 'empty') else True:
-                return "No operations to print"
-            s.write("Raw operations:\n")
+                raise RecovError("No operations to print")
+            out.write("Raw operations:\n")
             for op in self._obank.beginAll() if hasattr(self._obank, 'beginAll') else []:
-                s.write(f"{op.getSeqNum()}:\t")
-                s.write(op.printRaw() if hasattr(op, 'printRaw') else str(op))
-                s.write("\n")
+                out.write(f"{op.getSeqNum()}:\t")
+                out.write(op.printRaw() if hasattr(op, 'printRaw') else str(op))
+                out.write("\n")
         else:
             if hasattr(self._bblocks, 'printRaw'):
-                s.write(self._bblocks.printRaw())
+                self._bblocks.printRaw(out)
             else:
                 for i in range(self._bblocks.getSize()):
                     bl = self._bblocks.getBlock(i)
                     if isinstance(bl, BlockBasic):
-                        s.write(f"  Block {bl.getIndex()} ({bl.getStart()} - {bl.getStop()}):\n")
+                        out.write(f"  Block {bl.getIndex()} ({bl.getStart()} - {bl.getStop()}):\n")
                         for op in bl.getOpList():
-                            s.write(f"    {op.printRaw()}\n")
-        return s.getvalue()
+                            out.write(f"    {op.printRaw()}\n")
+        if owns_stream:
+            return out.getvalue()
+        return None
 
     def find(self, addr) -> Optional[Varnode]:
         """Find a Varnode by address."""

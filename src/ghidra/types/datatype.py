@@ -2469,6 +2469,17 @@ class TypeSpacebase(Datatype):
 # TypeFactory
 # =========================================================================
 
+class DatatypeWarning:
+    """A warning associated with a Datatype."""
+
+    def __init__(self, dt: Datatype, warn: str) -> None:
+        self.dataType = dt
+        self.warning = warn
+
+    def getWarning(self) -> str:
+        return self.warning
+
+
 class TypeFactory:
     """A container for Datatype objects.
 
@@ -3106,7 +3117,17 @@ class TypeFactory:
         dt.flags |= Datatype.warning_issued
         if not hasattr(self, '_warnings'):
             self._warnings = []
-        self._warnings.append((dt, warn))
+        self._warnings.append(DatatypeWarning(dt, warn))
+
+    def beginWarnings(self):
+        """Return an iterator over issued data-type warnings."""
+        if not hasattr(self, '_warnings'):
+            self._warnings = []
+        return iter(self._warnings)
+
+    def endWarnings(self):
+        """Return the logical end of the warning sequence."""
+        return None
 
     def removeWarning(self, dt: Datatype) -> None:
         """Remove all warnings for the given data-type.
@@ -3115,8 +3136,13 @@ class TypeFactory:
         """
         if not hasattr(self, '_warnings'):
             return
-        self._warnings = [(d, w) for d, w in self._warnings
-                          if not (d.getId() == dt.getId() and d.getName() == dt.getName())]
+        self._warnings = [
+            warning for warning in self._warnings
+            if not (
+                warning.dataType.getId() == dt.getId()
+                and warning.dataType.getName() == dt.getName()
+            )
+        ]
 
     # --- Additional type creation ---
 

@@ -10,6 +10,7 @@ from enum import IntFlag
 from typing import TYPE_CHECKING, Optional, List, Iterator, Set
 
 from ghidra.core.address import Address, calc_mask
+from ghidra.core.error import LowlevelError
 from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_JOIN, IPTR_FSPEC, IPTR_IOP, IPTR_INTERNAL, IPTR_PROCESSOR, IPTR_SPACEBASE
 from ghidra.core.pcoderaw import VarnodeData
 from ghidra.core.opcodes import OpCode as _OpCode
@@ -1090,32 +1091,47 @@ class Varnode:
             return ct
         return None
 
-    def printInfo(self) -> str:
+    def printInfo(self, s=None):
         """Print raw attribute info about the Varnode."""
-        parts = [self.printRaw()]
+        import io
+
+        owns_stream = s is None
+        out = io.StringIO() if owns_stream else s
+
+        dtype = getattr(self, "_type", None)
+        if dtype is not None and hasattr(dtype, "printRaw"):
+            out.write(dtype.printRaw())
+        else:
+            out.write("unknown")
+        out.write(" = ")
+        out.write(self.printRaw())
         if self.isAddrTied():
-            parts.append('tied')
+            out.write(" tied")
         if self.isMapped():
-            parts.append('mapped')
+            out.write(" mapped")
         if self.isPersist():
-            parts.append('persistent')
+            out.write(" persistent")
         if self.isTypeLock():
-            parts.append('tlock')
+            out.write(" tlock")
         if self.isNameLock():
-            parts.append('nlock')
+            out.write(" nlock")
         if self.isSpacebase():
-            parts.append('base')
+            out.write(" base")
         if self.isUnaffected():
-            parts.append('unaff')
+            out.write(" unaff")
         if self.isImplied():
-            parts.append('implied')
+            out.write(" implied")
         if self.isAddrForce():
-            parts.append('addrforce')
+            out.write(" addrforce")
         if self.isReadOnly():
-            parts.append('readonly')
-        parts.append(f'consumed=0x{self._consumed:x}')
-        parts.append(f'create=0x{self._create_index:x}')
-        return ' '.join(parts)
+            out.write(" readonly")
+        out.write(f" (consumed=0x{getattr(self, '_consumed', 0):x})")
+        out.write(f" (internal={hex(id(self))})")
+        out.write(f" (create=0x{getattr(self, '_create_index', 0):x})")
+        out.write("\n")
+        if owns_stream:
+            return out.getvalue()
+        return None
 
     def printCover(self) -> str:
         """Print raw coverage info."""
@@ -1330,6 +1346,21 @@ def _sort_varnode_def_loc_key(vn: Varnode) -> tuple[int, ...]:
     return tuple(key)
 
 
+def _sort_varnode_loc_def_key(vn: Varnode) -> tuple[int, ...]:
+    key = [*_sort_address_key(vn.getAddr()), vn.getSize()]
+    input_or_written = vn.getFlags() & (Varnode.input | Varnode.written)
+    key.append(((input_or_written - 1) & 0xFFFFFFFF))
+    if input_or_written == Varnode.written:
+        seq = vn.getDef().getSeqNum()
+        key.extend((*_sort_address_key(seq.getAddr()), seq.getTime()))
+        key.append(0)
+    elif input_or_written == 0:
+        key.extend((0, 0, vn.getCreateIndex()))
+    else:
+        key.extend((0, 0, 0))
+    return tuple(key)
+
+
 # =========================================================================
 # VarnodeBank
 # =========================================================================
@@ -1417,6 +1448,8 @@ class VarnodeBank:
 
     def destroy(self, vn: Varnode) -> None:
         """Remove a Varnode from the bank (O(1) via dict pop)."""
+        if vn.getDef() is not None or not vn.hasNoDescend():
+            raise LowlevelError("Deleting integrated varnode")
         vnid = id(vn)
         self._loc_tree.pop(vnid, None)
         self._def_tree.pop(vnid, None)
@@ -1433,6 +1466,8 @@ class VarnodeBank:
         sbucket = self._space_varnodes.get(spc_id)
         if sbucket is not None:
             sbucket.discard(vn)
+            if not sbucket:
+                del self._space_varnodes[spc_id]
 
     def clearDead(self) -> None:
         """Remove Varnodes that have no def and no descendants."""
@@ -1461,7 +1496,7 @@ class VarnodeBank:
         return self._create_index
 
     def beginLoc(self) -> Iterator[Varnode]:
-        return iter(self._loc_tree.values())
+        return iter(sorted(self._loc_tree.values(), key=_sort_varnode_loc_def_key))
 
     def beginDef(self) -> Iterator[Varnode]:
         return iter(sorted(self._def_tree.values(), key=_sort_varnode_def_loc_key))
@@ -1492,16 +1527,38 @@ class VarnodeBank:
     def createUnique(self, s: int, dt=None) -> Varnode:
         """Create a temporary Varnode in unique space."""
         from ghidra.core.address import Address as Addr
-        # Use a simple unique offset scheme
-        addr = Addr(None, self._uniq_id)  # Placeholder unique address
+        space = self._uniq_space
+        if space is None and self._manage is not None and hasattr(self._manage, 'getUniqueSpace'):
+            space = self._manage.getUniqueSpace()
+            self._uniq_space = space
+        if self._uniq_id == 0:
+            if self._manage is not None and hasattr(self._manage, 'getUniqueBase'):
+                self._uniq_id = self._manage.getUniqueBase()
+            elif space is not None and hasattr(space, 'getTrans'):
+                trans = space.getTrans()
+                if hasattr(trans, 'getUniqueStart'):
+                    self._uniq_id = trans.getUniqueStart(0)
+        addr = Addr(space, self._uniq_id)
         self._uniq_id += s
         return self.create(s, addr, dt)
 
     def createDefUnique(self, s: int, dt, op) -> Varnode:
         """Create a temporary Varnode as output of a PcodeOp."""
-        vn = self.createUnique(s, dt)
-        vn.setDef(op)
-        return vn
+        from ghidra.core.address import Address as Addr
+        space = self._uniq_space
+        if space is None and self._manage is not None and hasattr(self._manage, 'getUniqueSpace'):
+            space = self._manage.getUniqueSpace()
+            self._uniq_space = space
+        if self._uniq_id == 0:
+            if self._manage is not None and hasattr(self._manage, 'getUniqueBase'):
+                self._uniq_id = self._manage.getUniqueBase()
+            elif space is not None and hasattr(space, 'getTrans'):
+                trans = space.getTrans()
+                if hasattr(trans, 'getUniqueStart'):
+                    self._uniq_id = trans.getUniqueStart(0)
+        addr = Addr(space, self._uniq_id)
+        self._uniq_id += s
+        return self.createDef(s, addr, dt, op)
 
     def numVarnodes(self) -> int:
         return len(self._loc_tree)
@@ -1647,7 +1704,10 @@ class VarnodeBank:
 
     def beginLocSpace(self, spaceid: AddrSpace) -> List[Varnode]:
         """Get Varnodes in given address space sorted by location."""
-        return [vn for vn in self._loc_tree.values() if vn.getSpace() is spaceid]
+        return sorted(
+            (vn for vn in self._loc_tree.values() if vn.getSpace() is spaceid),
+            key=_sort_varnode_loc_def_key,
+        )
 
     def endLocSpace(self, spaceid: AddrSpace) -> List[Varnode]:
         return []
@@ -1658,8 +1718,14 @@ class VarnodeBank:
 
     def beginLocSize(self, s: int, addr: Address) -> List[Varnode]:
         """Get Varnodes of given size at given address."""
-        return [vn for vn in self._loc_tree.values()
-                if vn.getAddr() == addr and vn.getSize() == s]
+        bucket = self._addr_idx.get(self._addr_key(addr, s))
+        if bucket is None:
+            return []
+        loc_tree = self._loc_tree
+        return sorted(
+            (loc_tree[vnid] for vnid in bucket if vnid in loc_tree),
+            key=_sort_varnode_loc_def_key,
+        )
 
     def beginLocFlags(self, s: int, addr: Address, fl: int) -> List[Varnode]:
         """Get Varnodes of given size at address with matching flags."""
