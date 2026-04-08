@@ -1716,6 +1716,13 @@ class VarnodeBank:
         """Get Varnodes starting at given address."""
         return [vn for vn in self._loc_tree.values() if vn.getAddr() == addr]
 
+    def endLocAddr(self, addr: Address) -> List[Varnode]:
+        """Get Varnodes that start strictly after the given address."""
+        return sorted(
+            (vn for vn in self._loc_tree.values() if addr < vn.getAddr()),
+            key=_sort_varnode_loc_def_key,
+        )
+
     def beginLocSize(self, s: int, addr: Address) -> List[Varnode]:
         """Get Varnodes of given size at given address."""
         bucket = self._addr_idx.get(self._addr_key(addr, s))
@@ -1724,6 +1731,17 @@ class VarnodeBank:
         loc_tree = self._loc_tree
         return sorted(
             (loc_tree[vnid] for vnid in bucket if vnid in loc_tree),
+            key=_sort_varnode_loc_def_key,
+        )
+
+    def endLocSize(self, s: int, addr: Address) -> List[Varnode]:
+        """Get Varnodes strictly after the given size/address range key."""
+        return sorted(
+            (
+                vn
+                for vn in self._loc_tree.values()
+                if vn.getAddr() > addr or (vn.getAddr() == addr and vn.getSize() > s)
+            ),
             key=_sort_varnode_loc_def_key,
         )
 
@@ -1741,6 +1759,78 @@ class VarnodeBank:
             elif fl == 0 and vn_fl == 0:
                 result.append(vn)
         return result
+
+    def endLocFlags(self, s: int, addr: Address, fl: int) -> List[Varnode]:
+        """Get Varnodes strictly after the given size/address/flag range key."""
+        result = []
+        for vn in self._loc_tree.values():
+            if vn.getAddr() > addr:
+                result.append(vn)
+                continue
+            if vn.getAddr() != addr:
+                continue
+            if vn.getSize() > s:
+                result.append(vn)
+                continue
+            if vn.getSize() != s:
+                continue
+            if fl == Varnode.input:
+                if not vn.isInput():
+                    result.append(vn)
+            elif fl == Varnode.written:
+                if not vn.isInput() and not vn.isWritten():
+                    result.append(vn)
+        return sorted(result, key=_sort_varnode_loc_def_key)
+
+    def beginLocDef(
+        self, s: int, addr: Address, pc: Address, uniq: int = None
+    ) -> List[Varnode]:
+        """Get written Varnodes at the location whose defining SeqNum is >= (pc, uniq)."""
+        min_uniq = 0 if uniq is None else uniq
+        result = []
+        for vn in self.beginLocSize(s, addr):
+            if not vn.isWritten():
+                continue
+            op = vn.getDef()
+            if op is None:
+                continue
+            op_addr = op.getAddr()
+            op_time = op.getTime()
+            if op_addr < pc or (op_addr == pc and op_time < min_uniq):
+                continue
+            result.append(vn)
+        return result
+
+    def endLocDef(
+        self, s: int, addr: Address, pc: Address, uniq: int = None
+    ) -> List[Varnode]:
+        """Get Varnodes strictly after the written (size, addr, pc, uniq) boundary."""
+        result = []
+        for vn in self._loc_tree.values():
+            if vn.getAddr() > addr:
+                result.append(vn)
+                continue
+            if vn.getAddr() != addr:
+                continue
+            if vn.getSize() > s:
+                result.append(vn)
+                continue
+            if vn.getSize() != s:
+                continue
+            if not vn.isWritten():
+                if not vn.isInput():
+                    result.append(vn)
+                continue
+            op = vn.getDef()
+            if op is None:
+                continue
+            op_addr = op.getAddr()
+            if op_addr > pc:
+                result.append(vn)
+                continue
+            if uniq is not None and op_addr == pc and op.getTime() > uniq:
+                result.append(vn)
+        return sorted(result, key=_sort_varnode_loc_def_key)
 
     def beginDefFlags(self, fl: int) -> List[Varnode]:
         """Get Varnodes by definition property."""
@@ -1760,15 +1850,50 @@ class VarnodeBank:
                 key=_sort_varnode_def_loc_key,
             )
 
+    def endDefFlags(self, fl: int) -> List[Varnode]:
+        """Get Varnodes strictly after the given definition property partition."""
+        if fl == Varnode.input:
+            return sorted(
+                (vn for vn in self._def_tree.values() if not vn.isInput()),
+                key=_sort_varnode_def_loc_key,
+            )
+        if fl == Varnode.written:
+            return sorted(
+                (vn for vn in self._def_tree.values() if vn.isFree()),
+                key=_sort_varnode_def_loc_key,
+            )
+        return []
+
     def beginDefFlagsAddr(self, fl: int, addr: Address) -> List[Varnode]:
         """Get Varnodes by definition property and address."""
+        if fl == Varnode.written:
+            raise LowlevelError("Cannot get contiguous written AND addressed")
         if fl == Varnode.input:
             return sorted(
                 (vn for vn in self._def_tree.values()
                  if vn.isInput() and vn.getAddr() == addr),
                 key=_sort_varnode_def_loc_key,
             )
-        return []
+        return sorted(
+            (vn for vn in self._def_tree.values()
+             if vn.isFree() and vn.getAddr() == addr),
+            key=_sort_varnode_def_loc_key,
+        )
+
+    def endDefFlagsAddr(self, fl: int, addr: Address) -> List[Varnode]:
+        """Get Varnodes strictly after the addressed input/free definition partition."""
+        if fl == Varnode.written:
+            raise LowlevelError("Cannot get contiguous written AND addressed")
+        group = ((fl - 1) & 0xFFFFFFFF)
+        boundary_key = (group, *_sort_address_key(addr), 1000000, 0)
+        return sorted(
+            (
+                vn
+                for vn in self._def_tree.values()
+                if _sort_varnode_def_loc_key(vn) >= boundary_key
+            ),
+            key=_sort_varnode_def_loc_key,
+        )
 
     def overlapLoc(self, startiter, bounds: list) -> int:
         """Given start, return maximal range of overlapping Varnodes.
@@ -1776,35 +1901,43 @@ class VarnodeBank:
         Returns union of Varnode flags across the range.
         bounds is filled with sub-range iterators (as lists of Varnodes).
         """
-        # Simplified Python version: collect all overlapping varnodes
-        all_vns = list(self._loc_tree.values())
-        if not all_vns:
-            return 0
-        # Find the varnode at startiter position
-        start_idx = 0
         if isinstance(startiter, int):
-            start_idx = startiter
-        vn = all_vns[start_idx]
+            all_vns = sorted(self._loc_tree.values(), key=_sort_varnode_loc_def_key)
+            iter_vns = all_vns[startiter:]
+        elif isinstance(startiter, Varnode):
+            all_vns = sorted(self._loc_tree.values(), key=_sort_varnode_loc_def_key)
+            try:
+                start_idx = all_vns.index(startiter)
+            except ValueError:
+                return 0
+            iter_vns = all_vns[start_idx:]
+        else:
+            iter_vns = list(startiter)
+        if not iter_vns:
+            return 0
+        vn = iter_vns[0]
         spc = vn.getSpace()
         off = vn.getOffset()
         maxOff = off + (vn.getSize() - 1)
         flags = vn.getFlags()
-        group = [vn]
-        idx = start_idx + 1
-        while idx < len(all_vns):
-            vn2 = all_vns[idx]
-            if vn2.getSpace() is not spc or vn2.getOffset() > maxOff:
+        bounds.append(iter_vns)
+        iter_vns = self.endLocFlags(vn.getSize(), vn.getAddr(), Varnode.written)
+        bounds.append(iter_vns)
+        while iter_vns:
+            vn = iter_vns[0]
+            if vn.getSpace() is not spc or vn.getOffset() > maxOff:
                 break
-            if vn2.isFree():
-                idx += 1
+            if vn.isFree():
+                iter_vns = self.endLocFlags(vn.getSize(), vn.getAddr(), 0)
                 continue
-            endOff = vn2.getOffset() + (vn2.getSize() - 1)
+            endOff = vn.getOffset() + (vn.getSize() - 1)
             if endOff > maxOff:
                 maxOff = endOff
-            flags |= vn2.getFlags()
-            group.append(vn2)
-            idx += 1
-        bounds.extend(group)
+            flags |= vn.getFlags()
+            bounds.append(iter_vns)
+            iter_vns = self.endLocFlags(vn.getSize(), vn.getAddr(), Varnode.written)
+            bounds.append(iter_vns)
+        bounds.append(iter_vns)
         return flags
 
     def verifyIntegrity(self) -> None:

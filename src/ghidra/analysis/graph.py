@@ -7,7 +7,7 @@ and DAG-based structuring support.
 """
 
 from __future__ import annotations
-from typing import List, Optional, Set, Dict, Tuple
+from typing import List, Optional, Set, Dict, Tuple, TextIO
 
 
 class DomInfo:
@@ -391,3 +391,199 @@ class SCCDetector:
             if len(scc) > 1 and nodeIdx in scc:
                 return True
         return False
+
+
+_BLOCK_ATTRIBUTES = (
+    "\n// Attributes\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=SizeOut,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=SizeIn,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Internal,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Index,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Start,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Stop,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=SetKeyAttribute,\n"
+    "        Category=Vertices,"
+    "        Name=Index;\n\n"
+)
+
+_BLOCK_PROPERTIES = (
+    "\n// AutomaticArrangement\n"
+    "  *CMD = AlterLocalPreferences, Name = AutomaticArrangement,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  EnableAutomaticArrangement=true,\n"
+    "  OnlyActOnVerticesWithoutCoordsIfOff=false,\n"
+    "  DontUpdateMediumWithUserArrangement=false,\n"
+    "  UserAddedArrangmentParams=({ServiceName=SimpleHierarchyFromSources,ServiceParams={~SkipPromptForParams=true}}),\n"
+    "  SmallSize=50,\n"
+    "  DontUpdateLargeWithUserArrangement=true,\n"
+    "  NewVertexActionIfOff=ArrangeByMDS,\n"
+    "  MediumSizeArrangement=SimpleHierarchyFromSources,\n"
+    "  SmallSizeArrangement=SimpleHierarchyFromSources,\n"
+    "  MediumSize=800,\n"
+    "  LargeSizeArrangement=ArrangeInCircle,\n"
+    "  DontUpdateSmallWithUserArrangement=false,\n"
+    "  ActionSizeGainIfOff=1.0;\n"
+    "\n// VertexColors\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexColors,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Mapping=({DisplayChoice=Red,AttributeValue=0},\n"
+    "  {DisplayChoice=Blue,AttributeValue=1},\n"
+    "  {DisplayChoice=Yellow,AttributeValue=2}),\n"
+    "  ChoiceForValueNotCovered=Purple,\n"
+    "  Extraction=CompleteValue,\n"
+    "  ExtractionParams={},\n"
+    "  AttributeName=SizeOut,\n"
+    "  ChoiceForMissingValue=Purple,\n"
+    "  CanOverride=true,\n"
+    "  OverrideAttributeName=Color,\n"
+    "  UsingRange=false;\n"
+    "\n//     VertexIcons\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexIcons,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Mapping=({DisplayChoice=Square,AttributeValue=0}),\n"
+    "  ChoiceForValueNotCovered=Circle,\n"
+    "  Extraction=CompleteValue,\n"
+    "  ExtractionParams={},\n"
+    "  AttributeName=SizeIn,\n"
+    "  ChoiceForMissingValue=Circle,\n"
+    "  CanOverride=true,\n"
+    "  OverrideAttributeName=Icon,\n"
+    "  UsingRange=false;\n"
+    "\n//     VertexLabels\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexLabels,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Center=({MaxLines=4,SqueezeLinesTogether=true,TreatBackSlashNAsNewLine=false,FontSize=10,Format=StandardFormat,IncludeBackground=false,BackgroundColor=Black,AttributeName=Start,UseSpecialFontName=false,SpecialColor=Black,SpecialFontName=SansSerif,UseSpecialColor=false,LabelAlignment=Center,MaxWidth=100}),\n"
+    "  East=(),\n"
+    "  SouthEast=(),\n"
+    "  North=(),\n"
+    "  West=(),\n"
+    "  SouthWest=(),\n"
+    "  NorthEast=(),\n"
+    "  South=(),\n"
+    "  NorthWest=();\n"
+)
+
+
+def _print_block_vertex(block, out: TextIO) -> None:
+    out.write(
+        f" {block.sizeOut()} {block.sizeIn()} {block.getIndex()} "
+        f"{block.getStart().getOffset():x} {block.getStop().getOffset():x}\n"
+    )
+
+
+def _print_block_edge(block, out: TextIO) -> None:
+    for i in range(block.sizeIn()):
+        out.write(f"{block.getIn(i).getIndex()} {block.getIndex()}\n")
+
+
+def _dump_block_vertex(graph, out: TextIO, falsenode: bool) -> None:
+    out.write(
+        "\n\n// Add Vertices\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddVertices,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=SizeOut, Location=1},\n"
+        "          {Name=SizeIn, Location=2},\n"
+        "          {Name=Internal, Location=3},\n"
+        "          {Name=Index, Location=4},\n"
+        "          {Name=Start, Location=5},\n"
+        "          {Name=Stop, Location=6});\n\n"
+    )
+    if falsenode:
+        out.write("-1 0 0 -1 0 0\n")
+    for i in range(graph.getSize()):
+        _print_block_vertex(graph.getBlock(i), out)
+    out.write("*END_COLUMNS\n")
+
+
+def _dump_block_edges(graph, out: TextIO) -> None:
+    out.write(
+        "\n\n// Add Edges\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddEdges,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=*FromKey, Location=1},\n"
+        "          {Name=*ToKey, Location=2});\n\n"
+    )
+    for i in range(graph.getSize()):
+        _print_block_edge(graph.getBlock(i), out)
+    out.write("*END_COLUMNS\n")
+
+
+def _print_dom_edge(block, out: TextIO, falsenode: bool) -> None:
+    dom = block.getImmedDom()
+    if dom is not None:
+        out.write(f"{dom.getIndex()} {block.getIndex()}\n")
+    elif falsenode:
+        out.write(f"-1 {block.getIndex()}\n")
+
+
+def _dump_dom_edges(graph, out: TextIO, falsenode: bool) -> None:
+    out.write(
+        "\n\n// Add Edges\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddEdges,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=*FromKey, Location=1},\n"
+        "          {Name=*ToKey, Location=2});\n\n"
+    )
+    for i in range(graph.getSize()):
+        _print_dom_edge(graph.getBlock(i), out, falsenode)
+    out.write("*END_COLUMNS\n")
+
+
+def _dump_block_attributes(out: TextIO) -> None:
+    out.write(_BLOCK_ATTRIBUTES)
+
+
+def _dump_block_properties(out: TextIO) -> None:
+    out.write(_BLOCK_PROPERTIES)
+
+
+def dump_controlflow_graph(name: str, graph, out: TextIO) -> None:
+    """Serialize the control-flow graph in Renoir format.
+
+    C++ ref: ``dump_controlflow_graph``
+    """
+    out.write(f"*CMD=NewGraphWindow, WindowName={name}-controlflow;\n")
+    out.write(f"*CMD=*NEXUS,Name={name}-controlflow;\n")
+    _dump_block_properties(out)
+    _dump_block_attributes(out)
+    _dump_block_vertex(graph, out, False)
+    _dump_block_edges(graph, out)
+
+
+def dump_dom_graph(name: str, graph, out: TextIO) -> None:
+    """Serialize the dominator graph in Renoir format.
+
+    C++ ref: ``dump_dom_graph``
+    """
+    count = 0
+    for i in range(graph.getSize()):
+        if graph.getBlock(i).getImmedDom() is None:
+            count += 1
+    falsenode = count > 1
+    out.write(f"*CMD=NewGraphWindow, WindowName={name}-dom;\n")
+    out.write(f"*CMD=*NEXUS,Name={name}-dom;\n")
+    _dump_block_properties(out)
+    _dump_block_attributes(out)
+    _dump_block_vertex(graph, out, falsenode)
+    _dump_dom_edges(graph, out, falsenode)

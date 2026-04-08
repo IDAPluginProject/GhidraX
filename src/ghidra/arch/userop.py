@@ -17,6 +17,9 @@ class UserPcodeOp:
     injected = 2
     volatile_read = 3
     volatile_write = 4
+    segment = 5
+    jumpassist = 6
+    BUILTIN_STRINGDATA = 0x10000000
     BUILTIN_VOLATILE_READ = 1
     BUILTIN_VOLATILE_WRITE = 2
 
@@ -245,7 +248,9 @@ class UserOpManage:
         if i in self._builtinmap:
             return self._builtinmap[i]
         glb = self.glb
-        if i == UserPcodeOp.BUILTIN_VOLATILE_READ:
+        if i == UserPcodeOp.BUILTIN_STRINGDATA:
+            res = InternalStringOp("stringdata", glb, UserPcodeOp.BUILTIN_STRINGDATA)
+        elif i == UserPcodeOp.BUILTIN_VOLATILE_READ:
             res = VolatileReadOp("read_volatile", glb)
         elif i == UserPcodeOp.BUILTIN_VOLATILE_WRITE:
             res = VolatileWriteOp("write_volatile", glb)
@@ -494,8 +499,9 @@ class JumpAssistOp(UserPcodeOp):
 
 class InternalStringOp(UserPcodeOp):
     """A user-op for internal string operations."""
-    def __init__(self, nm="", glb=None, ind=-1):
+    def __init__(self, nm="stringdata", glb=None, ind=-1):
         super().__init__(nm, glb, 7, ind)  # string_data=7
+        self.flags |= UserPcodeOp.display_string
 
 
 class DatatypeUserOp(UserPcodeOp):

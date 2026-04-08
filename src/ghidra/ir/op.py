@@ -922,7 +922,6 @@ class PcodeOpBank:
                 if bucket is not None:
                     bucket.pop(oid, None)
         self._deadlist[oid] = op        # O(1)
-        self._removeFromCodeList(op)
 
     def _addToCodeList(self, op: PcodeOp) -> None:
         opc = op.code()
@@ -1010,6 +1009,20 @@ class PcodeOpBank:
     def beginAll(self) -> Iterator[PcodeOp]:
         return iter(op for _, op in self._orderedOptreeItems())
 
+    def begin(self, key) -> Iterator[PcodeOp]:
+        """Begin iterator for an opcode-specific list or a specific address."""
+        if isinstance(key, Address):
+            return iter(self.beginByAddr(key))
+        if key == OpCode.CPUI_STORE:
+            return iter(self.getStoreList())
+        if key == OpCode.CPUI_LOAD:
+            return iter(self.getLoadList())
+        if key == OpCode.CPUI_RETURN:
+            return iter(self.getReturnList())
+        if key == OpCode.CPUI_CALLOTHER:
+            return iter(self.getUserOpList())
+        return iter(())
+
     def beginAlive(self) -> Iterator[PcodeOp]:
         return iter(self._alivelist.values())
 
@@ -1038,6 +1051,10 @@ class PcodeOpBank:
 
     def endDead(self):
         """End sentinel for dead list iteration."""
+        return None
+
+    def end(self, key):
+        """End sentinel for an opcode-specific list or a specific address."""
         return None
 
     def endAlive(self):

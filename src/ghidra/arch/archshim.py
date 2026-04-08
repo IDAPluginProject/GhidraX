@@ -15,7 +15,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 from typing import Callable, List, Optional
 
-from ghidra.core.address import Address
+from ghidra.core.address import Address, RangeList
 from ghidra.arch.userop import UserOpManage
 from ghidra.ir.typeop import registerTypeOps
 from ghidra.output.printlanguage import PrintLanguageCapability
@@ -373,6 +373,7 @@ class ArchitectureStandalone:
         self._restart_rebuilder: Optional[Callable] = None
         self.inst = registerTypeOps(self.types, self.translate)
         self._load_laned_registers(sla_path)
+        self.nohighptr = RangeList()
         # Create a symbol database with a global scope
         from ghidra.database.database import Database
         self.symboltab = Database(self)
@@ -472,6 +473,13 @@ class ArchitectureStandalone:
     def getStackSpace(self):
         """Return the stack space (may be None for raw binaries)."""
         return getattr(self._spc_mgr, '_stackSpace', None)
+
+    def highPtrPossible(self, loc: Address, size: int) -> bool:
+        from ghidra.core.space import IPTR_INTERNAL
+
+        if loc.getSpace() is not None and loc.getSpace().getType() == IPTR_INTERNAL:
+            return False
+        return not self.nohighptr.inRange(loc, size)
 
     def getLanedRegister(self, loc: Address, size: int):
         for record in self.lanerecords:

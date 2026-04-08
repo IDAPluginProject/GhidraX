@@ -32,6 +32,9 @@ class _SpacebasePoint:
         self.offset = offset
         self.size = size
 
+    def getAddr(self) -> Address:
+        return Address(self.space, self.offset)
+
 
 class _StackSpace(AddrSpace):
     """Minimal stack space (IPTR_SPACEBASE) backed by ESP/RSP.

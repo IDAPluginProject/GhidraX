@@ -33,9 +33,6 @@ class PcodeEmitFd(PcodeEmit):
         isize: int,
     ) -> None:
         fd = self._fd
-        if fd is None:
-            raise RuntimeError("PcodeEmitFd has no Funcdata attached")
-
         if outvar is not None:
             op = fd.newOp(isize, addr)
             fd.newVarnodeOut(outvar.size, Address(outvar.space, outvar.offset), op)
@@ -45,7 +42,7 @@ class PcodeEmitFd(PcodeEmit):
         fd.opSetOpcode(op, opc)
 
         start_slot = 0
-        if op.isCodeRef() and vars_:
+        if op.isCodeRef():
             addrcode = Address(vars_[0].space, vars_[0].offset)
             fd.opSetInput(op, fd.newCodeRef(addrcode), 0)
             start_slot = 1
@@ -53,9 +50,6 @@ class PcodeEmitFd(PcodeEmit):
         for slot in range(start_slot, isize):
             var = vars_[slot]
             vn = fd.newVarnode(var.size, Address(var.space, var.offset))
-            if opc in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE) and slot == 0 and hasattr(vn, "setSpaceFromConst"):
-                arch = fd.getArch() if hasattr(fd, "getArch") else None
-                data_space = arch.getDefaultDataSpace() if arch is not None and hasattr(arch, "getDefaultDataSpace") else None
-                if data_space is not None:
-                    vn.setSpaceFromConst(data_space)
+            if opc in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE) and slot == 0:
+                vn.setSpaceFromConst(fd.getArch().getDefaultDataSpace())
             fd.opSetInput(op, vn, slot)

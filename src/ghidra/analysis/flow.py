@@ -1498,19 +1498,25 @@ class FlowInfo:
         Passes back a list of JumpTable objects and a list of BRANCHIND ops
         that could not be reached.
         """
-        if not hasattr(self._data, 'recoverJumpTable'):
+        from ghidra.analysis.funcdata import Funcdata
+        from ghidra.analysis.jumptable import JumpTable
+
+        if not self._tablelist:
             return
+        op = self._tablelist[0]
+        nm = self._data.getName() + "@@jump@" + op.getAddr().printRaw()
+        partial = Funcdata(nm, nm, self._data.getScopeLocal().getParent(), self._data.getAddress(), None)
         for op in self._tablelist:
-            mode_ref = ['success']
-            jt = self._data.recoverJumpTable(op, self, mode_ref)
+            mode_ref = [JumpTable.RecoveryMode.success]
+            jt = self._data.recoverJumpTable(partial, op, self, mode_ref)
             if jt is None:
                 if not self.isFlowForInline():
                     self.truncateIndirectJump(op, mode_ref[0])
             else:
-                if hasattr(jt, 'isPartial') and jt.isPartial():
+                if jt.isPartial():
                     if len(self._tablelist) > 1 and not self.isInArray(notreached, op):
                         notreached.append(op)
-                    elif hasattr(jt, 'markComplete'):
+                    else:
                         jt.markComplete()
             newTables.append(jt)
 

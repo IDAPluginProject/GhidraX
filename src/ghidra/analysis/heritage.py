@@ -13,9 +13,12 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from collections import defaultdict
 from bisect import bisect_left, bisect_right
 
-from ghidra.core.address import Address, calc_mask
+from ghidra.core.address import Address, RangeList, calc_mask
+from ghidra.core.error import LowlevelError
+from ghidra.core.pcoderaw import VarnodeData
 from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_SPACEBASE, IPTR_INTERNAL, IPTR_PROCESSOR, IPTR_IOP
 from ghidra.core.opcodes import OpCode
+from ghidra.analysis.rangeutil import ValueSetSolver, WidenerFull, WidenerNone
 
 if TYPE_CHECKING:
     from ghidra.ir.varnode import Varnode
@@ -131,7 +134,7 @@ class LocationMap:
 
     class SizePass:
         __slots__ = ('size', 'pass_')
-        def __init__(self, size: int = 0, pass_: int = 0):
+        def __init__(self, size: int, pass_: int):
             self.size = size
             self.pass_ = pass_
 
@@ -140,7 +143,7 @@ class LocationMap:
         self._by_base: dict = {}  # base → {addr: SizePass} for fast same-space lookup
 
     def add(self, addr: Address, size: int, pass_: int,
-            intersect_ref: list = None) -> tuple[Address, "LocationMap.SizePass"]:
+            intersect_ref: list) -> tuple[Address, "LocationMap.SizePass"]:
         """Mark new address as heritaged and return the containing entry.
 
         intersect_ref[0] is set to:
@@ -148,8 +151,6 @@ class LocationMap:
           1 if there is a partial intersection with something old
           2 if the range is contained in an old range
         """
-        if intersect_ref is None:
-            intersect_ref = [0]
         intersect_ref[0] = 0
 
         addr_base = addr.base
@@ -233,12 +234,23 @@ class LocationMap:
             return -1
         return result[1].pass_
 
-    def erase(self, addr: Address) -> None:
+    def erase(self, iter_or_addr) -> Optional[tuple[Address, "LocationMap.SizePass"]]:
+        addr = iter_or_addr[0] if isinstance(iter_or_addr, tuple) else iter_or_addr
+        sorted_addrs = sorted(self._map)
+        next_entry: Optional[tuple[Address, "LocationMap.SizePass"]] = None
         if addr in self._map:
-            del self._map[addr]
+            idx = sorted_addrs.index(addr)
+            if idx + 1 < len(sorted_addrs):
+                next_addr = sorted_addrs[idx + 1]
+                next_entry = (next_addr, self._map[next_addr])
+            if addr in self._map:
+                del self._map[addr]
             bb = self._by_base.get(addr.base)
             if bb is not None and addr in bb:
                 del bb[addr]
+                if not bb:
+                    del self._by_base[addr.base]
+        return next_entry
 
     def clear(self) -> None:
         self._map.clear()
@@ -263,7 +275,7 @@ class MemRange:
     new_addresses = 1
     old_addresses = 2
 
-    def __init__(self, addr: Address, size: int, flags: int = 0):
+    def __init__(self, addr: Address, size: int, flags: int):
         self.addr = addr
         self.size = size
         self.flags = flags
@@ -314,10 +326,10 @@ class TaskList:
         return idx
 
     def begin(self):
-        return iter(self._list)
+        return 0
 
     def end(self):
-        return None
+        return len(self._list)
 
     def clear(self) -> None:
         self._list.clear()
@@ -352,21 +364,19 @@ class PriorityQueue:
 
     def reset(self, maxdepth: int) -> None:
         """Reset to an empty queue."""
+        if self._curdepth == -1 and maxdepth == len(self._queue) - 1:
+            return
         self._queue = [[] for _ in range(maxdepth + 1)]
         self._curdepth = -1
 
     def insert(self, bl: FlowBlock, depth: int) -> None:
         """Insert a block into the queue given its priority."""
-        while len(self._queue) <= depth:
-            self._queue.append([])
         self._queue[depth].append(bl)
         if depth > self._curdepth:
             self._curdepth = depth
 
     def extract(self) -> Optional[FlowBlock]:
         """Retrieve the highest priority block."""
-        if self._curdepth < 0:
-            return None
         res = self._queue[self._curdepth].pop()
         while self._curdepth >= 0 and not self._queue[self._curdepth]:
             self._curdepth -= 1
@@ -461,7 +471,7 @@ class LoadGuard:
         self.spc = s
         self.pointerBase = off
         self.minimumOffset = 0
-        self.maximumOffset = s.getHighest() if s else 0xFFFFFFFFFFFFFFFF
+        self.maximumOffset = s.getHighest()
         self.step = 0
         self.analysisState = 0
 
@@ -512,7 +522,7 @@ class LoadGuard:
                     size = rangeSize * rng.getStep()
             else:
                 self.minimumOffset = self.pointerBase
-        maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+        maxAddr = self.spc.getHighest()
         if self.minimumOffset > maxAddr:
             self.minimumOffset = maxAddr
             self.maximumOffset = self.minimumOffset
@@ -540,10 +550,10 @@ class LoadGuard:
             self.minimumOffset = rng.getMin()
             self.maximumOffset = (rng.getEnd() - 1) & rng.getMask()
             if self.maximumOffset < self.minimumOffset:
-                maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+                maxAddr = self.spc.getHighest()
                 self.maximumOffset = maxAddr
                 self.analysisState = 1
-        maxAddr = self.spc.getHighest() if self.spc else 0xFFFFFFFFFFFFFFFF
+        maxAddr = self.spc.getHighest()
         if self.minimumOffset > maxAddr:
             self.minimumOffset = maxAddr
         if self.maximumOffset > maxAddr:
@@ -554,11 +564,21 @@ class LoadGuard:
 
     def isValid(self, opc) -> bool:
         """Return True if the record still describes an active LOAD."""
-        if self.op is None:
-            return False
-        if hasattr(self.op, 'isDead') and self.op.isDead():
-            return False
-        return self.op.code() == opc
+        return (not self.op.isDead()) and self.op.code() == opc
+
+
+class StackNode:
+    nonconstant_index = 1
+    multiequal = 2
+
+    __slots__ = ("vn", "offset", "traversals", "descend", "iter")
+
+    def __init__(self, vn, offset: int, traversals: int) -> None:
+        self.vn = vn
+        self.offset = offset
+        self.traversals = traversals
+        self.descend = vn.getDescend()
+        self.iter = 0
 
 
 class Heritage:
@@ -603,12 +623,9 @@ class Heritage:
     # Info management
     # ----------------------------------------------------------------
 
-    def getInfo(self, spc: AddrSpace) -> Optional[HeritageInfo]:
+    def getInfo(self, spc: AddrSpace) -> HeritageInfo:
         """Get the heritage status for the given address space."""
-        idx = spc.getIndex()
-        if idx < len(self._infolist):
-            return self._infolist[idx]
-        return None
+        return self._infolist[spc.getIndex()]
 
     def clearInfoList(self) -> None:
         """Reset heritage status for all address spaces."""
@@ -788,21 +805,23 @@ class Heritage:
         For reads smaller than the range, add SUBPIECE. For writes smaller,
         add PIECE. If guardPerformed, add INDIRECTs for CALL/STORE/LOAD effects.
         """
-        from ghidra.ir.varnode import Varnode as VnCls
         for i, vn in enumerate(read):
-            descs = list(vn.beginDescend())
-            if not descs:
+            descs = vn.getDescend()
+            if len(descs) == 0:
                 continue
+            op = descs[0]
+            if len(descs) != 1:
+                raise LowlevelError("Free varnode with multiple reads")
             if vn.getSize() < size:
                 if _heritage_debug_enabled():
                     _debug_heritage(
                         "guard.read "
                         f"range={addr.getSpace().getName()}[{addr.getOffset():#x}:{size}] "
                         f"vn={_format_vn_debug(vn)} "
-                        f"follow=@{descs[0].getAddr().getOffset():#x} "
-                        f"opc={descs[0].code()}"
+                        f"follow=@{op.getAddr().getOffset():#x} "
+                        f"opc={op.code()}"
                     )
-                read[i] = vn = self.normalizeReadSize(vn, descs[0], addr, size)
+                read[i] = vn = self.normalizeReadSize(vn, op, addr, size)
             vn.setActiveHeritage()
         for i, vn in enumerate(write):
             if vn.getSize() < size:
@@ -818,18 +837,12 @@ class Heritage:
                 write[i] = vn = self.normalizeWriteSize(vn, addr, size)
             vn.setActiveHeritage()
         if guardPerformed:
-            fl = 0
-            if hasattr(self._fd, 'getScopeLocal'):
-                scope = self._fd.getScopeLocal()
-                if hasattr(scope, 'queryProperties'):
-                    fl_ref = [0]
-                    scope.queryProperties(addr, size, Address(), fl_ref)
-                    fl = fl_ref[0] if isinstance(fl_ref[0], int) else fl
+            fl_ref = [0]
+            self._fd.getScopeLocal().queryProperties(addr, size, Address(), fl_ref)
+            fl = fl_ref[0]
             self.guardCalls(fl, addr, size, write)
             self.guardReturns(fl, addr, size, write)
-            # Only guard stores/loads if high pointer is possible
-            glb = self._fd.getArch() if hasattr(self._fd, 'getArch') else None
-            if glb is None or not hasattr(glb, 'highPtrPossible') or glb.highPtrPossible(addr, size):
+            if self._fd.getArch().highPtrPossible(addr, size):
                 self.guardStores(addr, size, write)
                 self.guardLoads(fl, addr, size, write)
 
@@ -868,9 +881,7 @@ class Heritage:
         for vn in newinput:
             vn.setWriteMask()
         newout = self._fd.newVarnode(size, addr)
-        result = self.concatPieces(newinput, None, newout)
-        if result is not None:
-            result.setActiveHeritage()
+        self.concatPieces(newinput, None, newout).setActiveHeritage()
 
     def guardCalls(self, fl: int, addr: Address, size: int, write: list) -> None:
         """Guard CALL/CALLIND ops in preparation for renaming algorithm.
@@ -1128,31 +1139,25 @@ class Heritage:
 
         C++ ref: ``Heritage::guardCallOverlappingInput``
         """
-        if not hasattr(fc, 'getBiggestContainedInputParam'):
-            return
-        vData = type('VData', (), {'space': None, 'offset': 0, 'size': 0})()
-        if not fc.getBiggestContainedInputParam(transAddr, size, vData):
-            return
-        active = fc.getActiveInput() if hasattr(fc, 'getActiveInput') else None
-        truncAddr = Address(vData.space, vData.offset)
-        diff = truncAddr.getOffset() - transAddr.getOffset()
-        truncAddr = addr + diff  # Convert to caller's perspective
-        if active is not None and hasattr(active, 'whichTrial'):
-            if active.whichTrial(truncAddr, size) >= 0:
-                return  # Already a trial
-        truncateAmount = addr.justifiedContain(size, truncAddr, vData.size, False)
-        op = fc.getOp()
-        subpieceOp = self._fd.newOp(2, op.getAddr())
-        self._fd.opSetOpcode(subpieceOp, OpCode.CPUI_SUBPIECE)
-        wholeVn = self._fd.newVarnode(size, addr)
-        wholeVn.setActiveHeritage()
-        self._fd.opSetInput(subpieceOp, wholeVn, 0)
-        self._fd.opSetInput(subpieceOp, self._fd.newConstant(4, truncateAmount), 1)
-        vn = self._fd.newVarnodeOut(vData.size, truncAddr, subpieceOp)
-        self._fd.opInsertBefore(subpieceOp, op)
-        if active is not None and hasattr(active, 'registerTrial'):
-            active.registerTrial(truncAddr, vData.size)
-        self._fd.opInsertInput(op, vn, op.numInput())
+        vData = VarnodeData()
+        if fc.getBiggestContainedInputParam(transAddr, size, vData):
+            active = fc.getActiveInput()
+            truncAddr = Address(vData.space, vData.offset)
+            diff = truncAddr.getOffset() - transAddr.getOffset()
+            truncAddr = addr + diff
+            if active.whichTrial(truncAddr, size) < 0:
+                truncateAmount = addr.justifiedContain(size, truncAddr, vData.size, False)
+                op = fc.getOp()
+                subpieceOp = self._fd.newOp(2, op.getAddr())
+                self._fd.opSetOpcode(subpieceOp, OpCode.CPUI_SUBPIECE)
+                wholeVn = self._fd.newVarnode(size, addr)
+                wholeVn.setActiveHeritage()
+                self._fd.opSetInput(subpieceOp, wholeVn, 0)
+                self._fd.opSetInput(subpieceOp, self._fd.newConstant(4, truncateAmount), 1)
+                vn = self._fd.newVarnodeOut(vData.size, truncAddr, subpieceOp)
+                self._fd.opInsertBefore(subpieceOp, op)
+                active.registerTrial(truncAddr, vData.size)
+                self._fd.opInsertInput(op, vn, op.numInput())
 
     def guardOutputOverlap(self, callOp, addr: Address, size: int, retAddr: Address, retSize: int, write: list) -> None:
         """Insert created INDIRECT ops to guard the output of a call.
@@ -1333,88 +1338,40 @@ class Heritage:
         write.clear()
         inputvars.clear()
         remove.clear()
-        if self._fd is None:
-            return 0
+        start = memrange.addr.getOffset()
+        endaddr = memrange.addr + memrange.size
+        wraparound = endaddr.getOffset() < start
+        target_space = memrange.addr.getSpace()
         maxsize = 0
-        target_spc = memrange.addr.getSpace()
-        range_off = memrange.addr.offset
-        range_end = range_off + memrange.size
-        _WM = 0x02    # Varnode.writemask (addlflags)
-        _WR = 0x10    # Varnode.written (flags)
-        _IP = 0x08    # Varnode.input (flags)
-        _HK = 0x26    # Varnode.insert|constant|annotation (isHeritageKnown mask)
-        _OP_MARKER = 0x40     # PcodeOp.marker flag
-        _OP_RETCPY = 0x80000  # PcodeOp.return_copy flag
-        if _sorted_idx is not None:
-            # Fast path: binary search using parallel offset list (Python 3.9 compatible)
-            spc_entry = _sorted_idx.get(id(target_spc))
-            if spc_entry is not None:
-                sorted_offsets, sorted_vns = spc_entry
-                # All varnodes with offset < range_end can potentially overlap
-                hi = bisect_right(sorted_offsets, range_end - 1)
-                # Start from varnodes with offset >= range_off - 128 (max varnode size bound)
-                lo = bisect_left(sorted_offsets, range_off - 128)
-                lo = max(0, lo)
-                for i in range(lo, hi):
-                    vn_off, _, vn = sorted_vns[i]
-                    vn_sz = vn._size
-                    if vn_off + vn_sz <= range_off:
-                        continue  # Doesn't reach range start
-                    if vn._addlflags & _WM:
-                        continue
-                    vn_flags = vn._flags
-                    if vn_flags & _WR:
-                        op = vn._def
-                        op_flags = op._flags
-                        if op_flags & (_OP_MARKER | _OP_RETCPY):
-                            if vn_sz < memrange.size:
-                                remove.append(vn)
-                                continue
-                            memrange.clearProperty(MemRange.new_addresses)
-                        if vn_sz > maxsize:
-                            maxsize = vn_sz
-                        write.append(vn)
-                    elif not (vn_flags & _HK) and vn._descend:
-                        read.append(vn)
-                    elif vn_flags & _IP:
-                        inputvars.append(vn)
-                if _heritage_debug_range_matches(memrange.addr, memrange.size):
-                    _debug_heritage(
-                        "collect "
-                        f"range={_format_range_debug(memrange.addr, memrange.size)} "
-                        f"maxsize={maxsize} "
-                        f"read={_format_vn_list_debug(read)} "
-                        f"write={_format_vn_list_debug(write)} "
-                        f"input={_format_vn_list_debug(inputvars)} "
-                        f"remove={_format_vn_list_debug(remove)}"
-                    )
-                return maxsize
-        # Fallback: linear scan via space index (vn objects stored directly)
-        vbank = self._fd._vbank
-        spc_bucket = vbank._space_varnodes.get(id(target_spc), ())
-        for vn in spc_bucket:
-            vn_off = vn._loc.offset
-            vn_sz = vn._size
-            if vn_off + vn_sz <= range_off or vn_off >= range_end:
+
+        for vn in self._fd.beginLoc():
+            vnaddr = vn.getAddr()
+            if vnaddr < memrange.addr:
                 continue
-            vn_flags = vn._flags
-            if vn._addlflags & _WM:
+            if wraparound:
+                if vn.getSpace() is not target_space:
+                    break
+            else:
+                if not (vnaddr < endaddr):
+                    break
+
+            if vn.isWriteMask():
                 continue
-            if vn_flags & _WR:
-                op = vn._def
-                op_flags = op._flags
-                if op_flags & (_OP_MARKER | _OP_RETCPY):
-                    if vn_sz < memrange.size:
+            if vn.isWritten():
+                op = vn.getDef()
+                if op.isMarker() or op.isReturnCopy():
+                    if vn.getSize() < memrange.size:
                         remove.append(vn)
                         continue
                     memrange.clearProperty(MemRange.new_addresses)
-                if vn_sz > maxsize:
-                    maxsize = vn_sz
+                if vn.getSize() > maxsize:
+                    maxsize = vn.getSize()
                 write.append(vn)
-            elif not (vn_flags & _HK) and vn._descend:
+            elif (not vn.isHeritageKnown()) and (not vn.hasNoDescend()):
                 read.append(vn)
-            elif vn_flags & _IP:
+            elif vn.isInput():
                 inputvars.append(vn)
+
         if _heritage_debug_range_matches(memrange.addr, memrange.size):
             _debug_heritage(
                 "collect "
@@ -1429,19 +1386,15 @@ class Heritage:
 
     def normalizeReadSize(self, vn, op, addr: Address, size: int):
         """Normalize the size of a read Varnode, prior to heritage."""
-        if not hasattr(self._fd, 'newOp'):
-            return vn
         newop = self._fd.newOp(2, op.getAddr())
         self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
         vn1 = self._fd.newVarnode(size, addr)
         overlap = vn.overlap(addr, size)
-        addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
-        vn2 = self._fd.newConstant(addrSize, overlap if overlap >= 0 else 0)
+        vn2 = self._fd.newConstant(addr.getAddrSize(), overlap)
         self._fd.opSetInput(newop, vn1, 0)
         self._fd.opSetInput(newop, vn2, 1)
         self._fd.opSetOutput(newop, vn)
-        if hasattr(newop.getOut(), 'setWriteMask'):
-            newop.getOut().setWriteMask()
+        newop.getOut().setWriteMask()
         if _heritage_debug_enabled():
             _debug_heritage(
                 "normalizeReadSize "
@@ -1460,31 +1413,22 @@ class Heritage:
         of the address range currently being linked, create the missing pieces
         and concatenate everything into a new Varnode of the correct size.
         """
-        if not hasattr(self._fd, 'newOp'):
-            return vn
-
         op = vn.getDef()
-        if op is None:
-            return vn
-
-        overlap = vn.overlap(addr, size) if hasattr(vn, 'overlap') else 0
-        if overlap < 0:
-            overlap = 0
+        overlap = vn.overlap(addr, size)
         mostsigsize = size - (overlap + vn.getSize())
 
         mostvn = None
         leastvn = None
-        bigendian = addr.isBigEndian() if hasattr(addr, 'isBigEndian') else False
+        bigendian = addr.isBigEndian()
 
         # Create most significant piece if needed
-        if mostsigsize > 0:
+        if mostsigsize != 0:
             if bigendian:
                 pieceaddr = addr
             else:
                 pieceaddr = addr + (overlap + vn.getSize())
 
-            isCall = op.isCall() if hasattr(op, 'isCall') else False
-            if isCall and self.callOpIndirectEffect(pieceaddr, mostsigsize, op):
+            if op.isCall() and self.callOpIndirectEffect(pieceaddr, mostsigsize, op):
                 newop = self._fd.newIndirectCreation(op, pieceaddr, mostsigsize, False)
                 mostvn = newop.getOut()
             else:
@@ -1494,8 +1438,7 @@ class Heritage:
                 big.setActiveHeritage()
                 self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetInput(newop, big, 0)
-                addrSize = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
-                self._fd.opSetInput(newop, self._fd.newConstant(addrSize, overlap + vn.getSize()), 1)
+                self._fd.opSetInput(newop, self._fd.newConstant(addr.getAddrSize(), overlap + vn.getSize()), 1)
                 if _heritage_debug_enabled():
                     _debug_heritage(
                         "normalizeWriteSize.most "
@@ -1507,14 +1450,13 @@ class Heritage:
                 self._fd.opInsertBefore(newop, op)
 
         # Create least significant piece if needed
-        if overlap > 0:
+        if overlap != 0:
             if bigendian:
                 pieceaddr = addr + (size - overlap)
             else:
                 pieceaddr = addr
 
-            isCall = op.isCall() if hasattr(op, 'isCall') else False
-            if isCall and self.callOpIndirectEffect(pieceaddr, overlap, op):
+            if op.isCall() and self.callOpIndirectEffect(pieceaddr, overlap, op):
                 newop = self._fd.newIndirectCreation(op, pieceaddr, overlap, False)
                 leastvn = newop.getOut()
             else:
@@ -1524,8 +1466,7 @@ class Heritage:
                 big.setActiveHeritage()
                 self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetInput(newop, big, 0)
-                addrSize2 = addr.getAddrSize() if hasattr(addr, 'getAddrSize') else 4
-                self._fd.opSetInput(newop, self._fd.newConstant(addrSize2, 0), 1)
+                self._fd.opSetInput(newop, self._fd.newConstant(addr.getAddrSize(), 0), 1)
                 if _heritage_debug_enabled():
                     _debug_heritage(
                         "normalizeWriteSize.least "
@@ -1537,7 +1478,7 @@ class Heritage:
                 self._fd.opInsertBefore(newop, op)
 
         # Concatenate least significant piece with vn
-        if overlap > 0 and leastvn is not None:
+        if overlap != 0:
             newop = self._fd.newOp(2, op.getAddr())
             if bigendian:
                 midvn = self._fd.newVarnodeOut(overlap + vn.getSize(), vn.getAddr(), newop)
@@ -1551,15 +1492,13 @@ class Heritage:
             midvn = vn
 
         # Concatenate most significant piece
-        if mostsigsize > 0 and mostvn is not None:
+        if mostsigsize != 0:
             newop = self._fd.newOp(2, op.getAddr())
             bigout = self._fd.newVarnodeOut(size, addr, newop)
             self._fd.opSetOpcode(newop, OpCode.CPUI_PIECE)
             self._fd.opSetInput(newop, mostvn, 0)
             self._fd.opSetInput(newop, midvn, 1)
-            defop = midvn.getDef() if midvn is not vn else op
-            if defop is not None:
-                self._fd.opInsertAfter(newop, defop)
+            self._fd.opInsertAfter(newop, midvn.getDef())
         else:
             bigout = midvn
 
@@ -1568,14 +1507,16 @@ class Heritage:
 
     def concatPieces(self, vnlist: list, insertop, finalvn):
         """Concatenate a list of Varnodes together using PIECE ops."""
-        if not vnlist or not hasattr(self._fd, 'newOp'):
-            return finalvn
-        if len(vnlist) == 1:
-            return vnlist[0]
         preexist = vnlist[0]
-        bigendian = preexist.getAddr().isBigEndian() if hasattr(preexist.getAddr(), 'isBigEndian') else False
-        opaddr = self._fd.getAddress() if insertop is None else insertop.getAddr()
-        bl = self._fd.getBasicBlocks().getStartBlock() if insertop is None else insertop.getParent()
+        bigendian = preexist.getAddr().isBigEndian()
+        if insertop is None:
+            bl = self._fd.getBasicBlocks().getStartBlock()
+            insert_pos = 0
+            opaddr = self._fd.getAddress()
+        else:
+            bl = insertop.getParent()
+            insert_pos = bl.getOpList().index(insertop)
+            opaddr = insertop.getAddr()
         for i in range(1, len(vnlist)):
             vn = vnlist[i]
             newop = self._fd.newOp(2, opaddr)
@@ -1591,22 +1532,23 @@ class Heritage:
             else:
                 self._fd.opSetInput(newop, vn, 0)
                 self._fd.opSetInput(newop, preexist, 1)
-            if insertop is None and bl is not None:
-                self._fd.opInsertBegin(newop, bl)
-            elif insertop is not None:
-                self._fd.opInsertBefore(newop, insertop)
+            self._fd.opInsert(newop, bl, insert_pos)
+            insert_pos += 1
             preexist = newvn
         return preexist
 
     def splitPieces(self, vnlist: list, insertop, addr: Address, size: int, startvn) -> None:
         """Build a set of Varnode piece expressions at the given location."""
-        if not vnlist or not hasattr(self._fd, 'newOp'):
-            return
-        bigendian = addr.isBigEndian() if hasattr(addr, 'isBigEndian') else False
+        bigendian = addr.isBigEndian()
         baseoff = addr.getOffset() + size if bigendian else addr.getOffset()
-        opaddr = self._fd.getAddress() if insertop is None else insertop.getAddr()
-        bl = self._fd.getBasicBlocks().getStartBlock() if insertop is None else insertop.getParent()
-        insert_anchor = insertop
+        if insertop is None:
+            bl = self._fd.getBasicBlocks().getStartBlock()
+            insert_pos = 0
+            opaddr = self._fd.getAddress()
+        else:
+            bl = insertop.getParent()
+            insert_pos = bl.getOpList().index(insertop) + 1
+            opaddr = insertop.getAddr()
         for vn in vnlist:
             newop = self._fd.newOp(2, opaddr)
             self._fd.opSetOpcode(newop, OpCode.CPUI_SUBPIECE)
@@ -1617,13 +1559,8 @@ class Heritage:
             self._fd.opSetInput(newop, startvn, 0)
             self._fd.opSetInput(newop, self._fd.newConstant(4, diff), 1)
             self._fd.opSetOutput(newop, vn)
-            if bl is None:
-                continue
-            if insert_anchor is None:
-                self._fd.opInsertBegin(newop, bl)
-            else:
-                self._fd.opInsertAfter(newop, insert_anchor)
-            insert_anchor = newop
+            self._fd.opInsert(newop, bl, insert_pos)
+            insert_pos += 1
 
     @staticmethod
     def buildRefinement(refine: list, addr: Address, vnlist: list) -> None:
@@ -1852,13 +1789,10 @@ class Heritage:
     def callOpIndirectEffect(self, addr: Address, size: int, op) -> bool:
         """Determine if the address range is affected by the given call p-code op."""
         if op.code() in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
-            if hasattr(self._fd, 'getCallSpecs'):
-                fc = self._fd.getCallSpecs(op)
-                if fc is None:
-                    return True
-                if hasattr(fc, 'hasEffectTranslate'):
-                    return fc.hasEffectTranslate(addr, size) != 'unaffected'
-            return True
+            fc = self._fd.getCallSpecs(op)
+            if fc is None:
+                return True
+            return fc.hasEffectTranslate(addr, size) != 'unaffected'
         return False
 
     def bumpDeadcodeDelay(self, spc: AddrSpace) -> None:
@@ -1888,89 +1822,50 @@ class Heritage:
         C++ ref: ``Heritage::removeRevisitedMarkers``
         """
         info = self.getInfo(addr.getSpace())
-        if info is not None and info.deadremoved > 0:
+        if info.deadremoved > 0:
             self.bumpDeadcodeDelay(addr.getSpace())
             if not info.warningissued:
                 info.warningissued = True
-                if hasattr(self._fd, 'warningHeader'):
-                    self._fd.warningHeader(f"Heritage AFTER dead removal. Revisit: {addr}")
+                self._fd.warningHeader(f"Heritage AFTER dead removal. Revisit: {addr}")
 
+        newInputs = []
         for vn in remove:
             op = vn.getDef()
-            if op is None:
-                continue
             bl = op.getParent()
-            opc = op.code()
-
-            # Determine insertion position (the op AFTER which we insert the SUBPIECE)
-            insertAfterOp = None
-            if opc == OpCode.CPUI_INDIRECT:
-                # Insert SUBPIECE after target of INDIRECT
+            if op.code() == OpCode.CPUI_INDIRECT:
                 iopVn = op.getIn(1)
                 from ghidra.ir.op import PcodeOp as PcodeOpCls
-                targetOp = None
-                if hasattr(PcodeOpCls, 'getOpFromConst'):
-                    targetOp = PcodeOpCls.getOpFromConst(iopVn.getAddr())
-                if targetOp is not None and not (hasattr(targetOp, 'isDead') and targetOp.isDead()):
-                    insertAfterOp = targetOp
+                targetOp = PcodeOpCls.getOpFromConst(iopVn.getAddr())
+                if targetOp.isDead():
+                    pos = bl.getOpList().index(op) + 1
                 else:
-                    insertAfterOp = op  # Fallback: after the INDIRECT itself
-                if hasattr(vn, 'clearAddrForce'):
-                    vn.clearAddrForce()
-            elif opc == OpCode.CPUI_MULTIEQUAL:
-                # Insert SUBPIECE after all MULTIEQUALs in block
-                insertAfterOp = op
-                if bl is not None and hasattr(bl, 'getOpList'):
-                    found = False
-                    for blop in bl.getOpList():
-                        if found:
-                            if blop.code() == OpCode.CPUI_MULTIEQUAL:
-                                insertAfterOp = blop
-                            else:
-                                break
-                        elif blop is op:
-                            found = True
+                    pos = bl.getOpList().index(targetOp) + 1
+                vn.clearAddrForce()
+            elif op.code() == OpCode.CPUI_MULTIEQUAL:
+                pos = bl.getOpList().index(op) + 1
+                while pos < len(bl.getOpList()) and bl.getOpList()[pos].code() == OpCode.CPUI_MULTIEQUAL:
+                    pos += 1
             else:
-                # Remove return form COPY
-                if hasattr(self._fd, 'opUnlink'):
-                    self._fd.opUnlink(op)
+                self._fd.opUnlink(op)
                 continue
 
-            # Calculate overlap offset
-            offset = vn.overlap(addr, size) if hasattr(vn, 'overlap') else 0
-            if offset < 0:
-                offset = 0
-
-            # Uninsert the old op, replace with SUBPIECE from larger free varnode
-            if hasattr(self._fd, 'opUninsert'):
-                self._fd.opUninsert(op)
-
-            newInputs = []
+            offset = vn.overlap(addr, size)
+            self._fd.opUninsert(op)
+            newInputs.clear()
             big = self._fd.newVarnode(size, addr)
             big.setActiveHeritage()
             newInputs.append(big)
             newInputs.append(self._fd.newConstant(4, offset))
-
             self._fd.opSetOpcode(op, OpCode.CPUI_SUBPIECE)
             self._fd.opSetAllInput(op, newInputs)
-
-            # Insert at the correct position
-            if bl is not None and insertAfterOp is not None:
-                self._fd.opInsertAfter(op, insertAfterOp)
-            elif bl is not None:
-                self._fd.opInsertBegin(op, bl)
-
+            self._fd.opInsert(op, bl, pos)
             vn.setWriteMask()
 
     def clearStackPlaceholders(self, info: HeritageInfo) -> None:
         """Clear any placeholder LOADs associated with calls."""
-        if self._fd is None:
-            return
-        if hasattr(self._fd, 'numCalls'):
-            for i in range(self._fd.numCalls()):
-                fc = self._fd.getCallSpecs(i)
-                if fc is not None and hasattr(fc, 'abortSpacebaseRelative'):
-                    fc.abortSpacebaseRelative(self._fd)
+        numCalls = self._fd.numCalls()
+        for i in range(numCalls):
+            self._fd.getCallSpecs(i).abortSpacebaseRelative(self._fd)
         info.hasCallPlaceholders = False
 
     def processJoins(self) -> None:
@@ -1982,47 +1877,32 @@ class Heritage:
 
         C++ ref: ``Heritage::processJoins``
         """
-        arch = self._fd.getArch() if hasattr(self._fd, 'getArch') else None
-        if arch is None:
-            return
-        joinspace = arch.getJoinSpace() if hasattr(arch, 'getJoinSpace') else None
-        if joinspace is None:
-            return
-        if not hasattr(self._fd, 'beginLoc'):
-            return
-        # Collect varnodes in join-space
-        vnlist = []
-        for vn in list(self._fd.beginLoc(joinspace)) if hasattr(self._fd, 'beginLoc') else []:
+        arch = self._fd.getArch()
+        joinspace = arch.getJoinSpace()
+        for vn in self._fd.beginLoc(joinspace):
             if vn.getSpace() is not joinspace:
                 break
-            vnlist.append(vn)
-        for vn in vnlist:
-            if not hasattr(arch, 'findJoin'):
-                continue
             joinrec = arch.findJoin(vn.getOffset())
-            if joinrec is None:
-                continue
-            piecespace = joinrec.getPiece(0).space if hasattr(joinrec, 'getPiece') else None
-            if hasattr(joinrec, 'getUnified'):
-                unified = joinrec.getUnified()
-                if unified.size != vn.getSize():
-                    raise Exception("Joined varnode does not match size of record")
+            piecespace = joinrec.getPiece(0).space
+
+            if joinrec.getUnified().size != vn.getSize():
+                raise LowlevelError("Joined varnode does not match size of record")
             if vn.isFree():
-                if hasattr(joinrec, 'isFloatExtension') and joinrec.isFloatExtension():
-                    self._floatExtensionRead(vn, joinrec)
+                if joinrec.isFloatExtension():
+                    self.floatExtensionRead(vn, joinrec)
                 else:
-                    self._splitJoinRead(vn, joinrec)
-            info = self.getInfo(piecespace) if piecespace is not None else None
-            if info is None:
-                continue
+                    self.splitJoinRead(vn, joinrec)
+
+            info = self.getInfo(piecespace)
             if self._pass != info.delay:
                 continue
-            if hasattr(joinrec, 'isFloatExtension') and joinrec.isFloatExtension():
-                self._floatExtensionWrite(vn, joinrec)
-            else:
-                self._splitJoinWrite(vn, joinrec)
 
-    def _splitJoinLevel(self, lastcombo: list, nextlev: list, joinrec) -> None:
+            if joinrec.isFloatExtension():
+                self.floatExtensionWrite(vn, joinrec)
+            else:
+                self.splitJoinWrite(vn, joinrec)
+
+    def splitJoinLevel(self, lastcombo: list, nextlev: list, joinrec) -> None:
         """Perform one level of Varnode splitting to match a JoinRecord.
 
         Split all pieces in lastcombo, putting them into nextlev in order,
@@ -2036,8 +1916,6 @@ class Heritage:
         numpieces = joinrec.numPieces()
         recnum = 0
         for curvn in lastcombo:
-            if recnum >= numpieces:
-                break
             if curvn.getSize() == joinrec.getPiece(recnum).size:
                 nextlev.append(curvn)
                 nextlev.append(None)
@@ -2068,7 +1946,7 @@ class Heritage:
                 nextlev.append(leasthalf)
                 recnum = j
 
-    def _splitJoinRead(self, vn, joinrec) -> None:
+    def splitJoinRead(self, vn, joinrec) -> None:
         """Construct pieces for a join-space Varnode read by an operation.
 
         Given a splitting specification (JoinRecord) and a Varnode, build a
@@ -2077,20 +1955,15 @@ class Heritage:
 
         C++ ref: ``Heritage::splitJoinRead``
         """
-        if not hasattr(joinrec, 'numPieces'):
-            return
-        op = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
-        if op is None:
-            return
+        op = vn.loneDescend()
         isPrimitive = True
-        if vn.isTypeLock() and hasattr(vn, 'getType') and vn.getType() is not None:
-            if hasattr(vn.getType(), 'isPrimitiveWhole'):
-                isPrimitive = vn.getType().isPrimitiveWhole()
+        if vn.isTypeLock():
+            isPrimitive = vn.getType().isPrimitiveWhole()
 
         lastcombo = [vn]
         while len(lastcombo) < joinrec.numPieces():
             nextlev = []
-            self._splitJoinLevel(lastcombo, nextlev, joinrec)
+            self.splitJoinLevel(lastcombo, nextlev, joinrec)
             for i in range(len(lastcombo)):
                 curvn = lastcombo[i]
                 mosthalf = nextlev[2 * i]
@@ -2104,17 +1977,14 @@ class Heritage:
                 self._fd.opSetInput(concat, leasthalf, 1)
                 self._fd.opInsertBefore(concat, op)
                 if isPrimitive:
-                    if hasattr(mosthalf, 'setPrecisHi'):
-                        mosthalf.setPrecisHi()
-                    if hasattr(leasthalf, 'setPrecisLo'):
-                        leasthalf.setPrecisLo()
+                    mosthalf.setPrecisHi()
+                    leasthalf.setPrecisLo()
                 else:
-                    if hasattr(self._fd, 'opMarkNoCollapse'):
-                        self._fd.opMarkNoCollapse(concat)
+                    self._fd.opMarkNoCollapse(concat)
                 op = concat  # Keep op as earliest in concatenation construction
             lastcombo = [v for v in nextlev if v is not None]
 
-    def _splitJoinWrite(self, vn, joinrec) -> None:
+    def splitJoinWrite(self, vn, joinrec) -> None:
         """Split a written join-space Varnode into specified pieces.
 
         Given a splitting specification (JoinRecord) and a Varnode, build a
@@ -2123,42 +1993,35 @@ class Heritage:
 
         C++ ref: ``Heritage::splitJoinWrite``
         """
-        if not hasattr(joinrec, 'numPieces'):
-            return
-        op = vn.getDef() if vn.isWritten() else None
-        bb = self._fd.getBasicBlocks().getBlock(0) if hasattr(self._fd, 'getBasicBlocks') else None
+        op = vn.getDef()
+        bb = self._fd.getBasicBlocks().getBlock(0)
         isPrimitive = True
-        if vn.isTypeLock() and hasattr(vn, 'getType') and vn.getType() is not None:
-            if hasattr(vn.getType(), 'isPrimitiveWhole'):
-                isPrimitive = vn.getType().isPrimitiveWhole()
+        if vn.isTypeLock():
+            isPrimitive = vn.getType().isPrimitiveWhole()
 
         lastcombo = [vn]
         while len(lastcombo) < joinrec.numPieces():
             nextlev = []
-            self._splitJoinLevel(lastcombo, nextlev, joinrec)
+            self.splitJoinLevel(lastcombo, nextlev, joinrec)
             for i in range(len(lastcombo)):
                 curvn = lastcombo[i]
                 mosthalf = nextlev[2 * i]
                 leasthalf = nextlev[2 * i + 1]
                 if leasthalf is None:
                     continue  # Varnode didn't get split this level
-                # SUBPIECE for most-significant half
-                if vn.isInput() and bb is not None:
+                if vn.isInput():
                     split = self._fd.newOp(2, bb.getStart())
-                elif op is not None:
-                    split = self._fd.newOp(2, op.getAddr())
                 else:
-                    continue
+                    split = self._fd.newOp(2, op.getAddr())
                 self._fd.opSetOpcode(split, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetOutput(split, mosthalf)
                 self._fd.opSetInput(split, curvn, 0)
                 self._fd.opSetInput(split, self._fd.newConstant(4, leasthalf.getSize()), 1)
-                if op is None and bb is not None:
+                if op is None:
                     self._fd.opInsertBegin(split, bb)
                 else:
                     self._fd.opInsertAfter(split, op)
                 op = split  # Keep op as latest in split construction
-                # SUBPIECE for least-significant half
                 split2 = self._fd.newOp(2, op.getAddr())
                 self._fd.opSetOpcode(split2, OpCode.CPUI_SUBPIECE)
                 self._fd.opSetOutput(split2, leasthalf)
@@ -2166,14 +2029,12 @@ class Heritage:
                 self._fd.opSetInput(split2, self._fd.newConstant(4, 0), 1)
                 self._fd.opInsertAfter(split2, op)
                 if isPrimitive:
-                    if hasattr(mosthalf, 'setPrecisHi'):
-                        mosthalf.setPrecisHi()
-                    if hasattr(leasthalf, 'setPrecisLo'):
-                        leasthalf.setPrecisLo()
+                    mosthalf.setPrecisHi()
+                    leasthalf.setPrecisLo()
                 op = split2  # Keep op as latest in split construction
             lastcombo = [v for v in nextlev if v is not None]
 
-    def _floatExtensionRead(self, vn, joinrec) -> None:
+    def floatExtensionRead(self, vn, joinrec) -> None:
         """Create float truncation into a free lower precision join-space Varnode.
 
         Given a Varnode with logically lower precision, as given by a float
@@ -2182,18 +2043,16 @@ class Heritage:
 
         C++ ref: ``Heritage::floatExtensionRead``
         """
-        op = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
-        if op is None:
-            return
+        op = vn.loneDescend()
         trunc = self._fd.newOp(1, op.getAddr())
         vdata = joinrec.getPiece(0)  # Float extensions have exactly 1 piece
-        bigvn = self._fd.newVarnode(vdata.size, Address(vdata.space, vdata.offset))
+        bigvn = self._fd.newVarnode(vdata.size, vdata.getAddr())
         self._fd.opSetOpcode(trunc, OpCode.CPUI_FLOAT_FLOAT2FLOAT)
         self._fd.opSetOutput(trunc, vn)
         self._fd.opSetInput(trunc, bigvn, 0)
         self._fd.opInsertBefore(trunc, op)
 
-    def _floatExtensionWrite(self, vn, joinrec) -> None:
+    def floatExtensionWrite(self, vn, joinrec) -> None:
         """Create float extension from a lower precision join-space Varnode.
 
         Given a Varnode with logically lower precision, as given by a float
@@ -2202,17 +2061,15 @@ class Heritage:
 
         C++ ref: ``Heritage::floatExtensionWrite``
         """
-        op = vn.getDef() if vn.isWritten() else None
+        op = vn.getDef()
         bb = self._fd.getBasicBlocks().getBlock(0)
         if vn.isInput():
             ext = self._fd.newOp(1, bb.getStart())
-        elif op is not None:
-            ext = self._fd.newOp(1, op.getAddr())
         else:
-            return
+            ext = self._fd.newOp(1, op.getAddr())
         vdata = joinrec.getPiece(0)  # Float extensions have exactly 1 piece
         self._fd.opSetOpcode(ext, OpCode.CPUI_FLOAT_FLOAT2FLOAT)
-        self._fd.newVarnodeOut(vdata.size, Address(vdata.space, vdata.offset), ext)
+        self._fd.newVarnodeOut(vdata.size, vdata.getAddr(), ext)
         self._fd.opSetInput(ext, vn, 0)
         if op is None:
             self._fd.opInsertBegin(ext, bb)
@@ -2221,21 +2078,19 @@ class Heritage:
 
     def generateLoadGuard(self, node, op, spc: AddrSpace) -> None:
         """Generate a guard record given an indexed LOAD into a stack space."""
-        if hasattr(op, 'usesSpacebasePtr') and not op.usesSpacebasePtr():
+        if not op.usesSpacebasePtr():
             guard = LoadGuard()
-            guard.set(op, spc, node.get('offset', 0) if isinstance(node, dict) else 0)
+            guard.set(op, spc, node.offset)
             self._loadGuard.append(guard)
-            if hasattr(self._fd, 'opMarkSpacebasePtr'):
-                self._fd.opMarkSpacebasePtr(op)
+            self._fd.opMarkSpacebasePtr(op)
 
     def generateStoreGuard(self, node, op, spc: AddrSpace) -> None:
         """Generate a guard record given an indexed STORE to a stack space."""
-        if hasattr(op, 'usesSpacebasePtr') and not op.usesSpacebasePtr():
+        if not op.usesSpacebasePtr():
             guard = LoadGuard()
-            guard.set(op, spc, node.get('offset', 0) if isinstance(node, dict) else 0)
+            guard.set(op, spc, node.offset)
             self._storeGuard.append(guard)
-            if hasattr(self._fd, 'opMarkSpacebasePtr'):
-                self._fd.opMarkSpacebasePtr(op)
+            self._fd.opMarkSpacebasePtr(op)
 
     def protectFreeStores(self, spc: AddrSpace, freeStores: list) -> bool:
         """Identify any STORE ops that use a free pointer from a given address space.
@@ -2247,11 +2102,9 @@ class Heritage:
 
         C++ ref: ``Heritage::protectFreeStores``
         """
-        if not hasattr(self._fd, 'beginOp'):
-            return False
         hasNew = False
         for op in self._fd.beginOp(OpCode.CPUI_STORE):
-            if hasattr(op, 'isDead') and op.isDead():
+            if op.isDead():
                 continue
             vn = op.getIn(1)
             while vn.isWritten():
@@ -2263,9 +2116,8 @@ class Heritage:
                     vn = defOp.getIn(0)
                 else:
                     break
-            if vn.isFree() and vn.getSpace() is spc:
-                if hasattr(self._fd, 'opMarkSpacebasePtr'):
-                    self._fd.opMarkSpacebasePtr(op)
+            if vn.isFree() and vn.getSpace() == spc:
+                self._fd.opMarkSpacebasePtr(op)
                 freeStores.append(op)
                 hasNew = True
         return hasNew
@@ -2281,91 +2133,87 @@ class Heritage:
 
         C++ ref: ``Heritage::discoverIndexedStackPointers``
         """
-        if not hasattr(spc, 'numSpacebase') or spc.numSpacebase() == 0:
-            return False
-        if not hasattr(self._fd, 'findVarnodeInput'):
-            return False
-
-        NONCONSTANT_INDEX = 1
-        MULTIEQUAL_FLAG = 2
         markedVn = []
+        path = []
         unknownStackStorage = False
 
         for i in range(spc.numSpacebase()):
             stackPointer = spc.getSpacebase(i)
-            spInput = self._fd.findVarnodeInput(stackPointer.size, Address(stackPointer.space, stackPointer.offset))
+            spInput = self._fd.findVarnodeInput(stackPointer.size, stackPointer.getAddr())
             if spInput is None:
                 continue
-            # DFS path: (varnode, offset, traversals, descend_iter)
-            descends = list(spInput.getDescend()) if hasattr(spInput, 'getDescend') else []
-            path = [(spInput, 0, 0, iter(descends))]
+            path.append(StackNode(spInput, 0, 0))
             while path:
-                curVn, curOffset, curTraversals, curIter = path[-1]
-                try:
-                    op = next(curIter)
-                except StopIteration:
+                curNode = path[-1]
+                if curNode.iter >= len(curNode.descend):
                     path.pop()
                     continue
+                op = curNode.descend[curNode.iter]
+                curNode.iter += 1
                 outVn = op.getOut()
-                if outVn is not None and hasattr(outVn, 'isMark') and outVn.isMark():
+                if outVn is not None and outVn.isMark():
                     continue
                 opc = op.code()
                 if opc == OpCode.CPUI_INT_ADD:
-                    otherSlot = 1 - op.getSlot(curVn) if hasattr(op, 'getSlot') else 1
+                    otherSlot = 1 - op.getSlot(curNode.vn)
                     otherVn = op.getIn(otherSlot)
                     if otherVn.isConstant():
-                        newOffset = (curOffset + otherVn.getOffset()) & calc_mask(spc.getAddrSize()) if hasattr(spc, 'getAddrSize') else curOffset + otherVn.getOffset()
-                        newDescends = list(outVn.getDescend()) if hasattr(outVn, 'getDescend') else []
-                        if newDescends:
-                            if hasattr(outVn, 'setMark'):
-                                outVn.setMark()
+                        newOffset = spc.wrapOffset(curNode.offset + otherVn.getOffset())
+                        nextNode = StackNode(outVn, newOffset, curNode.traversals)
+                        if nextNode.iter < len(nextNode.descend):
+                            outVn.setMark()
+                            path.append(nextNode)
                             markedVn.append(outVn)
-                            path.append((outVn, newOffset, curTraversals, iter(newDescends)))
-                        elif hasattr(outVn, 'getSpace') and outVn.getSpace() is not None and outVn.getSpace().getType() == IPTR_SPACEBASE:
+                        elif outVn.getSpace().getType() == IPTR_SPACEBASE:
                             unknownStackStorage = True
                     else:
-                        newDescends = list(outVn.getDescend()) if hasattr(outVn, 'getDescend') else []
-                        if newDescends:
-                            if hasattr(outVn, 'setMark'):
-                                outVn.setMark()
+                        nextNode = StackNode(outVn, curNode.offset, curNode.traversals | StackNode.nonconstant_index)
+                        if nextNode.iter < len(nextNode.descend):
+                            outVn.setMark()
+                            path.append(nextNode)
                             markedVn.append(outVn)
-                            path.append((outVn, curOffset, curTraversals | NONCONSTANT_INDEX, iter(newDescends)))
-                        elif hasattr(outVn, 'getSpace') and outVn.getSpace() is not None and outVn.getSpace().getType() == IPTR_SPACEBASE:
+                        elif outVn.getSpace().getType() == IPTR_SPACEBASE:
                             unknownStackStorage = True
-                elif opc in (OpCode.CPUI_COPY, OpCode.CPUI_INDIRECT):
-                    if outVn is not None:
-                        newDescends = list(outVn.getDescend()) if hasattr(outVn, 'getDescend') else []
-                        if newDescends:
-                            if hasattr(outVn, 'setMark'):
-                                outVn.setMark()
-                            markedVn.append(outVn)
-                            path.append((outVn, curOffset, curTraversals, iter(newDescends)))
-                        elif hasattr(outVn, 'getSpace') and outVn.getSpace() is not None and outVn.getSpace().getType() == IPTR_SPACEBASE:
-                            unknownStackStorage = True
+                elif opc == OpCode.CPUI_SEGMENTOP:
+                    if op.getIn(2) is not curNode.vn:
+                        continue
+                    nextNode = StackNode(outVn, curNode.offset, curNode.traversals)
+                    if nextNode.iter < len(nextNode.descend):
+                        outVn.setMark()
+                        path.append(nextNode)
+                        markedVn.append(outVn)
+                    elif outVn.getSpace().getType() == IPTR_SPACEBASE:
+                        unknownStackStorage = True
+                elif opc in (OpCode.CPUI_INDIRECT, OpCode.CPUI_COPY):
+                    nextNode = StackNode(outVn, curNode.offset, curNode.traversals)
+                    if nextNode.iter < len(nextNode.descend):
+                        outVn.setMark()
+                        path.append(nextNode)
+                        markedVn.append(outVn)
+                    elif outVn.getSpace().getType() == IPTR_SPACEBASE:
+                        unknownStackStorage = True
                 elif opc == OpCode.CPUI_MULTIEQUAL:
-                    if outVn is not None:
-                        newDescends = list(outVn.getDescend()) if hasattr(outVn, 'getDescend') else []
-                        if newDescends:
-                            if hasattr(outVn, 'setMark'):
-                                outVn.setMark()
-                            markedVn.append(outVn)
-                            path.append((outVn, curOffset, curTraversals | MULTIEQUAL_FLAG, iter(newDescends)))
-                        elif hasattr(outVn, 'getSpace') and outVn.getSpace() is not None and outVn.getSpace().getType() == IPTR_SPACEBASE:
-                            unknownStackStorage = True
+                    nextNode = StackNode(outVn, curNode.offset, curNode.traversals | StackNode.multiequal)
+                    if nextNode.iter < len(nextNode.descend):
+                        outVn.setMark()
+                        path.append(nextNode)
+                        markedVn.append(outVn)
+                    elif outVn.getSpace().getType() == IPTR_SPACEBASE:
+                        unknownStackStorage = True
                 elif opc == OpCode.CPUI_LOAD:
-                    if curTraversals != 0:
-                        self.generateLoadGuard({'offset': curOffset}, op, spc)
+                    if curNode.traversals != 0:
+                        self.generateLoadGuard(curNode, op, spc)
                 elif opc == OpCode.CPUI_STORE:
-                    if op.getIn(1) is curVn:
-                        if curTraversals != 0:
-                            self.generateStoreGuard({'offset': curOffset}, op, spc)
+                    if op.getIn(1) is curNode.vn:
+                        if curNode.traversals != 0:
+                            self.generateStoreGuard(curNode, op, spc)
                         else:
-                            if hasattr(self._fd, 'opMarkSpacebasePtr'):
-                                self._fd.opMarkSpacebasePtr(op)
+                            self._fd.opMarkSpacebasePtr(op)
+                else:
+                    continue
 
         for vn in markedVn:
-            if hasattr(vn, 'clearMark'):
-                vn.clearMark()
+            vn.clearMark()
         if unknownStackStorage and checkFreeStores:
             return self.protectFreeStores(spc, freeStores)
         return False
@@ -2379,35 +2227,25 @@ class Heritage:
 
         C++ ref: ``Heritage::reprocessFreeStores``
         """
-        if self._fd is None:
-            return
-        # Clear spacebase ptr marks on all free stores
         for op in freeStores:
-            if hasattr(self._fd, 'opClearSpacebasePtr'):
-                self._fd.opClearSpacebasePtr(op)
-        # Re-discover indexed stack pointers
+            self._fd.opClearSpacebasePtr(op)
         self.discoverIndexedStackPointers(spc, freeStores, False)
-        # For each store that is no longer marked, remove unnecessary INDIRECTs
         for op in freeStores:
-            if hasattr(op, 'usesSpacebasePtr') and op.usesSpacebasePtr():
-                continue  # Appropriately marked
-            # Walk backwards through INDIRECTs inserted just before this STORE
-            indOp = op.previousOp() if hasattr(op, 'previousOp') else None
+            if op.usesSpacebasePtr():
+                continue
+            indOp = op.previousOp()
             while indOp is not None:
                 if indOp.code() != OpCode.CPUI_INDIRECT:
                     break
                 iopVn = indOp.getIn(1)
-                if not hasattr(iopVn, 'getSpace') or iopVn.getSpace() is None:
-                    break
                 from ghidra.core.space import IPTR_IOP
                 if iopVn.getSpace().getType() != IPTR_IOP:
                     break
                 from ghidra.ir.op import PcodeOp
-                if hasattr(PcodeOp, 'getOpFromConst'):
-                    if op is not PcodeOp.getOpFromConst(iopVn.getAddr()):
-                        break
-                nextOp = indOp.previousOp() if hasattr(indOp, 'previousOp') else None
-                if indOp.getOut().getSpace() is spc:
+                if op is not PcodeOp.getOpFromConst(iopVn.getAddr()):
+                    break
+                nextOp = indOp.previousOp()
+                if indOp.getOut().getSpace() == spc:
                     self._fd.totalReplace(indOp.getOut(), indOp.getIn(0))
                     self._fd.opDestroy(indOp)
                 indOp = nextOp
@@ -2423,8 +2261,7 @@ class Heritage:
         """
         # Mark the sinks
         for op in copySinks:
-            if hasattr(op, 'setMark'):
-                op.setMark()
+            op.setMark()
         # BFS backwards from sinks
         pos = 0
         while pos < len(copySinks):
@@ -2436,23 +2273,23 @@ class Heritage:
                 vn = op.getIn(i)
                 if not vn.isWritten():
                     continue
-                if hasattr(vn, 'isAddrForce') and vn.isAddrForce():
+                if vn.isAddrForce():
                     continue  # Already address forced
                 newOp = vn.getDef()
-                if hasattr(newOp, 'isMark') and newOp.isMark():
+                if newOp.isMark():
                     continue  # Already visited
-                if hasattr(newOp, 'setMark'):
-                    newOp.setMark()
+                newOp.setMark()
                 opc = newOp.code()
                 isArtificial = False
                 if opc == OpCode.CPUI_COPY or opc == OpCode.CPUI_MULTIEQUAL:
                     isArtificial = True
-                    for j in range(newOp.numInput()):
+                    maxInNew = newOp.numInput()
+                    for j in range(maxInNew):
                         inVn = newOp.getIn(j)
                         if addr != inVn.getAddr():
                             isArtificial = False
                             break
-                elif opc == OpCode.CPUI_INDIRECT and (hasattr(newOp, 'isIndirectStore') and newOp.isIndirectStore()):
+                elif opc == OpCode.CPUI_INDIRECT and newOp.isIndirectStore():
                     inVn = newOp.getIn(0)
                     if addr == inVn.getAddr():
                         isArtificial = True
@@ -2463,18 +2300,17 @@ class Heritage:
 
     def propagateCopyAway(self, op) -> None:
         """Eliminate a COPY sink preserving its data-flow."""
-        if hasattr(self._fd, 'totalReplace') and hasattr(self._fd, 'opDestroy'):
-            inVn = op.getIn(0)
-            while inVn.isWritten():
-                nextOp = inVn.getDef()
-                if nextOp.code() != OpCode.CPUI_COPY:
-                    break
-                nextIn = nextOp.getIn(0)
-                if nextIn.getAddr() != inVn.getAddr():
-                    break
-                inVn = nextIn
-            self._fd.totalReplace(op.getOut(), inVn)
-            self._fd.opDestroy(op)
+        inVn = op.getIn(0)
+        while inVn.isWritten():
+            nextOp = inVn.getDef()
+            if nextOp.code() != OpCode.CPUI_COPY:
+                break
+            nextIn = nextOp.getIn(0)
+            if nextIn.getAddr() != inVn.getAddr():
+                break
+            inVn = nextIn
+        self._fd.totalReplace(op.getOut(), inVn)
+        self._fd.opDestroy(op)
 
     def handleNewLoadCopies(self) -> None:
         """Mark the boundary of artificial ops introduced by load guards.
@@ -2492,23 +2328,14 @@ class Heritage:
         copySinkSize = len(self._loadCopyOps)
         self.findAddressForces(self._loadCopyOps, forces)
         if forces:
-            # Build range list from load guards
-            loadRanges = None
-            try:
-                from ghidra.core.rangelist import RangeList
-                loadRanges = RangeList()
-                for guard in self._loadGuard:
-                    loadRanges.insertRange(guard.spc, guard.minimumOffset, guard.maximumOffset)
-            except (ImportError, AttributeError):
-                loadRanges = None
-            # Mark boundary ops as address forced
+            loadRanges = RangeList()
+            for guard in self._loadGuard:
+                loadRanges.insertRange(guard.spc, guard.minimumOffset, guard.maximumOffset)
             for op in forces:
                 vn = op.getOut()
-                if loadRanges is not None and hasattr(loadRanges, 'inRange'):
-                    if loadRanges.inRange(vn.getAddr(), 1):
-                        vn.setAddrForce()
-                if hasattr(op, 'clearMark'):
-                    op.clearMark()
+                if loadRanges.inRange(vn.getAddr(), 1):
+                    vn.setAddrForce()
+                op.clearMark()
         # Eliminate original COPY sinks
         for i in range(copySinkSize):
             op = self._loadCopyOps[i]
@@ -2516,52 +2343,72 @@ class Heritage:
         # Clear marks on remaining artificial COPYs
         for i in range(copySinkSize, len(self._loadCopyOps)):
             op = self._loadCopyOps[i]
-            if hasattr(op, 'clearMark'):
-                op.clearMark()
+            op.clearMark()
         self._loadCopyOps.clear()
 
     def analyzeNewLoadGuards(self) -> None:
         """Make final determination of what range new LoadGuards are protecting.
 
-        Walk backwards through unanalyzed load and store guards. If a
-        ValueSetSolver is available, use it to narrow the guarded ranges.
-        Otherwise, mark all unanalyzed guards as having full range.
-
         C++ ref: ``Heritage::analyzeNewLoadGuards``
         """
         nothingToDo = True
-        if self._loadGuard and hasattr(self._loadGuard[-1], 'analysisState'):
+        if self._loadGuard:
             if self._loadGuard[-1].analysisState == 0:
                 nothingToDo = False
-        if self._storeGuard and hasattr(self._storeGuard[-1], 'analysisState'):
+        if self._storeGuard:
             if self._storeGuard[-1].analysisState == 0:
                 nothingToDo = False
         if nothingToDo:
             return
-        # Collect unanalyzed guards from the back
+
+        sinks = []
+        reads = []
+
         loadStart = len(self._loadGuard)
-        for i in range(len(self._loadGuard) - 1, -1, -1):
-            guard = self._loadGuard[i]
-            if hasattr(guard, 'analysisState') and guard.analysisState != 0:
+        while loadStart > 0:
+            guard = self._loadGuard[loadStart - 1]
+            if guard.analysisState != 0:
                 break
-            loadStart = i
+            loadStart -= 1
+            reads.append(guard.op)
+            sinks.append(guard.op.getIn(1))
+
         storeStart = len(self._storeGuard)
-        for i in range(len(self._storeGuard) - 1, -1, -1):
-            guard = self._storeGuard[i]
-            if hasattr(guard, 'analysisState') and guard.analysisState != 0:
+        while storeStart > 0:
+            guard = self._storeGuard[storeStart - 1]
+            if guard.analysisState != 0:
                 break
-            storeStart = i
-        # Without ValueSetSolver, just finalize all unanalyzed guards with full range
-        for i in range(loadStart, len(self._loadGuard)):
-            guard = self._loadGuard[i]
-            if hasattr(guard, 'analysisState'):
-                if guard.analysisState == 0:
-                    guard.analysisState = 2  # Mark as finalized (full range)
-        for i in range(storeStart, len(self._storeGuard)):
-            guard = self._storeGuard[i]
-            if hasattr(guard, 'analysisState'):
-                if guard.analysisState == 0:
-                    guard.analysisState = 2  # Mark as finalized (full range)
+            storeStart -= 1
+            reads.append(guard.op)
+            sinks.append(guard.op.getIn(1))
+
+        stackSpc = self._fd.getArch().getStackSpace()
+        stackReg = None
+        if stackSpc is not None and stackSpc.numSpacebase() > 0:
+            stackReg = self._fd.findSpacebaseInput(stackSpc)
+
+        vsSolver = ValueSetSolver()
+        vsSolver.establishValueSets(sinks, reads, stackReg, False)
+        widener = WidenerNone()
+        vsSolver.solve(10000, widener)
+
+        runFullAnalysis = False
+        for guard in self._loadGuard[loadStart:]:
+            guard.establishRange(vsSolver.getValueSetRead(guard.op.getSeqNum()))
+            if guard.analysisState == 0:
+                runFullAnalysis = True
+        for guard in self._storeGuard[storeStart:]:
+            guard.establishRange(vsSolver.getValueSetRead(guard.op.getSeqNum()))
+            if guard.analysisState == 0:
+                runFullAnalysis = True
+
+        if runFullAnalysis:
+            fullWidener = WidenerFull()
+            vsSolver.solve(10000, fullWidener)
+            for guard in self._loadGuard[loadStart:]:
+                guard.finalizeRange(vsSolver.getValueSetRead(guard.op.getSeqNum()))
+            for guard in self._storeGuard[storeStart:]:
+                guard.finalizeRange(vsSolver.getValueSetRead(guard.op.getSeqNum()))
 
     # ----------------------------------------------------------------
     # ADT and phi-node placement
@@ -2577,39 +2424,6 @@ class Heritage:
         """
         graph = self._fd.getBasicBlocks()
         size = graph.getSize()
-        if size == 0:
-            return
-
-        # Step 1: Build dominator tree
-        self._buildDominatorTree()
-
-        # Build domchild from the dominator tree
-        self._domchild = [[] for _ in range(size)]
-        for i in range(size):
-            bl = graph.getBlock(i)
-            idom = bl.getImmedDom() if hasattr(bl, 'getImmedDom') else None
-            if idom is not None:
-                pidx = idom.getIndex()
-                if 0 <= pidx < size:
-                    self._domchild[pidx].append(bl)
-
-        # Compute depth via BFS from root
-        self._depth = [0] * size
-        self._maxdepth = 0
-        stack = [(0, 0)]
-        while stack:
-            idx, d = stack.pop()
-            self._depth[idx] = d
-            if d > self._maxdepth:
-                self._maxdepth = d
-            for child in self._domchild[idx]:
-                stack.append((child.getIndex(), d + 1))
-
-        # Step 2: Initialize augment and flags
-        self._augment = [[] for _ in range(size)]
-        self._flags = [0] * size
-
-        # Step 3: Find up-edges and compute boundary nodes
         a = [0] * size
         b = [0] * size
         t = [0] * size
@@ -2617,63 +2431,57 @@ class Heritage:
         upstart = []
         upend = []
 
+        self._augment.clear()
+        self._augment = [[] for _ in range(size)]
+        self._flags.clear()
+        self._flags = [0] * size
+
+        self._domchild = graph.buildDomTree()
+        self._depth, self._maxdepth = graph.buildDomDepth()
+
         for i in range(size):
             x = graph.getBlock(i)
-            for child in self._domchild[i]:
-                for k in range(child.sizeIn()):
-                    u = child.getIn(k)
-                    idom = child.getImmedDom() if hasattr(child, 'getImmedDom') else None
-                    if u is not idom:  # u->child is an up-edge
+            for j in range(len(self._domchild[i])):
+                v = self._domchild[i][j]
+                for k in range(v.sizeIn()):
+                    u = v.getIn(k)
+                    if u is not v.getImmedDom():
                         upstart.append(u)
-                        upend.append(child)
+                        upend.append(v)
                         b[u.getIndex()] += 1
                         t[x.getIndex()] += 1
 
-        # Bottom-up pass to determine boundary nodes
         for i in range(size - 1, -1, -1):
             k_sum = 0
             l_sum = 0
-            for child in self._domchild[i]:
-                cidx = child.getIndex()
-                k_sum += a[cidx]
-                l_sum += z[cidx]
+            for j in range(len(self._domchild[i])):
+                child = self._domchild[i][j]
+                k_sum += a[child.getIndex()]
+                l_sum += z[child.getIndex()]
             a[i] = b[i] - t[i] + k_sum
             z[i] = 1 + l_sum
             if len(self._domchild[i]) == 0 or z[i] > a[i] + 1:
                 self._flags[i] |= Heritage.boundary_node
                 z[i] = 1
 
-        # Compute z[] for path compression
+        if size == 0:
+            return
+
         z[0] = -1
         for i in range(1, size):
-            bl = graph.getBlock(i)
-            idom = bl.getImmedDom() if hasattr(bl, 'getImmedDom') else None
-            if idom is not None:
-                j = idom.getIndex()
-                if (self._flags[j] & Heritage.boundary_node) != 0:
-                    z[i] = j
-                else:
-                    z[i] = z[j]
+            j = graph.getBlock(i).getImmedDom().getIndex()
+            if (self._flags[j] & Heritage.boundary_node) != 0:
+                z[i] = j
+            else:
+                z[i] = z[j]
 
-        # Build the augment array from up-edges
         for i in range(len(upstart)):
             v = upend[i]
-            idom = v.getImmedDom() if hasattr(v, 'getImmedDom') else None
-            j = idom.getIndex() if idom is not None else 0
+            j = v.getImmedDom().getIndex()
             k = upstart[i].getIndex()
-            while j < k:  # while idom(v) properly dominates u
+            while j < k:
                 self._augment[k].append(v)
                 k = z[k]
-
-        # Sort each augment list by idom index ascending.
-        # C++ visitIncr uses `break` when idom(v).index >= j, which assumes
-        # augment entries are sorted by idom index.  In C++ this is guaranteed
-        # by DFS block ordering; Python block indices may differ, so we must
-        # sort explicitly.
-        for lst in self._augment:
-            if len(lst) > 1:
-                lst.sort(key=lambda v: v.getImmedDom().getIndex()
-                         if v.getImmedDom() is not None else 0)
 
     def visitIncr(self, qnode, vnode) -> None:
         """The heart of the phi-node placement algorithm."""

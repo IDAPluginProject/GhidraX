@@ -79,9 +79,9 @@ class _State:
 
     __slots__ = ('op', 'slot', 'flags', 'offset')
 
-    def __init__(self, op: 'PcodeOp', slot_or_old=0, *, from_subpiece: bool = False):
+    def __init__(self, op: 'PcodeOp', slot_or_old=0):
         self.op = op
-        if from_subpiece and isinstance(slot_or_old, _State):
+        if isinstance(slot_or_old, _State):
             old: _State = slot_or_old
             self.slot = 0
             self.flags = 0
@@ -129,19 +129,16 @@ class AncestorRealistic:
         self.multiDepth: int = 0
         self.allowFailingPath: bool = False
 
-    def _mark(self, vn: 'Varnode') -> None:
+    def mark(self, vn: 'Varnode') -> None:
         self.markedVn.append(vn)
-        if hasattr(vn, 'setMark'):
-            vn.setMark()
+        vn.setMark()
 
     # -----------------------------------------------------------------
     def checkConditionalExe(self, state: _State) -> bool:
         bl = state.op.getParent()
-        if bl is None or bl.sizeIn() != 2:
+        if bl.sizeIn() != 2:
             return False
         solidBlock = bl.getIn(state.getSolidSlot())
-        if solidBlock is None:
-            return False
         if solidBlock.sizeOut() != 1:
             return False
         return True
@@ -150,94 +147,80 @@ class AncestorRealistic:
     def enterNode(self) -> int:
         state = self.stateStack[-1]
         stateVn: 'Varnode' = state.op.getIn(state.slot)
-        if hasattr(stateVn, 'isMark') and stateVn.isMark():
+        if stateVn.isMark():
             return self.pop_success
         if not stateVn.isWritten():
             if stateVn.isInput():
-                if hasattr(stateVn, 'isUnaffected') and stateVn.isUnaffected():
+                if stateVn.isUnaffected():
                     return self.pop_fail
                 if stateVn.isPersist():
                     return self.pop_success
-                if hasattr(stateVn, 'isDirectWrite') and not stateVn.isDirectWrite():
+                if not stateVn.isDirectWrite():
                     return self.pop_fail
             return self.pop_success
 
-        self._mark(stateVn)
+        self.mark(stateVn)
         op = stateVn.getDef()
         opc = op.code()
 
         if opc == OpCode.CPUI_INDIRECT:
-            if hasattr(op, 'isIndirectCreation') and op.isIndirectCreation():
-                if hasattr(self.trial, 'setIndCreateFormed'):
-                    self.trial.setIndCreateFormed()
-                in0 = op.getIn(0)
-                if hasattr(in0, 'isIndirectZero') and in0.isIndirectZero():
+            if op.isIndirectCreation():
+                self.trial.setIndCreateFormed()
+                if op.getIn(0).isIndirectZero():
                     return self.pop_failkill
                 return self.pop_success
-            if not (hasattr(op, 'isIndirectStore') and op.isIndirectStore()):
-                outvn = op.getOut()
-                if outvn is not None and hasattr(outvn, 'isReturnAddress') and outvn.isReturnAddress():
+            if not op.isIndirectStore():
+                if op.getOut().isReturnAddress():
                     return self.pop_fail
-                if self.trial is not None and hasattr(self.trial, 'isKilledByCall') and self.trial.isKilledByCall():
+                if self.trial.isKilledByCall():
                     return self.pop_fail
             self.stateStack.append(_State(op, 0))
             return self.enter_node
 
         elif opc == OpCode.CPUI_SUBPIECE:
-            outSpc = op.getOut().getSpace() if op.getOut() is not None and hasattr(op.getOut(), 'getSpace') else None
-            isInternal = outSpc is not None and hasattr(outSpc, 'getType') and outSpc.getType() == IPTR_INTERNAL
-            isIncidental = (hasattr(op, 'isIncidentalCopy') and op.isIncidentalCopy()) or \
-                           (hasattr(op.getIn(0), 'isIncidentalCopy') and op.getIn(0).isIncidentalCopy())
-            overlapVal = -1
-            if hasattr(op.getOut(), 'overlap'):
-                overlapVal = op.getOut().overlap(op.getIn(0))
-            matchOffset = (overlapVal == int(op.getIn(1).getOffset()))
+            isInternal = op.getOut().getSpace().getType() == IPTR_INTERNAL
+            isIncidental = op.isIncidentalCopy() or op.getIn(0).isIncidentalCopy()
+            matchOffset = op.getOut().overlap(op.getIn(0)) == int(op.getIn(1).getOffset())
             if isInternal or isIncidental or matchOffset:
-                self.stateStack.append(_State(op, state, from_subpiece=True))
+                self.stateStack.append(_State(op, state))
                 return self.enter_node
             # Minimal traversal for other SUBPIECEs
-            curOp = op
             while True:
-                vn = curOp.getIn(0)
-                if not (hasattr(vn, 'isMark') and vn.isMark()) and vn.isInput():
-                    if (hasattr(vn, 'isUnaffected') and vn.isUnaffected()) or \
-                       (hasattr(vn, 'isDirectWrite') and not vn.isDirectWrite()):
+                vn = op.getIn(0)
+                if (not vn.isMark()) and vn.isInput():
+                    if vn.isUnaffected() or (not vn.isDirectWrite()):
                         return self.pop_fail
-                curOp = vn.getDef() if vn.isWritten() else None
-                if curOp is None:
+                op = vn.getDef()
+                if op is None:
                     break
-                c = curOp.code()
+                c = op.code()
                 if c != OpCode.CPUI_COPY and c != OpCode.CPUI_SUBPIECE:
                     break
             return self.pop_solid
 
         elif opc == OpCode.CPUI_COPY:
-            outSpc = op.getOut().getSpace() if op.getOut() is not None and hasattr(op.getOut(), 'getSpace') else None
-            isInternal = outSpc is not None and hasattr(outSpc, 'getType') and outSpc.getType() == IPTR_INTERNAL
-            isIncidental = (hasattr(op, 'isIncidentalCopy') and op.isIncidentalCopy()) or \
-                           (hasattr(op.getIn(0), 'isIncidentalCopy') and op.getIn(0).isIncidentalCopy())
-            sameAddr = op.getOut() is not None and op.getIn(0) is not None and op.getOut().getAddr() == op.getIn(0).getAddr()
+            isInternal = op.getOut().getSpace().getType() == IPTR_INTERNAL
+            isIncidental = op.isIncidentalCopy() or op.getIn(0).isIncidentalCopy()
+            sameAddr = op.getOut().getAddr() == op.getIn(0).getAddr()
             if isInternal or isIncidental or sameAddr:
                 self.stateStack.append(_State(op, 0))
                 return self.enter_node
             # Minimal traversal for other COPYs
             vn = op.getIn(0)
             while True:
-                if not (hasattr(vn, 'isMark') and vn.isMark()) and vn.isInput():
-                    if hasattr(vn, 'isDirectWrite') and not vn.isDirectWrite():
+                if (not vn.isMark()) and vn.isInput():
+                    if not vn.isDirectWrite():
                         return self.pop_fail
-                if hasattr(op, 'isStoreUnmapped') and op.isStoreUnmapped():
+                if op.isStoreUnmapped():
                     return self.pop_fail
-                curOp = vn.getDef() if vn.isWritten() else None
-                if curOp is None:
+                op = vn.getDef()
+                if op is None:
                     break
-                c = curOp.code()
+                c = op.code()
                 if c == OpCode.CPUI_COPY or c == OpCode.CPUI_SUBPIECE:
-                    vn = curOp.getIn(0)
-                    op = curOp
+                    vn = op.getIn(0)
                 elif c == OpCode.CPUI_PIECE:
-                    vn = curOp.getIn(1)
-                    op = curOp
+                    vn = op.getIn(1)
                 else:
                     break
             return self.pop_solid
@@ -248,15 +231,14 @@ class AncestorRealistic:
             return self.enter_node
 
         elif opc == OpCode.CPUI_PIECE:
-            if self.trial is not None and stateVn.getSize() > self.trial.getSize():
+            if stateVn.getSize() > self.trial.getSize():
                 if state.offset == 0 and op.getIn(1).getSize() <= self.trial.getSize():
                     self.stateStack.append(_State(op, 1))
                     return self.enter_node
                 elif state.offset == op.getIn(1).getSize() and op.getIn(0).getSize() <= self.trial.getSize():
                     self.stateStack.append(_State(op, 0))
                     return self.enter_node
-                outSpc = stateVn.getSpace() if hasattr(stateVn, 'getSpace') else None
-                if outSpc is not None and hasattr(outSpc, 'getType') and outSpc.getType() != IPTR_SPACEBASE:
+                if stateVn.getSpace().getType() != IPTR_SPACEBASE:
                     return self.pop_fail
             return self.pop_solid
 
@@ -285,8 +267,7 @@ class AncestorRealistic:
                             if not self.checkConditionalExe(state):
                                 pop_command = self.pop_fail
                             else:
-                                if self.trial is not None and hasattr(self.trial, 'setCondExeEffect'):
-                                    self.trial.setCondExeEffect()
+                                self.trial.setCondExeEffect()
                         else:
                             pop_command = self.pop_fail
                 elif prevstate.seenKill():
@@ -315,7 +296,7 @@ class AncestorRealistic:
 
         inVn = op.getIn(slot)
         if inVn.isInput():
-            if not (hasattr(t, 'hasCondExeEffect') and t.hasCondExeEffect()):
+            if not t.hasCondExeEffect():
                 return False
 
         command = self.enter_node
@@ -328,17 +309,13 @@ class AncestorRealistic:
 
         # Clean up marks
         for vn in self.markedVn:
-            if hasattr(vn, 'clearMark'):
-                vn.clearMark()
+            vn.clearMark()
 
         if command == self.pop_success:
-            if hasattr(t, 'setAncestorRealistic'):
-                t.setAncestorRealistic()
+            t.setAncestorRealistic()
             return True
         elif command == self.pop_solid:
-            if hasattr(t, 'setAncestorRealistic'):
-                t.setAncestorRealistic()
-            if hasattr(t, 'setAncestorSolid'):
-                t.setAncestorSolid()
+            t.setAncestorRealistic()
+            t.setAncestorSolid()
             return True
         return False
