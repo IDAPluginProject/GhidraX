@@ -1710,6 +1710,11 @@ class VarnodeBank:
         )
 
     def endLocSpace(self, spaceid: AddrSpace) -> List[Varnode]:
+        target_index = _sort_space_key(spaceid)
+        all_vns = sorted(self._loc_tree.values(), key=_sort_varnode_loc_def_key)
+        for i, vn in enumerate(all_vns):
+            if _sort_space_key(vn.getSpace()) > target_index:
+                return all_vns[i:]
         return []
 
     def beginLocAddr(self, addr: Address) -> List[Varnode]:

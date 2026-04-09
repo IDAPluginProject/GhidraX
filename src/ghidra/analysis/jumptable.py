@@ -6,8 +6,10 @@ JumpTable, JumpModel, JumpBasic, LoadTable, PathMeld, GuardRecord.
 """
 
 from __future__ import annotations
+from bisect import bisect_left
 from typing import Optional, List, Dict, Set
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
 
 
 class IndexPair:
@@ -26,6 +28,10 @@ class IndexPair:
             return self.blockPosition < other.blockPosition
         return self.addressIndex < other.addressIndex
 
+    @staticmethod
+    def compareByPosition(op1, op2):
+        return op1.blockPosition < op2.blockPosition
+
     def __eq__(self, other):
         return self.blockPosition == other.blockPosition and self.addressIndex == other.addressIndex
 
@@ -36,10 +42,13 @@ class IndexPair:
 class LoadTable:
     """A description of where and how data was loaded from memory."""
 
-    def __init__(self, addr: Optional[Address] = None, sz: int = 0, nm: int = 1) -> None:
+    def __init__(self, addr: Optional[Address] = None, sz: int = 0, nm: Optional[int] = None) -> None:
         self.addr: Address = addr if addr is not None else Address()
         self.size: int = sz
-        self.num: int = nm
+        if nm is None:
+            self.num = 0 if addr is None and sz == 0 else 1
+        else:
+            self.num = nm
 
     def __lt__(self, other):
         return self.addr < other.addr
@@ -71,19 +80,51 @@ class LoadTable:
     @staticmethod
     def collapseTable(table: list) -> None:
         """Collapse adjacent table entries."""
-        if len(table) <= 1:
+        if not table:
             return
-        table.sort()
-        i = 0
-        while i < len(table) - 1:
-            cur = table[i]
-            nxt = table[i + 1]
-            endaddr = cur.addr + cur.size * cur.num
-            if endaddr == nxt.addr and cur.size == nxt.size:
-                cur.num += nxt.num
-                table.pop(i + 1)
+
+        issorted = True
+        iter_idx = 0
+        total_num = table[iter_idx].num
+        size = table[iter_idx].size
+        nextaddr = table[iter_idx].addr + size
+        iter_idx += 1
+
+        while iter_idx < len(table):
+            cur = table[iter_idx]
+            if cur.addr == nextaddr and cur.size == size:
+                total_num += cur.num
+                nextaddr = cur.addr + cur.size
             else:
-                i += 1
+                issorted = False
+                break
+            iter_idx += 1
+
+        if issorted:
+            table[:] = [table[0]]
+            table[0].num = total_num
+            return
+
+        table.sort()
+
+        count = 1
+        last_idx = 0
+        iter_idx = 1
+        nextaddr = table[last_idx].addr + table[last_idx].size * table[last_idx].num
+        while iter_idx < len(table):
+            cur = table[iter_idx]
+            last = table[last_idx]
+            if cur.addr == nextaddr and cur.size == last.size:
+                last.num += cur.num
+                nextaddr = cur.addr + cur.size * cur.num
+            elif nextaddr < cur.addr or cur.size != last.size:
+                last_idx += 1
+                table[last_idx] = cur
+                nextaddr = cur.addr + cur.size * cur.num
+                count += 1
+            iter_idx += 1
+
+        table[:] = table[:count]
 
 
 class RootedOp:
@@ -146,7 +187,6 @@ class PathMeld:
 
         C++ ref: PathMeld::set (3 overloads) in jumptable.cc
         """
-        self.clear()
         if vn is not None:
             # set(PcodeOp*, Varnode*)
             self.commonVn.append(vn)
@@ -154,7 +194,7 @@ class PathMeld:
         elif isinstance(op_or_path, PathMeld):
             # set(const PathMeld&)
             self.commonVn = list(op_or_path.commonVn)
-            self.opMeld = list(op_or_path.opMeld)
+            self.opMeld = [RootedOp(entry.op, entry.rootVn) for entry in op_or_path.opMeld]
         elif isinstance(op_or_path, list):
             # set(const vector<PcodeOpNode>&)
             for i, node in enumerate(op_or_path):
@@ -169,7 +209,7 @@ class PathMeld:
         """
         shift = len(op2.commonVn)
         self.commonVn = op2.commonVn + self.commonVn
-        self.opMeld = list(op2.opMeld) + self.opMeld
+        self.opMeld = [RootedOp(entry.op, entry.rootVn) for entry in op2.opMeld] + self.opMeld
         for i in range(len(op2.opMeld), len(self.opMeld)):
             self.opMeld[i].rootVn += shift
 
@@ -180,7 +220,7 @@ class PathMeld:
         """
         newVn = []
         for vn in self.commonVn:
-            if hasattr(vn, 'isMark') and vn.isMark():
+            if vn.isMark():
                 parentMap.append(len(newVn))
                 newVn.append(vn)
                 vn.clearMark()
@@ -201,7 +241,7 @@ class PathMeld:
         C++ ref: PathMeld::meldOps in jumptable.cc
         """
         for entry in self.opMeld:
-            pos = parentMap[entry.rootVn] if entry.rootVn < len(parentMap) else -1
+            pos = parentMap[entry.rootVn]
             if pos == -1:
                 entry.op = None
             else:
@@ -264,23 +304,22 @@ class PathMeld:
 
         for node in path:
             vn = node.op.getIn(node.slot)
-            if hasattr(vn, 'setMark'):
-                vn.setMark()
+            vn.setMark()
         self.internalIntersect(parentMap)
         cutOff = -1
 
         for i, node in enumerate(path):
             vn = node.op.getIn(node.slot)
-            if not (hasattr(vn, 'isMark') and vn.isMark()):
+            if not vn.isMark():
                 cutOff = i + 1
-            elif hasattr(vn, 'clearMark'):
+            else:
                 vn.clearMark()
         newCutoff = self.meldOps(path, cutOff, parentMap)
         if newCutoff >= 0:
             self.truncatePaths(newCutoff)
         del path[cutOff:]
 
-    def markPaths(self, val: bool, startVarnode: int = 0) -> None:
+    def markPaths(self, val: bool, startVarnode: int) -> None:
         """Mark or unmark all PcodeOps up to the given Varnode index.
 
         C++ ref: PathMeld::markPaths in jumptable.cc
@@ -294,12 +333,10 @@ class PathMeld:
             return
         if val:
             for i in range(startOp + 1):
-                if hasattr(self.opMeld[i].op, 'setMark'):
-                    self.opMeld[i].op.setMark()
+                self.opMeld[i].op.setMark()
         else:
             for i in range(startOp + 1):
-                if hasattr(self.opMeld[i].op, 'clearMark'):
-                    self.opMeld[i].op.clearMark()
+                self.opMeld[i].op.clearMark()
 
 
 class GuardRecord:
@@ -311,10 +348,10 @@ class GuardRecord:
         self.readOp = readOp
         self.vn = vn
         self.indpath: int = path
-        self.range = rng._makeCopy() if rng is not None and hasattr(rng, "_makeCopy") else rng
+        self.range = rng._makeCopy()
         bits_preserved_out: list = []
-        self.baseVn = self.quasiCopy(vn, bits_preserved_out) if vn is not None else None
-        self.bitsPreserved: int = bits_preserved_out[0] if bits_preserved_out else 0
+        self.baseVn = self.quasiCopy(vn, bits_preserved_out)
+        self.bitsPreserved: int = bits_preserved_out[0]
         self.unrolled: bool = unrolled
 
     def isUnrolled(self) -> bool:
@@ -366,7 +403,7 @@ class GuardRecord:
         """
         from ghidra.core.address import mostsigbit_set
         from ghidra.core.opcodes import OpCode
-        nzmask = vn.getNZMask() if hasattr(vn, 'getNZMask') else 0
+        nzmask = vn.getNZMask()
         bitsPreserved = mostsigbit_set(nzmask) + 1
         if bitsPreserved == 0:
             if isinstance(bitsPreserved_out, list):
@@ -374,43 +411,43 @@ class GuardRecord:
                 bitsPreserved_out.append(0)
             return vn
         mask = (1 << bitsPreserved) - 1
-        op = vn.getDef() if vn.isWritten() else None
+        op = vn.getDef()
         while op is not None:
             opc = op.code()
             if opc == OpCode.CPUI_COPY:
                 vn = op.getIn(0)
-                op = vn.getDef() if vn.isWritten() else None
+                op = vn.getDef()
             elif opc == OpCode.CPUI_INT_AND:
                 constVn = op.getIn(1)
                 if constVn.isConstant() and constVn.getOffset() == mask:
                     vn = op.getIn(0)
-                    op = vn.getDef() if vn.isWritten() else None
+                    op = vn.getDef()
                 else:
                     op = None
             elif opc == OpCode.CPUI_INT_OR:
                 constVn = op.getIn(1)
                 if constVn.isConstant() and ((constVn.getOffset() | mask) == (constVn.getOffset() ^ mask)):
                     vn = op.getIn(0)
-                    op = vn.getDef() if vn.isWritten() else None
+                    op = vn.getDef()
                 else:
                     op = None
             elif opc in (OpCode.CPUI_INT_SEXT, OpCode.CPUI_INT_ZEXT):
                 if op.getIn(0).getSize() * 8 >= bitsPreserved:
                     vn = op.getIn(0)
-                    op = vn.getDef() if vn.isWritten() else None
+                    op = vn.getDef()
                 else:
                     op = None
             elif opc == OpCode.CPUI_PIECE:
                 if op.getIn(1).getSize() * 8 >= bitsPreserved:
                     vn = op.getIn(1)
-                    op = vn.getDef() if vn.isWritten() else None
+                    op = vn.getDef()
                 else:
                     op = None
             elif opc == OpCode.CPUI_SUBPIECE:
                 constVn = op.getIn(1)
                 if constVn.isConstant() and constVn.getOffset() == 0:
                     vn = op.getIn(0)
-                    op = vn.getDef() if vn.isWritten() else None
+                    op = vn.getDef()
                 else:
                     op = None
             else:
@@ -432,11 +469,11 @@ class GuardRecord:
         if self.bitsPreserved == bitsPreserved2:
             if self.baseVn is baseVn2:
                 return 1
-            loadOp = self.baseVn.getDef() if self.baseVn.isWritten() else None
-            loadOp2 = baseVn2.getDef() if baseVn2.isWritten() else None
+            loadOp = self.baseVn.getDef()
+            loadOp2 = baseVn2.getDef()
         else:
-            loadOp = self.vn.getDef() if self.vn.isWritten() else None
-            loadOp2 = vn2.getDef() if vn2.isWritten() else None
+            loadOp = self.vn.getDef()
+            loadOp2 = vn2.getDef()
         if loadOp is None or loadOp2 is None:
             return 0
         if GuardRecord.oneOffMatch(loadOp, loadOp2) == 1:
@@ -473,26 +510,80 @@ class GuardRecord:
 class JumpModel:
     """Base class for jump-table execution models."""
 
-    def __init__(self, jt=None) -> None:
+    def __init__(self, jt) -> None:
         self.jumptable = jt
+
+    def isOverride(self) -> bool:
+        raise NotImplementedError("JumpModel.isOverride must be implemented by subclasses")
+
+    def getTableSize(self) -> int:
+        raise NotImplementedError("JumpModel.getTableSize must be implemented by subclasses")
+
+    def recoverModel(self, fd, indop, matchsize: int, maxtablesize: int) -> bool:
+        raise NotImplementedError("JumpModel.recoverModel must be implemented by subclasses")
+
+    def buildAddresses(self, fd, indop, addresstable: list,
+                       loadpoints=None, loadcounts=None) -> None:
+        raise NotImplementedError("JumpModel.buildAddresses must be implemented by subclasses")
+
+    def findUnnormalized(self, maxaddsub: int, maxleftright: int, maxext: int) -> None:
+        raise NotImplementedError("JumpModel.findUnnormalized must be implemented by subclasses")
+
+    def buildLabels(self, fd, addresstable: list, label: list, orig=None) -> None:
+        raise NotImplementedError("JumpModel.buildLabels must be implemented by subclasses")
+
+    def foldInNormalization(self, fd, indop):
+        raise NotImplementedError("JumpModel.foldInNormalization must be implemented by subclasses")
+
+    def foldInGuards(self, fd, jump) -> bool:
+        raise NotImplementedError("JumpModel.foldInGuards must be implemented by subclasses")
+
+    def sanityCheck(self, fd, indop, addresstable: list,
+                    loadpoints: list = None, loadcounts=None) -> bool:
+        raise NotImplementedError("JumpModel.sanityCheck must be implemented by subclasses")
+
+    def clone(self, jt):
+        raise NotImplementedError("JumpModel.clone must be implemented by subclasses")
+
+    def clear(self) -> None:
+        pass
+
+    def encode(self, encoder) -> None:
+        pass
+
+    def decode(self, decoder) -> None:
+        pass
+
+
+class JumpModelTrivial(JumpModel):
+    """Trivial model where the BRANCHIND input is the switch variable."""
+
+    def __init__(self, jt) -> None:
+        super().__init__(jt)
+        self._size: int = 0
 
     def isOverride(self) -> bool:
         return False
 
     def getTableSize(self) -> int:
-        return 0
+        return self._size
 
-    def recoverModel(self, fd, indop, matchsize: int = 0, maxtablesize: int = 1024) -> bool:
-        return False
+    def recoverModel(self, fd, indop, matchsize: int, maxtablesize: int) -> bool:
+        self._size = indop.getParent().sizeOut()
+        return self._size != 0 and self._size <= matchsize
 
-    def buildAddresses(self, fd, indop, addresstable: list,
-                       loadpoints=None, loadcounts=None) -> None:
-        pass
+    def buildAddresses(self, fd, indop, addresstable, loadpoints=None, loadcounts=None):
+        addresstable.clear()
+        bl = indop.getParent()
+        for i in range(bl.sizeOut()):
+            outbl = bl.getOut(i)
+            addresstable.append(outbl.getStart())
+
+    def buildLabels(self, fd, addresstable, label, orig):
+        for addr in addresstable:
+            label.append(addr.getOffset())
 
     def findUnnormalized(self, maxaddsub: int = 0, maxleftright: int = 0, maxext: int = 0) -> None:
-        pass
-
-    def buildLabels(self, fd, addresstable: list, label: list, orig=None) -> None:
         pass
 
     def foldInNormalization(self, fd, indop):
@@ -506,50 +597,147 @@ class JumpModel:
         return True
 
     def clone(self, jt):
-        return JumpModel(jt)
-
-    def clear(self) -> None:
-        pass
-
-
-class JumpModelTrivial(JumpModel):
-    """Trivial model where the BRANCHIND input is the switch variable."""
-
-    def __init__(self, jt=None) -> None:
-        super().__init__(jt)
-        self._size: int = 0
-
-    def getTableSize(self) -> int:
-        return self._size
-
-    def recoverModel(self, fd, indop, matchsize=0, maxtablesize=1024) -> bool:
-        if indop is None:
-            return False
-        parent = indop.getParent() if hasattr(indop, 'getParent') else None
-        if parent is None:
-            return False
-        self._size = parent.sizeOut()
-        return self._size > 0
-
-    def buildAddresses(self, fd, indop, addresstable, loadpoints=None, loadcounts=None):
-        if indop is None:
-            return
-        parent = indop.getParent() if hasattr(indop, 'getParent') else None
-        if parent is None:
-            return
-        for i in range(parent.sizeOut()):
-            bl = parent.getOut(i)
-            if bl is not None:
-                addresstable.append(bl.getStart() if hasattr(bl, 'getStart') else Address())
-
-    def buildLabels(self, fd, addresstable, label, orig=None):
-        for i in range(len(addresstable)):
-            label.append(i)
-
-    def clone(self, jt):
         m = JumpModelTrivial(jt)
         m._size = self._size
         return m
+
+
+class JumpAssisted(JumpModel):
+    """A jump-table model assisted by a jumpassist user-op."""
+
+    def __init__(self, jt) -> None:
+        super().__init__(jt)
+        self.assistOp = None
+        self.userop = None
+        self.sizeIndices: int = 0
+        self.switchvn = None
+
+    def isOverride(self) -> bool:
+        return False
+
+    def getTableSize(self) -> int:
+        return self.sizeIndices + 1
+
+    def recoverModel(self, fd, indop, matchsize: int, maxtablesize: int) -> bool:
+        from ghidra.arch.userop import UserPcodeOp
+        from ghidra.core.opcodes import OpCode
+
+        addrVn = indop.getIn(0)
+        if not addrVn.isWritten():
+            return False
+        self.assistOp = addrVn.getDef()
+        if self.assistOp is None:
+            return False
+        if self.assistOp.code() != OpCode.CPUI_CALLOTHER:
+            return False
+        if self.assistOp.numInput() < 3:
+            return False
+        index = self.assistOp.getIn(0).getOffset()
+        tmpOp = fd.getArch().userops.getOp(index)
+        if tmpOp.getType() != UserPcodeOp.jumpassist:
+            return False
+        self.userop = tmpOp
+
+        self.switchvn = self.assistOp.getIn(1)
+        for i in range(2, self.assistOp.numInput()):
+            if not self.assistOp.getIn(i).isConstant():
+                return False
+        if self.userop.getCalcSize() == -1:
+            self.sizeIndices = self.assistOp.getIn(2).getOffset()
+        else:
+            pcodeScript = fd.getArch().pcodeinjectlib.getPayload(self.userop.getCalcSize())
+            inputs = []
+            numInputs = self.assistOp.numInput() - 1
+            if pcodeScript.sizeInput() != numInputs:
+                raise LowlevelError(f"{self.userop.getName()}: <size_pcode> has wrong number of parameters")
+            for i in range(numInputs):
+                inputs.append(self.assistOp.getIn(i + 1).getOffset())
+            self.sizeIndices = pcodeScript.evaluate(inputs)
+        if matchsize != 0 and matchsize - 1 != self.sizeIndices:
+            return False
+        if self.sizeIndices > maxtablesize:
+            return False
+        return True
+
+    def buildAddresses(self, fd, indop, addresstable, loadpoints, loadcounts) -> None:
+        if self.userop.getIndex2Addr() == -1:
+            raise LowlevelError("Final index2addr calculation outside of jumpassist")
+        pcodeScript = fd.getArch().pcodeinjectlib.getPayload(self.userop.getIndex2Addr())
+        addresstable.clear()
+
+        spc = indop.getAddr().getSpace()
+        inputs = []
+        numInputs = self.assistOp.numInput() - 1
+        if pcodeScript.sizeInput() != numInputs:
+            raise LowlevelError(f"{self.userop.getName()}: <addr_pcode> has wrong number of parameters")
+        for i in range(numInputs):
+            inputs.append(self.assistOp.getIn(i + 1).getOffset())
+
+        mask = ~0
+        bit = fd.getArch().funcptr_align
+        if bit != 0:
+            mask = (mask >> bit) << bit
+        for index in range(self.sizeIndices):
+            inputs[0] = index
+            output = pcodeScript.evaluate(inputs)
+            output &= mask
+            addresstable.append(Address(spc, output))
+
+        defaultScript = fd.getArch().pcodeinjectlib.getPayload(self.userop.getDefaultAddr())
+        if defaultScript.sizeInput() != numInputs:
+            raise LowlevelError(f"{self.userop.getName()}: <default_pcode> has wrong number of parameters")
+        inputs[0] = 0
+        defaultAddress = defaultScript.evaluate(inputs)
+        addresstable.append(Address(spc, defaultAddress))
+
+    def findUnnormalized(self, maxaddsub: int, maxleftright: int, maxext: int) -> None:
+        pass
+
+    def buildLabels(self, fd, addresstable, label, orig) -> None:
+        if orig.sizeIndices != self.sizeIndices:
+            raise LowlevelError("JumpAssisted table size changed during recovery")
+        if self.userop.getIndex2Case() == -1:
+            for i in range(self.sizeIndices):
+                label.append(i)
+        else:
+            pcodeScript = fd.getArch().pcodeinjectlib.getPayload(self.userop.getIndex2Case())
+            inputs = []
+            numInputs = self.assistOp.numInput() - 1
+            if numInputs != pcodeScript.sizeInput():
+                raise LowlevelError(f"{self.userop.getName()}: <case_pcode> has wrong number of parameters")
+            for i in range(numInputs):
+                inputs.append(self.assistOp.getIn(i + 1).getOffset())
+
+            for index in range(self.sizeIndices):
+                inputs[0] = index
+                output = pcodeScript.evaluate(inputs)
+                label.append(output)
+        label.append(JumpValues.NO_LABEL)
+
+    def foldInNormalization(self, fd, indop):
+        outvn = self.assistOp.getOut()
+        for op in list(outvn.beginDescend()):
+            fd.opSetInput(op, self.switchvn, 0)
+        fd.opDestroy(self.assistOp)
+        return self.switchvn
+
+    def foldInGuards(self, fd, jump) -> bool:
+        origVal = jump.getDefaultBlock()
+        jump.setLastAsDefault()
+        return origVal != jump.getDefaultBlock()
+
+    def sanityCheck(self, fd, indop, addresstable, loadpoints, loadcounts) -> bool:
+        return True
+
+    def clone(self, jt):
+        clone = JumpAssisted(jt)
+        clone.userop = self.userop
+        clone.sizeIndices = self.sizeIndices
+        return clone
+
+    def clear(self) -> None:
+        self.assistOp = None
+        self.switchvn = None
 
 
 class JumpTable:
@@ -587,6 +775,8 @@ class JumpTable:
             self.collectloads = op2.collectloads
             self.defaultIsFolded = False
             self.block2addr = []
+            if op2.jmodel is not None:
+                self.jmodel = op2.jmodel.clone(self)
             return
         self.glb = glb
         self.opaddress: Address = addr if addr is not None else Address()
@@ -606,6 +796,10 @@ class JumpTable:
         self.collectloads: bool = False
         self.defaultIsFolded: bool = False
         self.block2addr: List[IndexPair] = []
+
+    def __del__(self) -> None:
+        self.jmodel = None
+        self.origmodel = None
 
     def isRecovered(self) -> bool:
         return len(self.addresstable) > 0
@@ -638,7 +832,7 @@ class JumpTable:
         return self.indirect
 
     def setIndirectOp(self, ind) -> None:
-        self.opaddress = ind.getAddr() if hasattr(ind, 'getAddr') else Address()
+        self.opaddress = ind.getAddr()
         self.indirect = ind
 
     def setNormMax(self, maddsub: int, mleftright: int, mext: int) -> None:
@@ -662,61 +856,78 @@ class JumpTable:
         return self.defaultIsFolded
 
     def getAddressByIndex(self, i: int) -> Address:
-        return self.addresstable[i] if i < len(self.addresstable) else Address()
+        return self.addresstable[i]
 
     def getLabelByIndex(self, i: int) -> int:
-        return self.label[i] if i < len(self.label) else 0
+        return self.label[i]
 
     def block2Position(self, bl) -> int:
         """Get the out-edge position of the given block relative to the switch parent.
 
         C++ ref: ``JumpTable::block2Position``
         """
-        parent = self.indirect.getParent() if self.indirect is not None else None
-        if parent is None:
-            raise Exception("Requested block, not in jumptable")
+        parent = self.indirect.getParent()
         for position in range(bl.sizeIn()):
             if bl.getIn(position) is parent:
-                if hasattr(bl, 'getInRevIndex'):
-                    return bl.getInRevIndex(position)
-                return position
-        raise Exception("Requested block, not in jumptable")
+                return bl.getInRevIndex(position)
+        raise LowlevelError("Requested block, not in jumptable")
+
+    @staticmethod
+    def isReachable(op) -> bool:
+        """Check if the given op is still reachable after collapsed guards.
+
+        C++ ref: ``JumpTable::isReachable``
+        """
+        from ghidra.core.opcodes import OpCode
+
+        parent = op.getParent()
+        for _ in range(2):
+            if parent.sizeIn() != 1:
+                return True
+            bl = parent.getIn(0)
+            if bl.sizeOut() != 2:
+                continue
+            cbranch = bl.lastOp()
+            if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
+                continue
+            vn = cbranch.getIn(1)
+            if not vn.isConstant():
+                continue
+            trueslot = 0 if cbranch.isBooleanFlip() else 1
+            if vn.getOffset() == 0:
+                trueslot = 1 - trueslot
+            if bl.getOut(trueslot) is not parent:
+                return False
+            parent = bl
+        return True
 
     def numIndicesByBlock(self, bl) -> int:
         """Count the number of address table entries targeting the given block.
 
         C++ ref: ``JumpTable::numIndicesByBlock``
         """
-        if not self.block2addr:
-            # Fallback for pre-switchOver state
-            blstart = bl.getStart() if hasattr(bl, 'getStart') else None
-            if blstart is None:
-                return 0
-            return sum(1 for addr in self.addresstable if addr == blstart)
-        try:
-            pos = self.block2Position(bl)
-        except Exception:
-            return 0
-        return sum(1 for ip in self.block2addr if ip.blockPosition == pos)
+        pos = self.block2Position(bl)
+        left = bisect_left(self.block2addr, IndexPair(pos, -1))
+        right = bisect_left(self.block2addr, IndexPair(pos + 1, -1))
+        return right - left
 
-    def getIndexByBlock(self, bl, i: int = 0) -> int:
+    def getIndexByBlock(self, bl, i: int) -> int:
         """Get the i-th address table index for the given block.
 
         C++ ref: ``JumpTable::getIndexByBlock``
         """
         pos = self.block2Position(bl)
+        idx = bisect_left(self.block2addr, IndexPair(pos, 0))
         count = 0
-        for ip in self.block2addr:
-            if ip.blockPosition == pos:
-                if count == i:
-                    return ip.addressIndex
-                count += 1
-        block_start = bl.getStart() if hasattr(bl, 'getStart') else None
-        mapping = [(ip.blockPosition, ip.addressIndex) for ip in self.block2addr]
-        raise Exception(
-            f"Could not get jumptable index for block start={block_start} pos={pos} "
-            f"ordinal={i} block2addr={mapping}"
-        )
+        while idx < len(self.block2addr):
+            ip = self.block2addr[idx]
+            if ip.blockPosition != pos:
+                break
+            if count == i:
+                return ip.addressIndex
+            count += 1
+            idx += 1
+        raise LowlevelError("Could not get jumptable index for block")
 
     def recoverAddresses(self, fd) -> None:
         """Recover the raw jump-table addresses."""
@@ -727,14 +938,17 @@ class JumpTable:
             raise LowlevelError(f"Could not recover jumptable at {self.opaddress}. Too many branches")
         if self.jmodel.getTableSize() == 0:
             raise LowlevelError(f"Jumptable with 0 entries at {self.opaddress}")
-        self.addresstable.clear()
-        self.jmodel.buildAddresses(fd, self.indirect, self.addresstable,
-                                   self.loadpoints if self.collectloads else None)
-        self.sanityCheck(fd)
+        if self.collectloads:
+            loadcounts: list[int] = []
+            self.jmodel.buildAddresses(fd, self.indirect, self.addresstable, self.loadpoints, loadcounts)
+            self.sanityCheck(fd, loadcounts)
+            LoadTable.collapseTable(self.loadpoints)
+        else:
+            self.jmodel.buildAddresses(fd, self.indirect, self.addresstable, None, None)
+            self.sanityCheck(fd, None)
 
     def recoverLabels(self, fd) -> None:
         """Recover case labels for this jump-table."""
-        self.label.clear()
         if self.jmodel is not None:
             if self.origmodel is None or self.origmodel.getTableSize() == 0:
                 self.jmodel.findUnnormalized(self.maxaddsub, self.maxleftright, self.maxext)
@@ -744,38 +958,30 @@ class JumpTable:
                 self.jmodel.buildLabels(fd, self.addresstable, self.label, self.origmodel)
         else:
             self.jmodel = JumpModelTrivial(self)
-            max_jumptable_size = (
-                self.glb.max_jumptable_size
-                if self.glb is not None and hasattr(self.glb, "max_jumptable_size")
-                else 1024
-            )
-            self.jmodel.recoverModel(fd, self.indirect, len(self.addresstable), max_jumptable_size)
-            self.jmodel.buildAddresses(fd, self.indirect, self.addresstable)
+            self.jmodel.recoverModel(fd, self.indirect, len(self.addresstable), self.glb.max_jumptable_size)
+            self.jmodel.buildAddresses(fd, self.indirect, self.addresstable, None, None)
             self.trivialSwitchOver()
             self.jmodel.buildLabels(fd, self.addresstable, self.label, self.origmodel)
         self.clearSavedModel()
 
     def foldInNormalization(self, fd) -> None:
         """Hide the normalization code."""
-        if self.jmodel is not None:
-            from ghidra.core.address import calc_mask, minimalmask
-            from ghidra.core.opcodes import OpCode
+        from ghidra.core.address import calc_mask, minimalmask
+        from ghidra.core.opcodes import OpCode
 
-            switchvn = self.jmodel.foldInNormalization(fd, self.indirect)
-            if switchvn is None:
-                return
+        switchvn = self.jmodel.foldInNormalization(fd, self.indirect)
+        if switchvn is None:
+            return
 
-            self.switchVarConsume = minimalmask(switchvn.getNZMask())
-            if self.switchVarConsume >= calc_mask(switchvn.getSize()):
-                if switchvn.isWritten():
-                    op = switchvn.getDef()
-                    if op.code() == OpCode.CPUI_INT_SEXT:
-                        self.switchVarConsume = calc_mask(op.getIn(0).getSize())
+        self.switchVarConsume = minimalmask(switchvn.getNZMask())
+        if self.switchVarConsume >= calc_mask(switchvn.getSize()):
+            if switchvn.isWritten():
+                op = switchvn.getDef()
+                if op.code() == OpCode.CPUI_INT_SEXT:
+                    self.switchVarConsume = calc_mask(op.getIn(0).getSize())
 
     def foldInGuards(self, fd) -> bool:
-        if self.jmodel is not None:
-            return self.jmodel.foldInGuards(fd, self)
-        return False
+        return self.jmodel.foldInGuards(fd, self)
 
     def getLastBlock(self) -> int:
         return self.lastBlock
@@ -797,6 +1003,16 @@ class JumpTable:
 
     def checkForMultistage(self, fd) -> bool:
         """Check if this jump-table needs multistage recovery."""
+        if len(self.addresstable) != 1:
+            return False
+        if self.partialTable:
+            return False
+        if self.indirect is None:
+            return False
+
+        if fd.getOverride().queryMultistageJumptable(self.indirect.getAddr()):
+            self.partialTable = True
+            return True
         return False
 
     def switchOver(self, flow) -> None:
@@ -809,26 +1025,19 @@ class JumpTable:
         C++ ref: ``JumpTable::switchOver``
         """
         self.block2addr.clear()
-        parent = self.indirect.getParent() if self.indirect is not None else None
-        if parent is None:
-            return
+        parent = self.indirect.getParent()
 
         for i, addr in enumerate(self.addresstable):
-            op = flow.target(addr) if hasattr(flow, 'target') else None
-            if op is None:
-                continue
+            op = flow.target(addr)
             tmpbl = op.getParent()
-            pos = -1
-            for j in range(parent.sizeOut()):
-                if parent.getOut(j) is tmpbl:
-                    pos = j
+            for pos in range(parent.sizeOut()):
+                if parent.getOut(pos) is tmpbl:
                     break
-            if pos == -1:
-                raise Exception("Jumptable destination not linked")
+            else:
+                raise LowlevelError("Jumptable destination not linked")
             self.block2addr.append(IndexPair(pos, i))
 
-        if self.block2addr:
-            self.lastBlock = self.block2addr[-1].blockPosition
+        self.lastBlock = self.block2addr[-1].blockPosition
         self.block2addr.sort()
 
         # Find the most common block position -> default block
@@ -845,41 +1054,66 @@ class JumpTable:
                 maxcount = count
                 self.defaultBlock = curPos
 
-    def recoverModel(self, fd) -> bool:
+    def recoverModel(self, fd) -> None:
         """Recover the model for this jump-table."""
-        max_jumptable_size = (
-            self.glb.max_jumptable_size
-            if self.glb is not None and hasattr(self.glb, "max_jumptable_size")
-            else 1024
-        )
+        from ghidra.core.opcodes import OpCode
+
+        max_jumptable_size = self.glb.max_jumptable_size
         matchsize = len(self.addresstable)
 
         if self.jmodel is not None:
             if self.jmodel.isOverride():
-                return self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size)
+                self.jmodel.recoverModel(fd, self.indirect, 0, max_jumptable_size)
+                return
             self.jmodel = None
 
-        # JumpAssisted is not implemented in Python yet. Follow the native
-        # fallback order for the common switch models.
+        vn = self.indirect.getIn(0)
+        if vn.isWritten():
+            op = vn.getDef()
+            if op.code() == OpCode.CPUI_CALLOTHER:
+                self.jmodel = JumpAssisted(self)
+                if self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size):
+                    return
+
         jbasic = JumpBasic(self)
         self.jmodel = jbasic
         if self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size):
-            return True
+            return
 
         jbasic2 = JumpBasic2(self)
-        jbasic2.initializeStart(jbasic.pathMeld)
+        jbasic2.initializeStart(jbasic.getPathMeld())
         self.jmodel = jbasic2
         if self.jmodel.recoverModel(fd, self.indirect, matchsize, max_jumptable_size):
-            return True
+            return
 
         self.jmodel = None
-        return False
 
-    def sanityCheck(self, fd) -> bool:
+    def sanityCheck(self, fd, loadcounts=None) -> None:
         """Verify the recovered jump-table."""
-        if self.jmodel is None:
-            return False
-        return self.jmodel.sanityCheck(fd, self.indirect, self.addresstable)
+        if self.jmodel.isOverride():
+            return
+
+        sz = len(self.addresstable)
+        if not JumpTable.isReachable(self.indirect):
+            self.partialTable = True
+
+        if len(self.addresstable) == 1:
+            isthunk = False
+            addr = self.addresstable[0]
+            if addr.getOffset() == 0:
+                isthunk = True
+            else:
+                addr2 = self.indirect.getAddr()
+                diff = abs(addr.getOffset() - addr2.getOffset())
+                if diff > 0xFFFF:
+                    isthunk = True
+            if isthunk:
+                raise JumptableThunkError("Likely thunk")
+
+        if not self.jmodel.sanityCheck(fd, self.indirect, self.addresstable, self.loadpoints, loadcounts):
+            raise LowlevelError(f"Jumptable at {self.opaddress} did not pass sanity check.")
+        if sz != len(self.addresstable):
+            fd.warning("Sanity check requires truncation of jumptable", self.opaddress)
 
     def trivialSwitchOver(self) -> None:
         """Simple switch-over when table is already complete.
@@ -888,21 +1122,33 @@ class JumpTable:
 
         C++ ref: ``JumpTable::trivialSwitchOver``
         """
+        from ghidra.core.error import LowlevelError
+
         self.block2addr.clear()
-        parent = self.indirect.getParent() if self.indirect is not None else None
-        if parent is None:
-            return
+        parent = self.indirect.getParent()
         numOut = parent.sizeOut()
         if numOut != len(self.addresstable):
-            raise Exception("Trivial addresstable and switch block size do not match")
+            raise LowlevelError("Trivial addresstable and switch block size do not match")
         for i in range(numOut):
             self.block2addr.append(IndexPair(i, i))
         self.lastBlock = numOut - 1
         self.defaultBlock = -1
 
-    def recoverMultistage(self, fd) -> bool:
+    def recoverMultistage(self, fd) -> None:
         """Attempt multistage recovery."""
-        return False
+        self.saveModel()
+
+        oldaddresstable = list(self.addresstable)
+        self.addresstable.clear()
+        self.loadpoints.clear()
+        try:
+            self.recoverAddresses(fd)
+        except (JumptableThunkError, LowlevelError):
+            self.restoreSavedModel()
+            self.addresstable = oldaddresstable
+            fd.warning("Second-stage recovery error", self.indirect.getAddr())
+        self.partialTable = False
+        self.clearSavedModel()
 
     def encode(self, encoder) -> None:
         """Encode this jump-table as a <jumptable> element.
@@ -913,25 +1159,23 @@ class JumpTable:
             ELEM_JUMPTABLE, ELEM_DEST, ATTRIB_LABEL,
         )
         if not self.isRecovered():
-            return
+            raise LowlevelError("Trying to save unrecovered jumptable")
         encoder.openElement(ELEM_JUMPTABLE)
         self.opaddress.encode(encoder)
         for i, addr in enumerate(self.addresstable):
             encoder.openElement(ELEM_DEST)
-            if not addr.isInvalid():
-                spc = addr.getSpace()
-                if spc is not None and hasattr(spc, 'encodeAttributes'):
-                    spc.encodeAttributes(encoder, addr.getOffset())
+            spc = addr.getSpace()
+            off = addr.getOffset()
+            if spc is not None:
+                spc.encodeAttributes(encoder, off)
             if i < len(self.label):
                 if self.label[i] != JumpValues.NO_LABEL:
                     encoder.writeUnsignedInteger(ATTRIB_LABEL, self.label[i])
             encoder.closeElement(ELEM_DEST)
         for lp in self.loadpoints:
-            if hasattr(lp, 'encode'):
-                lp.encode(encoder)
+            lp.encode(encoder)
         if self.jmodel is not None and self.jmodel.isOverride():
-            if hasattr(self.jmodel, 'encode'):
-                self.jmodel.encode(encoder)
+            self.jmodel.encode(encoder)
         encoder.closeElement(ELEM_JUMPTABLE)
 
     def decode(self, decoder) -> None:
@@ -959,7 +1203,7 @@ class JumpTable:
                         break
                     if attribId == ATTRIB_LABEL.id:
                         if missedlabel:
-                            raise Exception("Jumptable entries are missing labels")
+                            raise LowlevelError("Jumptable entries are missing labels")
                         lab = decoder.readUnsignedInteger()
                         self.label.append(lab)
                         foundlabel = True
@@ -973,11 +1217,10 @@ class JumpTable:
                 lp.decode(decoder)
                 self.loadpoints.append(lp)
             elif subId == ELEM_BASICOVERRIDE.id:
+                if self.jmodel is not None:
+                    raise LowlevelError("Duplicate jumptable override specs")
                 self.jmodel = JumpBasicOverride(self)
                 self.jmodel.decode(decoder)
-            else:
-                decoder.openElement()
-                decoder.closeElement(subId)
         decoder.closeElement(elemId)
         if self.label:
             while len(self.label) < len(self.addresstable):
@@ -985,18 +1228,17 @@ class JumpTable:
 
     def setOverride(self, addrtable: list, naddr, h: int, sv: int) -> None:
         """Force a manual override of the jump-table addresses."""
-        self.addresstable = list(addrtable)
-        self.switchVarConsume = sv
-        self.jmodel = JumpModelTrivial(self)
+        override = JumpBasicOverride(self)
+        self.jmodel = override
+        override.setAddresses(addrtable)
+        override.setNorm(naddr, h)
+        override.setStartingValue(sv)
 
     def addBlockToSwitch(self, bl, lab: int) -> None:
         """Force a given basic-block to be a switch destination."""
-        addr = bl.getStart() if hasattr(bl, 'getStart') else Address()
-        self.addresstable.append(addr)
-        parent = self.indirect.getParent() if self.indirect is not None else None
-        if parent is not None:
-            self.lastBlock = parent.sizeOut()
-            self.block2addr.append(IndexPair(self.lastBlock, len(self.addresstable) - 1))
+        self.addresstable.append(bl.getStart())
+        self.lastBlock = self.indirect.getParent().sizeOut()
+        self.block2addr.append(IndexPair(self.lastBlock, len(self.addresstable) - 1))
         self.label.append(lab)
 
     def saveModel(self) -> None:
@@ -1024,37 +1266,31 @@ class JumpTable:
                 self.saveModel()
             else:
                 self.clearSavedModel()
-                if hasattr(fd, "warning"):
-                    fd.warning("Switch is manually overridden", self.opaddress)
+                fd.warning("Switch is manually overridden", self.opaddress)
 
         self.recoverModel(fd)
         if self.jmodel is not None and self.jmodel.getTableSize() != len(self.addresstable):
             if len(self.addresstable) == 1 and self.jmodel.getTableSize() > 1:
-                override = fd.getOverride() if hasattr(fd, "getOverride") else None
-                if override is not None and hasattr(override, "insertMultistageJump"):
-                    override.insertMultistageJump(self.opaddress)
-                if hasattr(fd, "setRestartPending"):
-                    fd.setRestartPending(True)
+                fd.getOverride().insertMultistageJump(self.opaddress)
+                fd.setRestartPending(True)
                 return
-            if hasattr(fd, "warning"):
-                fd.warning("Could not find normalized switch variable to match jumptable", self.opaddress)
+            fd.warning("Could not find normalized switch variable to match jumptable", self.opaddress)
 
     def clear(self) -> None:
         self.clearSavedModel()
-        if self.jmodel is not None:
-            if self.jmodel.isOverride():
-                self.jmodel.clear()
-            else:
-                self.jmodel = None
+        if self.jmodel.isOverride():
+            self.jmodel.clear()
+        else:
+            self.jmodel = None
         self.addresstable.clear()
         self.block2addr.clear()
-        self.indirect = None
-        self.switchVarConsume = 0xFFFFFFFFFFFFFFFF
-        self.partialTable = False
+        self.lastBlock = -1
         self.label.clear()
         self.loadpoints.clear()
+        self.indirect = None
+        self.switchVarConsume = 0xFFFFFFFFFFFFFFFF
         self.defaultBlock = -1
-        self.lastBlock = -1
+        self.partialTable = False
 
 
 # RecoveryMode as class-level enum on JumpTable
@@ -1067,44 +1303,43 @@ JumpTable.RecoveryMode = type('RecoveryMode', (), {
 })
 
 
-class JumptableThunkError(Exception):
+class JumptableThunkError(LowlevelError):
     """Exception thrown for a thunk mechanism that looks like a jump-table."""
-    pass
 
 
 class JumpValues:
     """An iterator over values a switch variable can take."""
-    NO_LABEL = 0xFFFFFFFFFFFFFFFF
+    NO_LABEL = 0xBAD1ABE1BAD1ABE1
 
     def truncate(self, nm: int) -> None:
-        pass
+        raise NotImplementedError("JumpValues.truncate must be implemented by subclasses")
 
     def getSize(self) -> int:
-        return 0
+        raise NotImplementedError("JumpValues.getSize must be implemented by subclasses")
 
     def contains(self, val: int) -> bool:
-        return False
+        raise NotImplementedError("JumpValues.contains must be implemented by subclasses")
 
     def initializeForReading(self) -> bool:
-        return False
+        raise NotImplementedError("JumpValues.initializeForReading must be implemented by subclasses")
 
     def next(self) -> bool:
-        return False
+        raise NotImplementedError("JumpValues.next must be implemented by subclasses")
 
     def getValue(self) -> int:
-        return 0
+        raise NotImplementedError("JumpValues.getValue must be implemented by subclasses")
 
     def getStartVarnode(self):
-        return None
+        raise NotImplementedError("JumpValues.getStartVarnode must be implemented by subclasses")
 
     def getStartOp(self):
-        return None
+        raise NotImplementedError("JumpValues.getStartOp must be implemented by subclasses")
 
     def isReversible(self) -> bool:
-        return False
+        raise NotImplementedError("JumpValues.isReversible must be implemented by subclasses")
 
     def clone(self):
-        return JumpValues()
+        raise NotImplementedError("JumpValues.clone must be implemented by subclasses")
 
 
 class JumpValuesRange(JumpValues):
@@ -1118,13 +1353,23 @@ class JumpValuesRange(JumpValues):
         self._curval: int = 0
 
     def setRange(self, rng) -> None:
-        self.range = rng
+        self.range = rng._makeCopy()
 
     def setStartVn(self, vn) -> None:
         self.normqvn = vn
 
     def setStartOp(self, op) -> None:
         self.startop = op
+
+    def truncate(self, nm: int) -> None:
+        from ghidra.core.address import count_leading_zeros
+
+        range_size = 64 - count_leading_zeros(self.range.getMask())
+        range_size >>= 3
+        left = self.range.getMin()
+        step = self.range.getStep()
+        right = (left + step * nm) & self.range.getMask()
+        self.range.setRange(left, right, range_size, step)
 
     def getSize(self) -> int:
         return self.range.getSize()
@@ -1133,7 +1378,7 @@ class JumpValuesRange(JumpValues):
         return self.range.contains(val)
 
     def initializeForReading(self) -> bool:
-        if self.range.isEmpty():
+        if self.range.getSize() == 0:
             return False
         self._curval = self.range.getMin()
         return True
@@ -1156,7 +1401,7 @@ class JumpValuesRange(JumpValues):
 
     def clone(self):
         r = JumpValuesRange()
-        r.range = self.range
+        r.range = self.range._makeCopy()
         r.normqvn = self.normqvn
         r.startop = self.startop
         return r
@@ -1190,8 +1435,13 @@ class JumpValuesRangeDefault(JumpValuesRange):
         return super().contains(val)
 
     def initializeForReading(self) -> bool:
-        self._lastvalue = False
-        return super().initializeForReading()
+        if self.range.getSize() == 0:
+            self._curval = self._extravalue
+            self._lastvalue = True
+        else:
+            self._curval = self.range.getMin()
+            self._lastvalue = False
+        return True
 
     def next(self) -> bool:
         if self._lastvalue:
@@ -1218,7 +1468,7 @@ class JumpValuesRangeDefault(JumpValuesRange):
 
     def clone(self):
         r = JumpValuesRangeDefault()
-        r.range = self.range
+        r.range = self.range._makeCopy()
         r.normqvn = self.normqvn
         r.startop = self.startop
         r._extravalue = self._extravalue
@@ -1235,7 +1485,7 @@ class EmulateFunction:
 
         class _JumpTableEmulator(EmulatePcodeOp):
             def __init__(self, outer, fd):
-                super().__init__(fd.getArch() if fd is not None and hasattr(fd, "getArch") else None)
+                super().__init__(fd.getArch())
                 self._outer = outer
 
             def getVarnodeValue(self, vn) -> int:
@@ -1245,6 +1495,7 @@ class EmulateFunction:
                 self._outer.setVarnodeValue(vn, val)
 
             def fallthruOp(self) -> None:
+                self.lastOp = self.currentOp
                 self._outer._lastOp = self.currentOp
 
             def executeBranch(self) -> None:
@@ -1268,16 +1519,15 @@ class EmulateFunction:
 
             def executeLoad(self) -> None:
                 from ghidra.core.address import Address
-                from ghidra.core.space import AddrSpace as _AddrSpace
 
-                off = self.getVarnodeValue(self.currentOp.getIn(1))
-                spc = self.currentOp.getIn(0).getSpaceFromConst()
-                off = _AddrSpace.addressToByte(off, spc.getWordSize())
-                sz = self.currentOp.getOut().getSize()
                 if self._outer._loadpoints is not None:
+                    off = self.getVarnodeValue(self.currentOp.getIn(1))
+                    spc = self.currentOp.getIn(0).getSpaceFromConst()
+                    from ghidra.core.space import AddrSpace as _AddrSpace
+                    off = _AddrSpace.addressToByte(off, spc.getWordSize())
+                    sz = self.currentOp.getOut().getSize()
                     self._outer._loadpoints.append(LoadTable(Address(spc, off), sz))
-                res = self.getLoadImageValue(spc, off, sz)
-                self.setVarnodeValue(self.currentOp.getOut(), res)
+                super().executeLoad()
 
         self._fd = fd
         self._varnodeMap: dict = {}
@@ -1289,24 +1539,21 @@ class EmulateFunction:
         self._loadpoints = val
 
     def getVarnodeValue(self, vn) -> int:
-        if vn is not None and hasattr(vn, "isConstant") and vn.isConstant():
+        if vn.isConstant():
             return vn.getOffset()
-        key = id(vn)
-        if key in self._varnodeMap:
-            return self._varnodeMap[key]
-        if self._emu is not None and vn is not None:
-            return self._emu.getLoadImageValue(vn.getSpace(), vn.getOffset(), vn.getSize())
-        return 0
+        if vn in self._varnodeMap:
+            return self._varnodeMap[vn]
+        return self._emu.getLoadImageValue(vn.getSpace(), vn.getOffset(), vn.getSize())
 
     def setVarnodeValue(self, vn, val: int) -> None:
-        self._varnodeMap[id(vn)] = val
+        self._varnodeMap[vn] = val
 
     def setExecuteAddress(self, addr: Address) -> None:
         from ghidra.core.error import LowlevelError
 
-        if addr.getSpace() is None or not addr.getSpace().hasPhysical():
+        if not addr.getSpace().hasPhysical():
             raise LowlevelError("Bad execute address")
-        current_op = self._fd.target(addr) if self._fd is not None and hasattr(self._fd, "target") else None
+        current_op = self._fd.target(addr)
         if current_op is None:
             raise LowlevelError("Could not set execute address")
         self._emu.setCurrentOp(current_op)
@@ -1335,18 +1582,18 @@ class EmulateFunction:
             startop = pathMeld.getOp(i)
         if i == pathMeld.numOps():
             raise LowlevelError("Bad jumptable emulation")
-        if startvn is not None and not startvn.isConstant():
+        if not startvn.isConstant():
             self.setVarnodeValue(startvn, val)
+        self._emu.lastOp = self._lastOp
         while i > 0:
             curop = pathMeld.getOp(i)
             i -= 1
             self._emu.setCurrentOp(curop)
-            self._emu.lastOp = self._lastOp
             try:
                 self._emu.executeCurrentOp()
             except DataUnavailError:
                 raise LowlevelError(f"Could not emulate address calculation at {curop.getAddr()}")
-            self._lastOp = self._emu.lastOp
+        self._lastOp = self._emu.lastOp
         invn = pathMeld.getOp(0).getIn(0)
         return self.getVarnodeValue(invn)
 
@@ -1357,7 +1604,7 @@ class JumpBasic(JumpModel):
     C++ ref: JumpBasic in jumptable.hh / jumptable.cc
     """
 
-    def __init__(self, jt=None) -> None:
+    def __init__(self, jt) -> None:
         super().__init__(jt)
         self.pathMeld = PathMeld()
         self.jrange: Optional[JumpValuesRange] = None
@@ -1366,16 +1613,20 @@ class JumpBasic(JumpModel):
         self.normalvn = None  # Varnode: the normalized switch variable
         self.switchvn = None  # Varnode: the unnormalized switch variable
 
+    def getPathMeld(self):
+        return self.pathMeld
+
     def getValueRange(self):
         return self.jrange
+
+    def __del__(self) -> None:
+        self.jrange = None
 
     def isOverride(self) -> bool:
         return False
 
     def getTableSize(self) -> int:
-        if self.jrange is not None:
-            return self.jrange.getSize()
-        return 0
+        return self.jrange.getSize()
 
     # ------------------------------------------------------------------
     # Static helpers
@@ -1403,9 +1654,9 @@ class JumpBasic(JumpModel):
         """
         if vn.isConstant():
             return False
-        if hasattr(vn, 'isAnnotation') and vn.isAnnotation():
+        if vn.isAnnotation():
             return False
-        if hasattr(vn, 'isReadOnly') and vn.isReadOnly():
+        if vn.isReadOnly():
             return False
         return True
 
@@ -1415,7 +1666,7 @@ class JumpBasic(JumpModel):
 
         C++ ref: JumpBasic::getStride in jumptable.cc
         """
-        mask = vn.getNZMask() if hasattr(vn, 'getNZMask') else 0xFFFFFFFFFFFFFFFF
+        mask = vn.getNZMask()
         if (mask & 0x3f) == 0:
             return 32
         stride = 1
@@ -1470,7 +1721,9 @@ class JumpBasic(JumpModel):
 
         C++ ref: JumpBasic::backup2Switch in jumptable.cc
         """
-        from ghidra.core.error import LowlevelError
+        from ghidra.emulate.memstate import MemoryImage
+        from ghidra.ir.op import PcodeOp
+
         curvn = outvn
         while curvn is not invn:
             op = curvn.getDef()
@@ -1480,22 +1733,29 @@ class JumpBasic(JumpModel):
             for slot in range(op.numInput()):
                 if not op.getIn(slot).isConstant():
                     break
-            evalType = op.getEvalType() if hasattr(op, 'getEvalType') else -1
-            if evalType == 2:  # PcodeOp::binary
+            evalType = op.getEvalType()
+            if evalType == PcodeOp.binary:
                 otherslot = 1 - slot
                 otherAddr = op.getIn(otherslot).getAddr()
                 if not otherAddr.isConstant():
-                    otherval = 0  # Would need MemoryImage for readonly
+                    mem = MemoryImage(otherAddr.getSpace(), 4, 1024, fd.getArch().loader)
+                    otherval = mem.getValue(otherAddr.getOffset(), op.getIn(otherslot).getSize())
                 else:
                     otherval = otherAddr.getOffset()
-                if hasattr(top, 'recoverInputBinary'):
-                    output = top.recoverInputBinary(slot, op.getOut().getSize(), output,
-                                                    op.getIn(slot).getSize(), otherval)
+                output = top.recoverInputBinary(
+                    slot,
+                    op.getOut().getSize(),
+                    output,
+                    op.getIn(slot).getSize(),
+                    otherval,
+                )
                 curvn = op.getIn(slot)
-            elif evalType == 1:  # PcodeOp::unary
-                if hasattr(top, 'recoverInputUnary'):
-                    output = top.recoverInputUnary(op.getOut().getSize(), output,
-                                                   op.getIn(slot).getSize())
+            elif evalType == PcodeOp.unary:
+                output = top.recoverInputUnary(
+                    op.getOut().getSize(),
+                    output,
+                    op.getIn(slot).getSize(),
+                )
                 curvn = op.getIn(slot)
             else:
                 raise LowlevelError("Bad switch normalization op")
@@ -1560,7 +1820,7 @@ class JumpBasic(JumpModel):
         from ghidra.analysis.rangeutil import CircleRange
         maxbranch = 2
         maxpullback = 2
-        usenzmask = not self.jumptable.isPartial() if self.jumptable is not None else True
+        usenzmask = not self.jumptable.isPartial()
 
         self.selectguards.clear()
 
@@ -1581,16 +1841,16 @@ class JumpBasic(JumpModel):
                     if prevbl.sizeOut() != 1:
                         break
                     bl = prevbl
-                indpath = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
+                indpath = bl.getInRevIndex(0)
 
-            cbranch = prevbl.lastOp() if hasattr(prevbl, 'lastOp') else None
+            cbranch = prevbl.lastOp()
             if cbranch is None or cbranch.code() != OpCode.CPUI_CBRANCH:
                 break
             if i != 0:
                 otherbl = prevbl.getOut(1 - indpath)
-                otherop = otherbl.lastOp() if hasattr(otherbl, 'lastOp') else None
+                otherop = otherbl.lastOp()
                 if otherop is not None and otherop.code() == OpCode.CPUI_BRANCHIND:
-                    if self.jumptable is not None and otherop is not self.jumptable.getIndirectOp():
+                    if otherop is not self.jumptable.getIndirectOp():
                         break
 
             toswitchval = (indpath == 1)
@@ -1600,14 +1860,14 @@ class JumpBasic(JumpModel):
             vn = cbranch.getIn(1)
             rng = CircleRange.fromBool(toswitchval)
 
-            indpathstore = (1 - indpath) if (hasattr(prevbl, 'getFlipPath') and prevbl.getFlipPath()) else indpath
+            indpathstore = (1 - indpath) if prevbl.getFlipPath() else indpath
             self.selectguards.append(GuardRecord(cbranch, cbranch, indpathstore, rng, vn))
             for j in range(maxpullback):
                 if not vn.isWritten():
                     break
                 readOp = vn.getDef()
                 result = rng.pullBack(readOp, usenzmask)
-                if result is None or result[0] is None:
+                if result[0] is None:
                     break
                 vn = result[0]
                 if rng.isEmpty():
@@ -1624,7 +1884,7 @@ class JumpBasic(JumpModel):
         stride = 1
         if vn.isConstant():
             rng = CircleRange.fromSingle(vn.getOffset(), vn.getSize())
-        elif vn.isWritten() and hasattr(vn.getDef(), 'isBoolOutput') and vn.getDef().isBoolOutput():
+        elif vn.isWritten() and vn.getDef().isBoolOutput():
             rng = CircleRange(0, 2, 1, 1)
         else:
             maxValue = JumpBasic.getMaxValue(vn)
@@ -1633,7 +1893,7 @@ class JumpBasic(JumpModel):
 
         bitsPreserved_out = []
         baseVn = GuardRecord.quasiCopy(vn, bitsPreserved_out)
-        bitsPreserved = bitsPreserved_out[0] if bitsPreserved_out else 0
+        bitsPreserved = bitsPreserved_out[0]
         for guard in self.selectguards:
             matchval = guard.valueMatch(vn, baseVn, bitsPreserved)
             if matchval == 0:
@@ -1674,8 +1934,7 @@ class JumpBasic(JumpModel):
                     maxsize = sz
                     self.jrange.setRange(rng)
                     self.jrange.setStartVn(self.pathMeld.getVarnode(i))
-                    earlyOp = self.pathMeld.getEarliestOp(i) if hasattr(self.pathMeld, 'getEarliestOp') else self.pathMeld.getOp(i)
-                    self.jrange.setStartOp(earlyOp)
+                    self.jrange.setStartOp(self.pathMeld.getEarliestOp(i))
 
     def findNormalized(self, fd, rootbl, pathout: int, matchsize: int, maxtablesize: int) -> None:
         """Do all work to recover the normalized switch variable.
@@ -1687,10 +1946,17 @@ class JumpBasic(JumpModel):
         sz = self.jrange.getSize()
         if sz > maxtablesize and self.pathMeld.numCommonVarnode() == 1:
             vn = self.pathMeld.getVarnode(0)
-            if hasattr(vn, 'isReadOnly') and vn.isReadOnly():
+            if vn.isReadOnly():
                 from ghidra.analysis.rangeutil import CircleRange
-                # Would need MemoryImage to read value — simplified
+                from ghidra.emulate.memstate import MemoryImage
+
+                glb = fd.getArch()
+                mem = MemoryImage(vn.getSpace(), 4, 16, glb.loader)
+                val = mem.getValue(vn.getOffset(), vn.getSize())
                 self.varnodeIndex = 0
+                self.jrange.setRange(CircleRange.fromSingle(val, vn.getSize()))
+                self.jrange.setStartVn(vn)
+                self.jrange.setStartOp(self.pathMeld.getOp(0))
 
     def markFoldableGuards(self) -> None:
         """Mark the guard CBRANCHs that are truly part of the model.
@@ -1700,7 +1966,7 @@ class JumpBasic(JumpModel):
         vn = self.pathMeld.getVarnode(self.varnodeIndex)
         bitsPreserved_out = []
         baseVn = GuardRecord.quasiCopy(vn, bitsPreserved_out)
-        bitsPreserved = bitsPreserved_out[0] if bitsPreserved_out else 0
+        bitsPreserved = bitsPreserved_out[0]
         for guardRecord in self.selectguards:
             if guardRecord.valueMatch(vn, baseVn, bitsPreserved) == 0 or guardRecord.isUnrolled():
                 guardRecord.clear()
@@ -1716,13 +1982,10 @@ class JumpBasic(JumpModel):
             if op is None:
                 continue
             readOp = guard.getReadOp()
-            if readOp is not None:
-                if val:
-                    if hasattr(readOp, 'setMark'):
-                        readOp.setMark()
-                else:
-                    if hasattr(readOp, 'clearMark'):
-                        readOp.clearMark()
+            if val:
+                readOp.setMark()
+            else:
+                readOp.clearMark()
 
     def flowsOnlyToModel(self, vn, trailOp) -> bool:
         """Check if vn only flows into the model (marked ops).
@@ -1732,7 +1995,7 @@ class JumpBasic(JumpModel):
         for op in vn.getDescend():
             if op is trailOp:
                 continue
-            if not (hasattr(op, 'isMark') and op.isMark()):
+            if not op.isMark():
                 return False
         return True
 
@@ -1741,29 +2004,37 @@ class JumpBasic(JumpModel):
 
         C++ ref: JumpBasic::checkUnrolledGuard in jumptable.cc
         """
-        from ghidra.core.opcodes import OpCode
         from ghidra.analysis.rangeutil import CircleRange
         varArray = []
         if not self.checkCommonCbranch(varArray, bl):
             return
-        if JumpBasic.duplicateVarnodes(varArray):
+        indpath = bl.getInRevIndex(0)
+        toswitchval = indpath == 1
+        pred_block = bl.getIn(0)
+        cbranch = pred_block.lastOp()
+        if cbranch.isBooleanFlip():
+            toswitchval = not toswitchval
+        rng = CircleRange.fromBool(toswitchval)
+        indpathstore = 1 - indpath if pred_block.getFlipPath() else indpath
+        readOp = cbranch
+        for _ in range(maxpullback):
+            if JumpBasic.duplicateVarnodes(varArray):
+                self.selectguards.append(GuardRecord(cbranch, readOp, indpathstore, rng, varArray[0], True))
+            else:
+                multiOp = bl.findMultiequal(varArray)
+                if multiOp is not None:
+                    self.selectguards.append(GuardRecord(cbranch, readOp, indpathstore, rng, multiOp.getOut(), True))
             vn = varArray[0]
-            rng = CircleRange.fromBool(True)
-            indpathstore = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
-            cbranch = bl.getIn(0).lastOp() if hasattr(bl.getIn(0), 'lastOp') else None
-            if cbranch is not None:
-                self.selectguards.append(GuardRecord(cbranch, cbranch, indpathstore, rng, vn, True))
-                for j in range(maxpullback):
-                    if not vn.isWritten():
-                        break
-                    readOp = vn.getDef()
-                    result = rng.pullBack(readOp, usenzmask)
-                    if result is None or result[0] is None:
-                        break
-                    vn = result[0]
-                    if rng.isEmpty():
-                        break
-                    self.selectguards.append(GuardRecord(cbranch, readOp, indpathstore, rng, vn, True))
+            if not vn.isWritten():
+                break
+            next_read_op = vn.getDef()
+            vn, _markup = rng.pullBack(next_read_op, usenzmask)
+            if vn is None:
+                break
+            if rng.isEmpty():
+                break
+            if not bl.liftVerifyUnroll(varArray, next_read_op.getSlot(vn)):
+                break
 
     def checkCommonCbranch(self, varArray: list, bl) -> bool:
         """Check for common CBRANCH flow across incoming blocks.
@@ -1772,21 +2043,20 @@ class JumpBasic(JumpModel):
         """
         from ghidra.core.opcodes import OpCode
         curBlock = bl.getIn(0)
-        op = curBlock.lastOp() if hasattr(curBlock, 'lastOp') else None
+        op = curBlock.lastOp()
         if op is None or op.code() != OpCode.CPUI_CBRANCH:
             return False
-        outslot = bl.getInRevIndex(0) if hasattr(bl, 'getInRevIndex') else 0
+        outslot = bl.getInRevIndex(0)
         isOpFlip = op.isBooleanFlip()
         varArray.append(op.getIn(1))
         for i in range(1, bl.sizeIn()):
             curBlock = bl.getIn(i)
-            op = curBlock.lastOp() if hasattr(curBlock, 'lastOp') else None
+            op = curBlock.lastOp()
             if op is None or op.code() != OpCode.CPUI_CBRANCH:
                 return False
             if op.isBooleanFlip() != isOpFlip:
                 return False
-            revIdx = bl.getInRevIndex(i) if hasattr(bl, 'getInRevIndex') else i
-            if outslot != revIdx:
+            if outslot != bl.getInRevIndex(i):
                 return False
             varArray.append(op.getIn(1))
         return True
@@ -1794,7 +2064,7 @@ class JumpBasic(JumpModel):
     # ------------------------------------------------------------------
     # Core model methods
     # ------------------------------------------------------------------
-    def recoverModel(self, fd, indop, matchsize: int = 0, maxtablesize: int = 1024) -> bool:
+    def recoverModel(self, fd, indop, matchsize: int, maxtablesize: int) -> bool:
         """Recover the jump-table model.
 
         C++ ref: JumpBasic::recoverModel in jumptable.cc
@@ -1808,7 +2078,7 @@ class JumpBasic(JumpModel):
         return True
 
     def buildAddresses(self, fd, indop, addresstable: list,
-                       loadpoints=None, loadcounts=None) -> None:
+                       loadpoints, loadcounts) -> None:
         """Build the address table by emulating the switch paths.
 
         C++ ref: JumpBasic::buildAddresses in jumptable.cc
@@ -1817,9 +2087,9 @@ class JumpBasic(JumpModel):
         emul = EmulateFunction(fd)
         emul.setLoadCollect(loadpoints)
 
+        from ghidra.core.space import AddrSpace
         mask = 0xFFFFFFFFFFFFFFFF
-        glb = fd.getArch() if hasattr(fd, 'getArch') else None
-        bit = glb.funcptr_align if glb is not None and hasattr(glb, 'funcptr_align') else 0
+        bit = fd.getArch().funcptr_align
         if bit != 0:
             mask = (mask >> bit) << bit
         spc = indop.getAddr().getSpace()
@@ -1829,16 +2099,14 @@ class JumpBasic(JumpModel):
             addr_offset = emul.emulatePath(val, self.pathMeld,
                                            self.jrange.getStartOp(),
                                            self.jrange.getStartVarnode())
-            wordsize = spc.getWordSize() if spc is not None and hasattr(spc, 'getWordSize') else 1
-            if wordsize > 1:
-                addr_offset = addr_offset * wordsize
+            addr_offset = AddrSpace.addressToByte(addr_offset, spc.getWordSize())
             addr_offset &= mask
             addresstable.append(Address(spc, addr_offset))
-            if loadcounts is not None and loadpoints is not None:
+            if loadcounts is not None:
                 loadcounts.append(len(loadpoints))
             notdone = self.jrange.next()
 
-    def findUnnormalized(self, maxaddsub: int = 0, maxleftright: int = 0, maxext: int = 0) -> None:
+    def findUnnormalized(self, maxaddsub: int, maxleftright: int, maxext: int) -> None:
         """Find the unnormalized switch variable by walking back through normalization ops.
 
         C++ ref: JumpBasic::findUnnormalized in jumptable.cc
@@ -1885,34 +2153,31 @@ class JumpBasic(JumpModel):
             i += 1
         self.markModel(False)
 
-    def buildLabels(self, fd, addresstable: list, label: list, orig=None) -> None:
+    def buildLabels(self, fd, addresstable: list, label: list, orig) -> None:
         """Build case labels for the address table.
 
         C++ ref: JumpBasic::buildLabels in jumptable.cc
         """
-        origrange = orig.getValueRange() if orig is not None and hasattr(orig, 'getValueRange') else self.jrange
-        if origrange is None:
-            for i in range(len(addresstable)):
-                label.append(i)
-            return
+        from ghidra.core.opbehavior import EvaluationError
+        origrange = orig.getValueRange()
 
         notdone = origrange.initializeForReading()
         while notdone:
             val = origrange.getValue()
             needswarning = 0
             if origrange.isReversible():
-                if self.jrange is not None and not self.jrange.contains(val):
+                if not self.jrange.contains(val):
                     needswarning = 1
                 try:
                     switchval = JumpBasic.backup2Switch(fd, val, self.normalvn, self.switchvn)
-                except Exception:
+                except EvaluationError:
                     switchval = JumpValues.NO_LABEL
                     needswarning = 2
             else:
                 switchval = JumpValues.NO_LABEL
-            if needswarning == 1 and hasattr(fd, 'warning') and len(label) < len(addresstable):
+            if needswarning == 1:
                 fd.warning("This code block may not be properly labeled as switch case", addresstable[len(label)])
-            elif needswarning == 2 and hasattr(fd, 'warning') and len(label) < len(addresstable):
+            elif needswarning == 2:
                 fd.warning("Calculation of case label failed", addresstable[len(label)])
             label.append(switchval)
             if len(label) >= len(addresstable):
@@ -1920,8 +2185,7 @@ class JumpBasic(JumpModel):
             notdone = origrange.next()
 
         while len(label) < len(addresstable):
-            if hasattr(fd, 'warning'):
-                fd.warning("Bad switch case", addresstable[len(label)])
+            fd.warning("Bad switch case", addresstable[len(label)])
             label.append(JumpValues.NO_LABEL)
 
     def foldInNormalization(self, fd, indop):
@@ -1929,8 +2193,7 @@ class JumpBasic(JumpModel):
 
         C++ ref: JumpBasic::foldInNormalization in jumptable.cc
         """
-        if self.switchvn is not None and hasattr(fd, 'opSetInput'):
-            fd.opSetInput(indop, self.switchvn, 0)
+        fd.opSetInput(indop, self.switchvn, 0)
         return self.switchvn
 
     def foldInOneGuard(self, fd, guard, jump) -> bool:
@@ -1938,13 +2201,12 @@ class JumpBasic(JumpModel):
 
         C++ ref: JumpBasic::foldInOneGuard in jumptable.cc
         """
-        from ghidra.core.opcodes import OpCode
         cbranch = guard.getBranch()
         cbranchblock = cbranch.getParent()
         if cbranchblock.sizeOut() != 2:
             return False
         indpath = guard.getPath()
-        if hasattr(cbranchblock, 'getFlipPath') and cbranchblock.getFlipPath():
+        if cbranchblock.getFlipPath():
             indpath = 1 - indpath
         switchbl = jump.getIndirectOp().getParent()
         if cbranchblock.getOut(indpath) is not switchbl:
@@ -1962,19 +2224,16 @@ class JumpBasic(JumpModel):
         if jump.hasFoldedDefault() and jump.getDefaultBlock() != pos:
             return False
 
-        if hasattr(switchbl, 'noInterveningStatement') and not switchbl.noInterveningStatement():
+        if not switchbl.noInterveningStatement():
             return False
 
         if pos == switchbl.sizeOut():
-            if hasattr(jump, 'addBlockToSwitch'):
-                jump.addBlockToSwitch(guardtarget, JumpValues.NO_LABEL)
+            jump.addBlockToSwitch(guardtarget, JumpValues.NO_LABEL)
             jump.setLastAsDefault()
-            if hasattr(fd, 'pushBranch'):
-                fd.pushBranch(cbranchblock, 1 - indpath, switchbl)
+            fd.pushBranch(cbranchblock, 1 - indpath, switchbl)
         else:
             val = 0 if ((indpath == 0) != cbranch.isBooleanFlip()) else 1
-            if hasattr(fd, 'opSetInput') and hasattr(fd, 'newConstant'):
-                fd.opSetInput(cbranch, fd.newConstant(cbranch.getIn(0).getSize(), val), 1)
+            fd.opSetInput(cbranch, fd.newConstant(cbranch.getIn(0).getSize(), val), 1)
             jump.setDefaultBlock(pos)
         jump.setFoldedDefault()
         guard.clear()
@@ -1990,7 +2249,7 @@ class JumpBasic(JumpModel):
             cbranch = guard.getBranch()
             if cbranch is None:
                 continue
-            if hasattr(cbranch, 'isDead') and cbranch.isDead():
+            if cbranch.isDead():
                 guard.clear()
                 continue
             if self.foldInOneGuard(fd, guard, jump):
@@ -1998,11 +2257,12 @@ class JumpBasic(JumpModel):
         return change
 
     def sanityCheck(self, fd, indop, addresstable: list,
-                    loadpoints=None, loadcounts=None) -> bool:
+                    loadpoints: list, loadcounts=None) -> bool:
         """Validate the address table, truncating at first unreasonable entry.
 
         C++ ref: JumpBasic::sanityCheck in jumptable.cc
         """
+        from ghidra.arch.loadimage import DataUnavailError
         if not addresstable:
             return True
         addr = addresstable[0]
@@ -2013,15 +2273,10 @@ class JumpBasic(JumpModel):
                     break
                 diff = abs(addr.getOffset() - addresstable[i].getOffset())
                 if diff > 0xffff:
-                    glb = fd.getArch() if hasattr(fd, 'getArch') else None
-                    loader = glb.loader if glb is not None and hasattr(glb, 'loader') else None
                     dataavail = True
-                    if loader is not None and hasattr(loader, 'loadFill'):
-                        try:
-                            loader.loadFill(bytearray(4), 4, addresstable[i])
-                        except Exception:
-                            dataavail = False
-                    else:
+                    try:
+                        fd.getArch().loader.loadFill(bytearray(4), 4, addresstable[i])
+                    except DataUnavailError:
                         dataavail = False
                     if not dataavail:
                         break
@@ -2031,9 +2286,8 @@ class JumpBasic(JumpModel):
             return False
         if i != len(addresstable):
             del addresstable[i:]
-            if self.jrange is not None:
-                self.jrange.truncate(i)
-            if loadcounts is not None and loadpoints is not None:
+            self.jrange.truncate(i)
+            if loadcounts is not None:
                 del loadpoints[loadcounts[i - 1]:]
         return True
 
@@ -2043,8 +2297,7 @@ class JumpBasic(JumpModel):
         C++ ref: JumpBasic::clone in jumptable.cc
         """
         res = JumpBasic(jt)
-        if self.jrange is not None:
-            res.jrange = self.jrange.clone()
+        res.jrange = self.jrange.clone()
         return res
 
     def clear(self):
@@ -2065,7 +2318,7 @@ class JumpBasic2(JumpBasic):
     C++ ref: JumpBasic2 in jumptable.hh / jumptable.cc
     """
 
-    def __init__(self, jt=None) -> None:
+    def __init__(self, jt) -> None:
         super().__init__(jt)
         self.extravn = None  # Varnode at the join point
         self.origPathMeld = PathMeld()
@@ -2081,7 +2334,7 @@ class JumpBasic2(JumpBasic):
         self.extravn = pMeld.getVarnode(pMeld.numCommonVarnode() - 1)
         self.origPathMeld.set(pMeld)
 
-    def recoverModel(self, fd, indop, matchsize: int = 0, maxtablesize: int = 1024) -> bool:
+    def recoverModel(self, fd, indop, matchsize: int, maxtablesize: int) -> bool:
         """Try to recover a two-path jump-table model.
 
         C++ ref: JumpBasic2::recoverModel in jumptable.cc
@@ -2097,9 +2350,7 @@ class JumpBasic2(JumpBasic):
             return False
         if multiop.numInput() != 2:
             return False
-        # Search for a constant along one of the paths
         path = -1
-        copyop = None
         extravalue = 0
         for p in range(2):
             vn = multiop.getIn(p)
@@ -2111,13 +2362,12 @@ class JumpBasic2(JumpBasic):
             othervn = cop.getIn(0)
             if othervn.isConstant():
                 extravalue = othervn.getOffset()
-                copyop = cop
                 path = p
                 break
         if path == -1:
             return False
         rootbl = multiop.getParent().getIn(1 - path)
-        pathout = multiop.getParent().getInRevIndex(1 - path) if hasattr(multiop.getParent(), 'getInRevIndex') else 0
+        pathout = multiop.getParent().getInRevIndex(1 - path)
         jdef = JumpValuesRangeDefault()
         self.jrange = jdef
         jdef.setExtraValue(extravalue)
@@ -2138,19 +2388,17 @@ class JumpBasic2(JumpBasic):
 
         C++ ref: JumpBasic2::checkNormalDominance in jumptable.cc
         """
-        if hasattr(self.normalvn, 'isInput') and self.normalvn.isInput():
-            return True
-        if not self.normalvn.isWritten():
+        if self.normalvn.isInput():
             return True
         defblock = self.normalvn.getDef().getParent()
         switchblock = self.pathMeld.getOp(0).getParent()
         while switchblock is not None:
             if switchblock is defblock:
                 return True
-            switchblock = switchblock.getImmedDom() if hasattr(switchblock, 'getImmedDom') else None
+            switchblock = switchblock.getImmedDom()
         return False
 
-    def findUnnormalized(self, maxaddsub: int = 0, maxleftright: int = 0, maxext: int = 0) -> None:
+    def findUnnormalized(self, maxaddsub: int, maxleftright: int, maxext: int) -> None:
         """Find the unnormalized switch variable, handling backward normalization.
 
         C++ ref: JumpBasic2::findUnnormalized in jumptable.cc
@@ -2182,8 +2430,7 @@ class JumpBasic2(JumpBasic):
         C++ ref: JumpBasic2::clone in jumptable.cc
         """
         res = JumpBasic2(jt)
-        if self.jrange is not None:
-            res.jrange = self.jrange.clone()
+        res.jrange = self.jrange.clone()
         return res
 
     def clear(self):
@@ -2196,57 +2443,203 @@ class JumpBasic2(JumpBasic):
         super().clear()
 
 
-class JumpBasicOverride(JumpModel):
-    """A jump-table model where addresses are explicitly provided by an override."""
+class JumpBasicOverride(JumpBasic):
+    """A jump-table model where destination addresses are provided explicitly."""
 
-    def __init__(self, jt=None) -> None:
+    def __init__(self, jt) -> None:
         super().__init__(jt)
-        self._addrOverride: list = []
+        self.adset: Set[Address] = set()
+        self.values: List[int] = []
+        self.addrtable: List[Address] = []
+        self.startingvalue: int = 0
+        self.normaddress = Address()
+        self.hash: int = 0
+        self.istrivial: bool = False
+
+    def setAddresses(self, adtable) -> None:
+        for addr in adtable:
+            self.adset.add(Address(addr.getSpace(), addr.getOffset()))
+
+    def findStartOp(self, vn) -> int:
+        descendants = list(vn.beginDescend())
+        for op in descendants:
+            op.setMark()
+        res = -1
+        for i in range(self.pathMeld.numOps()):
+            if self.pathMeld.getOp(i).isMark():
+                res = i
+                break
+        for op in descendants:
+            op.clearMark()
+        return res
+
+    def trialNorm(self, fd, trialvn, tolerance: int) -> int:
+        from ghidra.core.space import AddrSpace
+
+        opi = self.findStartOp(trialvn)
+        if opi < 0:
+            return -1
+        startop = self.pathMeld.getOp(opi)
+        if self.values:
+            return opi
+
+        emul = EmulateFunction(fd)
+        spc = startop.getAddr().getSpace()
+        val = self.startingvalue
+        total = 0
+        miss = 0
+        alreadyseen: Set[Address] = set()
+        while total < len(self.adset):
+            try:
+                addr = emul.emulatePath(val, self.pathMeld, startop, trialvn)
+            except LowlevelError:
+                addr = 0
+                miss = tolerance
+            addr = AddrSpace.addressToByte(addr, spc.getWordSize())
+            newaddr = Address(spc, addr)
+            if newaddr in self.adset:
+                if newaddr not in alreadyseen:
+                    alreadyseen.add(newaddr)
+                    total += 1
+                self.values.append(val)
+                self.addrtable.append(newaddr)
+                if len(self.values) > len(self.adset) + 100:
+                    break
+                miss = 0
+            else:
+                miss += 1
+                if miss >= tolerance:
+                    break
+            val += 1
+
+        if total == len(self.adset):
+            return opi
+        self.values.clear()
+        self.addrtable.clear()
+        return -1
+
+    def setupTrivial(self) -> None:
+        if not self.addrtable:
+            for addr in sorted(self.adset):
+                self.addrtable.append(Address(addr.getSpace(), addr.getOffset()))
+        self.values.clear()
+        for addr in self.addrtable:
+            self.values.append(addr.getOffset())
+        self.varnodeIndex = 0
+        self.normalvn = self.pathMeld.getVarnode(0)
+        self.istrivial = True
+
+    def findLikelyNorm(self):
+        from ghidra.core.opcodes import OpCode
+
+        res = None
+        i = 0
+        while i < self.pathMeld.numOps():
+            op = self.pathMeld.getOp(i)
+            if op.code() == OpCode.CPUI_LOAD:
+                res = self.pathMeld.getOpParent(i)
+                break
+            i += 1
+        if res is None:
+            return res
+        i += 1
+        while i < self.pathMeld.numOps():
+            op = self.pathMeld.getOp(i)
+            if op.code() == OpCode.CPUI_INT_ADD:
+                res = self.pathMeld.getOpParent(i)
+                break
+            i += 1
+        i += 1
+        while i < self.pathMeld.numOps():
+            op = self.pathMeld.getOp(i)
+            if op.code() == OpCode.CPUI_INT_MULT:
+                res = self.pathMeld.getOpParent(i)
+                break
+            i += 1
+        return res
+
+    def clearCopySpecific(self) -> None:
+        self.selectguards.clear()
+        self.pathMeld.clear()
+        self.normalvn = None
+        self.switchvn = None
+
+    def setNorm(self, addr: Address, h: int) -> None:
+        self.normaddress = Address(addr.getSpace(), addr.getOffset())
+        self.hash = h
+
+    def setStartingValue(self, val: int) -> None:
+        self.startingvalue = val
 
     def isOverride(self) -> bool:
         return True
 
     def getTableSize(self) -> int:
-        return len(self._addrOverride)
+        return len(self.addrtable)
 
-    def recoverModel(self, fd, indop, matchsize=0, maxtablesize=1024) -> bool:
-        return len(self._addrOverride) > 0
+    def recoverModel(self, fd, indop, matchsize, maxtablesize) -> bool:
+        self.clearCopySpecific()
+        self.findDeterminingVarnodes(indop, 0)
+        if not self.istrivial:
+            trialvn = None
+            if self.hash != 0:
+                from ghidra.analysis.dynamic import DynamicHash
 
-    def buildAddresses(self, fd, indop, addresstable, loadpoints=None, loadcounts=None):
-        addresstable.extend(self._addrOverride)
+                dyn = DynamicHash()
+                trialvn = dyn.findVarnode(fd, self.normaddress, self.hash)
+            if trialvn is None and (not self.values or self.hash == 0):
+                trialvn = self.findLikelyNorm()
+            if trialvn is not None:
+                opi = self.trialNorm(fd, trialvn, 10)
+                if opi >= 0:
+                    self.varnodeIndex = opi
+                    self.normalvn = trialvn
+                    return True
+        self.setupTrivial()
+        return True
 
-    def findUnnormalized(self, maxaddsub=0, maxleftright=0, maxext=0):
-        pass
+    def buildAddresses(self, fd, indop, addresstable, loadpoints, loadcounts) -> None:
+        addresstable.clear()
+        for addr in self.addrtable:
+            addresstable.append(Address(addr.getSpace(), addr.getOffset()))
 
-    def buildLabels(self, fd, addresstable, label, orig=None):
-        for i in range(len(addresstable)):
-            label.append(i)
+    def buildLabels(self, fd, addresstable, label, orig) -> None:
+        from ghidra.core.opbehavior import EvaluationError
 
-    def foldInNormalization(self, fd, indop):
-        return None
+        for val in self.values:
+            try:
+                addr = JumpBasic.backup2Switch(fd, val, self.normalvn, self.switchvn)
+            except EvaluationError:
+                addr = JumpValues.NO_LABEL
+            label.append(addr)
+            if len(label) >= len(addresstable):
+                break
+
+        while len(label) < len(addresstable):
+            fd.warning("Bad switch case", addresstable[len(label)])
+            label.append(JumpValues.NO_LABEL)
 
     def foldInGuards(self, fd, jump) -> bool:
         return False
 
-    def sanityCheck(self, fd, indop, addresstable, loadpoints=None, loadcounts=None) -> bool:
+    def sanityCheck(self, fd, indop, addresstable, loadpoints, loadcounts) -> bool:
         return True
 
     def clone(self, jt):
-        m = JumpBasicOverride(jt)
-        m._addrOverride = list(self._addrOverride)
-        return m
+        res = JumpBasicOverride(jt)
+        res.adset = {Address(addr.getSpace(), addr.getOffset()) for addr in self.adset}
+        res.values = list(self.values)
+        res.addrtable = [Address(addr.getSpace(), addr.getOffset()) for addr in self.addrtable]
+        res.startingvalue = self.startingvalue
+        res.normaddress = Address(self.normaddress.getSpace(), self.normaddress.getOffset())
+        res.hash = self.hash
+        return res
 
-    def clear(self):
-        self._addrOverride.clear()
-
-    def getNumOverrides(self) -> int:
-        return len(self._addrOverride)
-
-    def addOverride(self, addr) -> None:
-        self._addrOverride.append(addr)
-
-    def getOverride(self, i: int):
-        return self._addrOverride[i]
+    def clear(self) -> None:
+        self.clearCopySpecific()
+        self.values.clear()
+        self.addrtable.clear()
+        self.istrivial = False
 
     def encode(self, encoder) -> None:
         """Encode this override as a <basicoverride> element.
@@ -2254,17 +2647,32 @@ class JumpBasicOverride(JumpModel):
         C++ ref: ``JumpBasicOverride::encode``
         """
         from ghidra.core.marshal import (
-            ELEM_BASICOVERRIDE, ELEM_DEST,
-            ELEM_NORMADDR, ELEM_NORMHASH, ELEM_STARTVAL,
             ATTRIB_CONTENT,
+            ELEM_BASICOVERRIDE,
+            ELEM_DEST,
+            ELEM_NORMADDR,
+            ELEM_NORMHASH,
+            ELEM_STARTVAL,
         )
+
         encoder.openElement(ELEM_BASICOVERRIDE)
-        for addr in self._addrOverride:
+        for addr in sorted(self.adset):
             encoder.openElement(ELEM_DEST)
             spc = addr.getSpace()
-            if spc is not None and hasattr(spc, 'encodeAttributes'):
-                spc.encodeAttributes(encoder, addr.getOffset())
+            off = addr.getOffset()
+            spc.encodeAttributes(encoder, off)
             encoder.closeElement(ELEM_DEST)
+        if self.hash != 0:
+            encoder.openElement(ELEM_NORMADDR)
+            self.normaddress.getSpace().encodeAttributes(encoder, self.normaddress.getOffset())
+            encoder.closeElement(ELEM_NORMADDR)
+            encoder.openElement(ELEM_NORMHASH)
+            encoder.writeUnsignedInteger(ATTRIB_CONTENT, self.hash)
+            encoder.closeElement(ELEM_NORMHASH)
+        if self.startingvalue != 0:
+            encoder.openElement(ELEM_STARTVAL)
+            encoder.writeUnsignedInteger(ATTRIB_CONTENT, self.startingvalue)
+            encoder.closeElement(ELEM_STARTVAL)
         encoder.closeElement(ELEM_BASICOVERRIDE)
 
     def decode(self, decoder) -> None:
@@ -2273,17 +2681,33 @@ class JumpBasicOverride(JumpModel):
         C++ ref: ``JumpBasicOverride::decode``
         """
         from ghidra.core.marshal import (
-            ELEM_BASICOVERRIDE, ELEM_DEST,
-            ELEM_NORMADDR, ELEM_NORMHASH, ELEM_STARTVAL,
             ATTRIB_CONTENT,
+            ELEM_BASICOVERRIDE,
+            ELEM_DEST,
+            ELEM_NORMADDR,
+            ELEM_NORMHASH,
+            ELEM_STARTVAL,
         )
+        from ghidra.core.pcoderaw import VarnodeData
+
         elemId = decoder.openElement(ELEM_BASICOVERRIDE)
         while True:
             subId = decoder.openElement()
             if subId == 0:
                 break
             if subId == ELEM_DEST.id:
-                addr = Address.decode(decoder)
-                self._addrOverride.append(addr)
+                vData = VarnodeData()
+                vData.decodeFromAttributes(decoder)
+                self.adset.add(vData.getAddr())
+            elif subId == ELEM_NORMADDR.id:
+                vData = VarnodeData()
+                vData.decodeFromAttributes(decoder)
+                self.normaddress = vData.getAddr()
+            elif subId == ELEM_NORMHASH.id:
+                self.hash = decoder.readUnsignedInteger(ATTRIB_CONTENT)
+            elif subId == ELEM_STARTVAL.id:
+                self.startingvalue = decoder.readUnsignedInteger(ATTRIB_CONTENT)
             decoder.closeElement(subId)
         decoder.closeElement(elemId)
+        if not self.adset:
+            raise LowlevelError("Empty jumptable override")

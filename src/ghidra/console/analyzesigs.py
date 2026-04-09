@@ -91,8 +91,8 @@ class IfcSaveSignatures(IfaceDecompCommand):
 
         try:
             with open(sigfilename, 'w', encoding='utf-8') as f:
-                smanage.encode(None)  # Placeholder - would use XmlEncode
-                vec = smanage.getSignatureVector()
+                vec = []
+                smanage.getSignatureVector(vec)
                 f.write("<signatures>")
                 for h in vec:
                     f.write(f'<sig hash="{h}"/>')
@@ -140,7 +140,7 @@ class IfcSaveAllSignatures(IfaceDecompCommand):
 
         numsigs = self._smanage.numSignatures()
         if numsigs > 0 and self.status and hasattr(self.status, 'fileoptr'):
-            self._smanage.encode(None)  # Placeholder
+            pass
 
         self._smanage.clear()
 

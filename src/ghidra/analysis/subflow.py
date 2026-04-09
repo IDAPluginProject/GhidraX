@@ -9,7 +9,8 @@ and replaces operations to work on the smaller values directly.
 from __future__ import annotations
 from typing import Optional, List, Dict
 from ghidra.core.opcodes import OpCode
-from ghidra.core.address import calc_mask, leastsigbit_set, mostsigbit_set, sign_extend
+from ghidra.core.address import calc_mask, leastsigbit_set, mostsigbit_set, sign_extend_sized
+from ghidra.ir.typeop import TypeOpFloatInt2Float
 from ghidra.transform.transform import TransformManager, LaneDescription
 
 
@@ -24,9 +25,6 @@ class ReplaceVarnode:
         self.val: int = 0
         self.defop = None
 
-    def getVarnode(self): return self.vn
-    def getReplacement(self): return self.replacement
-
 
 class ReplaceOp:
     """Placeholder for a PcodeOp operating on smaller logical values."""
@@ -39,10 +37,6 @@ class ReplaceOp:
         self.numparams: int = nparams
         self.output: Optional[ReplaceVarnode] = None
         self.input: List[ReplaceVarnode] = []
-
-    def getOp(self): return self.op
-    def getReplacement(self): return self.replacement
-    def getOpcode(self): return self.opc
 
 
 class PatchRecord:
@@ -125,7 +119,7 @@ class SubvariableFlow:
         if not orop.getIn(idx).isConstant():
             return -1
         orval = orop.getIn(idx).getOffset()
-        if (mask & (~orval & calc_mask(orop.getIn(idx).getSize()))) == 0:
+        if (mask & (~orval)) == 0:
             return idx
         return -1
 
@@ -148,9 +142,7 @@ class SubvariableFlow:
         """Add vn to subgraph. Returns (ReplaceVarnode, inworklist) or (None, False)."""
         vid = id(vn)
         if vn.isMark():
-            res = self._varmap.get(vid)
-            if res is None:
-                return None, False
+            res = self._varmap[vid]
             if res.mask != mask:
                 return None, False
             return res, False
@@ -159,8 +151,7 @@ class SubvariableFlow:
             if self._sextrestrictions:
                 cval = vn.getOffset()
                 smallval = cval & mask
-                sextval = sign_extend(smallval, self._flowsize * 8 - 1)
-                sextval &= calc_mask(vn.getSize())
+                sextval = sign_extend_sized(smallval, self._flowsize, vn.getSize())
                 if sextval != cval:
                     return None, False
             return self._addConstant(None, mask, 0, vn), False
@@ -168,33 +159,31 @@ class SubvariableFlow:
         if vn.isFree():
             return None, False
 
-        if hasattr(vn, 'isAddrForce') and vn.isAddrForce() and vn.getSize() != self._flowsize:
+        if vn.isAddrForce() and vn.getSize() != self._flowsize:
             return None, False
 
         if self._sextrestrictions:
             if vn.getSize() != self._flowsize:
                 if (not self._aggressive) and vn.isInput():
                     return None, False
-                if hasattr(vn, 'isPersist') and vn.isPersist():
+                if vn.isPersist():
                     return None, False
-            if hasattr(vn, 'isTypeLock') and vn.isTypeLock():
+            if vn.isTypeLock():
                 tp = vn.getType()
-                if hasattr(tp, 'getMetatype'):
-                    from ghidra.types.datatype import TYPE_PARTIALSTRUCT
-                    if tp.getMetatype() != TYPE_PARTIALSTRUCT:
-                        if tp.getSize() != self._flowsize:
-                            return None, False
+                from ghidra.types.datatype import TYPE_PARTIALSTRUCT
+                if tp.getMetatype() != TYPE_PARTIALSTRUCT:
+                    if tp.getSize() != self._flowsize:
+                        return None, False
         else:
             if self._bitsize >= 8:
                 if (not self._aggressive) and ((vn.getConsume() & ~mask) != 0):
                     return None, False
-                if hasattr(vn, 'isTypeLock') and vn.isTypeLock():
+                if vn.isTypeLock():
                     tp = vn.getType()
-                    if hasattr(tp, 'getMetatype'):
-                        from ghidra.types.datatype import TYPE_PARTIALSTRUCT
-                        if tp.getMetatype() != TYPE_PARTIALSTRUCT:
-                            if tp.getSize() != self._flowsize:
-                                return None, False
+                    from ghidra.types.datatype import TYPE_PARTIALSTRUCT
+                    if tp.getMetatype() != TYPE_PARTIALSTRUCT:
+                        if tp.getSize() != self._flowsize:
+                            return None, False
             if vn.isInput():
                 if self._bitsize < 8:
                     return None, False
@@ -204,6 +193,7 @@ class SubvariableFlow:
         res = ReplaceVarnode(vn, mask)
         self._varmap[vid] = res
         vn.setMark()
+        res.replacement = None
         res.defop = None
         inworklist = True
         if vn.getSize() == self._flowsize:
@@ -211,7 +201,7 @@ class SubvariableFlow:
                 inworklist = False
                 res.replacement = vn
             elif mask == 1:
-                if vn.isWritten() and hasattr(vn.getDef(), 'isBoolOutput') and vn.getDef().isBoolOutput():
+                if vn.isWritten() and vn.getDef().isBoolOutput():
                     inworklist = False
                     res.replacement = vn
         return res, inworklist
@@ -220,9 +210,9 @@ class SubvariableFlow:
         """Create a subgraph op node given its output variable node."""
         if outrvn.defop is not None:
             return outrvn.defop
-        rop = ReplaceOp(outrvn.vn.getDef() if outrvn.vn is not None and outrvn.vn.isWritten() else None, opc, numparam)
-        rop.output = outrvn
+        rop = ReplaceOp(outrvn.vn.getDef(), opc, numparam)
         outrvn.defop = rop
+        rop.output = outrvn
         self._oplist.append(rop)
         return rop
 
@@ -270,8 +260,6 @@ class SubvariableFlow:
         """Add a constant variable node to the subgraph."""
         res = ReplaceVarnode(constvn, mask)
         sa = leastsigbit_set(mask)
-        if sa < 0:
-            sa = 0
         res.val = (mask & constvn.getOffset()) >> sa
         res.defop = None
         self._newvarlist.append(res)
@@ -321,8 +309,6 @@ class SubvariableFlow:
     def _addExtensionPatch(self, rvn: ReplaceVarnode, pushop, sa: int) -> None:
         if sa == -1:
             sa = leastsigbit_set(rvn.mask)
-            if sa < 0:
-                sa = 0
         self._patchlist.append(PatchRecord(PatchRecord.extension_patch, pushop, rvn, None, sa))
 
     def _addComparePatch(self, in1: ReplaceVarnode, in2: ReplaceVarnode, op) -> None:
@@ -339,14 +325,13 @@ class SubvariableFlow:
         if not self._aggressive:
             if (rvn.vn.getConsume() & ~rvn.mask) != 0:
                 return False
-        fc = self._fd.getCallSpecs(op) if hasattr(self._fd, 'getCallSpecs') else None
+        fc = self._fd.getCallSpecs(op)
         if fc is None:
             return False
-        if hasattr(fc, 'isInputActive') and fc.isInputActive():
+        if fc.isInputActive():
             return False
-        if hasattr(fc, 'isInputLocked') and fc.isInputLocked():
-            if not (hasattr(fc, 'isDotdotdot') and fc.isDotdotdot()):
-                return False
+        if fc.isInputLocked() and (not fc.isDotdotdot()):
+            return False
         self._patchlist.append(PatchRecord(PatchRecord.parameter_patch, op, rvn, None, slot))
         self._pullcount += 1
         return True
@@ -354,27 +339,24 @@ class SubvariableFlow:
     def _tryReturnPull(self, op, rvn: ReplaceVarnode, slot: int) -> bool:
         if slot == 0:
             return False
-        if hasattr(self._fd, 'getFuncProto') and self._fd.getFuncProto().isOutputLocked():
+        if self._fd.getFuncProto().isOutputLocked():
             return False
         if not self._aggressive:
             if (rvn.vn.getConsume() & ~rvn.mask) != 0:
                 return False
         if not self._returnsTraversed:
-            if hasattr(self._fd, 'beginOp'):
-                for retop in self._fd.beginOp(OpCode.CPUI_RETURN):
-                    if hasattr(retop, 'getHaltType') and retop.getHaltType() != 0:
-                        continue
-                    if slot >= retop.numInput():
-                        continue
-                    retvn = retop.getIn(slot)
-                    rep, inworklist = self._setReplacement(retvn, rvn.mask)
-                    if rep is None:
-                        return False
-                    if inworklist:
-                        self._worklist.append(rep)
-                    elif retvn.isConstant() and retop is not op:
-                        self._patchlist.append(PatchRecord(PatchRecord.parameter_patch, retop, rep, None, slot))
-                        self._pullcount += 1
+            for retop in self._fd.beginOp(OpCode.CPUI_RETURN):
+                if retop.getHaltType() != 0:
+                    continue
+                retvn = retop.getIn(slot)
+                rep, inworklist = self._setReplacement(retvn, rvn.mask)
+                if rep is None:
+                    return False
+                if inworklist:
+                    self._worklist.append(rep)
+                elif retvn.isConstant() and retop is not op:
+                    self._patchlist.append(PatchRecord(PatchRecord.parameter_patch, retop, rep, None, slot))
+                    self._pullcount += 1
             self._returnsTraversed = True
         self._patchlist.append(PatchRecord(PatchRecord.parameter_patch, op, rvn, None, slot))
         self._pullcount += 1
@@ -388,12 +370,12 @@ class SubvariableFlow:
             return False
         if self._bitsize < 8:
             return False
-        fc = self._fd.getCallSpecs(op) if hasattr(self._fd, 'getCallSpecs') else None
+        fc = self._fd.getCallSpecs(op)
         if fc is None:
             return False
-        if hasattr(fc, 'isOutputLocked') and fc.isOutputLocked():
+        if fc.isOutputLocked():
             return False
-        if hasattr(fc, 'isOutputActive') and fc.isOutputActive():
+        if fc.isOutputActive():
             return False
         self._addPush(op, rvn)
         return True
@@ -416,9 +398,10 @@ class SubvariableFlow:
             return False
         pullModification = True
         if rvn.vn.isWritten() and rvn.vn.getDef().code() == OpCode.CPUI_INT_ZEXT:
-            lone = rvn.vn.loneDescend()
-            if lone is op:
-                pullModification = False
+            if rvn.vn.getSize() == TypeOpFloatInt2Float.preferredZextSize(self._flowsize):
+                lone = rvn.vn.loneDescend()
+                if lone is op:
+                    pullModification = False
         self._patchlist.append(PatchRecord(PatchRecord.int2float_patch, op, rvn))
         if pullModification:
             self._pullcount += 1
@@ -435,11 +418,10 @@ class SubvariableFlow:
         callcount = 0
         vn = rvn.vn
 
-        desc_list = list(vn.beginDescend()) if hasattr(vn, 'beginDescend') else []
-        desc_iter = iter(desc_list)
-        for op in desc_iter:
+        desc_list = list(vn.beginDescend())
+        for index, op in enumerate(desc_list):
             outvn = op.getOut()
-            if outvn is not None and outvn.isMark() and not (hasattr(op, 'isCall') and op.isCall()):
+            if outvn is not None and outvn.isMark() and not op.isCall():
                 continue
             dcount += 1
             slot = op.getSlot(vn)
@@ -501,7 +483,7 @@ class SubvariableFlow:
                 if self._bitsize + sa > 8 * vn.getSize():
                     return False
                 rop = self._createOpDown(OpCode.CPUI_INT_MULT, 2, op, rvn, slot)
-                if not self._createLink(rop, (rvn.mask << sa) & calc_mask(outvn.getSize()), -1, outvn):
+                if not self._createLink(rop, rvn.mask << sa, -1, outvn):
                     return False
                 hcount += 1
 
@@ -678,7 +660,20 @@ class SubvariableFlow:
             elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
                 callcount += 1
                 if callcount > 1:
-                    slot = op.getRepeatSlot(vn, slot, op)
+                    first_slot = slot
+                    count = 1
+                    for prev in desc_list[:index]:
+                        if prev is op:
+                            count += 1
+                    if count != 1:
+                        recount = 1
+                        slot = -1
+                        for i in range(first_slot + 1, op.numInput()):
+                            if op.getIn(i) is vn:
+                                recount += 1
+                                if recount == count:
+                                    slot = i
+                                    break
                 if not self._tryCallPull(op, rvn, slot):
                     return False
                 hcount += 1
@@ -943,9 +938,10 @@ class SubvariableFlow:
         callcount = 0
         vn = rvn.vn
 
-        for op in list(vn.beginDescend()) if hasattr(vn, 'beginDescend') else []:
+        desc_list = list(vn.beginDescend())
+        for index, op in enumerate(desc_list):
             outvn = op.getOut()
-            if outvn is not None and outvn.isMark() and not (hasattr(op, 'isCall') and op.isCall()):
+            if outvn is not None and outvn.isMark() and not op.isCall():
                 continue
             dcount += 1
             slot = op.getSlot(vn)
@@ -995,7 +991,20 @@ class SubvariableFlow:
             elif opc in (OpCode.CPUI_CALL, OpCode.CPUI_CALLIND):
                 callcount += 1
                 if callcount > 1:
-                    slot = op.getRepeatSlot(vn, slot, op)
+                    first_slot = slot
+                    count = 1
+                    for prev in desc_list[:index]:
+                        if prev is op:
+                            count += 1
+                    if count != 1:
+                        recount = 1
+                        slot = -1
+                        for i in range(first_slot + 1, op.numInput()):
+                            if op.getIn(i) is vn:
+                                recount += 1
+                                if recount == count:
+                                    slot = i
+                                    break
                 if not self._tryCallPull(op, rvn, slot):
                     return False
                 hcount += 1
@@ -1091,8 +1100,7 @@ class SubvariableFlow:
                     break
         # Clear marks
         for vid, rvn in self._varmap.items():
-            if rvn.vn is not None and hasattr(rvn.vn, 'clearMark'):
-                rvn.vn.clearMark()
+            rvn.vn.clearMark()
         if not retval:
             return False
         if self._pullcount == 0:
@@ -1109,19 +1117,18 @@ class SubvariableFlow:
         sa = leastsigbit_set(rvn.mask) // 8
         if sa < 0:
             sa = 0
-        if hasattr(addr, 'isBigEndian') and addr.isBigEndian():
+        if addr.isBigEndian():
             addr = addr + (rvn.vn.getSize() - self._flowsize - sa)
         else:
             addr = addr + sa
-        if hasattr(addr, 'renormalize'):
-            addr.renormalize(self._flowsize)
+        addr.renormalize(self._flowsize)
         return addr
 
     def _useSameAddress(self, rvn: ReplaceVarnode) -> bool:
         """Decide if we use the same memory range for the replacement."""
         if rvn.vn.isInput():
             return True
-        if hasattr(rvn.vn, 'isAddrTied') and rvn.vn.isAddrTied():
+        if rvn.vn.isAddrTied():
             return False
         if (rvn.mask & 1) == 0:
             return False
@@ -1154,8 +1161,7 @@ class SubvariableFlow:
             return rvn.replacement
         if rvn.vn.isConstant():
             newVn = self._fd.newConstant(self._flowsize, rvn.val)
-            if hasattr(newVn, 'copySymbolIfValid'):
-                newVn.copySymbolIfValid(rvn.vn)
+            newVn.copySymbolIfValid(rvn.vn)
             return newVn
         isinput = rvn.vn.isInput()
         if self._useSameAddress(rvn):
@@ -1251,7 +1257,7 @@ class SubvariableFlow:
                 zextOp = fd.newOp(1, pullop.getAddr())
                 fd.opSetOpcode(zextOp, OpCode.CPUI_INT_ZEXT)
                 fd.opSetInput(zextOp, invn, 0)
-                sizeout = invn.getSize() * 2 if invn.getSize() <= 4 else 8
+                sizeout = TypeOpFloatInt2Float.preferredZextSize(invn.getSize())
                 outvn = fd.newUniqueOut(sizeout, zextOp)
                 fd.opInsertBefore(zextOp, pullop)
                 fd.opSetInput(pullop, outvn, 0)
@@ -1321,10 +1327,8 @@ class SplitFlow(TransformManager):
         if op.code() == OpCode.CPUI_INDIRECT:
             self.opSetInput(loOp, self.newIop(op.getIn(1)), 1)
             self.opSetInput(hiOp, self.newIop(op.getIn(1)), 1)
-            if hasattr(loOp, 'inheritIndirect'):
-                loOp.inheritIndirect(op)
-            if hasattr(hiOp, 'inheritIndirect'):
-                hiOp.inheritIndirect(op)
+            loOp.inheritIndirect(op)
+            hiOp.inheritIndirect(op)
             numParam = 1
         for i in range(numParam):
             if i == slot:
@@ -1352,7 +1356,7 @@ class SplitFlow(TransformManager):
                 if not self.addOp(op, rvn, op.getSlot(origvn)):
                     return False
             elif opc == OpCode.CPUI_SUBPIECE:
-                if hasattr(outvn, 'isPrecisLo') and (outvn.isPrecisLo() or outvn.isPrecisHi()):
+                if outvn.isPrecisLo() or outvn.isPrecisHi():
                     return False
                 val = int(op.getIn(1).getOffset())
                 loSize = self.laneDescription.getSize(0)
@@ -2920,6 +2924,8 @@ class RuleSubvarAnd:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarAnd(self._group)
 
     def getOpList(self) -> list:
@@ -2967,6 +2973,8 @@ class RuleSubvarSubpiece:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarSubpiece(self._group)
 
     def getOpList(self) -> list:
@@ -2981,7 +2989,7 @@ class RuleSubvarSubpiece:
             return 0
         mask = calc_mask(flowsize)
         mask <<= 8 * sa
-        aggressive = outvn.isPtrFlow() if hasattr(outvn, 'isPtrFlow') else False
+        aggressive = outvn.isPtrFlow()
         if not aggressive:
             if (vn.getConsume() & mask) != vn.getConsume():
                 return 0
@@ -3011,10 +3019,12 @@ class RuleSubvarCompZero:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarCompZero(self._group)
 
     def getOpList(self) -> list:
-        return [int(OpCode.CPUI_INT_EQUAL), int(OpCode.CPUI_INT_NOTEQUAL)]
+        return [int(OpCode.CPUI_INT_NOTEQUAL), int(OpCode.CPUI_INT_EQUAL)]
 
     def applyOp(self, op, data) -> int:
         if not op.getIn(1).isConstant():
@@ -3066,6 +3076,8 @@ class RuleSubvarShift:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarShift(self._group)
 
     def getOpList(self) -> list:
@@ -3081,7 +3093,7 @@ class RuleSubvarShift:
         mask = vn.getNZMask()
         if (mask >> sa) != 1:
             return 0  # Pulling out a single bit
-        mask = ((mask >> sa) << sa) & calc_mask(vn.getSize())
+        mask = (mask >> sa) << sa
         if op.getOut().hasNoDescend():
             return 0
         subflow = SubvariableFlow(data, vn, mask, False, False, False)
@@ -3104,6 +3116,8 @@ class RuleSubvarZext:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarZext(self._group)
 
     def getOpList(self) -> list:
@@ -3113,7 +3127,7 @@ class RuleSubvarZext:
         vn = op.getOut()
         invn = op.getIn(0)
         mask = calc_mask(invn.getSize())
-        aggressive = invn.isPtrFlow() if hasattr(invn, 'isPtrFlow') else False
+        aggressive = invn.isPtrFlow()
         subflow = SubvariableFlow(data, vn, mask, aggressive, False, False)
         if not subflow.doTrace():
             return 0
@@ -3135,6 +3149,8 @@ class RuleSubvarSext:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSubvarSext(self._group)
 
     def getOpList(self) -> list:
@@ -3151,8 +3167,7 @@ class RuleSubvarSext:
         return 1
 
     def reset(self, data) -> None:
-        arch = data.getArch() if hasattr(data, 'getArch') else None
-        self._isaggressive = getattr(arch, 'aggressive_ext_trim', False) if arch is not None else False
+        self._isaggressive = data.getArch().aggressive_ext_trim
 
 
 class RuleSplitFlow:
@@ -3168,6 +3183,8 @@ class RuleSplitFlow:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSplitFlow(self._group)
 
     def getOpList(self) -> list:
@@ -3180,7 +3197,7 @@ class RuleSplitFlow:
         vn = op.getIn(0)
         if not vn.isWritten():
             return 0
-        if hasattr(vn, 'isPrecisLo') and (vn.isPrecisLo() or vn.isPrecisHi()):
+        if vn.isPrecisLo() or vn.isPrecisHi():
             return 0
         if op.getOut().getSize() + loSize != vn.getSize():
             return 0  # Must take most significant part
@@ -3210,8 +3227,7 @@ class RuleSplitFlow:
         splitflow = SplitFlow(data, vn, loSize)
         if not splitflow.doTrace():
             return 0
-        if hasattr(splitflow, 'apply'):
-            splitflow.apply()
+        splitflow.apply()
         return 1
 
 

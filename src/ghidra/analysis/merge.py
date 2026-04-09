@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Optional, List, Tuple
 from bisect import bisect_left
 
 from ghidra.ir.cover import Cover, PcodeOpSet
-from ghidra.ir.op import PcodeOp
+from ghidra.ir.op import PcodeOp, PieceNode
 from ghidra.core.opcodes import OpCode
 
 # Pre-cached Varnode flag constants for hot merge test paths
@@ -96,8 +96,7 @@ class BlockVarnode:
         if op is None:
             self._index = 0
         else:
-            parent = op.getParent()
-            self._index = parent.getIndex() if parent is not None else 0
+            self._index = op.getParent().getIndex()
 
     def __lt__(self, op2: BlockVarnode) -> bool:
         return self._index < op2._index
@@ -143,24 +142,20 @@ class StackAffectingOps(PcodeOpSet):
     def populate(self) -> None:
         """Fill the set with CALL ops and guarded STORE ops."""
         for i in range(self._data.numCalls()):
-            fc = self._data.getCallSpecs(i)
-            if fc is not None:
-                self.addOp(fc.getOp())
-        # Store guards if available
-        if hasattr(self._data, 'getStoreGuards'):
-            for guard in self._data.getStoreGuards():
-                if hasattr(guard, 'isValid') and guard.isValid(OpCode.CPUI_STORE):
-                    self.addOp(guard.getOp())
+            op = self._data.getCallSpecs(i).getOp()
+            self.addOp(op)
+        for guard in self._data.getStoreGuards():
+            if guard.isValid(OpCode.CPUI_STORE):
+                self.addOp(guard.getOp())
         self.finalize()
 
     def affectsTest(self, op: PcodeOp, vn: Varnode) -> bool:
         """Test whether the given op might affect the given Varnode through aliasing."""
         if op.code() == OpCode.CPUI_STORE:
-            if hasattr(self._data, 'getStoreGuard'):
-                loadGuard = self._data.getStoreGuard(op)
-                if loadGuard is None:
-                    return True
-                return loadGuard.isGuarded(vn.getAddr())
+            loadGuard = self._data.getStoreGuard(op)
+            if loadGuard is None:
+                return True
+            return loadGuard.isGuarded(vn.getAddr())
         return True
 
 
@@ -194,7 +189,7 @@ class Merge:
         self._testCache.clear()
         self._copyTrims.clear()
         self._protoPartial.clear()
-        self._stackAffectingOps.clear() if hasattr(self._stackAffectingOps, 'clear') else None
+        self._stackAffectingOps.clear()
 
     # ----- Static test methods -----
 
@@ -207,9 +202,7 @@ class Merge:
             if high_in.getType() is not high_out.getType():
                 return False
         if high_out.isAddrTied() and high_in.isAddrTied():
-            t1 = high_out.getTiedVarnode()
-            t2 = high_in.getTiedVarnode()
-            if t1 is not None and t2 is not None and t1.getAddr() != t2.getAddr():
+            if high_in.getTiedVarnode().getAddr() != high_out.getTiedVarnode().getAddr():
                 return False
         if high_in.isInput():
             if high_out.isPersist():
@@ -241,6 +234,13 @@ class Merge:
                 return False
             if high_in.isPersist():
                 return False
+        if high_in._piece is not None and high_out._piece is not None:
+            group_in = high_in._piece.getGroup()
+            group_out = high_out._piece.getGroup()
+            if group_in is group_out:
+                return False
+            if high_in._piece.getSize() != group_in.getSize() and high_out._piece.getSize() != group_out.getSize():
+                return False
         s_in = high_in.getSymbol()
         s_out = high_out.getSymbol()
         if s_in is not None and s_out is not None:
@@ -261,11 +261,11 @@ class Merge:
             return False
         if high_out.isInput():
             vn = high_out.getInputVarnode()
-            if vn is not None and vn.isIllegalInput() and not vn.isIndirectOnly():
+            if vn.isIllegalInput() and not vn.isIndirectOnly():
                 return False
         if high_in.isInput():
             vn = high_in.getInputVarnode()
-            if vn is not None and vn.isIllegalInput() and not vn.isIndirectOnly():
+            if vn.isIllegalInput() and not vn.isIndirectOnly():
                 return False
         sym = high_in.getSymbol()
         if sym is not None and sym.isIsolated():
@@ -273,61 +273,26 @@ class Merge:
         sym = high_out.getSymbol()
         if sym is not None and sym.isIsolated():
             return False
+        if high_out._piece is not None and high_in._piece is not None:
+            return False
         return True
 
     @staticmethod
-    def mergeTestSpeculative(hi: HighVariable, ho: HighVariable) -> bool:
-        """Speculative tests — inlines required+adjacent+speculative using direct flag bits."""
-        if hi is ho:
-            return True
-        # Ensure flags are up to date (inline dirty check)
-        if hi._highflags & _HV_FLAGSDIRTY:
-            hi._updateFlags()
-        if ho._highflags & _HV_FLAGSDIRTY:
-            ho._updateFlags()
-        fi = hi._flags
-        fo = ho._flags
-        # --- speculative: neither can be input, persist, or addr-tied ---
-        if fi & _SPEC_EXCL or fo & _SPEC_EXCL:
+    def mergeTestSpeculative(high_out: HighVariable, high_in: HighVariable) -> bool:
+        """Speculative tests for merging HighVariables that are not Cover related."""
+        if not Merge.mergeTestAdjacent(high_out, high_in):
             return False
-        # --- required: typeLock type equality ---
-        if fi & _VN_TYPELOCK and fo & _VN_TYPELOCK:
-            if hi._highflags & _HV_TYPEDIRTY: hi._updateType()
-            if ho._highflags & _HV_TYPEDIRTY: ho._updateType()
-            if hi._type is not ho._type:
-                return False
-        # isAddrTied excluded above → skip tied-varnode check
-        # isInput excluded above → isExtraOut branch runs for both
-        if (fi & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
+        if high_out.isPersist():
             return False
-        if (fo & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
+        if high_in.isPersist():
             return False
-        # proto_partial: if both partial → no merge
-        if fi & _VN_PROTO_PARTIAL and fo & _VN_PROTO_PARTIAL:
+        if high_out.isInput():
             return False
-        # (proto_partial other subconditions excluded by isInput/isAddrTied/isPersist above)
-        # --- symbol check ---
-        if hi._highflags & _HV_SYMBOLDIRTY: hi._updateSymbol()
-        if ho._highflags & _HV_SYMBOLDIRTY: ho._updateSymbol()
-        s_in = hi._symbol
-        s_out = ho._symbol
-        if s_in is not None and s_out is not None:
-            if s_in is not s_out:
-                return False
-            if hi._symboloffset != ho._symboloffset:
-                return False
-        # --- adjacent: namelock both ---
-        if fi & _VN_NAMELOCK and fo & _VN_NAMELOCK:
+        if high_in.isInput():
             return False
-        # --- adjacent: type equality ---
-        if hi._highflags & _HV_TYPEDIRTY: hi._updateType()
-        if ho._highflags & _HV_TYPEDIRTY: ho._updateType()
-        if hi._type is not ho._type:
+        if high_out.isAddrTied():
             return False
-        # isInput excluded → skip getInputVarnode illegalInput check
-        if s_in is not None and s_in.isIsolated():
-            return False
-        if s_out is not None and s_out.isIsolated():
+        if high_in.isAddrTied():
             return False
         return True
 
@@ -360,11 +325,9 @@ class Merge:
         from ghidra.ir.varnode import Varnode as VnCls
         vn.setImplied()
         op = vn.getDef()
-        if op is None:
-            return
         for i in range(op.numInput()):
             defvn = op.getIn(i)
-            if defvn is None or not defvn.hasCover():
+            if not defvn.hasCover():
                 continue
             defvn.setFlags(VnCls.coverdirty)
 
@@ -378,22 +341,14 @@ class Merge:
             op = vn.getDef()
             if op.code() != OpCode.CPUI_COPY:
                 continue
-            in0 = op.getIn(0)
-            if in0 is None:
-                continue
-            if in0.getHigh() is high:
+            if op.getIn(0).getHigh() is high:
                 continue
             singlelist.append(vn)
 
     @staticmethod
     def compareHighByBlock(a: HighVariable, b: HighVariable) -> bool:
         """Compare HighVariables by the blocks they cover."""
-        ca = a.getCover() if hasattr(a, 'getCover') else None
-        cb = b.getCover() if hasattr(b, 'getCover') else None
-        if ca is not None and cb is not None and hasattr(ca, 'compareTo'):
-            result = ca.compareTo(cb)
-        else:
-            result = 0
+        result = a.getCover().compareTo(b.getCover())
         if result == 0:
             v1 = a.getInstance(0)
             v2 = b.getInstance(0)
@@ -415,8 +370,8 @@ class Merge:
         inVn2 = op2.getIn(0)
         if inVn1 is not inVn2:
             return inVn1.getCreateIndex() < inVn2.getCreateIndex()
-        idx1 = op1.getParent().getIndex() if op1.getParent() else 0
-        idx2 = op2.getParent().getIndex() if op2.getParent() else 0
+        idx1 = op1.getParent().getIndex()
+        idx2 = op2.getParent().getIndex()
         if idx1 != idx2:
             return idx1 < idx2
         return op1.getSeqNum().getOrder() < op2.getSeqNum().getOrder()
@@ -425,15 +380,11 @@ class Merge:
     def shadowedVarnode(vn: Varnode) -> bool:
         """Determine if vn is shadowed by another in the same HighVariable."""
         high = vn.getHigh()
-        if high is None:
-            return False
         for i in range(high.numInstances()):
             othervn = high.getInstance(i)
             if othervn is vn:
                 continue
-            c1 = vn.getCover()
-            c2 = othervn.getCover()
-            if c1 is not None and c2 is not None and c1.intersect(c2) == 2:
+            if vn.getCover().intersect(othervn.getCover()) == 2:
                 return True
         return False
 
@@ -448,17 +399,13 @@ class Merge:
             op = vn.getDef()
             if op.code() != OpCode.CPUI_COPY:
                 continue
-            _in0 = op.getIn(0)
-            if _in0 is None:
+            if op.getIn(0).getHigh() is high:
                 continue
-            if _in0.getHigh() is high:
+            if filterTemps and op.getOut().getSpace().getType() != IPTR_INTERNAL:
                 continue
-            if filterTemps and op.getOut().getSpace() is not None:
-                if op.getOut().getSpace().getType() != IPTR_INTERNAL:
-                    continue
             copyIns.append(op)
         copyIns.sort(key=lambda o: (o.getIn(0).getCreateIndex(),
-                                     o.getParent().getIndex() if o.getParent() else 0,
+                                     o.getParent().getIndex(),
                                      o.getSeqNum().getOrder()))
 
     # ----- Instance merge methods -----
@@ -470,51 +417,6 @@ class Merge:
         """
         if high1 is high2:
             return True
-        if isspeculative:
-            if high1._highflags & _HV_FLAGSDIRTY:
-                high1._updateFlags()
-            if high2._highflags & _HV_FLAGSDIRTY:
-                high2._updateFlags()
-            # Fast path: both highs are "clean" (no exclusion flags, no symbol)
-            if high1._spec_ok and high2._spec_ok:
-                if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
-                if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
-                if high1._type is not high2._type:
-                    return False
-            else:
-                # Full speculative test
-                fi = high1._flags; fo = high2._flags
-                if fi & _SPEC_EXCL or fo & _SPEC_EXCL:
-                    return False
-                if (fi & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
-                    return False
-                if (fo & _EXTRAOUT_MASK) == _VN_INDIRECT_CREATE:
-                    return False
-                if fi & _VN_PROTO_PARTIAL and fo & _VN_PROTO_PARTIAL:
-                    return False
-                if fi & _VN_TYPELOCK and fo & _VN_TYPELOCK:
-                    if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
-                    if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
-                    if high1._type is not high2._type:
-                        return False
-                if high1._highflags & _HV_SYMBOLDIRTY: high1._updateSymbol()
-                if high2._highflags & _HV_SYMBOLDIRTY: high2._updateSymbol()
-                s1 = high1._symbol; s2 = high2._symbol
-                if s1 is not None and s2 is not None:
-                    if s1 is not s2:
-                        return False
-                    if high1._symboloffset != high2._symboloffset:
-                        return False
-                if fi & _VN_NAMELOCK and fo & _VN_NAMELOCK:
-                    return False
-                if high1._highflags & _HV_TYPEDIRTY: high1._updateType()
-                if high2._highflags & _HV_TYPEDIRTY: high2._updateType()
-                if high1._type is not high2._type:
-                    return False
-                if s1 is not None and s1.isIsolated():
-                    return False
-                if s2 is not None and s2.isIsolated():
-                    return False
         if self._testCache.intersection(high1, high2):
             return False
         high1.merge(high2, self._testCache, isspeculative)
@@ -523,19 +425,28 @@ class Merge:
 
     def inflateTest(self, a: Varnode, high: HighVariable) -> bool:
         """Test if inflating Cover of a would cause intersections with high."""
-        self._testCache.updateHigh(high)
         ahigh = a.getHigh()
-        if ahigh is None:
-            return False
+        self._testCache.updateHigh(high)
+        highCover = high._internalCover
         for i in range(ahigh.numInstances()):
             b = ahigh.getInstance(i)
             if b.copyShadow(a):
                 continue
-            bc = b.getCover()
-            hc = high.getCover() if hasattr(high, 'getCover') else None
-            if bc is not None and hc is not None:
-                if bc.intersect(hc) == 2:
-                    return True
+            if b.getCover().intersect(highCover) == 2:
+                return True
+        piece = ahigh._piece
+        if piece is not None:
+            piece.updateIntersections()
+            for i in range(piece.numIntersection()):
+                otherPiece = piece.getIntersection(i)
+                otherHigh = otherPiece.getHigh()
+                off = otherPiece.getOffset() - piece.getOffset()
+                for j in range(otherHigh.numInstances()):
+                    b = otherHigh.getInstance(j)
+                    if b.partialCopyShadow(a, off):
+                        continue
+                    if b.getCover().intersect(highCover) == 2:
+                        return True
         return False
 
     def mergeTest(self, high: HighVariable, tmplist: List[HighVariable]) -> bool:
@@ -555,51 +466,51 @@ class Merge:
         """Snip off set of read p-code ops for a given Varnode."""
         if not markedop:
             return
-        # Insert a COPY to isolate reads
+        copyop = None
         afterop = None
         if vn.isInput():
-            bl = self._data.getBasicBlocks().getBlock(0) if hasattr(self._data, 'getBasicBlocks') else None
-            pc = bl.getStart() if bl is not None else vn.getAddr()
+            bl = self._data.getBasicBlocks().getBlock(0)
+            pc = bl.getStart()
+            afterop = None
         else:
             bl = vn.getDef().getParent()
             pc = vn.getDef().getAddr()
             if vn.getDef().code() == OpCode.CPUI_INDIRECT:
-                iop_vn = vn.getDef().getIn(1)
-                if iop_vn is not None and hasattr(PcodeOp, 'getOpFromConst'):
-                    afterop = PcodeOp.getOpFromConst(iop_vn.getAddr())
-            if afterop is None:
+                afterop = PcodeOp.getOpFromConst(vn.getDef().getIn(1).getAddr())
+            else:
                 afterop = vn.getDef()
-        copyop = self._allocateCopyTrim(vn, pc, markedop[0])
-        if copyop is None:
-            return
-        if vn.isInput():
-            if hasattr(self._data, 'opInsertBegin') and bl is not None:
-                _merge_debug_log(
-                    copyop.getAddr(),
-                    f"snipReads insert=begin vn={vn} block={bl.getIndex() if bl is not None else '?'}",
-                )
-                self._data.opInsertBegin(copyop, bl)
+        copyop = self.allocateCopyTrim(vn, pc, markedop[0])
+        if afterop is None:
+            _merge_debug_log(
+                copyop.getAddr(),
+                f"snipReads insert=begin vn={vn} block={bl.getIndex()}",
+            )
+            self._data.opInsertBegin(copyop, bl)
         else:
-            if hasattr(self._data, 'opInsertAfter'):
-                _merge_debug_log(
-                    copyop.getAddr(),
-                    f"snipReads insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
-                    f"prev_opc={afterop.code()} vn={vn}",
-                )
-                self._data.opInsertAfter(copyop, afterop)
-        # Replace reads
+            _merge_debug_log(
+                copyop.getAddr(),
+                f"snipReads insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
+                f"prev_opc={afterop.code()} vn={vn}",
+            )
+            self._data.opInsertAfter(copyop, afterop)
         for op in markedop:
             slot = op.getSlot(vn)
-            if hasattr(self._data, 'opSetInput'):
-                self._data.opSetInput(op, copyop.getOut(), slot)
+            self._data.opSetInput(op, copyop.getOut(), slot)
 
-    def _allocateCopyTrim(self, inVn: Varnode, addr, trimOp: PcodeOp):
+    def allocateCopyTrim(self, inVn: Varnode, addr, trimOp: PcodeOp):
         """Allocate COPY PcodeOp designed to trim an overextended Cover."""
-        if not hasattr(self._data, 'newOp'):
-            return None
         copyop = self._data.newOp(1, addr)
         self._data.opSetOpcode(copyop, OpCode.CPUI_COPY)
         ct = inVn.getType()
+        if ct.needsResolution():
+            if inVn.isWritten():
+                fieldNum = self._data.inheritResolution(ct, copyop, -1, inVn.getDef(), -1)
+                self._data.forceFacingType(ct, fieldNum, copyop, 0)
+            else:
+                slot = trimOp.getSlot(inVn)
+                resUnion = self._data.getUnionField(ct, trimOp, slot)
+                fieldNum = -1 if resUnion is None else resUnion.getFieldNum()
+                self._data.forceFacingType(ct, fieldNum, copyop, 0)
         outVn = self._data.newUnique(inVn.getSize(), ct)
         self._data.opSetOutput(copyop, outVn)
         self._data.opSetInput(copyop, inVn, 0)
@@ -614,43 +525,28 @@ class Merge:
         by creating a new COPY op from the Varnode to a new temporary.
         Returns True if specific instances are snipped.
         """
-        if not hasattr(indop, 'getIn') or indop.numInput() < 2:
-            return False
-        # Get the op causing the indirect effect
-        from ghidra.ir.op import PcodeOp as PcodeOpCls
-        if hasattr(PcodeOpCls, 'getOpFromConst'):
-            effect_op = PcodeOpCls.getOpFromConst(indop.getIn(1).getAddr())
-        else:
-            return False
-        if effect_op is None:
-            return False
-        # Collect instances of output->high that are inputs to effect_op
+        effect_op = PcodeOp.getOpFromConst(indop.getIn(1).getAddr())
         correctable: list = []
-        out_high = indop.getOut().getHigh()
-        if out_high is None:
-            return False
-        self.collectInputs(out_high, correctable, effect_op)
+        self.collectInputs(indop.getOut().getHigh(), correctable, effect_op)
         if not correctable:
             return False
-        # Sort by high variable
-        correctable.sort(key=lambda x: id(x[0].getIn(x[1]).getHigh()) if x[0].getIn(x[1]).getHigh() else 0)
+
+        correctable.sort(key=lambda item: id(item[0].getIn(item[1]).getHigh()))
         snipop = None
         curHigh = None
         for insertop, slot in correctable:
             vn = insertop.getIn(slot)
             if vn.getHigh() is not curHigh:
-                snipop = self._allocateCopyTrim(vn, insertop.getAddr(), insertop)
-                if snipop is not None and hasattr(self._data, 'opInsertBefore'):
-                    self._data.opInsertBefore(snipop, insertop)
+                snipop = self.allocateCopyTrim(vn, insertop.getAddr(), insertop)
+                self._data.opInsertBefore(snipop, insertop)
                 curHigh = vn.getHigh()
-            if snipop is not None and hasattr(self._data, 'opSetInput'):
-                self._data.opSetInput(insertop, snipop.getOut(), slot)
+            self._data.opSetInput(insertop, snipop.getOut(), slot)
         return True
 
     def eliminateIntersect(self, vn: Varnode, blocksort: List[BlockVarnode]) -> None:
         """Eliminate intersections of given Varnode with others in a list."""
         markedop: List[PcodeOp] = []
-        for op in list(vn.getDescendants()):
+        for op in vn.beginDescend():
             insertop = False
             single = Cover()
             single.addDefPoint(vn)
@@ -682,7 +578,7 @@ class Merge:
                         def1 = vn.getDef()
                         if def2 is None:
                             if def1 is None:
-                                if vn.getCreateIndex() < vn2.getCreateIndex():
+                                if vn < vn2:
                                     continue
                             else:
                                 continue
@@ -694,12 +590,9 @@ class Merge:
                         if not vn2.isWritten():
                             continue
                         indop = vn2.getDef()
-                        if indop is None or indop.code() != OpCode.CPUI_INDIRECT:
+                        if indop.code() != OpCode.CPUI_INDIRECT:
                             continue
-                        effect_op = None
-                        if hasattr(PcodeOp, 'getOpFromConst'):
-                            effect_op = PcodeOp.getOpFromConst(indop.getIn(1).getAddr())
-                        if effect_op is not op:
+                        if PcodeOp.getOpFromConst(indop.getIn(1).getAddr()) is not op:
                             continue
                         if overlaptype != 1:
                             if vn.copyShadow(indop.getIn(0)):
@@ -716,9 +609,16 @@ class Merge:
                 markedop.append(op)
         self.snipReads(vn, markedop)
 
-    def unifyAddress(self, varnodes: list) -> None:
+    def unifyAddress(self, startiter: list, enditer: list) -> None:
         """Make sure all Varnodes with the same storage can be merged."""
-        isectlist = [vn for vn in varnodes if not vn.isFree()]
+        isectlist = []
+        stop = enditer[0] if enditer else None
+        for vn in startiter:
+            if stop is not None and vn is stop:
+                break
+            if vn.isFree():
+                continue
+            isectlist.append(vn)
         blocksort = []
         for vn in isectlist:
             bvn = BlockVarnode()
@@ -733,69 +633,50 @@ class Merge:
 
         C++ ref: ``Merge::trimOpOutput``
         """
-        if not hasattr(self._data, 'newOp'):
-            return
         if op.code() == OpCode.CPUI_INDIRECT:
-            # Insert copyop AFTER the source of the indirect
-            afterop = None
-            if op.numInput() > 1:
-                iop_vn = op.getIn(1)
-                if hasattr(PcodeOp, 'getOpFromConst') and iop_vn is not None:
-                    afterop = PcodeOp.getOpFromConst(iop_vn.getAddr())
-            if afterop is None:
-                afterop = op
+            afterop = PcodeOp.getOpFromConst(op.getIn(1).getAddr())
         else:
             afterop = op
         vn = op.getOut()
         ct = vn.getType()
         copyop = self._data.newOp(1, op.getAddr())
         self._data.opSetOpcode(copyop, OpCode.CPUI_COPY)
-        if ct is not None and hasattr(ct, 'needsResolution') and ct.needsResolution():
-            if hasattr(self._data, 'inheritResolution'):
-                fieldNum = self._data.inheritResolution(ct, copyop, -1, op, -1)
-                if hasattr(self._data, 'forceFacingType'):
-                    self._data.forceFacingType(ct, fieldNum, copyop, 0)
-            if hasattr(ct, 'getMetatype'):
-                from ghidra.types.datatype import TYPE_PARTIALUNION
-                if ct.getMetatype() == TYPE_PARTIALUNION:
-                    ct = vn.getTypeDefFacing() if hasattr(vn, 'getTypeDefFacing') else ct
+        if ct.needsResolution():
+            fieldNum = self._data.inheritResolution(ct, copyop, -1, op, -1)
+            self._data.forceFacingType(ct, fieldNum, copyop, 0)
+            from ghidra.types.datatype import TYPE_PARTIALUNION
+
+            if ct.getMetatype() == TYPE_PARTIALUNION:
+                ct = vn.getTypeDefFacing()
         uniq = self._data.newUnique(vn.getSize(), ct)
         self._data.opSetOutput(op, uniq)
         self._data.opSetOutput(copyop, vn)
         self._data.opSetInput(copyop, uniq, 0)
-        if hasattr(self._data, 'opInsertAfter'):
-            _merge_debug_log(
-                copyop.getAddr(),
-                f"trimOpOutput insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
-                f"prev_opc={afterop.code()} op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} "
-                f"op_opc={op.code()}",
-            )
-            self._data.opInsertAfter(copyop, afterop)
+        _merge_debug_log(
+            copyop.getAddr(),
+            f"trimOpOutput insert=after prev={afterop.getAddr().getOffset():#x}#{afterop.getSeqNum().getOrder()} "
+            f"prev_opc={afterop.code()} op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} "
+            f"op_opc={op.code()}",
+        )
+        self._data.opInsertAfter(copyop, afterop)
 
     def trimOpInput(self, op: PcodeOp, slot: int) -> None:
         """Trim the input HighVariable of the given PcodeOp so its Cover is tiny."""
-        if not hasattr(self._data, 'newOp'):
-            return
         if op.code() == OpCode.CPUI_MULTIEQUAL:
-            inbl = op.getParent().getIn(slot)
-            pc = inbl.getStop()
+            bb = op.getParent().getIn(slot)
+            pc = bb.getStop()
         else:
-            inbl = None
             pc = op.getAddr()
         vn = op.getIn(slot)
-        copyop = self._allocateCopyTrim(vn, pc, op)
-        if copyop is None:
-            return
-        if hasattr(self._data, 'opSetInput'):
-            self._data.opSetInput(op, copyop.getOut(), slot)
+        copyop = self.allocateCopyTrim(vn, pc, op)
+        self._data.opSetInput(op, copyop.getOut(), slot)
         if op.code() == OpCode.CPUI_MULTIEQUAL:
-            if hasattr(self._data, 'opInsertEnd') and inbl is not None:
-                _merge_debug_log(
-                    copyop.getAddr(),
-                    f"trimOpInput insert=end op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} slot={slot}",
-                )
-                self._data.opInsertEnd(copyop, inbl)
-        elif hasattr(self._data, 'opInsertBefore'):
+            _merge_debug_log(
+                copyop.getAddr(),
+                f"trimOpInput insert=end op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} slot={slot}",
+            )
+            self._data.opInsertEnd(copyop, bb)
+        else:
             _merge_debug_log(
                 copyop.getAddr(),
                 f"trimOpInput insert=before op={op.getAddr().getOffset():#x}#{op.getSeqNum().getOrder()} "
@@ -803,14 +684,15 @@ class Merge:
             )
             self._data.opInsertBefore(copyop, op)
 
-    def mergeRangeMust(self, varnodes: list) -> None:
+    def mergeRangeMust(self, startiter: list, enditer: list) -> None:
         """Force the merge of a range of Varnodes with same size and address."""
-        if not varnodes:
-            return
-        vn = varnodes[0]
+        stop = enditer[0] if enditer else None
+        vn = startiter[0]
         self.mergeTestMust(vn)
         high = vn.getHigh()
-        for vn2 in varnodes[1:]:
+        for vn2 in startiter[1:]:
+            if stop is not None and vn2 is stop:
+                break
             if vn2.getHigh() is high:
                 continue
             self.mergeTestMust(vn2)
@@ -856,8 +738,13 @@ class Merge:
             else:
                 self.trimOpOutput(op)
         # Actually merge
+        from ghidra.core.error import LowlevelError
+
         for i in range(maxslot):
-            self.merge(op.getOut().getHigh(), op.getIn(i).getHigh(), False)
+            if not self.mergeTestRequired(op.getOut().getHigh(), op.getIn(i).getHigh()):
+                raise LowlevelError("Non-cover related merge restriction violated, despite trims")
+            if not self.merge(op.getOut().getHigh(), op.getIn(i).getHigh(), False):
+                raise LowlevelError(f"Unable to force merge of op at {op.getSeqNum()}")
 
     def mergeIndirect(self, indop: PcodeOp) -> None:
         """Force the merge of input and output Varnodes to a given INDIRECT op."""
@@ -869,21 +756,21 @@ class Merge:
         if self.mergeTestRequired(outvn.getHigh(), invn0.getHigh()):
             if self.merge(invn0.getHigh(), outvn.getHigh(), False):
                 return
-        # Fall back to snipping
-        self.snipOutputInterference(indop)
-        if self.mergeTestRequired(outvn.getHigh(), invn0.getHigh()):
-            if self.merge(invn0.getHigh(), outvn.getHigh(), False):
-                return
+        if self.snipOutputInterference(indop):
+            if self.mergeTestRequired(outvn.getHigh(), invn0.getHigh()):
+                if self.merge(invn0.getHigh(), outvn.getHigh(), False):
+                    return
         # Snip the INDIRECT itself
-        copyop = self._allocateCopyTrim(invn0, indop.getAddr(), indop)
-        if copyop is not None and hasattr(self._data, 'opSetInput'):
-            self._data.opSetInput(indop, copyop.getOut(), 0)
-            if hasattr(self._data, 'opInsertBefore'):
-                _merge_debug_log(
-                    copyop.getAddr(),
-                    f"mergeIndirect insert=before indop={indop.getAddr().getOffset():#x}#{indop.getSeqNum().getOrder()}",
-                )
-                self._data.opInsertBefore(copyop, indop)
+        copyop = self.allocateCopyTrim(invn0, indop.getAddr(), indop)
+        entry = outvn.getSymbolEntry()
+        if entry is not None and entry.getSymbol().getType().needsResolution():
+            self._data.inheritResolution(entry.getSymbol().getType(), copyop, -1, indop, -1)
+        self._data.opSetInput(indop, copyop.getOut(), 0)
+        _merge_debug_log(
+            copyop.getAddr(),
+            f"mergeIndirect insert=before indop={indop.getAddr().getOffset():#x}#{indop.getSeqNum().getOrder()}",
+        )
+        self._data.opInsertBefore(copyop, indop)
         if not self.mergeTestRequired(outvn.getHigh(), indop.getIn(0).getHigh()) or \
            not self.merge(indop.getIn(0).getHigh(), outvn.getHigh(), False):
             from ghidra.core.error import LowlevelError
@@ -895,44 +782,32 @@ class Merge:
             return
         for h in highvec:
             self._testCache.updateHigh(h)
-        def _compareHighByBlock(h):
-            """Sort key matching C++ Merge::compareHighByBlock."""
-            cover = h.getCover() if hasattr(h, 'getCover') else None
-            # Primary: cover compareTo order
-            cover_key = cover.compareTo_key() if cover is not None and hasattr(cover, 'compareTo_key') else 0
-            # Secondary: first instance address and def address
-            v = h.getInstance(0) if hasattr(h, 'getInstance') and h.numInstances() > 0 else None
-            addr_key = (v.getAddr().getSpace().getIndex() if v and v.getAddr().getSpace() else 0,
-                        v.getAddr().getOffset() if v else 0) if v else (0, 0)
-            defop = v.getDef() if v else None
-            def_key = (0, defop.getAddr().getSpace().getIndex() if defop and defop.getAddr().getSpace() else 0,
-                       defop.getAddr().getOffset() if defop else 0) if defop else (1, 0, 0)
-            return (cover_key, addr_key, def_key)
-        try:
-            highvec.sort(key=_compareHighByBlock)
-        except Exception:
-            highvec.sort(key=lambda h: id(h))  # Fallback if cover comparison not available
+        from functools import cmp_to_key
+
+        def _compare(a, b):
+            if Merge.compareHighByBlock(a, b):
+                return -1
+            if Merge.compareHighByBlock(b, a):
+                return 1
+            return 0
+
+        highvec.sort(key=cmp_to_key(_compare))
         highstack: List[HighVariable] = []
         for high in highvec:
-            merged = False
             for out in highstack:
-                if self.merge(out, high, True):
-                    merged = True
-                    break
-            if not merged:
+                if self.mergeTestSpeculative(out, high):
+                    if self.merge(out, high, True):
+                        break
+            else:
                 highstack.append(high)
 
     # ----- Public merge entry points -----
 
     def mergeOpcode(self, opc: OpCode) -> None:
         """Try to force input/output merge for all ops of a given type."""
-        if not hasattr(self._data, 'getBasicBlocks'):
-            return
         bblocks = self._data.getBasicBlocks()
         for i in range(bblocks.getSize()):
             bl = bblocks.getBlock(i)
-            if not hasattr(bl, 'beginOp'):
-                continue
             for op in bl.beginOp():
                 if op.code() != opc:
                     continue
@@ -949,27 +824,32 @@ class Merge:
     def mergeByDatatype(self, varnodes: list) -> None:
         """Try to merge all HighVariables with the same data-type."""
         highlist: List[HighVariable] = []
-        seen = set()
         for vn in varnodes:
             if vn.isFree():
                 continue
             high = vn.getHigh()
-            if high is None or id(high) in seen:
+            if high.isMark():
                 continue
             if not self.mergeTestBasic(vn):
                 continue
-            seen.add(id(high))
+            high.setMark()
             highlist.append(high)
-        # Group by datatype
-        groups: dict = {}
         for high in highlist:
+            high.clearMark()
+
+        while highlist:
+            highvec: List[HighVariable] = []
+            high = highlist.pop(0)
             ct = high.getType()
-            key = id(ct)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(high)
-        for group in groups.values():
-            self.mergeLinear(group)
+            highvec.append(high)
+            remaining: List[HighVariable] = []
+            for other in highlist:
+                if ct == other.getType():
+                    highvec.append(other)
+                else:
+                    remaining.append(other)
+            highlist = remaining
+            self.mergeLinear(highvec)
 
     def mergeAddrTied(self) -> None:
         """Force the merge of address-tied Varnodes.
@@ -979,74 +859,39 @@ class Merge:
         ranges, unifies addresses, merges ranges, and groups overlapping highs.
         """
         from ghidra.core.space import IPTR_PROCESSOR, IPTR_SPACEBASE
-        if not hasattr(self._data, 'beginLoc'):
-            return
-        # Group by space, then collect overlapping ranges
-        space_groups: dict = {}
-        for vn in self._data.beginLoc():
-            if vn.isFree():
+
+        startiter = list(self._data.beginLoc())
+        enditer = list(self._data.endLoc())
+        while startiter != enditer:
+            spc = startiter[0].getSpace()
+            spc_type = spc.getType()
+            if spc_type != IPTR_PROCESSOR and spc_type != IPTR_SPACEBASE:
+                startiter = self._data.endLoc(spc)
                 continue
-            spc = vn.getSpace()
-            if spc is None:
-                continue
-            stype = spc.getType() if hasattr(spc, 'getType') else -1
-            if stype != IPTR_PROCESSOR and stype != IPTR_SPACEBASE:
-                continue
-            spc_id = id(spc)
-            if spc_id not in space_groups:
-                space_groups[spc_id] = []
-            space_groups[spc_id].append(vn)
-        for vn_list in space_groups.values():
-            # Sort by (offset, size) to find overlapping ranges
-            vn_list.sort(key=lambda v: (v.getOffset(), v.getSize()))
-            i = 0
-            while i < len(vn_list):
-                vn = vn_list[i]
+            finaliter = self._data.endLoc(spc)
+            while startiter != finaliter:
+                vn = startiter[0]
                 if vn.isFree():
-                    i += 1
+                    startiter = self._data.endLoc(vn.getSize(), vn.getAddr(), 0)
                     continue
-                # Collect maximally overlapping range
-                maxOff = vn.getOffset() + vn.getSize() - 1
-                has_addrtied = vn.isAddrTied()
-                group = [vn]
-                j = i + 1
-                while j < len(vn_list):
-                    vn2 = vn_list[j]
-                    if vn2.isFree():
-                        j += 1
-                        continue
-                    if vn2.getOffset() > maxOff:
-                        break
-                    endOff = vn2.getOffset() + vn2.getSize() - 1
-                    if endOff > maxOff:
-                        maxOff = endOff
-                    if vn2.isAddrTied():
-                        has_addrtied = True
-                    group.append(vn2)
-                    j += 1
-                if has_addrtied and len(group) > 1:
-                    self.unifyAddress(group)
-                    self.mergeRangeMust(group)
-                    # groupWith for overlapping sub-ranges
-                    if len(group) > 2:
-                        vn1 = group[0]
-                        for k in range(1, len(group)):
-                            vn2 = group[k]
+                bounds = []
+                flags = self._data.overlapLoc(startiter, bounds)
+                max_idx = len(bounds) - 1
+                if (flags & _VN_ADDRTIED) != 0:
+                    self.unifyAddress(bounds[0], bounds[max_idx])
+                    for i in range(0, max_idx, 2):
+                        self.mergeRangeMust(bounds[i], bounds[i + 1])
+                    if max_idx > 2:
+                        vn1 = bounds[0][0]
+                        for i in range(2, max_idx, 2):
+                            vn2 = bounds[i][0]
                             off = int(vn2.getOffset() - vn1.getOffset())
-                            h1 = vn1.getHigh() if hasattr(vn1, 'getHigh') else None
-                            h2 = vn2.getHigh() if hasattr(vn2, 'getHigh') else None
-                            if h1 is not None and h2 is not None and hasattr(h2, 'groupWith'):
-                                try:
-                                    h2.groupWith(off, h1)
-                                except Exception:
-                                    pass
-                i = j
+                            vn2.getHigh().groupWith(off, vn1.getHigh())
+                startiter = bounds[max_idx]
 
     def mergeMarker(self) -> None:
         """Force the merge of input/output Varnodes to MULTIEQUAL and INDIRECT ops."""
-        if not hasattr(self._data, 'beginOpAlive'):
-            return
-        for op in self._data.getAliveOps():
+        for op in self._data.beginOpAlive():
             if not op.isMarker() or op.isIndirectCreation():
                 continue
             if op.code() == OpCode.CPUI_INDIRECT:
@@ -1060,27 +905,19 @@ class Merge:
         Symbols that have more than one SymbolEntry may attach to more than one
         Varnode. These Varnodes need to be merged to properly represent a single variable.
         """
-        if not hasattr(self._data, 'getScopeLocal'):
-            return
         scope = self._data.getScopeLocal()
-        if not hasattr(scope, 'beginMultiEntry'):
-            return
         for symbol in scope.beginMultiEntry():
             mergeList: List[Varnode] = []
-            numEntries = symbol.numEntries() if hasattr(symbol, 'numEntries') else 0
+            numEntries = symbol.numEntries()
             mergeCount = 0
             skipCount = 0
             conflictCount = 0
             for i in range(numEntries):
                 prevSize = len(mergeList)
-                entry = symbol.getMapEntry(i) if hasattr(symbol, 'getMapEntry') else None
-                if entry is None:
+                entry = symbol.getMapEntry(i)
+                if entry.getSize() != symbol.getType().getSize():
                     continue
-                if hasattr(entry, 'getSize') and hasattr(symbol, 'getType'):
-                    if entry.getSize() != symbol.getType().getSize():
-                        continue
-                if hasattr(self._data, 'findLinkedVarnodes'):
-                    self._data.findLinkedVarnodes(entry, mergeList)
+                self._data.findLinkedVarnodes(entry, mergeList)
                 if len(mergeList) == prevSize:
                     skipCount += 1
             if not mergeList:
@@ -1093,17 +930,13 @@ class Merge:
                     continue
                 self._testCache.updateHigh(newHigh)
                 if not self.mergeTestRequired(high, newHigh):
-                    if hasattr(symbol, 'setMergeProblems'):
-                        symbol.setMergeProblems()
-                    if hasattr(newHigh, 'setUnmerged'):
-                        newHigh.setUnmerged()
+                    symbol.setMergeProblems()
+                    newHigh.setUnmerged()
                     conflictCount += 1
                     continue
                 if not self.merge(high, newHigh, False):
-                    if hasattr(symbol, 'setMergeProblems'):
-                        symbol.setMergeProblems()
-                    if hasattr(newHigh, 'setUnmerged'):
-                        newHigh.setUnmerged()
+                    symbol.setMergeProblems()
+                    newHigh.setUnmerged()
                     conflictCount += 1
                     continue
                 mergeCount += 1
@@ -1111,21 +944,19 @@ class Merge:
                 msg = 'Unable to'
                 if mergeCount != 0:
                     msg += ' fully'
-                name = symbol.getName() if hasattr(symbol, 'getName') else '?'
-                msg += f' merge symbol: {name}'
+                msg += f' merge symbol: {symbol.getName()}'
                 if skipCount > 0:
                     msg += ' -- Some instance varnodes not found.'
                 if conflictCount > 0:
                     msg += ' -- Some merges are forbidden'
-                if hasattr(self._data, 'warningHeader'):
-                    self._data.warningHeader(msg)
+                self._data.warningHeader(msg)
 
     def groupPartials(self) -> None:
         """Run through CONCAT tree roots and group each tree."""
         for op in self._protoPartial:
-            if hasattr(op, 'isDead') and op.isDead():
+            if op.isDead():
                 continue
-            if hasattr(op, 'isPartialRoot') and not op.isPartialRoot():
+            if not op.isPartialRoot():
                 continue
             self.groupPartialRoot(op.getOut())
 
@@ -1136,70 +967,51 @@ class Merge:
         of the same variable. The tree is reconstructed from the root Varnode.
         """
         high = vn.getHigh()
-        if high is None or high.numInstances() != 1:
+        if high.numInstances() != 1:
             return
 
         baseOffset = 0
         entry = vn.getSymbolEntry()
-        if entry is not None and hasattr(entry, 'getOffset'):
+        if entry is not None:
             baseOffset = entry.getOffset()
 
-        # Gather pieces from the CONCAT tree
-        pieces: list = []
-        if hasattr(vn, 'getDef') and vn.getDef() is not None:
-            self._gatherPieceNodes(pieces, vn, vn.getDef(), baseOffset, baseOffset)
+        pieces: list[PieceNode] = []
+        PieceNode.gatherPieces(pieces, vn, vn.getDef(), baseOffset, baseOffset)
 
-        # Check all nodes are still valid
         throwOut = False
-        for piece_vn, piece_off in pieces:
-            if not piece_vn.isProtoPartial() or piece_vn.getHigh().numInstances() != 1:
+        for piece in pieces:
+            nodeVn = piece.getVarnode()
+            if not nodeVn.isProtoPartial() or nodeVn.getHigh().numInstances() != 1:
                 throwOut = True
                 break
 
         if throwOut:
-            for piece_vn, _ in pieces:
-                piece_vn.clearProtoPartial()
+            for piece in pieces:
+                piece.getVarnode().clearProtoPartial()
         else:
-            for piece_vn, piece_off in pieces:
-                if hasattr(piece_vn.getHigh(), 'groupWith'):
-                    piece_vn.getHigh().groupWith(piece_off - baseOffset, high)
-
-    def _gatherPieceNodes(self, pieces: list, root, op, baseOff: int, curOff: int) -> None:
-        """Recursively gather piece nodes from a CONCAT tree."""
-        if op is None:
-            return
-        if op.code() == OpCode.CPUI_PIECE:
-            # High part = input 0, Low part = input 1
-            hiVn = op.getIn(0)
-            loVn = op.getIn(1)
-            loSize = loVn.getSize()
-            # Recurse into sub-pieces
-            if loVn.isWritten() and loVn.getDef().code() == OpCode.CPUI_PIECE:
-                self._gatherPieceNodes(pieces, root, loVn.getDef(), baseOff, curOff)
-            else:
-                pieces.append((loVn, curOff))
-            hiOff = curOff + loSize
-            if hiVn.isWritten() and hiVn.getDef().code() == OpCode.CPUI_PIECE:
-                self._gatherPieceNodes(pieces, root, hiVn.getDef(), baseOff, hiOff)
-            else:
-                pieces.append((hiVn, hiOff))
+            for piece in pieces:
+                nodeVn = piece.getVarnode()
+                nodeVn.getHigh().groupWith(piece.getTypeOffset() - baseOffset, high)
 
     def mergeAdjacent(self) -> None:
         """Speculatively merge Varnodes that are input/output to the same p-code op."""
-        if not hasattr(self._data, 'getAliveOps'):
-            return
-        for op in self._data.getAliveOps():
+        for op in self._data.beginOpAlive():
             if op.isCall():
                 continue
             vn1 = op.getOut()
-            if vn1 is None or not self.mergeTestBasic(vn1):
+            if not self.mergeTestBasic(vn1):
                 continue
             high_out = vn1.getHigh()
+            ct = op.outputTypeLocal()
             for i in range(op.numInput()):
+                if ct is not op.inputTypeLocal(i):
+                    continue
                 vn2 = op.getIn(i)
                 if not self.mergeTestBasic(vn2):
                     continue
                 if vn1.getSize() != vn2.getSize():
+                    continue
+                if vn2.getDef() is None and not vn2.isInput():
                     continue
                 high_in = vn2.getHigh()
                 if not self.mergeTestAdjacent(high_out, high_in):
@@ -1224,52 +1036,130 @@ class Merge:
                     continue
                 if not vn1.copyShadow(vn2):
                     continue
-                c2 = vn2.getCover()
-                if c2 is not None and hasattr(c2, 'containVarnodeDef'):
-                    if c2.containVarnodeDef(vn1) == 1:
-                        if hasattr(self._data, 'opSetInput'):
-                            self._data.opSetInput(vn1.getDef(), vn2, 0)
-                        res = True
-                        break
-                c1 = vn1.getCover()
-                if c1 is not None and hasattr(c1, 'containVarnodeDef'):
-                    if c1.containVarnodeDef(vn2) == 1:
-                        if hasattr(self._data, 'opSetInput'):
-                            self._data.opSetInput(vn2.getDef(), vn1, 0)
-                        singlelist[j] = None
-                        res = True
+                if vn2.getCover().containVarnodeDef(vn1) == 1:
+                    self._data.opSetInput(vn1.getDef(), vn2, 0)
+                    res = True
+                    break
+                if vn1.getCover().containVarnodeDef(vn2) == 1:
+                    self._data.opSetInput(vn2.getDef(), vn1, 0)
+                    singlelist[j] = None
+                    res = True
         return res
 
     def processCopyTrims(self) -> None:
         """Try to reduce/eliminate COPYs produced by the merge trimming process."""
+        multiCopy: List[HighVariable] = []
+        for i in range(len(self._copyTrims)):
+            high = self._copyTrims[i].getOut().getHigh()
+            if not high.hasCopyIn1():
+                multiCopy.append(high)
+                high.setCopyIn1()
+            else:
+                high.setCopyIn2()
         self._copyTrims.clear()
+        for i in range(len(multiCopy)):
+            high = multiCopy[i]
+            if high.hasCopyIn2():
+                self.processHighDominantCopy(high)
+            high.clearCopyIns()
 
     def markInternalCopies(self) -> None:
         """Mark redundant/internal COPY PcodeOps."""
-        if not hasattr(self._data, 'getAliveOps'):
-            return
-        for op in self._data.getAliveOps():
-            if op.code() == OpCode.CPUI_COPY:
+        multiCopy: List[HighVariable] = []
+        for op in self._data.beginOpAlive():
+            opc = op.code()
+            if opc == OpCode.CPUI_COPY:
                 v1 = op.getOut()
-                h1 = v1.getHigh() if v1 is not None else None
-                _in0c = op.getIn(0)
-                if h1 is not None and _in0c is not None and h1 is _in0c.getHigh():
-                    if hasattr(self._data, 'opMarkNonPrinting'):
+                h1 = v1.getHigh()
+                if h1 is op.getIn(0).getHigh():
+                    self._data.opMarkNonPrinting(op)
+                else:
+                    if not h1.hasCopyIn1():
+                        h1.setCopyIn1()
+                        multiCopy.append(h1)
+                    else:
+                        h1.setCopyIn2()
+                    if v1.hasNoDescend() and self.shadowedVarnode(v1):
                         self._data.opMarkNonPrinting(op)
+            elif opc == OpCode.CPUI_PIECE:
+                v1 = op.getOut()
+                v2 = op.getIn(0)
+                v3 = op.getIn(1)
+                p1 = v1.getHigh()._piece
+                p2 = v2.getHigh()._piece
+                p3 = v3.getHigh()._piece
+                if p1 is None or p2 is None or p3 is None:
+                    continue
+                if p1.getGroup() != p2.getGroup():
+                    continue
+                if p1.getGroup() != p3.getGroup():
+                    continue
+                if v1.getSpace().isBigEndian():
+                    if p2.getOffset() != p1.getOffset():
+                        continue
+                    if p3.getOffset() != p1.getOffset() + v2.getSize():
+                        continue
+                else:
+                    if p3.getOffset() != p1.getOffset():
+                        continue
+                    if p2.getOffset() != p1.getOffset() + v3.getSize():
+                        continue
+                self._data.opMarkNonPrinting(op)
+                if v2.isImplied():
+                    v2.clearImplied()
+                    v2.setExplicit()
+                if v3.isImplied():
+                    v3.clearImplied()
+                    v3.setExplicit()
+            elif opc == OpCode.CPUI_SUBPIECE:
+                v1 = op.getOut()
+                v2 = op.getIn(0)
+                p1 = v1.getHigh()._piece
+                p2 = v2.getHigh()._piece
+                if p1 is None or p2 is None:
+                    continue
+                if p1.getGroup() != p2.getGroup():
+                    continue
+                val = op.getIn(1).getOffset()
+                if v1.getSpace().isBigEndian():
+                    if p2.getOffset() + (v2.getSize() - v1.getSize() - val) != p1.getOffset():
+                        continue
+                else:
+                    if p2.getOffset() + val != p1.getOffset():
+                        continue
+                self._data.opMarkNonPrinting(op)
+                if v2.isImplied():
+                    v2.clearImplied()
+                    v2.setExplicit()
+        for high in multiCopy:
+            if high.hasCopyIn2():
+                self._data.getMerge().processHighRedundantCopy(high)
+            high.clearCopyIns()
 
     def registerProtoPartialRoot(self, vn: Varnode) -> None:
         """Register an unmapped CONCAT stack with the merge process."""
-        if vn.getDef() is not None:
-            self._protoPartial.append(vn.getDef())
+        self._protoPartial.append(vn.getDef())
 
     def checkCopyPair(self, high: HighVariable, domOp: PcodeOp, subOp: PcodeOp) -> bool:
         """Check if the given COPY ops are redundant."""
         domBlock = domOp.getParent()
         subBlock = subOp.getParent()
-        if domBlock is None or subBlock is None:
+        if not domBlock.dominates(subBlock):
             return False
-        if hasattr(domBlock, 'dominates') and not domBlock.dominates(subBlock):
-            return False
+        range_ = Cover()
+        range_.addDefPoint(domOp.getOut())
+        range_.addRefPoint(subOp, subOp.getIn(0))
+        inVn = domOp.getIn(0)
+        for i in range(high.numInstances()):
+            vn = high.getInstance(i)
+            if not vn.isWritten():
+                continue
+            op = vn.getDef()
+            if op.code() == OpCode.CPUI_COPY:
+                if op.getIn(0) is inVn:
+                    continue
+            if range_.contain(op, 1):
+                return False
         return True
 
     def buildDominantCopy(self, high: HighVariable, copy: List[PcodeOp], pos: int, size: int) -> None:
@@ -1279,59 +1169,90 @@ class Merge:
         dominates all the others, or a new dominating COPY is constructed. Replacement only
         happens with COPY outputs that are temporary registers.
         """
-        if not hasattr(self._data, 'newOp'):
-            return
-        # Find common dominating block
         from ghidra.block.block import FlowBlock
-        blockSet = []
-        for i in range(size):
-            parent = copy[pos + i].getParent()
-            if parent is not None:
-                blockSet.append(parent)
-        if not blockSet:
-            return
-        domBl = FlowBlock.findCommonBlock(blockSet) if hasattr(FlowBlock, 'findCommonBlock') else blockSet[0]
+        blockSet = [copy[pos + i].getParent() for i in range(size)]
+        domBl = FlowBlock.findCommonBlock(blockSet)
         domCopy = copy[pos]
         rootVn = domCopy.getIn(0)
         domVn = domCopy.getOut()
-        domCopyIsNew = (domBl is not domCopy.getParent())
-
-        if domCopyIsNew:
-            # Create a new dominant COPY
-            domCopy = self._data.newOp(1, domBl.getStop() if hasattr(domBl, 'getStop') else domCopy.getAddr())
+        if domBl is domCopy.getParent():
+            domCopyIsNew = False
+        else:
+            domCopyIsNew = True
+            oldCopy = domCopy
+            domCopy = self._data.newOp(1, domBl.getStop())
             self._data.opSetOpcode(domCopy, OpCode.CPUI_COPY)
             ct = rootVn.getType()
+            if ct.needsResolution():
+                resUnion = self._data.getUnionField(ct, oldCopy, 0)
+                fieldNum = -1 if resUnion is None else resUnion.getFieldNum()
+                self._data.forceFacingType(ct, fieldNum, domCopy, 0)
+                self._data.forceFacingType(ct, fieldNum, domCopy, -1)
+                from ghidra.types.datatype import TYPE_PARTIALUNION
+
+                if ct.getMetatype() == TYPE_PARTIALUNION:
+                    ct = rootVn.getTypeReadFacing(oldCopy)
             domVn = self._data.newUnique(rootVn.getSize(), ct)
             self._data.opSetOutput(domCopy, domVn)
             self._data.opSetInput(domCopy, rootVn, 0)
-            if hasattr(self._data, 'opInsertEnd'):
-                self._data.opInsertEnd(domCopy, domBl)
+            self._data.opInsertEnd(domCopy, domBl)
 
-        # Replace non-intersecting COPYs with read of dominant Varnode
+        bCover = Cover()
+        for i in range(high.numInstances()):
+            vn = high.getInstance(i)
+            if vn.isWritten():
+                op = vn.getDef()
+                if op.code() == OpCode.CPUI_COPY:
+                    if op.getIn(0).copyShadow(rootVn):
+                        continue
+            bCover.merge(vn.getCover())
+
+        count = size
         for i in range(size):
             op = copy[pos + i]
             if op is domCopy:
                 continue
             outVn = op.getOut()
-            if outVn is not domVn:
-                if hasattr(self._data, 'totalReplace'):
+            aCover = Cover()
+            aCover.addDefPoint(domVn)
+            for desc_op in outVn.beginDescend():
+                aCover.addRefPoint(desc_op, outVn)
+            if bCover.intersect(aCover) > 1:
+                count -= 1
+                op.setMark()
+
+        if count <= 1:
+            for i in range(size):
+                copy[pos + i].setMark()
+            count = 0
+            if domCopyIsNew:
+                self._data.opDestroy(domCopy)
+
+        for i in range(size):
+            op = copy[pos + i]
+            if op.isMark():
+                op.clearMark()
+            else:
+                outVn = op.getOut()
+                if outVn is not domVn:
+                    outVn.getHigh().remove(outVn)
                     self._data.totalReplace(outVn, domVn)
-                if hasattr(self._data, 'opDestroy'):
                     self._data.opDestroy(op)
+        if count > 0 and domCopyIsNew:
+            high.merge(domVn.getHigh(), None, True)
 
     def markRedundantCopies(self, high: HighVariable, copy: List[PcodeOp], pos: int, size: int) -> None:
         """Mark redundant COPY ops as non-printing."""
         for i in range(size - 1, 0, -1):
             subOp = copy[pos + i]
-            if hasattr(subOp, 'isDead') and subOp.isDead():
+            if subOp.isDead():
                 continue
             for j in range(i - 1, -1, -1):
                 domOp = copy[pos + j]
-                if hasattr(domOp, 'isDead') and domOp.isDead():
+                if domOp.isDead():
                     continue
                 if self.checkCopyPair(high, domOp, subOp):
-                    if hasattr(self._data, 'opMarkNonPrinting'):
-                        self._data.opMarkNonPrinting(subOp)
+                    self._data.opMarkNonPrinting(subOp)
                     break
 
     def processHighDominantCopy(self, high: HighVariable) -> None:
@@ -1383,32 +1304,28 @@ class Merge:
 
         C++ ref: ``Merge::verifyHighCovers``
         """
-        if self._data is None:
-            return
-        if not hasattr(self._data, 'beginLoc'):
-            return
+        _enditer = self._data.endLoc()
         for vn in self._data.beginLoc():
-            if hasattr(vn, 'hasCover') and vn.hasCover():
-                high = vn.getHigh() if hasattr(vn, 'getHigh') else None
-                if high is None:
-                    continue
-                if hasattr(high, 'hasCopyIn1') and not high.hasCopyIn1():
-                    if hasattr(high, 'setCopyIn1'):
-                        high.setCopyIn1()
-                    if hasattr(high, 'verifyCover'):
-                        high.verifyCover()
+            if vn.hasCover():
+                high = vn.getHigh()
+                if not high.hasCopyIn1():
+                    high.setCopyIn1()
+                    high.verifyCover()
 
     def collectInputs(self, high: HighVariable, oplist: list, op: PcodeOp) -> None:
         """Collect Varnode instances from a HighVariable that are inputs to a given PcodeOp."""
+        group = None
+        if high._piece is not None:
+            group = high._piece.getGroup()
         while True:
             for i in range(op.numInput()):
                 vn = op.getIn(i)
                 if vn.isAnnotation():
                     continue
                 testHigh = vn.getHigh()
-                if testHigh is high:
+                testPiece = testHigh._piece
+                if testHigh is high or (testPiece is not None and testPiece.getGroup() == group):
                     oplist.append((op, i))
-            prev = op.previousOp() if hasattr(op, 'previousOp') else None
-            if prev is None or prev.code() != OpCode.CPUI_INDIRECT:
+            op = op.previousOp()
+            if op is None or op.code() != OpCode.CPUI_INDIRECT:
                 break
-            op = prev

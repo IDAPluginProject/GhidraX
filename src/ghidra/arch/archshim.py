@@ -366,6 +366,7 @@ class ArchitectureStandalone:
         self.pcodeinjectlib = None
         self.inst = []
         self.lanerecords = []
+        self.splitrecords = []
         self.allacts = ActionDatabase()
         self.userops = UserOpManage()
         self.print_ = PrintLanguageCapability.getDefault().buildLanguage(self)

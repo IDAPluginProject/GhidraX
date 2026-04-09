@@ -7,6 +7,7 @@ When a register can be logically split into smaller lanes (e.g. XMM into
 """
 
 from __future__ import annotations
+from bisect import bisect_left
 from typing import List, Optional, TYPE_CHECKING
 from ghidra.core.address import Address
 from ghidra.core.opcodes import OpCode
@@ -97,7 +98,11 @@ class PreferSplitRecord:
     def __lt__(self, other) -> bool:
         if not isinstance(other, PreferSplitRecord):
             return NotImplemented
-        return self.storage < other.storage
+        if self.storage.getSpace() != other.storage.getSpace():
+            return self.storage.getSpace().getIndex() < other.storage.getSpace().getIndex()
+        if self.totalSize != other.totalSize:
+            return self.totalSize > other.totalSize
+        return self.storage.getOffset() < other.storage.getOffset()
 
 
 class PreferSplitManager:
@@ -125,8 +130,7 @@ class PreferSplitManager:
     def init(self, fd: Funcdata, records) -> None:
         """Initialize with a Funcdata and list of PreferSplitRecords."""
         self._data = fd
-        if records is not None:
-            self._records = list(records) if not isinstance(records, list) else records
+        self._records = records
 
     def addRecord(self, rec: PreferSplitRecord) -> None:
         self._records.append(rec)
@@ -138,17 +142,21 @@ class PreferSplitManager:
         C++ ref: PreferSplitManager::findRecord uses binary search (lower_bound).
         """
         if sz is not None:
-            for rec in self._records:
-                if rec.storage == addr_or_vn and rec.totalSize == sz:
-                    return rec
+            templ = PreferSplitRecord()
+            templ.storage = addr_or_vn
+            templ.totalSize = sz
         else:
             vn = addr_or_vn
-            if vn is None:
-                return None
-            for rec in self._records:
-                if rec.storage == vn.getAddr() and rec.totalSize == vn.getSize():
-                    return rec
-        return None
+            templ = PreferSplitRecord()
+            templ.storage = vn.getAddr()
+            templ.totalSize = vn.getSize()
+        index = bisect_left(self._records, templ)
+        if index == len(self._records):
+            return None
+        rec = self._records[index]
+        if templ < rec:
+            return None
+        return rec
 
     def hasSplit(self, addr: Address, sz: int) -> bool:
         return self.findRecord(addr, sz) is not None
@@ -263,8 +271,7 @@ class PreferSplitManager:
         invn = defop.getIn(0)
         istemp = False
         if not invn.isConstant():
-            spcType = invn.getSpace().getType() if hasattr(invn.getSpace(), 'getType') else -1
-            if spcType != self.IPTR_INTERNAL:
+            if invn.getSpace().getType() != self.IPTR_INTERNAL:
                 inrec = self.findRecord(invn)
                 if inrec is None:
                     return (False, istemp)
@@ -283,7 +290,7 @@ class PreferSplitManager:
         """
         invn = defop.getIn(0)
         ininst = PreferSplitManager.SplitInstance(invn, inst.splitoffset)
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, True, True)
         self._fillinInstance(ininst, bigendian, True, True)
         self._createCopyOps(ininst, inst, defop, istemp)
@@ -296,8 +303,7 @@ class PreferSplitManager:
         """
         outvn = readop.getOut()
         istemp = False
-        spcType = outvn.getSpace().getType() if hasattr(outvn.getSpace(), 'getType') else -1
-        if spcType != self.IPTR_INTERNAL:
+        if outvn.getSpace().getType() != self.IPTR_INTERNAL:
             outrec = self.findRecord(outvn)
             if outrec is None:
                 return (False, istemp)
@@ -314,7 +320,7 @@ class PreferSplitManager:
         """
         outvn = readop.getOut()
         outinst = PreferSplitManager.SplitInstance(outvn, inst.splitoffset)
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, True, True)
         self._fillinInstance(outinst, bigendian, True, True)
         self._createCopyOps(inst, outinst, readop, istemp)
@@ -327,7 +333,7 @@ class PreferSplitManager:
         invn = op.getIn(0)
         if invn.isConstant():
             return True
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         if bigendian:
             losize = inst.vn.getSize() - inst.splitoffset
         else:
@@ -342,7 +348,7 @@ class PreferSplitManager:
         C++ ref: PreferSplitManager::splitZext (lines 160-188)
         """
         ininst = PreferSplitManager.SplitInstance(op.getIn(0), inst.splitoffset)
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         if bigendian:
             hisize = inst.splitoffset
             losize = inst.vn.getSize() - inst.splitoffset
@@ -366,7 +372,7 @@ class PreferSplitManager:
 
         C++ ref: PreferSplitManager::testPiece (lines 190-200)
         """
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         if bigendian:
             if op.getIn(0).getSize() != inst.splitoffset:
                 return False
@@ -382,7 +388,7 @@ class PreferSplitManager:
         """
         loin = op.getIn(1)
         hiin = op.getIn(0)
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, True, True)
         hiop = self._data.newOp(1, op.getAddr())
         loop = self._data.newOp(1, op.getAddr())
@@ -426,7 +432,7 @@ class PreferSplitManager:
         """
         suboff = int(op.getIn(1).getOffset())
         grabbinglo = (suboff == 0)
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, not grabbinglo, grabbinglo)
         self._data.opSetOpcode(op, int(OpCode.CPUI_COPY))
         self._data.opRemoveInput(op, 1)
@@ -442,7 +448,7 @@ class PreferSplitManager:
 
         C++ ref: PreferSplitManager::splitLoad (lines 271-314)
         """
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, True, True)
         hiop = self._data.newOp(2, op.getAddr())
         loop = self._data.newOp(2, op.getAddr())
@@ -461,13 +467,14 @@ class PreferSplitManager:
         self._data.opSetOutput(hiop, inst.hi)
         self._data.opSetOutput(loop, inst.lo)
         spaceid = op.getIn(0)
+        spc = spaceid.getSpaceFromConst()
         spaceid2 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
         self._data.opSetInput(hiop, spaceid2, 0)
         spaceid3 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
         self._data.opSetInput(loop, spaceid3, 0)
         if ptrvn.isFree():
             ptrvn = self._data.newVarnode(ptrvn.getSize(), ptrvn.getSpace(), ptrvn.getOffset())
-        if bigendian:
+        if spc.isBigEndian():
             self._data.opSetInput(hiop, ptrvn, 1)
             self._data.opSetInput(loop, addvn, 1)
         else:
@@ -483,7 +490,7 @@ class PreferSplitManager:
 
         C++ ref: PreferSplitManager::splitStore (lines 322-365)
         """
-        bigendian = inst.vn.getSpace().isBigEndian() if hasattr(inst.vn.getSpace(), 'isBigEndian') else False
+        bigendian = inst.vn.getSpace().isBigEndian()
         self._fillinInstance(inst, bigendian, True, True)
         hiop = self._data.newOp(3, op.getAddr())
         loop = self._data.newOp(3, op.getAddr())
@@ -503,13 +510,14 @@ class PreferSplitManager:
         self._data.opSetInput(hiop, inst.hi, 2)
         self._data.opSetInput(loop, inst.lo, 2)
         spaceid = op.getIn(0)
+        spc = spaceid.getSpaceFromConst()
         spaceid2 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
         self._data.opSetInput(hiop, spaceid2, 0)
         spaceid3 = self._data.newConstant(spaceid.getSize(), spaceid.getOffset())
         self._data.opSetInput(loop, spaceid3, 0)
         if ptrvn.isFree():
             ptrvn = self._data.newVarnode(ptrvn.getSize(), ptrvn.getSpace(), ptrvn.getOffset())
-        if bigendian:
+        if spc.isBigEndian():
             self._data.opSetInput(hiop, ptrvn, 1)
             self._data.opSetInput(loop, addvn, 1)
         else:
@@ -550,7 +558,7 @@ class PreferSplitManager:
         else:
             if not vn.isFree():
                 return False
-            op = vn.loneDescend() if hasattr(vn, 'loneDescend') else None
+            op = vn.loneDescend()
             if op is None:
                 return False
             opc = op.code()
@@ -578,29 +586,20 @@ class PreferSplitManager:
 
         C++ ref: PreferSplitManager::splitRecord (lines 430-449)
         """
-        if self._data is None:
-            return
         addr = rec.storage
         inst = PreferSplitManager.SplitInstance(None, rec.splitSize)
-        if hasattr(self._data, 'beginLoc') and hasattr(self._data, 'endLoc'):
-            while True:
-                found = False
-                for vn in list(self._data.iterLoc(rec.totalSize, addr)):
-                    inst.vn = vn
-                    inst.lo = None
-                    inst.hi = None
-                    if self._splitVarnode(inst):
-                        found = True
-                        break
-                if not found:
+        while True:
+            self._data.endLoc(rec.totalSize, addr)
+            found = False
+            for vn in list(self._data.beginLoc(rec.totalSize, addr)):
+                inst.vn = vn
+                inst.lo = None
+                inst.hi = None
+                if self._splitVarnode(inst):
+                    found = True
                     break
-        elif hasattr(self._data, '_vbank'):
-            for vn in list(self._data._vbank.beginLoc()):
-                if vn.getAddr() == rec.storage and vn.getSize() == rec.totalSize:
-                    inst.vn = vn
-                    inst.lo = None
-                    inst.hi = None
-                    self._splitVarnode(inst)
+            if not found:
+                break
 
     def _testTemporary(self, inst: 'PreferSplitManager.SplitInstance') -> bool:
         """Test if a temporary can be split.
@@ -620,7 +619,7 @@ class PreferSplitManager:
                 return False
         else:
             return False
-        for readop in (list(inst.vn.getDescend()) if hasattr(inst.vn, 'getDescend') else []):
+        for readop in list(inst.vn.getDescend()):
             ropc = readop.code()
             if ropc == OpCode.CPUI_SUBPIECE:
                 if not self._testSubpiece(inst, readop):
@@ -648,7 +647,7 @@ class PreferSplitManager:
             self._splitZext(inst, op)
 
         while True:
-            descend = list(vn.getDescend()) if hasattr(vn, 'getDescend') else []
+            descend = list(vn.getDescend())
             if not descend:
                 break
             readop = descend[0]
@@ -667,8 +666,6 @@ class PreferSplitManager:
 
         C++ ref: PreferSplitManager::split (lines 558-563)
         """
-        if self._data is None:
-            return
         for rec in self._records:
             self._splitRecord(rec)
 
@@ -679,31 +676,28 @@ class PreferSplitManager:
         """
         defops: list = []
         for tmpop in self._tempsplits:
-            if hasattr(tmpop, 'isDead') and tmpop.isDead():
+            if tmpop.isDead():
                 continue
             vn = tmpop.getIn(0)
             if vn.isWritten():
                 defop = vn.getDef()
                 if defop.code() == OpCode.CPUI_SUBPIECE:
                     invn = defop.getIn(0)
-                    spcType = invn.getSpace().getType() if hasattr(invn.getSpace(), 'getType') else -1
-                    if spcType == self.IPTR_INTERNAL:
+                    if invn.getSpace().getType() == self.IPTR_INTERNAL:
                         defops.append(defop)
             outvn = tmpop.getOut()
-            if outvn is not None:
-                for descop in (list(outvn.getDescend()) if hasattr(outvn, 'getDescend') else []):
-                    if descop.code() == OpCode.CPUI_PIECE:
-                        poutvn = descop.getOut()
-                        pspcType = poutvn.getSpace().getType() if hasattr(poutvn.getSpace(), 'getType') else -1
-                        if pspcType == self.IPTR_INTERNAL:
-                            defops.append(descop)
+            for descop in list(outvn.getDescend()):
+                if descop.code() == OpCode.CPUI_PIECE:
+                    poutvn = descop.getOut()
+                    if poutvn.getSpace().getType() == self.IPTR_INTERNAL:
+                        defops.append(descop)
         for defop in defops:
-            if hasattr(defop, 'isDead') and defop.isDead():
+            if defop.isDead():
                 continue
             opc = defop.code()
             if opc == OpCode.CPUI_PIECE:
                 vn = defop.getOut()
-                bigendian = vn.getSpace().isBigEndian() if hasattr(vn.getSpace(), 'isBigEndian') else False
+                bigendian = vn.getSpace().isBigEndian()
                 if bigendian:
                     splitoff = defop.getIn(0).getSize()
                 else:
@@ -714,7 +708,7 @@ class PreferSplitManager:
             elif opc == OpCode.CPUI_SUBPIECE:
                 vn = defop.getIn(0)
                 suboff = defop.getIn(1).getOffset()
-                bigendian = vn.getSpace().isBigEndian() if hasattr(vn.getSpace(), 'isBigEndian') else False
+                bigendian = vn.getSpace().isBigEndian()
                 if bigendian:
                     if suboff == 0:
                         splitoff = vn.getSize() - defop.getOut().getSize()

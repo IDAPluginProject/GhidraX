@@ -11,10 +11,19 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from ghidra.core.error import LowlevelError
+from ghidra.core.marshal import ATTRIB_OFFSET, ATTRIB_SPACE, ATTRIB_VAL, XmlEncode
 from ghidra.console.protocol import (
     read_string_stream_raw, write_string_stream,
 )
-from ghidra.analysis.signature import SigManager, GraphSigManager
+from ghidra.analysis.signature import (
+    ATTRIB_BADDATA,
+    ATTRIB_UNIMPL,
+    ELEM_CALL,
+    ELEM_SIG,
+    ELEM_SIGNATURES,
+    GraphSigManager,
+    SigManager,
+)
 
 if TYPE_CHECKING:
     from typing import BinaryIO, Dict
@@ -225,27 +234,37 @@ def _simple_signature(fd, sout) -> None:
     mgr = GraphSigManager()
     mgr.setCurrentFunction(fd)
     mgr.generate()
-    mgr.sortByHash()
-    vec = mgr.getSignatureVector()
-    xml = "<signatures>"
+    vec = []
+    mgr.getSignatureVector(vec)
+
+    encoder = XmlEncode(do_format=False)
+    encoder.openElement(ELEM_SIGNATURES)
+    if fd.hasUnimplemented():
+        encoder.writeBool(ATTRIB_UNIMPL, True)
+    if fd.hasBadData():
+        encoder.writeBool(ATTRIB_BADDATA, True)
     for h in vec:
-        xml += f'<sig hash="{h}"/>'
-    xml += "</signatures>"
-    sout.write(xml.encode("utf-8"))
+        encoder.openElement(ELEM_SIG)
+        encoder.writeUnsignedInteger(ATTRIB_VAL, h)
+        encoder.closeElement(ELEM_SIG)
+    for i in range(fd.numCalls()):
+        fc = fd.getCallSpecs(i)
+        addr = fc.getEntryAddress()
+        if not addr.isInvalid():
+            encoder.openElement(ELEM_CALL)
+            encoder.writeSpace(ATTRIB_SPACE, addr.getSpace())
+            encoder.writeUnsignedInteger(ATTRIB_OFFSET, addr.getOffset())
+            encoder.closeElement(ELEM_CALL)
+    encoder.closeElement(ELEM_SIGNATURES)
+    sout.write(encoder.toString().encode("utf-8"))
 
 
 def _debug_signature(fd, sout) -> None:
     """Generate a verbose feature encoding with debug info."""
-    import io as _io
     mgr = GraphSigManager()
     mgr.setCurrentFunction(fd)
     mgr.generate()
     mgr.sortByHash()
-    xml = '<signatures debug="true">'
-    for i in range(mgr.numSignatures()):
-        sig = mgr.getSignature(i)
-        origin = _io.StringIO()
-        sig.printOrigin(origin)
-        xml += f'<sig hash="{sig.getHash()}" origin="{origin.getvalue()}"/>'
-    xml += "</signatures>"
-    sout.write(xml.encode("utf-8"))
+    encoder = XmlEncode(do_format=False)
+    mgr.encode(encoder)
+    sout.write(encoder.toString().encode("utf-8"))

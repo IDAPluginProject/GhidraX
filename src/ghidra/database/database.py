@@ -489,11 +489,8 @@ class Symbol:
         else:
             self.dispflags &= ~Symbol.is_this_ptr
 
-    def setMergeProblems(self, val: bool) -> None:
-        if val:
-            self.dispflags |= Symbol.merge_problems
-        else:
-            self.dispflags &= ~Symbol.merge_problems
+    def setMergeProblems(self) -> None:
+        self.dispflags |= Symbol.merge_problems
 
     def checkSizeTypeLock(self) -> bool:
         return self.isSizeTypeLocked()
@@ -1792,6 +1789,17 @@ class ScopeInternal(Scope):
 
     def getSymbolList(self) -> List[Symbol]:
         return list(self._symbolsById.values())
+
+    def beginMultiEntry(self) -> Iterator[Symbol]:
+        multi_entry = [
+            sym for sym in self._symbolsById.values()
+            if sym.isMultiEntry()
+        ]
+        multi_entry.sort(key=lambda sym: (sym.getName(), sym.nameDedup, sym.symbolId))
+        return iter(multi_entry)
+
+    def endMultiEntry(self) -> Iterator[Symbol]:
+        return iter(())
 
     def findFunction(self, addr: Address) -> Optional[FunctionSymbol]:
         """Find a FunctionSymbol by entry address."""
