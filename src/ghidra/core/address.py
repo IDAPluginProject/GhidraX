@@ -7,6 +7,7 @@ Classes for specifying addresses and other low-level constants.
 from __future__ import annotations
 
 from enum import IntEnum
+from io import StringIO
 from typing import TYPE_CHECKING, Optional, Set
 
 from ghidra.core.error import LowlevelError
@@ -23,6 +24,15 @@ from ghidra.core.marshal import (
 
 if TYPE_CHECKING:
     pass
+
+
+def _space_sort_key(space) -> int:
+    if space is None:
+        return -1
+    get_index = getattr(space, "getIndex", None)
+    if callable(get_index):
+        return get_index()
+    return id(space)
 
 
 # =========================================================================
@@ -74,12 +84,27 @@ def minimalmask(val: int) -> int:
     return 0xFF
 
 
-def sign_extend(val: int, bit: int) -> int:
-    """Sign extend *val* starting at *bit* (0=least significant)."""
+def sign_extend(val: int, bit_or_sizein: int, sizeout: Optional[int] = None) -> int:
+    """Sign extend a value.
+
+    Two-argument form matches ``sign_extend(intb val,int4 bit)``.
+    Three-argument form matches ``sign_extend(uintb in,int4 sizein,int4 sizeout)``.
+    """
+    if sizeout is not None:
+        sizein = min(bit_or_sizein, 8)
+        sizeout = min(sizeout, 8)
+        sval = val & 0xFFFFFFFFFFFFFFFF
+        sval = (sval << ((8 - sizein) * 8)) & 0xFFFFFFFFFFFFFFFF
+        if sval >= (1 << 63):
+            sval -= (1 << 64)
+        sval >>= (sizeout - sizein) * 8
+        res = sval & 0xFFFFFFFFFFFFFFFF
+        res >>= (8 - sizeout) * 8
+        return res
+
+    bit = bit_or_sizein
     sa = 64 - (bit + 1)
-    # Simulate C++ arithmetic shift on 64-bit
     val = (val << sa) & 0xFFFFFFFFFFFFFFFF
-    # Arithmetic right shift
     if val >= (1 << 63):
         val -= (1 << 64)
     val = val >> sa
@@ -110,20 +135,7 @@ def sign_extend_sized(val: int, sizein: int, sizeout: int) -> int:
     Takes the first *sizein* bytes of *val* and sign-extends to *sizeout* bytes,
     keeping any more significant bytes zero.
     """
-    sizein = min(sizein, 8)
-    sizeout = min(sizeout, 8)
-    # Simulate C++ intb sval = in; sval <<= (sizeof(intb)-sizein)*8;
-    sval = val & 0xFFFFFFFFFFFFFFFF
-    sval = (sval << ((8 - sizein) * 8)) & 0xFFFFFFFFFFFFFFFF
-    # Convert to signed 64-bit for arithmetic right shift
-    if sval >= (1 << 63):
-        sval -= (1 << 64)
-    # uintb res = (uintb)(sval >> (sizeout - sizein) * 8);
-    sval >>= (sizeout - sizein) * 8
-    res = sval & 0xFFFFFFFFFFFFFFFF
-    # res >>= (sizeof(uintb) - sizeout)*8;
-    res >>= (8 - sizeout) * 8
-    return res
+    return sign_extend(val, sizein, sizeout)
 
 
 def byte_swap(val: int, size: int) -> int:
@@ -228,21 +240,29 @@ class Address:
 
     __slots__ = ('base', 'offset')
 
-    def __init__(self, base: Optional[AddrSpace] = None, offset: int = 0) -> None:
-        self.base: Optional[AddrSpace] = base
-        self.offset: int = offset
+    def __init__(
+        self,
+        base: Optional[AddrSpace] | Address | MachExtreme = None,
+        offset: int = 0,
+    ) -> None:
+        if isinstance(base, Address):
+            self.base = base.base
+            self.offset = base.offset
+        elif isinstance(base, Address.MachExtreme):
+            if base == self.m_minimal:
+                self.base = None
+                self.offset = 0
+            else:
+                self.base = _ADDR_MAX_SENTINEL  # type: ignore[assignment]
+                self.offset = 0xFFFFFFFFFFFFFFFF
+        else:
+            self.base = base
+            self.offset = offset
 
     @classmethod
     def from_extreme(cls, ex: MachExtreme) -> Address:
         """Create an extremal address (minimal or maximal)."""
-        addr = cls.__new__(cls)
-        if ex == cls.m_minimal:
-            addr.base = None
-            addr.offset = 0
-        else:
-            addr.base = _ADDR_MAX_SENTINEL  # type: ignore[assignment]
-            addr.offset = 0xFFFFFFFFFFFFFFFF
-        return addr
+        return cls(ex)
 
     def isInvalid(self) -> bool:
         return self.base is None
@@ -255,12 +275,29 @@ class Address:
         assert self.base is not None and self.base is not _ADDR_MAX_SENTINEL
         return self.base.isBigEndian()
 
-    def printRaw(self) -> str:
+    def printRaw(self, s=None):
+        text: str
         if self.base is None:
-            return "invalid_addr"
-        if self.base is _ADDR_MAX_SENTINEL:
-            return "max_addr"
-        return self.base.printRaw(self.offset)
+            text = "invalid_addr"
+        elif self.base is _ADDR_MAX_SENTINEL:
+            text = "max_addr"
+        elif s is None:
+            try:
+                text = self.base.printRaw(self.offset)
+            except TypeError:
+                buf = StringIO()
+                self.base.printRaw(buf, self.offset)
+                text = buf.getvalue()
+        else:
+            try:
+                self.base.printRaw(s, self.offset)
+            except TypeError:
+                s.write(self.base.printRaw(self.offset))
+            return None
+        if s is not None:
+            s.write(text)
+            return None
+        return text
 
     def read(self, s: str) -> int:
         assert self.base is not None
@@ -277,6 +314,11 @@ class Address:
     def getShortcut(self) -> str:
         assert self.base is not None
         return self.base.getShortcut()
+
+    def assign(self, op2: Address) -> Address:
+        self.base = op2.base
+        self.offset = op2.offset
+        return self
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, Address):
@@ -411,22 +453,49 @@ class Address:
         If *with_size* is True, returns (Address, size).
         Otherwise returns just Address.
         """
-        elem_id = decoder.openElement(ELEM_ADDR)
-        spc = None
-        offset = 0
-        size = 0
-        while True:
-            attrib_id = decoder.getNextAttributeId()
-            if attrib_id == 0:
-                break
-            if attrib_id == ATTRIB_SPACE.id:
-                spc = decoder.readSpace()
-            elif attrib_id == ATTRIB_OFFSET.id:
-                offset = decoder.readUnsignedInteger()
-            elif attrib_id == ATTRIB_SIZE.id:
-                size = decoder.readSignedInteger()
-        decoder.closeElement(elem_id)
-        addr = Address(spc, offset) if spc is not None else Address()
+        from ghidra.core.error import DecoderError
+        from ghidra.core.pcoderaw import VarnodeData
+
+        try:
+            elem_id = decoder.openElement()
+        except (DecoderError, IndexError):
+            elem_id = 0
+
+        if elem_id == 0:
+            spc = None
+            offset = 0
+            size = 0
+            found_offset = False
+            decoder.rewindAttributes()
+            while True:
+                attrib_id = decoder.getNextAttributeId()
+                if attrib_id == 0:
+                    break
+                if attrib_id == ATTRIB_SPACE.id:
+                    spc = decoder.readSpace()
+                elif attrib_id == ATTRIB_OFFSET.id:
+                    offset = decoder.readUnsignedInteger()
+                    found_offset = True
+                elif attrib_id == ATTRIB_SIZE.id:
+                    size = decoder.readSignedInteger()
+                elif attrib_id == ATTRIB_NAME.id:
+                    manage = decoder.getAddrSpaceManager()
+                    trans = manage.getDefaultCodeSpace().getTrans()
+                    point = trans.getRegister(decoder.readString())
+                    spc = point.space
+                    offset = point.offset
+                    size = point.size
+                    found_offset = True
+            decoder.rewindAttributes()
+            if spc is not None and not found_offset:
+                raise LowlevelError("Address is missing offset")
+            addr = Address(spc, offset)
+        else:
+            var = VarnodeData()
+            var.decodeFromAttributes(decoder)
+            decoder.closeElement(elem_id)
+            addr = Address(var.space, var.offset)
+            size = var.size
         if with_size:
             return addr, size
         return addr
@@ -444,18 +513,24 @@ class SeqNum:
 
     __slots__ = ('pc', 'uniq', 'order')
 
-    def __init__(self, pc: Optional[Address] = None, uniq: int = 0) -> None:
-        self.pc: Address = pc if pc is not None else Address()
-        self.uniq: int = uniq
+    def __init__(self, pc: Optional[Address | SeqNum | Address.MachExtreme] = None, uniq: int = 0) -> None:
+        if isinstance(pc, SeqNum):
+            self.pc = Address(pc.pc) if isinstance(pc.pc, Address) else pc.pc
+            self.uniq = pc.uniq
+        elif pc in (Address.m_minimal, Address.m_maximal):
+            self.pc = Address(pc)
+            self.uniq = 0 if pc == Address.m_minimal else 0xFFFFFFFFFFFFFFFF
+        elif pc is None:
+            self.pc = Address()
+            self.uniq = uniq
+        else:
+            self.pc = Address(pc) if isinstance(pc, Address) else pc
+            self.uniq = uniq
         self.order: int = 0
 
     @classmethod
     def from_extreme(cls, ex: Address.MachExtreme) -> SeqNum:
-        sq = cls.__new__(cls)
-        sq.pc = Address.from_extreme(ex)
-        sq.uniq = 0 if ex == Address.m_minimal else 0xFFFFFFFF
-        sq.order = 0
-        return sq
+        return cls(ex)
 
     def getAddr(self) -> Address:
         return self.pc
@@ -498,7 +573,7 @@ class SeqNum:
 
     @staticmethod
     def decode(decoder: Decoder) -> SeqNum:
-        uniq = 0xFFFFFFFF
+        uniq = 0xFFFFFFFFFFFFFFFF
         elem_id = decoder.openElement(ELEM_SEQNUM)
         pc = Address.decode(decoder)
         while True:
@@ -528,7 +603,11 @@ class RangeProperties:
 
     def decode(self, decoder: Decoder) -> None:
         """Decode this from a stream."""
+        from ghidra.core.error import DecoderError
+
         elem_id = decoder.openElement()
+        if elem_id != ELEM_RANGE.id and elem_id != ELEM_REGISTER.id:
+            raise DecoderError("Expecting <range> or <register> element")
         while True:
             attrib_id = decoder.getNextAttributeId()
             if attrib_id == 0:
@@ -555,10 +634,25 @@ class Range:
 
     __slots__ = ('spc', 'first', 'last')
 
-    def __init__(self, spc: Optional[AddrSpace] = None, first: int = 0, last: int = 0) -> None:
-        self.spc: Optional[AddrSpace] = spc
-        self.first: int = first
-        self.last: int = last
+    def __init__(
+        self,
+        spc: Optional[AddrSpace | RangeProperties] = None,
+        first: int | AddrSpaceManager = 0,
+        last: int = 0,
+    ) -> None:
+        if isinstance(spc, RangeProperties):
+            props = spc
+            manage = first
+            if not hasattr(manage, "getSpaceByName") or not hasattr(manage, "getDefaultCodeSpace"):
+                raise TypeError("Range properties construction requires an AddrSpaceManager")
+            built = self.from_properties(props, manage)
+            self.spc = built.spc
+            self.first = built.first
+            self.last = built.last
+            return
+        self.spc = spc
+        self.first = first if isinstance(first, int) else 0
+        self.last = last
 
     @classmethod
     def from_properties(cls, props: RangeProperties, manage: AddrSpaceManager) -> Range:
@@ -616,8 +710,10 @@ class Range:
         return True
 
     def __lt__(self, other: Range) -> bool:
-        if self.spc.getIndex() != other.spc.getIndex():
-            return self.spc.getIndex() < other.spc.getIndex()
+        self_idx = _space_sort_key(self.spc)
+        other_idx = _space_sort_key(other.spc)
+        if self_idx != other_idx:
+            return self_idx < other_idx
         return self.first < other.first
 
     def __eq__(self, other: object) -> bool:
@@ -629,10 +725,14 @@ class Range:
     def __hash__(self) -> int:
         return hash((id(self.spc), self.first, self.last))
 
-    def printBounds(self) -> str:
+    def printBounds(self, s=None):
         """Print this Range to a stream."""
         sname = self.spc.getName() if self.spc else "?"
-        return f"{sname}: {self.first:x}-{self.last:x}"
+        text = f"{sname}: {self.first:x}-{self.last:x}"
+        if s is not None:
+            s.write(text)
+            return None
+        return text
 
     def encode(self, encoder: Encoder) -> None:
         encoder.openElement(ELEM_RANGE)
@@ -675,7 +775,11 @@ class Range:
 
     def decode(self, decoder: Decoder) -> None:
         """Reconstruct this object from a <range> or <register> element."""
+        from ghidra.core.error import DecoderError
+
         elem_id = decoder.openElement()
+        if elem_id != ELEM_RANGE.id and elem_id != ELEM_REGISTER.id:
+            raise DecoderError("Expecting <range> or <register> element")
         self.decodeFromAttributes(decoder)
         decoder.closeElement(elem_id)
 
@@ -689,9 +793,28 @@ class RangeList:
 
     def __init__(self, other: Optional[RangeList] = None) -> None:
         if other is not None:
-            self._ranges: list[Range] = list(other._ranges)
+            self._ranges: list[Range] = [
+                Range(r.spc, r.first, r.last) if isinstance(r, Range) else r for r in other._ranges
+            ]
         else:
             self._ranges: list[Range] = []
+
+    def _upper_bound(self, probe: Range) -> int:
+        lo = 0
+        hi = len(self._ranges)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if probe < self._ranges[mid]:
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def begin(self):
+        return iter(self._ranges)
+
+    def end(self):
+        return iter(())
 
     def clear(self) -> None:
         self._ranges.clear()
@@ -712,46 +835,59 @@ class RangeList:
         return self._ranges[-1] if self._ranges else None
 
     def getRange(self, spaceid: AddrSpace, offset: int) -> Optional[Range]:
-        for r in self._ranges:
-            if r.spc is spaceid and r.first <= offset <= r.last:
-                return r
+        if not self._ranges:
+            return None
+        iter_idx = self._upper_bound(Range(spaceid, offset, offset))
+        if iter_idx == 0:
+            return None
+        r = self._ranges[iter_idx - 1]
+        if r.spc is not spaceid:
+            return None
+        if r.last >= offset:
+            return r
         return None
 
     def insertRange(self, spc: AddrSpace, first: int, last: int) -> None:
-        """Insert a range of addresses, merging overlaps."""
-        new_range = Range(spc, first, last)
-        merged = []
-        inserted = False
-        for r in self._ranges:
-            if r.spc is not spc:
-                merged.append(r)
-                continue
-            # Check overlap or adjacency
-            if r.last + 1 < new_range.first or new_range.last + 1 < r.first:
-                merged.append(r)
-            else:
-                new_range = Range(spc, min(r.first, new_range.first),
-                                  max(r.last, new_range.last))
-        merged.append(new_range)
-        merged.sort()
-        self._ranges = merged
+        """Insert a range of addresses."""
+        iter1 = self._upper_bound(Range(spc, first, first))
+        if iter1 != 0:
+            iter1 -= 1
+            candidate = self._ranges[iter1]
+            if candidate.spc is not spc or candidate.last < first:
+                iter1 += 1
+
+        iter2 = self._upper_bound(Range(spc, last, last))
+
+        for r in self._ranges[iter1:iter2]:
+            if r.first < first:
+                first = r.first
+            if r.last > last:
+                last = r.last
+        self._ranges[iter1:iter2] = [Range(spc, first, last)]
 
     def removeRange(self, spc: AddrSpace, first: int, last: int) -> None:
         """Remove a range of addresses."""
-        result = []
-        for r in self._ranges:
-            if r.spc is not spc:
-                result.append(r)
-                continue
-            if r.last < first or r.first > last:
-                result.append(r)
-                continue
-            if r.first < first:
-                result.append(Range(spc, r.first, first - 1))
-            if r.last > last:
-                result.append(Range(spc, last + 1, r.last))
-        result.sort()
-        self._ranges = result
+        if not self._ranges:
+            return
+
+        iter1 = self._upper_bound(Range(spc, first, first))
+        if iter1 != 0:
+            iter1 -= 1
+            candidate = self._ranges[iter1]
+            if candidate.spc is not spc or candidate.last < first:
+                iter1 += 1
+
+        iter2 = self._upper_bound(Range(spc, last, last))
+
+        replacement: list[Range] = []
+        for r in self._ranges[iter1:iter2]:
+            a = r.first
+            b = r.last
+            if a < first:
+                replacement.append(Range(spc, a, first - 1))
+            if b > last:
+                replacement.append(Range(spc, last + 1, b))
+        self._ranges[iter1:iter2] = replacement
 
     def merge(self, op2: RangeList) -> None:
         for r in op2._ranges:
@@ -763,11 +899,14 @@ class RangeList:
             return True
         if not self._ranges:
             return False
-        for r in self._ranges:
-            if r.spc is addr.getSpace():
-                if r.first <= addr.getOffset() and (addr.getOffset() + size - 1) <= r.last:
-                    return True
-        return False
+
+        iter_idx = self._upper_bound(Range(addr.getSpace(), addr.getOffset(), addr.getOffset()))
+        if iter_idx == 0:
+            return False
+        r = self._ranges[iter_idx - 1]
+        if r.spc is not addr.getSpace():
+            return False
+        return r.last >= addr.getOffset() + size - 1
 
     def longestFit(self, addr: Address, maxsize: int) -> int:
         """Find size of biggest contiguous region containing given address."""
@@ -777,46 +916,54 @@ class RangeList:
             return 0
         offset = addr.getOffset()
         spc = addr.getSpace()
+        iter_idx = self._upper_bound(Range(spc, offset, offset))
+        if iter_idx == 0:
+            return 0
+        iter_idx -= 1
         sizeres = 0
-        # Find the first range whose first <= offset and last >= offset
-        found = False
-        for r in self._ranges:
+        if self._ranges[iter_idx].last < offset:
+            return sizeres
+        while iter_idx != len(self._ranges):
+            r = self._ranges[iter_idx]
             if r.spc is not spc:
-                if found:
-                    break
-                continue
+                break
             if r.first > offset:
                 break
-            if r.last >= offset:
-                found = True
-                sizeres += (r.last + 1 - offset)
-                offset = r.last + 1
-                if sizeres >= maxsize:
-                    break
-            elif not found:
-                continue
+            sizeres += r.last + 1 - offset
+            offset = r.last + 1
+            if sizeres >= maxsize:
+                break
+            iter_idx += 1
         return sizeres
 
     def getLastSignedRange(self, spaceid: AddrSpace) -> Optional[Range]:
         """Get the last Range viewing offsets as signed."""
         midway = spaceid.getHighest() // 2
-        # Look for biggest "positive" range (offset <= midway)
-        best = None
-        for r in self._ranges:
-            if r.spc is not spaceid:
-                continue
-            if r.first <= midway:
-                best = r
-        if best is not None:
-            return best
-        # No positive ranges, find biggest negative range
-        for r in reversed(self._ranges):
-            if r.spc is spaceid:
+        iter_idx = self._upper_bound(Range(spaceid, midway, midway))
+        if iter_idx != 0:
+            r = self._ranges[iter_idx - 1]
+            if r.getSpace() is spaceid:
+                return r
+
+        iter_idx = self._upper_bound(Range(spaceid, spaceid.getHighest(), spaceid.getHighest()))
+        if iter_idx != 0:
+            r = self._ranges[iter_idx - 1]
+            if r.getSpace() is spaceid:
                 return r
         return None
 
-    def printBounds(self) -> str:
-        return " ".join(r.printBounds() for r in self._ranges)
+    def printBounds(self, s=None):
+        if s is None:
+            buf = StringIO()
+            self.printBounds(buf)
+            return buf.getvalue()
+        if not self._ranges:
+            s.write("all\n")
+            return None
+        for r in self._ranges:
+            r.printBounds(s)
+            s.write("\n")
+        return None
 
     def encode(self, encoder: Encoder) -> None:
         encoder.openElement(ELEM_RANGELIST)
@@ -830,5 +977,10 @@ class RangeList:
         while decoder.peekElement() != 0:
             r = Range()
             r.decode(decoder)
-            self.insertRange(r.spc, r.first, r.last)
+            insert_idx = self._upper_bound(Range(r.spc, r.first, r.first))
+            if insert_idx != 0:
+                prev = self._ranges[insert_idx - 1]
+                if prev.spc is r.spc and prev.first == r.first:
+                    continue
+            self._ranges.insert(insert_idx, r)
         decoder.closeElement(elem_id)

@@ -11,12 +11,23 @@ import io
 import os
 from typing import Optional, TYPE_CHECKING
 
-from ghidra.core.error import LowlevelError
+from ghidra.arch.architecture import Architecture, ArchitectureCapability
 from ghidra.arch.sleigh_arch import SleighArchitecture
-from ghidra.arch.architecture import ArchitectureCapability
+from ghidra.core.error import LowlevelError
+from ghidra.core.marshal import (
+    AttributeId,
+    ELEM_BINARYIMAGE,
+    ELEM_CORETYPES,
+    ELEM_SPECEXTENSIONS,
+    ElementId,
+)
 
 if TYPE_CHECKING:
     pass
+
+
+ELEM_XML_SAVEFILE = ElementId("xml_savefile", 236)
+ATTRIB_ADJUSTVMA = AttributeId("adjustvma", 103)
 
 
 # =========================================================================
@@ -30,27 +41,36 @@ class XmlArchitectureCapability(ArchitectureCapability):
         super().__init__()
         self.name = "xml"
 
+    def __copy__(self):
+        raise TypeError("XmlArchitectureCapability is non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("XmlArchitectureCapability is non-copyable")
+
+    def __del__(self) -> None:
+        SleighArchitecture.shutdown()
+
     def buildArchitecture(self, filename: str, target: str,
                           estream: Optional[io.StringIO] = None):
         return XmlArchitecture(filename, target, estream)
 
     def isFileMatch(self, filename: str) -> bool:
-        """Check if file starts with '<bi' (likely <binaryimage>)."""
         if not os.path.isfile(filename):
             return False
         try:
             with open(filename, "r", encoding="utf-8", errors="ignore") as f:
-                header = f.read(10).lstrip()
-                return header.startswith("<bi")
+                while True:
+                    ch = f.read(1)
+                    if ch == "":
+                        return False
+                    if not ch.isspace():
+                        break
+                return ch == "<" and f.read(1) == "b" and f.read(1) == "i"
         except OSError:
             return False
 
     def isXmlMatch(self, doc) -> bool:
-        if doc is None:
-            return False
-        if hasattr(doc, 'tag'):
-            return doc.tag == "xml_savefile"
-        return False
+        return doc.getRoot().getName() == ELEM_XML_SAVEFILE.getName()
 
 
 # =========================================================================
@@ -64,44 +84,26 @@ class XmlArchitecture(SleighArchitecture):
     chunks and optional symbol information.
     """
 
-    def __init__(self, fname: str = "", targ: str = "",
+    def __init__(self, fname: str, targ: str,
                  estream: Optional[io.StringIO] = None) -> None:
         super().__init__(fname, targ, estream)
         self.adjustvma: int = 0
 
-    def buildLoader(self, store=None) -> None:
-        """Build a LoadImageXml from the stored XML document."""
+    def buildLoader(self, store) -> None:
         from ghidra.arch.loadimage_xml import LoadImageXml
 
         self.collectSpecFiles(self.errorstream)
 
-        el = None
-        if store is not None and hasattr(store, 'getTag'):
-            el = store.getTag("binaryimage")
-
+        el = store.getTag(ELEM_BINARYIMAGE.getName())
         if el is None:
-            # Try to open the file directly and parse
-            import xml.etree.ElementTree as ET
-            try:
-                tree = ET.parse(self.getFilename())
-                root = tree.getroot()
-                if root.tag == "binaryimage":
-                    el = root
-                elif store is not None and hasattr(store, 'registerTag'):
-                    store.registerTag(root)
-                    el = store.getTag("binaryimage") if hasattr(store, 'getTag') else root
-            except (ET.ParseError, OSError) as e:
-                raise LowlevelError(
-                    f"Could not parse XML file: {self.getFilename()}: {e}") from e
+            doc = store.openDocument(self.getFilename())
+            store.registerTag(doc.getRoot())
+            el = store.getTag(ELEM_BINARYIMAGE.getName())
 
         if el is None:
             raise LowlevelError("Could not find binaryimage tag")
 
-        ldr = LoadImageXml(self.getFilename())
-        # Parse chunks from the XML element
-        if hasattr(el, '__iter__'):
-            self._parseImageXml(ldr, el)
-        self.loader = ldr
+        self.loader = LoadImageXml(self.getFilename(), el)
 
     @staticmethod
     def _parseImageXml(ldr, el) -> None:
@@ -133,44 +135,38 @@ class XmlArchitecture(SleighArchitecture):
                     ldr.addSymbol(addr, name)
 
     def postSpecFile(self) -> None:
-        """Open the image data using the translator."""
-        if hasattr(super(), 'postSpecFile'):
-            super().postSpecFile()
-        if self.loader is not None and hasattr(self.loader, 'open'):
-            if self.translate is not None:
-                self.loader.open(self.translate)
-        if self.adjustvma != 0 and self.loader is not None:
+        Architecture.postSpecFile(self)
+        self.loader.open(self.translate)
+        if self.adjustvma != 0:
             self.loader.adjustVma(self.adjustvma)
 
     def encode(self, encoder) -> None:
-        """Encode the XML architecture state."""
-        if hasattr(encoder, 'openElement'):
-            encoder.openElement("xml_savefile")
-        if hasattr(self, 'encodeHeader'):
-            self.encodeHeader(encoder)
-        if hasattr(encoder, 'writeUnsignedInteger'):
-            encoder.writeUnsignedInteger("adjustvma", self.adjustvma)
-        if self.loader is not None and hasattr(self.loader, 'encode'):
-            self.loader.encode(encoder)
-        if self.types is not None and hasattr(self.types, 'encodeCoreTypes'):
-            self.types.encodeCoreTypes(encoder)
-        super().encode(encoder)
-        if hasattr(encoder, 'closeElement'):
-            encoder.closeElement("xml_savefile")
+        encoder.openElement(ELEM_XML_SAVEFILE)
+        self.encodeHeader(encoder)
+        encoder.writeUnsignedInteger(ATTRIB_ADJUSTVMA, self.adjustvma)
+        self.loader.encode(encoder)
+        self.types.encodeCoreTypes(encoder)
+        SleighArchitecture.encode(self, encoder)
+        encoder.closeElement(ELEM_XML_SAVEFILE)
 
-    def restoreXml(self, store=None) -> None:
-        """Restore XML architecture from store."""
-        if store is None:
-            return
-        el = None
-        if hasattr(store, 'getTag'):
-            el = store.getTag("xml_savefile")
+    def restoreXml(self, store) -> None:
+        el = store.getTag(ELEM_XML_SAVEFILE.getName())
         if el is None:
             raise LowlevelError("Could not find xml_savefile tag")
-        if hasattr(self, 'restoreXmlHeader'):
-            self.restoreXmlHeader(el)
-        adj = el.get("adjustvma", "0") if hasattr(el, 'get') else "0"
-        try:
-            self.adjustvma = int(adj, 0)
-        except (ValueError, TypeError):
-            self.adjustvma = 0
+        self.restoreXmlHeader(el)
+        self.adjustvma = int(el.getAttributeValue(ATTRIB_ADJUSTVMA.getName()), 0)
+        children = el.getChildren()
+        idx = 0
+        if idx < len(children) and children[idx].getName() == ELEM_BINARYIMAGE.getName():
+            store.registerTag(children[idx])
+            idx += 1
+        if idx < len(children) and children[idx].getName() == ELEM_SPECEXTENSIONS.getName():
+            store.registerTag(children[idx])
+            idx += 1
+        if idx < len(children) and children[idx].getName() == ELEM_CORETYPES.getName():
+            store.registerTag(children[idx])
+            idx += 1
+        self.init(store)
+        if idx < len(children):
+            store.registerTag(children[idx])
+            SleighArchitecture.restoreXml(self, store)

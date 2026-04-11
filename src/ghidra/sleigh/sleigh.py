@@ -128,6 +128,14 @@ class Sleigh(SleighBase):
     def setContextDatabase(self, cdb) -> None:
         self._context_db = cdb
 
+    def reset(self, ld, cdb) -> None:
+        self._loader = ld
+        self._context_db = cdb
+        self._cache = PcodeCacher()
+        self._discache = DisassemblyCache()
+        self._buf = b""
+        self._curaddr = Address()
+
     def initialize(self, store) -> None:
         """Initialize the SLEIGH engine from a DocumentStorage.
 

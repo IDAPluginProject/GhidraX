@@ -2487,6 +2487,8 @@ class TypeFactory:
     during decompilation.
     """
 
+    propagatedbg_on = False
+
     def __init__(self, glb=None) -> None:
         self._typeById: Dict[int, Datatype] = {}
         self._typeByName: Dict[str, Datatype] = {}
@@ -2917,6 +2919,85 @@ class TypeFactory:
         # In a full implementation, the flags would modify the TypeCode
         return dt
 
+    def decode(self, decoder: Decoder) -> None:
+        """Decode data-type elements into this container.
+
+        C++ ref: ``TypeFactory::decode``
+        """
+        from ghidra.core.marshal import ELEM_TYPEGRP
+
+        elemId = decoder.openElement(ELEM_TYPEGRP)
+        while decoder.peekElement() != 0:
+            self.decodeType(decoder)
+        decoder.closeElement(elemId)
+
+    def decodeCoreTypes(self, decoder: Decoder) -> None:
+        """Initialize basic data-types from a <coretypes> stream.
+
+        C++ ref: ``TypeFactory::decodeCoreTypes``
+        """
+        from ghidra.core.marshal import (
+            ATTRIB_CHAR,
+            ATTRIB_ID,
+            ATTRIB_METATYPE,
+            ATTRIB_NAME,
+            ATTRIB_SIZE,
+            ATTRIB_UTF,
+            ELEM_CORETYPES,
+            ELEM_VOID,
+        )
+
+        self.clear()
+
+        elemId = decoder.openElement(ELEM_CORETYPES)
+        while decoder.peekElement() != 0:
+            subId = decoder.openElement()
+            name = "void" if subId == ELEM_VOID.id else ""
+            type_id = 0
+            size = 1 if subId == ELEM_VOID.id else 0
+            metatype = TYPE_VOID if subId == ELEM_VOID.id else TYPE_UNKNOWN
+            ischar = False
+            isutf = False
+
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME.id:
+                    name = decoder.readString()
+                elif attribId == ATTRIB_ID.id:
+                    type_id = decoder.readUnsignedInteger()
+                elif attribId == ATTRIB_SIZE.id:
+                    size = decoder.readSignedInteger()
+                elif attribId == ATTRIB_METATYPE.id:
+                    metatype = string2metatype(decoder.readString())
+                elif attribId == ATTRIB_CHAR.id:
+                    ischar = decoder.readBool()
+                elif attribId == ATTRIB_UTF.id:
+                    isutf = decoder.readBool()
+
+            if isutf:
+                dt = TypeUnicode(name or "wchar", size or 2, metatype if metatype != TYPE_UNKNOWN else TYPE_INT)
+                dt.flags |= Datatype.coretype
+                self._cacheType(dt)
+            elif ischar:
+                dt = self.setCoreType(name or "char", 1, TYPE_INT if metatype == TYPE_UNKNOWN else metatype, True)
+            else:
+                if metatype == TYPE_UNKNOWN and subId != ELEM_VOID.id:
+                    metatype = TYPE_UNKNOWN
+                dt = self.setCoreType(name or ("void" if subId == ELEM_VOID.id else ""), size or 1, metatype, False)
+
+            if type_id != 0:
+                dt.id = type_id
+                self._typeById[type_id] = dt
+                if type_id >= self._nextId:
+                    self._nextId = type_id + 1
+
+            decoder.closeElement(subId)
+
+        decoder.closeElement(elemId)
+        self.cacheCoreTypes()
+
     # --- Alignment ---
 
     def setDefaultAlignmentMap(self) -> None:
@@ -3104,6 +3185,25 @@ class TypeFactory:
         for ct in self._typeById.values():
             self.orderRecurse(deporder, mark, ct)
         return deporder
+
+    def encode(self, encoder: Encoder) -> None:
+        """Encode all non-core types in dependency order.
+
+        C++ ref: ``TypeFactory::encode``
+        """
+        from ghidra.core.marshal import ELEM_TYPEGRP
+
+        deporder = self.dependentOrder()
+        encoder.openElement(ELEM_TYPEGRP)
+        for ct in deporder:
+            if len(ct.getName()) == 0:
+                continue
+            if ct.isCoreType():
+                meta = ct.getMetatype()
+                if meta not in (TYPE_PTR, TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION):
+                    continue
+            ct.encode(encoder)
+        encoder.closeElement(ELEM_TYPEGRP)
 
     # --- Warnings ---
 

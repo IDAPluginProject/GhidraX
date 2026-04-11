@@ -14,13 +14,18 @@ Seven commands are supported:
 
 from __future__ import annotations
 
-from typing import BinaryIO, Dict, List, Optional, TYPE_CHECKING
+import sys
+from typing import BinaryIO, ClassVar, Dict, List, Optional, TYPE_CHECKING
 
-from ghidra.core.error import LowlevelError, RecovError
+from ghidra.core.capability import CapabilityPoint
+from ghidra.core.address import Address
+from ghidra.core.error import DecoderError, LowlevelError, RecovError
+from ghidra.core.marshal import ElementId, PackedDecode, PackedEncode
+from ghidra.core.xml import DocumentStorage
+from ghidra.fspec.paramid import ParamIDAnalysis
 from ghidra.console.protocol import (
     JavaError,
-    read_to_any_burst, read_string_stream, read_string_stream_raw,
-    write_string_stream,
+    read_to_any_burst, read_string_stream,
     send_cmd_response_open, send_cmd_response_close,
     send_int_open, send_int_close,
     send_warning_open, send_warning_close,
@@ -39,6 +44,102 @@ if TYPE_CHECKING:
 
 _archlist: List[Optional[ArchitectureGhidra]] = []
 
+ELEM_DOC = ElementId("doc", 229)
+
+
+# ---------------------------------------------------------------------------
+# Capability registration and command dispatch
+# ---------------------------------------------------------------------------
+
+class GhidraCapability(CapabilityPoint):
+    """Capability point for commands available to the Ghidra client."""
+
+    commandmap: ClassVar[Dict[str, GhidraCommand]] = {}
+
+    def __init__(self, name: str = "") -> None:
+        super().__init__()
+        self.name = name
+
+    def getName(self) -> str:
+        return self.name
+
+    @staticmethod
+    def readCommand(sin: BinaryIO, sout: BinaryIO) -> int:
+        """Read and dispatch a single command from the Ghidra client.
+
+        C++ ref: ``GhidraCapability::readCommand``
+        """
+        while True:
+            burst = read_to_any_burst(sin)
+            if burst == BURST_COMMAND_OPEN:
+                break
+
+        function_name = read_string_stream(sin)
+        cmd = GhidraCapability.commandmap.get(function_name)
+        if cmd is None:
+            send_cmd_response_open(sout)
+            send_warning_open(sout)
+            sout.write(f"Bad command: {function_name}".encode("utf-8"))
+            send_warning_close(sout)
+            send_cmd_response_close(sout)
+            sout.flush()
+            return 0
+
+        return cmd.doit()
+
+    @staticmethod
+    def shutDown() -> None:
+        GhidraCapability.commandmap.clear()
+
+
+class GhidraDecompCapability(GhidraCapability):
+    """Singleton capability registering the core decompiler commands."""
+
+    _instance: ClassVar[Optional[GhidraDecompCapability]] = None
+
+    def __init__(self, sin: Optional[BinaryIO] = None, sout: Optional[BinaryIO] = None) -> None:
+        super().__init__("decomp")
+        self._sin = sin
+        self._sout = sout
+
+    def __copy__(self):
+        raise TypeError("GhidraDecompCapability is non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("GhidraDecompCapability is non-copyable")
+
+    @classmethod
+    def getInstance(
+        cls,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> GhidraDecompCapability:
+        if cls._instance is None:
+            cls._instance = cls(sin, sout)
+        else:
+            if sin is not None:
+                cls._instance._sin = sin
+            if sout is not None:
+                cls._instance._sout = sout
+        return cls._instance
+
+    def initialize(self) -> None:
+        if self._sin is None or self._sout is None:
+            raise LowlevelError("GhidraDecompCapability requires streams before initialize")
+
+        GhidraCapability.commandmap.clear()
+        GhidraCapability.commandmap.update(
+            {
+                "registerProgram": RegisterProgram(self._sin, self._sout),
+                "deregisterProgram": DeregisterProgram(self._sin, self._sout),
+                "flushNative": FlushNative(self._sin, self._sout),
+                "decompileAt": DecompileAt(self._sin, self._sout),
+                "structureGraph": StructureGraph(self._sin, self._sout),
+                "setAction": SetAction(self._sin, self._sout),
+                "setOptions": SetOptions(self._sin, self._sout),
+            }
+        )
+
 
 # ---------------------------------------------------------------------------
 # Base command class
@@ -52,11 +153,14 @@ class GhidraCommand:
     C++ ref: ``ghidra_process.hh::GhidraCommand``
     """
 
-    def __init__(self, sin: BinaryIO, sout: BinaryIO) -> None:
-        self._sin: BinaryIO = sin
-        self._sout: BinaryIO = sout
+    def __init__(self, sin: Optional[BinaryIO] = None, sout: Optional[BinaryIO] = None) -> None:
+        self._sin: BinaryIO = sin if sin is not None else sys.stdin.buffer
+        self._sout: BinaryIO = sout if sout is not None else sys.stdout.buffer
         self.ghidra: Optional[ArchitectureGhidra] = None
         self.status: int = 0  # 0 = continue, 1 = terminate
+
+    def __del__(self) -> None:
+        return None
 
     def loadParameters(self) -> None:
         """Read parameters. Default: read arch id.
@@ -107,18 +211,18 @@ class GhidraCommand:
             if burst != BURST_COMMAND_CLOSE:
                 raise JavaError("alignment", "Missing end of command")
             self.rawAction()
+        except DecoderError as err:
+            if self.ghidra is not None:
+                self.ghidra.printMessage("Marshaling error: " + err.explain)
         except JavaError as err:
-            pass_java_exception(self._sout, err.type, str(err))
+            pass_java_exception(self._sout, err.type, err.explain)
             return self.status
         except RecovError as err:
             if self.ghidra is not None:
-                self.ghidra.printMessage("Recoverable Error: " + str(err))
+                self.ghidra.printMessage("Recoverable Error: " + err.explain)
         except LowlevelError as err:
             if self.ghidra is not None:
-                self.ghidra.printMessage("Low-level Error: " + str(err))
-        except Exception as err:
-            if self.ghidra is not None:
-                self.ghidra.printMessage("Error: " + str(err))
+                self.ghidra.printMessage("Low-level Error: " + err.explain)
 
         self.sendResult()
         send_cmd_response_close(self._sout)
@@ -149,6 +253,10 @@ class RegisterProgram(GhidraCommand):
 
     def loadParameters(self) -> None:
         """Read four XML spec strings (no arch id for this command)."""
+        self._pspec = ""
+        self._cspec = ""
+        self._tspec = ""
+        self._corespec = ""
         self._pspec = read_string_stream(self._sin)
         self._cspec = read_string_stream(self._sin)
         self._tspec = read_string_stream(self._sin)
@@ -173,7 +281,8 @@ class RegisterProgram(GhidraCommand):
         self._corespec = ""
 
         # Initialize the architecture
-        self.ghidra.init()
+        store = DocumentStorage()
+        self.ghidra.init(store)
 
         if open_slot == -1:
             open_slot = len(_archlist)
@@ -254,6 +363,7 @@ class FlushNative(GhidraCommand):
                 scope = self.ghidra.symboltab.getGlobalScope()
                 if scope is not None:
                     scope.clear()
+                    self.ghidra.symboltab.deleteSubScopes(scope)
             if self.ghidra.types is not None:
                 self.ghidra.types.clearNoncore()
             if self.ghidra.commentdb is not None:
@@ -287,45 +397,47 @@ class DecompileAt(GhidraCommand):
 
     def loadParameters(self) -> None:
         super().loadParameters()
-        # Read the encoded address
-        addr_xml = read_string_stream_raw(self._sin)
-        self._addr = _decode_addr_xml(addr_xml, self.ghidra)
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        decoder = PackedDecode(self.ghidra)
+        ArchitectureGhidra.readStringStream(self._sin, decoder)
+        self._addr = Address.decode(decoder)
 
     def rawAction(self) -> None:
-        if self.ghidra is None or self._addr is None:
-            raise LowlevelError("Bad decompile address")
+        assert self.ghidra is not None
+        assert self._addr is not None
 
-        # Look up / create the function at the address
-        fd = None
-        if self.ghidra.symboltab is not None:
-            scope = self.ghidra.symboltab.getGlobalScope()
-            if scope is not None and hasattr(scope, 'queryFunction'):
-                fd = scope.queryFunction(self._addr)
-
+        fd = self.ghidra.symboltab.getGlobalScope().queryFunction(self._addr)
         if fd is None:
-            raise LowlevelError(f"Bad decompile address: {self._addr}")
+            message = (
+                "Bad decompile address: "
+                + self._addr.getShortcut()
+                + self._addr.printRaw()
+                + "\n"
+                + self._addr.getSpace().getName()
+                + " may not be a global space in the spec file."
+            )
+            raise LowlevelError(message)
 
         if not fd.isProcStarted():
-            act = self.ghidra.allacts.getCurrent()
-            if act is not None:
-                act.reset(fd)
-                act.perform(fd)
+            self.ghidra.allacts.getCurrent().reset(fd)
+            self.ghidra.allacts.getCurrent().perform(fd)
 
-        # Send results
         send_int_open(self._sout)
-
         if fd.isProcComplete():
-            # TODO: encode fd (syntax tree XML) when getSendSyntaxTree()
-
-            # Emit C code if requested
-            if (self.ghidra.getSendCCode() and
-                    self.ghidra.allacts.getCurrentName() == "decompile"):
-                if self.ghidra.print_ is not None:
+            encoder = PackedEncode(self._sout)
+            encoder.openElement(ELEM_DOC)
+            if self.ghidra.getSendParamMeasures() and self.ghidra.allacts.getCurrentName() == "paramid":
+                pidanalysis = ParamIDAnalysis(fd, True)
+                pidanalysis.encode(encoder, True)
+            else:
+                if self.ghidra.getSendParamMeasures():
+                    pidanalysis = ParamIDAnalysis(fd, False)
+                    pidanalysis.encode(encoder, True)
+                fd.encode(encoder, 0, self.ghidra.getSendSyntaxTree())
+                if self.ghidra.getSendCCode() and self.ghidra.allacts.getCurrentName() == "decompile":
                     self.ghidra.print_.docFunction(fd)
-
-            # Minimal <doc> wrapper — full encoding will be added later
-            self._sout.write(b"<doc/>")
-
+            encoder.closeElement(ELEM_DOC)
         send_int_close(self._sout)
 
 
@@ -341,21 +453,38 @@ class StructureGraph(GhidraCommand):
 
     def __init__(self, sin: BinaryIO, sout: BinaryIO) -> None:
         super().__init__(sin, sout)
-        self._graph_xml: bytes = b""
+        from ghidra.block.block import BlockGraph
+
+        self.ingraph = BlockGraph()
 
     def loadParameters(self) -> None:
         super().loadParameters()
-        self._graph_xml = read_string_stream_raw(self._sin)
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        decoder = PackedDecode(self.ghidra)
+        ArchitectureGhidra.readStringStream(self._sin, decoder)
+        self.ingraph.decode(decoder)
 
     def rawAction(self) -> None:
-        # TODO: parse the graph XML, build BlockGraph, structure it, encode result
         from ghidra.block.block import BlockGraph
         from ghidra.block.blockaction import CollapseStructure
 
-        # For now, send back an empty result
+        resultgraph = BlockGraph()
+        rootlist = []
+
+        resultgraph.buildCopy(self.ingraph)
+        resultgraph.structureLoops(rootlist)
+        resultgraph.calcForwardDominator(rootlist)
+
+        collapse = CollapseStructure(resultgraph)
+        collapse.collapseAll()
+        resultgraph.orderBlocks()
+
         send_int_open(self._sout)
-        self._sout.write(b"<block/>")
+        encoder = PackedEncode(self._sout)
+        resultgraph.encode(encoder)
         send_int_close(self._sout)
+        self.ingraph.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -376,10 +505,16 @@ class SetAction(GhidraCommand):
 
     def loadParameters(self) -> None:
         super().loadParameters()
-        self._actionstring = read_string_stream(self._sin)
-        self._printstring = read_string_stream(self._sin)
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        self._actionstring = ""
+        self._printstring = ""
+        self._actionstring = ArchitectureGhidra.readStringStream(self._sin)
+        self._printstring = ArchitectureGhidra.readStringStream(self._sin)
 
     def rawAction(self) -> None:
+        from ghidra.analysis.flow import FlowInfo
+
         self.res = False
 
         if self._actionstring:
@@ -400,16 +535,18 @@ class SetAction(GhidraCommand):
             elif ps == "noparammeasures":
                 self.ghidra.setSendParamMeasures(False)
             elif ps == "jumpload":
-                self.ghidra.flowoptions |= 0x20  # FlowInfo::record_jumploads
+                self.ghidra.flowoptions |= FlowInfo.record_jumploads
             elif ps == "nojumpload":
-                self.ghidra.flowoptions &= ~0x20
+                self.ghidra.flowoptions &= ~FlowInfo.record_jumploads
             else:
                 raise LowlevelError("Unknown print action: " + ps)
 
         self.res = True
 
     def sendResult(self) -> None:
-        write_string_stream(self._sout, "t" if self.res else "f")
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        ArchitectureGhidra.writeStringStream(self._sout, "t" if self.res else "f")
         super().sendResult()
 
 
@@ -425,25 +562,43 @@ class SetOptions(GhidraCommand):
 
     def __init__(self, sin: BinaryIO, sout: BinaryIO) -> None:
         super().__init__(sin, sout)
-        self._options_xml: bytes = b""
+        self._decoder = None
         self.res: bool = False
+
+    def __del__(self) -> None:
+        self._decoder = None
 
     def loadParameters(self) -> None:
         super().loadParameters()
-        self._options_xml = read_string_stream_raw(self._sin)
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        self._decoder = PackedDecode(self.ghidra)
+        ArchitectureGhidra.readStringStream(self._sin, self._decoder)
 
     def rawAction(self) -> None:
         self.res = False
-        if self.ghidra is not None:
-            self.ghidra.resetDefaults()
-            if self.ghidra.options is not None and self._options_xml:
-                # TODO: parse <optionslist> XML and apply to ghidra.options
-                pass
-            self.res = True
+        assert self.ghidra is not None
+        assert self._decoder is not None
+
+        self.ghidra.resetDefaults()
+        self.ghidra.options.decode(self._decoder)
+        self._decoder = None
+        self.res = True
 
     def sendResult(self) -> None:
-        write_string_stream(self._sout, "t" if self.res else "f")
+        from ghidra.console.ghidra_arch import ArchitectureGhidra
+
+        ArchitectureGhidra.writeStringStream(self._sout, "t" if self.res else "f")
         super().sendResult()
+
+
+# ---------------------------------------------------------------------------
+# Remote console hook
+# ---------------------------------------------------------------------------
+
+def connect_to_console(fd) -> None:
+    """Remote-console hook used only by native __REMOTE_SOCKET__ builds."""
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -455,15 +610,9 @@ def build_command_map(sin: BinaryIO, sout: BinaryIO) -> Dict[str, GhidraCommand]
 
     C++ ref: ``GhidraDecompCapability::initialize``
     """
-    return {
-        "registerProgram": RegisterProgram(sin, sout),
-        "deregisterProgram": DeregisterProgram(sin, sout),
-        "flushNative": FlushNative(sin, sout),
-        "decompileAt": DecompileAt(sin, sout),
-        "structureGraph": StructureGraph(sin, sout),
-        "setAction": SetAction(sin, sout),
-        "setOptions": SetOptions(sin, sout),
-    }
+    cap = GhidraDecompCapability.getInstance(sin, sout)
+    cap.initialize()
+    return GhidraCapability.commandmap
 
 
 def read_command(sin: BinaryIO, sout: BinaryIO,
@@ -472,27 +621,8 @@ def read_command(sin: BinaryIO, sout: BinaryIO,
 
     C++ ref: ``GhidraCapability::readCommand``
     """
-    # Align to command-open burst
-    while True:
-        burst = read_to_any_burst(sin)
-        if burst == BURST_COMMAND_OPEN:
-            break
-
-    # Read the command name
-    function_name = read_string_stream(sin)
-
-    cmd = commandmap.get(function_name)
-    if cmd is None:
-        # Unknown command — send error response (C++ uses warning bursts 0x10/0x11)
-        send_cmd_response_open(sout)
-        send_warning_open(sout)
-        sout.write(f"Bad command: {function_name}".encode("utf-8"))
-        send_warning_close(sout)
-        send_cmd_response_close(sout)
-        sout.flush()
-        return 0
-
-    return cmd.doit()
+    GhidraCapability.commandmap = commandmap
+    return GhidraCapability.readCommand(sin, sout)
 
 
 # ---------------------------------------------------------------------------

@@ -477,6 +477,7 @@ class UnknownProtoModel:
     def __init__(self, nm: str, placeHolder) -> None:
         self._name = nm
         self._placeholderModel = placeHolder
+        self._isPrinted = True if placeHolder is None else placeHolder.printInDecl()
 
     def getName(self) -> str:
         return self._name
@@ -489,6 +490,12 @@ class UnknownProtoModel:
 
     def setName(self, nm: str) -> None:
         self._name = nm
+
+    def printInDecl(self) -> bool:
+        return self._isPrinted
+
+    def setPrintInDecl(self, val: bool) -> None:
+        self._isPrinted = val
 
     def encode(self, encoder) -> None:
         """Encode this unknown prototype model.
@@ -506,6 +513,9 @@ class ProtoModelMerged:
     def __init__(self, glb=None) -> None:
         self._glb = glb
         self._modellist: list = []
+
+    def getName(self) -> str:
+        return self._name
 
     def numModels(self) -> int:
         return len(self._modellist)
@@ -2133,6 +2143,35 @@ class ProtoModel:
         self.internalStorage: List[VarnodeData] = []
         self.compatModel: Optional[ProtoModel] = None
 
+    def cloneWithName(self, name: str):
+        clone = ProtoModel(name, self.glb)
+        clone.extrapop = self.extrapop
+        clone.stackshift = self.stackshift
+        clone.input = self.input.clone() if self.input is not None and hasattr(self.input, "clone") else self.input
+        clone.output = self.output.clone() if self.output is not None and hasattr(self.output, "clone") else self.output
+        clone.defaultLocalRange = RangeList(self.defaultLocalRange)
+        clone.defaultParamRange = RangeList(self.defaultParamRange)
+        clone.unaffected = list(self.unaffected)
+        clone.killedbycall = list(self.killedbycall)
+        clone.likelytrash = list(self.likelytrash)
+        clone.internalStorage = list(self.internalStorage)
+        clone.effectlist = list(getattr(self, "effectlist", []))
+        clone._stackgrowsnegative = self.isStackGrowsNegative()
+        clone.hasThis = self.hasThis
+        clone.isConstruct = self.isConstruct
+        clone.hasUponEntry = self.hasUponEntry
+        clone.hasUponReturn = self.hasUponReturn
+        clone._injectUponEntry = self.getInjectUponEntry()
+        clone._injectUponReturn = self.getInjectUponReturn()
+        clone.injectUponEntry = clone._injectUponEntry
+        clone.injectUponReturn = clone._injectUponReturn
+        clone._isPrinted = True
+        clone.isPrinted = True
+        if name == "__thiscall":
+            clone.hasThis = True
+        clone.compatModel = self
+        return clone
+
     def getName(self) -> str:
         return self.name
 
@@ -2899,8 +2938,17 @@ class FuncProto:
     def getOutput(self) -> Optional[ProtoParameter]:
         return self.outparam
 
-    def setOutput(self, p: ProtoParameter) -> None:
-        self.outparam = p
+    def setOutput(self, p) -> None:
+        if isinstance(p, ProtoParameter):
+            self.outparam = p
+            return
+        tp = p.type if p is not None and hasattr(p, "type") else None
+        addr = p.addr if p is not None and hasattr(p, "addr") else Address()
+        size = tp.getSize() if tp is not None and hasattr(tp, "getSize") else 0
+        name = p.name if p is not None and hasattr(p, "name") else ""
+        out = ProtoParameter(name, tp, addr, size)
+        out.flags = p.flags if p is not None and hasattr(p, "flags") else 0
+        self.outparam = out
 
     def addParam(self, p: ProtoParameter) -> None:
         self.store.append(p)
@@ -3972,11 +4020,12 @@ class FuncProto:
         """Set parameter storage directly."""
         while len(self.store) <= i:
             self.store.append(ProtoParameter())
-        p = self.store[i]
-        if hasattr(p, '_name'):
-            p._name = name
-        if piece is not None and hasattr(piece, 'type'):
-            p._type = piece.type
+        tp = piece.type if piece is not None and hasattr(piece, "type") else None
+        addr = piece.addr if piece is not None and hasattr(piece, "addr") else Address()
+        size = tp.getSize() if tp is not None and hasattr(tp, "getSize") else 0
+        p = ProtoParameter(name, tp, addr, size)
+        p.flags = piece.flags if piece is not None and hasattr(piece, "flags") else 0
+        self.store[i] = p
 
     def removeParam(self, i: int) -> None:
         """Remove the i-th input parameter."""

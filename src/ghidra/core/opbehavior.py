@@ -11,7 +11,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, List
 
 from ghidra.core.error import LowlevelError
-from ghidra.core.opcodes import OpCode
+from ghidra.core.opcodes import OpCode, get_opname
 from ghidra.core.address import calc_mask, signbit_negative, popcount, count_leading_zeros
 from ghidra.core.types import to_signed, to_unsigned
 
@@ -21,7 +21,9 @@ if TYPE_CHECKING:
 
 class EvaluationError(LowlevelError):
     """Exception thrown when emulation evaluation of an operator fails."""
-    pass
+
+    def __init__(self, s: str) -> None:
+        super().__init__(s)
 
 
 # =========================================================================
@@ -36,6 +38,9 @@ class OpBehavior:
         self._isunary: bool = isun
         self._isspecial: bool = isspec
 
+    def __del__(self) -> None:
+        pass
+
     def getOpcode(self) -> OpCode:
         return self._opcode
 
@@ -46,24 +51,44 @@ class OpBehavior:
         return self._isunary
 
     def evaluateUnary(self, sizeout: int, sizein: int, in1: int) -> int:
-        raise EvaluationError(f"Unary evaluation not defined for {self._opcode.name}")
+        raise EvaluationError(
+            f"Unary emulation unimplemented for {get_opname(self._opcode)}"
+        )
 
     def evaluateBinary(self, sizeout: int, sizein: int, in1: int, in2: int) -> int:
-        raise EvaluationError(f"Binary evaluation not defined for {self._opcode.name}")
+        raise EvaluationError(
+            f"Binary emulation unimplemented for {get_opname(self._opcode)}"
+        )
 
     def evaluateTernary(self, sizeout: int, sizein: int, in1: int, in2: int, in3: int) -> int:
-        raise EvaluationError(f"Ternary evaluation not defined for {self._opcode.name}")
+        raise EvaluationError(
+            f"Ternary emulation unimplemented for {get_opname(self._opcode)}"
+        )
 
     def recoverInputBinary(self, slot: int, sizeout: int, out: int, sizein: int, inp: int) -> int:
-        raise EvaluationError(f"Cannot recover input for {self._opcode.name}")
+        raise EvaluationError(
+            "Cannot recover input parameter without loss of information"
+        )
 
     def recoverInputUnary(self, sizeout: int, out: int, sizein: int) -> int:
-        raise EvaluationError(f"Cannot recover input for {self._opcode.name}")
+        raise EvaluationError(
+            "Cannot recover input parameter without loss of information"
+        )
 
     @staticmethod
-    def registerInstructions(trans: Optional[Translate] = None) -> List[OpBehavior]:
+    def registerInstructions(
+        inst: Optional[List[Optional["OpBehavior"]]] = None,
+        trans: Optional[Translate] = None,
+    ) -> List["OpBehavior"]:
         """Build all pcode behaviors, returning a list indexed by OpCode value."""
-        inst: List[Optional[OpBehavior]] = [None] * OpCode.CPUI_MAX
+        if inst is not None and not isinstance(inst, list):
+            trans = inst
+            inst = None
+        if inst is None:
+            inst = [None] * OpCode.CPUI_MAX
+        else:
+            inst.clear()
+            inst.extend([None] * OpCode.CPUI_MAX)
         inst[OpCode.CPUI_COPY] = OpBehaviorCopy()
         inst[OpCode.CPUI_LOAD] = OpBehavior(OpCode.CPUI_LOAD, False, True)
         inst[OpCode.CPUI_STORE] = OpBehavior(OpCode.CPUI_STORE, False, True)
@@ -126,14 +151,14 @@ class OpBehavior:
         inst[OpCode.CPUI_INDIRECT] = OpBehavior(OpCode.CPUI_INDIRECT, False, True)
         inst[OpCode.CPUI_PIECE] = OpBehaviorPiece()
         inst[OpCode.CPUI_SUBPIECE] = OpBehaviorSubpiece()
-        inst[OpCode.CPUI_CAST] = OpBehavior(OpCode.CPUI_CAST, True, True)
+        inst[OpCode.CPUI_CAST] = OpBehavior(OpCode.CPUI_CAST, False, True)
         inst[OpCode.CPUI_PTRADD] = OpBehaviorPtradd()
         inst[OpCode.CPUI_PTRSUB] = OpBehaviorPtrsub()
         inst[OpCode.CPUI_SEGMENTOP] = OpBehavior(OpCode.CPUI_SEGMENTOP, False, True)
         inst[OpCode.CPUI_CPOOLREF] = OpBehavior(OpCode.CPUI_CPOOLREF, False, True)
         inst[OpCode.CPUI_NEW] = OpBehavior(OpCode.CPUI_NEW, False, True)
-        inst[OpCode.CPUI_INSERT] = OpBehavior(OpCode.CPUI_INSERT, False, True)
-        inst[OpCode.CPUI_EXTRACT] = OpBehavior(OpCode.CPUI_EXTRACT, False, True)
+        inst[OpCode.CPUI_INSERT] = OpBehavior(OpCode.CPUI_INSERT, False)
+        inst[OpCode.CPUI_EXTRACT] = OpBehavior(OpCode.CPUI_EXTRACT, False)
         inst[OpCode.CPUI_POPCOUNT] = OpBehaviorPopcount()
         inst[OpCode.CPUI_LZCOUNT] = OpBehaviorLzcount()
         return inst
@@ -148,10 +173,10 @@ class OpBehaviorCopy(OpBehavior):
         super().__init__(OpCode.CPUI_COPY, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        return in1 & calc_mask(sizeout)
+        return in1
 
     def recoverInputUnary(self, sizeout, out, sizein):
-        return out & calc_mask(sizein)
+        return out
 
 
 class OpBehaviorEqual(OpBehavior):
@@ -159,7 +184,7 @@ class OpBehaviorEqual(OpBehavior):
         super().__init__(OpCode.CPUI_INT_EQUAL, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return 1 if (in1 & calc_mask(sizein)) == (in2 & calc_mask(sizein)) else 0
+        return 1 if in1 == in2 else 0
 
 
 class OpBehaviorNotEqual(OpBehavior):
@@ -167,7 +192,7 @@ class OpBehaviorNotEqual(OpBehavior):
         super().__init__(OpCode.CPUI_INT_NOTEQUAL, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return 1 if (in1 & calc_mask(sizein)) != (in2 & calc_mask(sizein)) else 0
+        return 1 if in1 != in2 else 0
 
 
 class OpBehaviorIntSless(OpBehavior):
@@ -175,7 +200,14 @@ class OpBehaviorIntSless(OpBehavior):
         super().__init__(OpCode.CPUI_INT_SLESS, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return 1 if to_signed(in1, sizein) < to_signed(in2, sizein) else 0
+        if sizein <= 0:
+            return 0
+        mask = 0x80 << (8 * (sizein - 1))
+        bit1 = in1 & mask
+        bit2 = in2 & mask
+        if bit1 != bit2:
+            return 1 if bit1 != 0 else 0
+        return 1 if in1 < in2 else 0
 
 
 class OpBehaviorIntSlessEqual(OpBehavior):
@@ -183,7 +215,14 @@ class OpBehaviorIntSlessEqual(OpBehavior):
         super().__init__(OpCode.CPUI_INT_SLESSEQUAL, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return 1 if to_signed(in1, sizein) <= to_signed(in2, sizein) else 0
+        if sizein <= 0:
+            return 0
+        mask = 0x80 << (8 * (sizein - 1))
+        bit1 = in1 & mask
+        bit2 = in2 & mask
+        if bit1 != bit2:
+            return 1 if bit1 != 0 else 0
+        return 1 if in1 <= in2 else 0
 
 
 class OpBehaviorIntLess(OpBehavior):
@@ -191,8 +230,7 @@ class OpBehaviorIntLess(OpBehavior):
         super().__init__(OpCode.CPUI_INT_LESS, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        mask = calc_mask(sizein)
-        return 1 if (in1 & mask) < (in2 & mask) else 0
+        return 1 if in1 < in2 else 0
 
 
 class OpBehaviorIntLessEqual(OpBehavior):
@@ -200,8 +238,7 @@ class OpBehaviorIntLessEqual(OpBehavior):
         super().__init__(OpCode.CPUI_INT_LESSEQUAL, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        mask = calc_mask(sizein)
-        return 1 if (in1 & mask) <= (in2 & mask) else 0
+        return 1 if in1 <= in2 else 0
 
 
 class OpBehaviorIntZext(OpBehavior):
@@ -209,10 +246,13 @@ class OpBehaviorIntZext(OpBehavior):
         super().__init__(OpCode.CPUI_INT_ZEXT, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        return in1 & calc_mask(sizein)
+        return in1
 
     def recoverInputUnary(self, sizeout, out, sizein):
-        return out & calc_mask(sizein)
+        mask = calc_mask(sizein)
+        if (mask & out) != out:
+            raise EvaluationError("Output is not in range of zext operation")
+        return out
 
 
 class OpBehaviorIntSext(OpBehavior):
@@ -228,7 +268,15 @@ class OpBehaviorIntSext(OpBehavior):
         return in1 & calc_mask(sizeout)
 
     def recoverInputUnary(self, sizeout, out, sizein):
-        return out & calc_mask(sizein)
+        masklong = calc_mask(sizeout)
+        maskshort = calc_mask(sizein)
+        if (out & (maskshort ^ (maskshort >> 1))) == 0:
+            if (out & maskshort) != out:
+                raise EvaluationError("Output is not in range of sext operation")
+        else:
+            if (out & (masklong ^ maskshort)) != (masklong ^ maskshort):
+                raise EvaluationError("Output is not in range of sext operation")
+        return out & maskshort
 
 
 class OpBehaviorIntAdd(OpBehavior):
@@ -261,8 +309,7 @@ class OpBehaviorIntCarry(OpBehavior):
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
         mask = calc_mask(sizein)
-        res = (in1 & mask) + (in2 & mask)
-        return 1 if res > mask else 0
+        return 1 if in1 > ((in1 + in2) & mask) else 0
 
 
 class OpBehaviorIntScarry(OpBehavior):
@@ -270,13 +317,16 @@ class OpBehaviorIntScarry(OpBehavior):
         super().__init__(OpCode.CPUI_INT_SCARRY, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        s1 = to_signed(in1, sizein)
-        s2 = to_signed(in2, sizein)
-        res = s1 + s2
-        bits = sizein * 8
-        smin = -(1 << (bits - 1))
-        smax = (1 << (bits - 1)) - 1
-        return 1 if (res < smin or res > smax) else 0
+        res = in1 + in2
+        shift = sizein * 8 - 1
+        a = (in1 >> shift) & 1
+        b = (in2 >> shift) & 1
+        r = (res >> shift) & 1
+        r ^= a
+        a ^= b
+        a ^= 1
+        r &= a
+        return r
 
 
 class OpBehaviorIntSborrow(OpBehavior):
@@ -284,13 +334,16 @@ class OpBehaviorIntSborrow(OpBehavior):
         super().__init__(OpCode.CPUI_INT_SBORROW, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        s1 = to_signed(in1, sizein)
-        s2 = to_signed(in2, sizein)
-        res = s1 - s2
-        bits = sizein * 8
-        smin = -(1 << (bits - 1))
-        smax = (1 << (bits - 1)) - 1
-        return 1 if (res < smin or res > smax) else 0
+        res = in1 - in2
+        shift = sizein * 8 - 1
+        a = (in1 >> shift) & 1
+        b = (in2 >> shift) & 1
+        r = (res >> shift) & 1
+        a ^= r
+        r ^= b
+        r ^= 1
+        a &= r
+        return a
 
 
 class OpBehaviorInt2Comp(OpBehavior):
@@ -298,8 +351,7 @@ class OpBehaviorInt2Comp(OpBehavior):
         super().__init__(OpCode.CPUI_INT_2COMP, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        mask = calc_mask(sizeout)
-        return ((~in1) + 1) & mask
+        return (~(in1 - 1)) & calc_mask(sizein)
 
     def recoverInputUnary(self, sizeout, out, sizein):
         mask = calc_mask(sizein)
@@ -311,7 +363,7 @@ class OpBehaviorIntNegate(OpBehavior):
         super().__init__(OpCode.CPUI_INT_NEGATE, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        return (~in1) & calc_mask(sizeout)
+        return (~in1) & calc_mask(sizein)
 
     def recoverInputUnary(self, sizeout, out, sizein):
         return (~out) & calc_mask(sizein)
@@ -322,7 +374,7 @@ class OpBehaviorIntXor(OpBehavior):
         super().__init__(OpCode.CPUI_INT_XOR, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 ^ in2) & calc_mask(sizeout)
+        return in1 ^ in2
 
 
 class OpBehaviorIntAnd(OpBehavior):
@@ -330,7 +382,7 @@ class OpBehaviorIntAnd(OpBehavior):
         super().__init__(OpCode.CPUI_INT_AND, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 & in2) & calc_mask(sizeout)
+        return in1 & in2
 
 
 class OpBehaviorIntOr(OpBehavior):
@@ -338,7 +390,7 @@ class OpBehaviorIntOr(OpBehavior):
         super().__init__(OpCode.CPUI_INT_OR, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 | in2) & calc_mask(sizeout)
+        return in1 | in2
 
 
 class OpBehaviorIntLeft(OpBehavior):
@@ -353,12 +405,12 @@ class OpBehaviorIntLeft(OpBehavior):
         return (in1 << sa) & mask
 
     def recoverInputBinary(self, slot, sizeout, out, sizein, inp):
-        if slot != 0:
-            raise EvaluationError("Cannot recover shift amount")
         sa = int(inp)
-        if sa >= sizeout * 8:
-            return 0
-        return (out >> sa) & calc_mask(sizeout)
+        if slot != 0 or sa >= sizeout * 8:
+            return super().recoverInputBinary(slot, sizeout, out, sizein, inp)
+        if ((out << (8 * sizeout - sa)) & calc_mask(sizeout)) != 0:
+            raise EvaluationError("Output is not in range of left shift operation")
+        return out >> sa
 
 
 class OpBehaviorIntRight(OpBehavior):
@@ -366,19 +418,18 @@ class OpBehaviorIntRight(OpBehavior):
         super().__init__(OpCode.CPUI_INT_RIGHT, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        mask = calc_mask(sizein)
         sa = int(in2)
-        if sa >= sizein * 8:
-            return 0
-        return ((in1 & mask) >> sa) & calc_mask(sizeout)
-
-    def recoverInputBinary(self, slot, sizeout, out, sizein, inp):
-        if slot != 0:
-            raise EvaluationError("Cannot recover shift amount")
-        sa = int(inp)
         if sa >= sizeout * 8:
             return 0
-        return (out << sa) & calc_mask(sizeout)
+        return (in1 & calc_mask(sizeout)) >> sa
+
+    def recoverInputBinary(self, slot, sizeout, out, sizein, inp):
+        sa = int(inp)
+        if slot != 0 or sa >= sizeout * 8:
+            return super().recoverInputBinary(slot, sizeout, out, sizein, inp)
+        if (out >> (8 * sizein - sa)) != 0:
+            raise EvaluationError("Output is not in range of right shift operation")
+        return out << sa
 
 
 class OpBehaviorIntSright(OpBehavior):
@@ -387,21 +438,29 @@ class OpBehaviorIntSright(OpBehavior):
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
         sa = int(in2)
-        bits = sizein * 8
-        mask = calc_mask(sizein)
-        in1 &= mask
-        if sa >= bits:
-            return mask if signbit_negative(in1, sizein) else 0
-        sval = to_signed(in1, sizein)
-        return (sval >> sa) & calc_mask(sizeout)
+        if sa >= sizeout * 8:
+            return calc_mask(sizeout) if signbit_negative(in1, sizein) else 0
+        if signbit_negative(in1, sizein):
+            res = in1 >> sa
+            mask = calc_mask(sizein)
+            mask = (mask >> sa) ^ mask
+            res |= mask
+            return res
+        return in1 >> sa
 
     def recoverInputBinary(self, slot, sizeout, out, sizein, inp):
-        if slot != 0:
-            raise EvaluationError("Cannot recover shift amount")
         sa = int(inp)
-        if sa >= sizeout * 8:
-            return 0
-        return (out << sa) & calc_mask(sizeout)
+        if slot != 0 or sa >= sizeout * 8:
+            return super().recoverInputBinary(slot, sizeout, out, sizein, inp)
+        testval = out >> (sizein * 8 - sa - 1)
+        count = 0
+        for _ in range(sa + 1):
+            if (testval & 1) != 0:
+                count += 1
+            testval >>= 1
+        if count != sa + 1:
+            raise EvaluationError("Output is not in range of right shift operation")
+        return out << sa
 
 
 class OpBehaviorIntMult(OpBehavior):
@@ -417,11 +476,9 @@ class OpBehaviorIntDiv(OpBehavior):
         super().__init__(OpCode.CPUI_INT_DIV, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        mask = calc_mask(sizein)
-        in2 &= mask
         if in2 == 0:
-            raise EvaluationError("Division by zero")
-        return ((in1 & mask) // (in2)) & calc_mask(sizeout)
+            raise EvaluationError("Divide by 0")
+        return in1 // in2
 
 
 class OpBehaviorIntSdiv(OpBehavior):
@@ -431,7 +488,7 @@ class OpBehaviorIntSdiv(OpBehavior):
     def evaluateBinary(self, sizeout, sizein, in1, in2):
         s2 = to_signed(in2, sizein)
         if s2 == 0:
-            raise EvaluationError("Division by zero")
+            raise EvaluationError("Divide by 0")
         s1 = to_signed(in1, sizein)
         # Python integer division truncates towards negative infinity; C++ truncates towards zero
         import math
@@ -444,11 +501,9 @@ class OpBehaviorIntRem(OpBehavior):
         super().__init__(OpCode.CPUI_INT_REM, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        mask = calc_mask(sizein)
-        in2 &= mask
         if in2 == 0:
-            raise EvaluationError("Remainder by zero")
-        return ((in1 & mask) % in2) & calc_mask(sizeout)
+            raise EvaluationError("Remainder by 0")
+        return in1 % in2
 
 
 class OpBehaviorIntSrem(OpBehavior):
@@ -458,7 +513,7 @@ class OpBehaviorIntSrem(OpBehavior):
     def evaluateBinary(self, sizeout, sizein, in1, in2):
         s2 = to_signed(in2, sizein)
         if s2 == 0:
-            raise EvaluationError("Remainder by zero")
+            raise EvaluationError("Remainder by 0")
         s1 = to_signed(in1, sizein)
         import math
         result = s1 - int(math.trunc(s1 / s2)) * s2
@@ -474,7 +529,7 @@ class OpBehaviorBoolNegate(OpBehavior):
         super().__init__(OpCode.CPUI_BOOL_NEGATE, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        return 1 if (in1 & 1) == 0 else 0
+        return in1 ^ 1
 
 
 class OpBehaviorBoolXor(OpBehavior):
@@ -482,7 +537,7 @@ class OpBehaviorBoolXor(OpBehavior):
         super().__init__(OpCode.CPUI_BOOL_XOR, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 ^ in2) & 1
+        return in1 ^ in2
 
 
 class OpBehaviorBoolAnd(OpBehavior):
@@ -490,7 +545,7 @@ class OpBehaviorBoolAnd(OpBehavior):
         super().__init__(OpCode.CPUI_BOOL_AND, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 & in2) & 1
+        return in1 & in2
 
 
 class OpBehaviorBoolOr(OpBehavior):
@@ -498,7 +553,7 @@ class OpBehaviorBoolOr(OpBehavior):
         super().__init__(OpCode.CPUI_BOOL_OR, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        return (in1 | in2) & 1
+        return in1 | in2
 
 
 # =========================================================================
@@ -514,172 +569,174 @@ class _FloatOpBase(OpBehavior):
 
     def _getFormat(self, size: int):
         if self._translate is None:
-            from ghidra.core.float_format import FloatFormat
-            return FloatFormat(size)
+            return None
         return self._translate.getFloatFormat(size)
+
+    def _evaluate_with_binary_format(self, sizeout: int, sizein: int, in1: int, in2: int, opname: str) -> int:
+        fmt = self._getFormat(sizein)
+        if fmt is None:
+            return super().evaluateBinary(sizeout, sizein, in1, in2)
+        return getattr(fmt, opname)(in1, in2)
+
+    def _evaluate_with_unary_format(self, sizeout: int, sizein: int, in1: int, opname: str) -> int:
+        fmt = self._getFormat(sizein)
+        if fmt is None:
+            return super().evaluateUnary(sizeout, sizein, in1)
+        return getattr(fmt, opname)(in1)
 
 
 class OpBehaviorFloatEqual(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_EQUAL, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opEqual(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opEqual")
 
 
 class OpBehaviorFloatNotEqual(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_NOTEQUAL, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opNotEqual(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opNotEqual")
 
 
 class OpBehaviorFloatLess(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_LESS, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opLess(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opLess")
 
 
 class OpBehaviorFloatLessEqual(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_LESSEQUAL, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opLessEqual(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opLessEqual")
 
 
 class OpBehaviorFloatNan(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_NAN, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opNan(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opNan")
 
 
 class OpBehaviorFloatAdd(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_ADD, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opAdd(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opAdd")
 
 
 class OpBehaviorFloatDiv(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_DIV, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opDiv(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opDiv")
 
 
 class OpBehaviorFloatMult(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_MULT, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opMult(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opMult")
 
 
 class OpBehaviorFloatSub(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_SUB, False, trans)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        fmt = self._getFormat(sizein)
-        return fmt.opSub(in1, in2)
+        return self._evaluate_with_binary_format(sizeout, sizein, in1, in2, "opSub")
 
 
 class OpBehaviorFloatNeg(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_NEG, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opNeg(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opNeg")
 
 
 class OpBehaviorFloatAbs(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_ABS, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opAbs(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opAbs")
 
 
 class OpBehaviorFloatSqrt(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_SQRT, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opSqrt(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opSqrt")
 
 
 class OpBehaviorFloatInt2Float(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_INT2FLOAT, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
         fmt = self._getFormat(sizeout)
+        if fmt is None:
+            return super().evaluateUnary(sizeout, sizein, in1)
         return fmt.opInt2Float(in1, sizein)
 
 
 class OpBehaviorFloatFloat2Float(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_FLOAT2FLOAT, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
         fmt_in = self._getFormat(sizein)
         fmt_out = self._getFormat(sizeout)
+        if fmt_out is None or fmt_in is None:
+            return super().evaluateUnary(sizeout, sizein, in1)
         return fmt_in.opFloat2Float(in1, fmt_out)
 
 
 class OpBehaviorFloatTrunc(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_TRUNC, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
         fmt = self._getFormat(sizein)
+        if fmt is None:
+            return super().evaluateUnary(sizeout, sizein, in1)
         return fmt.opTrunc(in1, sizeout)
 
 
 class OpBehaviorFloatCeil(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_CEIL, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opCeil(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opCeil")
 
 
 class OpBehaviorFloatFloor(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_FLOOR, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opFloor(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opFloor")
 
 
 class OpBehaviorFloatRound(_FloatOpBase):
-    def __init__(self, trans=None):
+    def __init__(self, trans):
         super().__init__(OpCode.CPUI_FLOAT_ROUND, True, trans)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        fmt = self._getFormat(sizein)
-        return fmt.opRound(in1)
+        return self._evaluate_with_unary_format(sizeout, sizein, in1, "opRound")
 
 
 # =========================================================================
@@ -691,9 +748,7 @@ class OpBehaviorPiece(OpBehavior):
         super().__init__(OpCode.CPUI_PIECE, False)
 
     def evaluateBinary(self, sizeout, sizein, in1, in2):
-        # in1 = most significant, in2 = least significant
-        # sizein is the size of in2 (each input is sizein bytes)
-        return ((in1 << (sizein * 8)) | in2) & calc_mask(sizeout)
+        return (in1 << ((sizeout - sizein) * 8)) | in2
 
 
 class OpBehaviorSubpiece(OpBehavior):
@@ -727,7 +782,7 @@ class OpBehaviorPopcount(OpBehavior):
         super().__init__(OpCode.CPUI_POPCOUNT, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        return popcount(in1 & calc_mask(sizein))
+        return popcount(in1)
 
 
 class OpBehaviorLzcount(OpBehavior):
@@ -735,15 +790,4 @@ class OpBehaviorLzcount(OpBehavior):
         super().__init__(OpCode.CPUI_LZCOUNT, True)
 
     def evaluateUnary(self, sizeout, sizein, in1):
-        mask = calc_mask(sizein)
-        in1 &= mask
-        if in1 == 0:
-            return sizein * 8
-        # Count leading zeros in sizein*8 bit value
-        bits = sizein * 8
-        count = 0
-        for i in range(bits - 1, -1, -1):
-            if (in1 >> i) & 1:
-                break
-            count += 1
-        return count
+        return to_unsigned(count_leading_zeros(in1) - 8 * (8 - sizein), 8)

@@ -7,15 +7,17 @@ ArchOption base class + OptionDatabase dispatcher + all concrete option classes.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional, Dict
 
-from ghidra.core.error import LowlevelError
+from ghidra.core.error import LowlevelError, ParseError, RecovError
+from ghidra.core.marshal import ElementId
 
 if TYPE_CHECKING:
     from ghidra.arch.architecture import Architecture
 
 
-class ArchOption:
+class ArchOption(ABC):
     """Base class for options that affect Architecture configuration."""
 
     def __init__(self) -> None:
@@ -24,17 +26,19 @@ class ArchOption:
     def getName(self) -> str:
         return self.name
 
+    @abstractmethod
     def apply(self, glb, p1: str = "", p2: str = "", p3: str = "") -> str:
         raise NotImplementedError
 
     @staticmethod
     def onOrOff(p: str) -> bool:
-        p = p.strip().lower()
-        if p in ("on", "yes", "true", "1"):
+        if len(p) == 0:
             return True
-        if p in ("off", "no", "false", "0"):
+        if p == "on":
+            return True
+        if p == "off":
             return False
-        raise LowlevelError(f"Option must be 'on' or 'off': {p}")
+        raise ParseError("Must specify toggle value, on/off")
 
 
 class OptionDatabase:
@@ -42,22 +46,65 @@ class OptionDatabase:
 
     def __init__(self, glb) -> None:
         self._glb = glb
-        self._optionmap: Dict[str, ArchOption] = {}
+        self._optionmap: Dict[int, ArchOption] = {}
         self._registerDefaults()
 
     def _registerDefaults(self) -> None:
         for cls in _ALL_OPTIONS:
-            opt = cls()
-            self._optionmap[opt.name] = opt
+            self.registerOption(cls())
 
     def registerOption(self, option: ArchOption) -> None:
-        self._optionmap[option.name] = option
+        option_id = ElementId.find(option.getName(), 0)
+        self._optionmap[option_id] = option
 
-    def set(self, name: str, p1: str = "", p2: str = "", p3: str = "") -> str:
-        opt = self._optionmap.get(name)
+    def __del__(self) -> None:
+        if hasattr(self, "_optionmap"):
+            self._optionmap.clear()
+
+    def set(self, nameId: int, p1: str = "", p2: str = "", p3: str = "") -> str:
+        opt = self._optionmap.get(nameId)
         if opt is None:
-            raise LowlevelError(f"Unknown option: {name}")
+            raise ParseError("Unknown option")
         return opt.apply(self._glb, p1, p2, p3)
+
+    def decodeOne(self, decoder) -> None:
+        from ghidra.core.marshal import (
+            ATTRIB_CONTENT,
+            ELEM_PARAM1,
+            ELEM_PARAM2,
+            ELEM_PARAM3,
+        )
+
+        p1 = ""
+        p2 = ""
+        p3 = ""
+
+        elemId = decoder.openElement()
+        subId = decoder.openElement()
+        if subId == ELEM_PARAM1.id:
+            p1 = decoder.readString(ATTRIB_CONTENT)
+            decoder.closeElement(subId)
+            subId = decoder.openElement()
+            if subId == ELEM_PARAM2.id:
+                p2 = decoder.readString(ATTRIB_CONTENT)
+                decoder.closeElement(subId)
+                subId = decoder.openElement()
+                if subId == ELEM_PARAM3.id:
+                    p3 = decoder.readString(ATTRIB_CONTENT)
+                    decoder.closeElement(subId)
+        elif subId == 0:
+            p1 = decoder.readString(ATTRIB_CONTENT)
+
+        decoder.closeElement(elemId)
+        self.set(elemId, p1, p2, p3)
+
+    def decode(self, decoder) -> None:
+        from ghidra.core.marshal import ELEM_OPTIONSLIST
+
+        elemId = decoder.openElement(ELEM_OPTIONSLIST)
+        while decoder.peekElement() != 0:
+            self.decodeOne(decoder)
+        decoder.closeElement(elemId)
 
 
 # ================================================================
@@ -70,14 +117,30 @@ class OptionExtraPop(ArchOption):
         self.name = "extrapop"
 
     def apply(self, glb, p1="", p2="", p3=""):
+        from ghidra.fspec.fspec import ProtoModel
+
+        expop = -300
         if p1 == "unknown":
-            glb.extra_pop = -1
+            expop = ProtoModel.extrapop_unknown
         else:
             try:
-                glb.extra_pop = int(p1)
+                expop = int(p1, 0)
             except ValueError:
-                raise LowlevelError(f"Bad extrapop value: {p1}")
-        return "Extra pop set"
+                pass
+        if expop == -300:
+            raise ParseError("Bad extrapop adjustment parameter")
+        if len(p2) != 0:
+            fd = glb.symboltab.getGlobalScope().queryFunction(p2)
+            if fd is None:
+                raise RecovError("Unknown function name: " + p2)
+            fd.getFuncProto().setExtraPop(expop)
+            return "ExtraPop set for function " + p2
+        glb.defaultfp.setExtraPop(expop)
+        if glb.evalfp_current is not None:
+            glb.evalfp_current.setExtraPop(expop)
+        if glb.evalfp_called is not None:
+            glb.evalfp_called.setExtraPop(expop)
+        return "Global extrapop set"
 
 
 class OptionDefaultPrototype(ArchOption):
@@ -86,11 +149,11 @@ class OptionDefaultPrototype(ArchOption):
         self.name = "defaultprototype"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        model = glb.getModel(p1) if hasattr(glb, 'getModel') else None
+        model = glb.getModel(p1)
         if model is None:
-            raise LowlevelError(f"Unknown prototype model: {p1}")
+            raise LowlevelError("Unknown prototype model :" + p1)
         glb.setDefaultModel(model)
-        return f"Default prototype set to {p1}"
+        return "Set default prototype to " + p1
 
 
 class OptionInferConstPtr(ArchOption):
@@ -99,8 +162,12 @@ class OptionInferConstPtr(ArchOption):
         self.name = "inferconstptr"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        glb.infer_pointers = ArchOption.onOrOff(p1)
-        return f"Infer constant pointers {'on' if glb.infer_pointers else 'off'}"
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.infer_pointers = True
+            return "Constant pointers are now inferred"
+        glb.infer_pointers = False
+        return "Constant pointers must now be set explicitly"
 
 
 class OptionForLoops(ArchOption):
@@ -110,7 +177,7 @@ class OptionForLoops(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         glb.analyze_for_loops = ArchOption.onOrOff(p1)
-        return f"Analyze for loops {'on' if glb.analyze_for_loops else 'off'}"
+        return "Recovery of for-loops is " + p1
 
 
 class OptionNullPrinting(ArchOption):
@@ -120,9 +187,11 @@ class OptionNullPrinting(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         val = ArchOption.onOrOff(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.option_NULL = val
-        return f"NULL printing {'on' if val else 'off'}"
+        if glb.print_.getName() != "c-language":
+            return "Only c-language accepts the null printing option"
+        glb.print_.setNULLPrinting(val)
+        prop = "on" if val else "off"
+        return "Null printing turned " + prop
 
 
 class OptionInPlaceOps(ArchOption):
@@ -132,9 +201,11 @@ class OptionInPlaceOps(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         val = ArchOption.onOrOff(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.option_inplace_ops = val
-        return f"In-place operators {'on' if val else 'off'}"
+        if glb.print_.getName() != "c-language":
+            return "Can only set inplace operators for C language"
+        glb.print_.setInplaceOps(val)
+        prop = "on" if val else "off"
+        return "Inplace operators turned " + prop
 
 
 class OptionConventionPrinting(ArchOption):
@@ -144,9 +215,11 @@ class OptionConventionPrinting(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         val = ArchOption.onOrOff(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.option_convention = val
-        return f"Convention printing {'on' if val else 'off'}"
+        if glb.print_.getName() != "c-language":
+            return "Can only set convention printing for C language"
+        glb.print_.setConvention(val)
+        prop = "on" if val else "off"
+        return "Convention printing turned " + prop
 
 
 class OptionNoCastPrinting(ArchOption):
@@ -156,9 +229,11 @@ class OptionNoCastPrinting(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         val = ArchOption.onOrOff(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.option_nocasts = val
-        return f"No-cast printing {'on' if val else 'off'}"
+        if glb.print_.getName() != "c-language":
+            return "Can only set no cast printing for C language"
+        glb.print_.setNoCastPrinting(val)
+        prop = "on" if val else "off"
+        return "No cast printing turned " + prop
 
 
 class OptionHideExtensions(ArchOption):
@@ -168,9 +243,11 @@ class OptionHideExtensions(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         val = ArchOption.onOrOff(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.option_hide_exts = val
-        return f"Hide extensions {'on' if val else 'off'}"
+        if glb.print_.getName() != "c-language":
+            return "Can only toggle extension hiding for C language"
+        glb.print_.setHideImpliedExts(val)
+        prop = "on" if val else "off"
+        return "Implied extension hiding turned " + prop
 
 
 class OptionMaxLineWidth(ArchOption):
@@ -180,14 +257,13 @@ class OptionMaxLineWidth(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         try:
-            val = int(p1)
+            val = int(p1, 0)
         except ValueError:
-            raise LowlevelError(f"Bad maxlinewidth value: {p1}")
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            emit = glb.print_.getEmitter()
-            if emit is not None:
-                emit.setMaxLineSize(val)
-        return f"Max line width set to {val}"
+            val = -1
+        if val == -1:
+            raise ParseError("Must specify integer linewidth")
+        glb.print_.setMaxLineSize(val)
+        return "Maximum line width set to " + p1
 
 
 class OptionIndentIncrement(ArchOption):
@@ -197,14 +273,13 @@ class OptionIndentIncrement(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         try:
-            val = int(p1)
+            val = int(p1, 0)
         except ValueError:
-            raise LowlevelError(f"Bad indentincrement value: {p1}")
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            emit = glb.print_.getEmitter()
-            if emit is not None:
-                emit.setIndentIncrement(val)
-        return f"Indent increment set to {val}"
+            val = -1
+        if val == -1:
+            raise ParseError("Must specify integer increment")
+        glb.print_.setIndentIncrement(val)
+        return "Characters per indent level set to " + p1
 
 
 class OptionCommentIndent(ArchOption):
@@ -214,12 +289,13 @@ class OptionCommentIndent(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         try:
-            val = int(p1)
+            val = int(p1, 0)
         except ValueError:
-            raise LowlevelError(f"Bad commentindent value: {p1}")
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.setLineCommentIndent(val)
-        return f"Comment indent set to {val}"
+            val = -1
+        if val == -1:
+            raise ParseError("Must specify integer comment indent")
+        glb.print_.setLineCommentIndent(val)
+        return "Comment indent set to " + p1
 
 
 class OptionCommentStyle(ArchOption):
@@ -228,14 +304,8 @@ class OptionCommentStyle(ArchOption):
         self.name = "commentstyle"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            if p1 in ("c", "/*"):
-                glb.print_.setCommentDelimeter("/* ", " */", False)
-            elif p1 in ("cplusplus", "//"):
-                glb.print_.setCommentDelimeter("// ", "", True)
-            else:
-                raise LowlevelError(f"Unknown comment style: {p1}")
-        return f"Comment style set to {p1}"
+        glb.print_.setCommentStyle(p1)
+        return "Comment style set to " + p1
 
 
 class OptionCommentHeader(ArchOption):
@@ -245,10 +315,17 @@ class OptionCommentHeader(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         from ghidra.database.comment import Comment
-        tp = Comment.encodeCommentType(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.setHeaderComment(tp)
-        return f"Comment header type set to {p1}"
+
+        toggle = ArchOption.onOrOff(p2)
+        flags = glb.print_.getHeaderComment()
+        val = Comment.encodeCommentType(p1)
+        if toggle:
+            flags |= val
+        else:
+            flags &= ~val
+        glb.print_.setHeaderComment(flags)
+        prop = "on" if toggle else "off"
+        return "Header comment type " + p1 + " turned " + prop
 
 
 class OptionCommentInstruction(ArchOption):
@@ -258,10 +335,17 @@ class OptionCommentInstruction(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         from ghidra.database.comment import Comment
-        tp = Comment.encodeCommentType(p1)
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.setInstructionComment(tp)
-        return f"Comment instruction type set to {p1}"
+
+        toggle = ArchOption.onOrOff(p2)
+        flags = glb.print_.getInstructionComment()
+        val = Comment.encodeCommentType(p1)
+        if toggle:
+            flags |= val
+        else:
+            flags &= ~val
+        glb.print_.setInstructionComment(flags)
+        prop = "on" if toggle else "off"
+        return "Instruction comment type " + p1 + " turned " + prop
 
 
 class OptionIntegerFormat(ArchOption):
@@ -270,9 +354,8 @@ class OptionIntegerFormat(ArchOption):
         self.name = "integerformat"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.setIntegerFormat(p1)
-        return f"Integer format set to {p1}"
+        glb.print_.setIntegerFormat(p1)
+        return "Integer format set to " + p1
 
 
 class OptionSetAction(ArchOption):
@@ -281,9 +364,14 @@ class OptionSetAction(ArchOption):
         self.name = "setaction"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'allacts'):
-            glb.allacts.setCurrent(p1)
-        return f"Current action set to {p1}"
+        if len(p1) == 0:
+            raise ParseError("Must specify preexisting action")
+        if len(p2) != 0:
+            glb.allacts.cloneGroup(p1, p2)
+            glb.allacts.setCurrent(p2)
+            return "Created " + p2 + " by cloning " + p1 + " and made it current"
+        glb.allacts.setCurrent(p1)
+        return "Set current action to " + p1
 
 
 class OptionCurrentAction(ArchOption):
@@ -292,9 +380,20 @@ class OptionCurrentAction(ArchOption):
         self.name = "currentaction"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'allacts'):
+        if len(p1) == 0 or len(p2) == 0:
+            raise ParseError("Must specify subaction, on/off")
+        res = "Toggled "
+        if len(p3) != 0:
             glb.allacts.setCurrent(p1)
-        return f"Current action set to {p1}"
+            val = ArchOption.onOrOff(p3)
+            glb.allacts.toggleAction(p1, p2, val)
+            res += p2 + " in action " + p1
+        else:
+            val = ArchOption.onOrOff(p2)
+            cur_name = glb.allacts.getCurrentName()
+            glb.allacts.toggleAction(cur_name, p1, val)
+            res += p1 + " in action " + cur_name
+        return res
 
 
 class OptionToggleRule(ArchOption):
@@ -303,11 +402,19 @@ class OptionToggleRule(ArchOption):
         self.name = "togglerule"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'allacts'):
-            act = glb.allacts.getCurrent()
-            if act is not None and hasattr(act, 'toggleRule'):
-                act.toggleRule(p1, p2)
-        return f"Rule {p1} toggled"
+        if len(p1) == 0:
+            raise ParseError("Must specify rule path")
+        if len(p2) == 0:
+            raise ParseError("Must specify on/off")
+        val = ArchOption.onOrOff(p2)
+        root = glb.allacts.getCurrent()
+        if root is None:
+            raise LowlevelError("Missing current action")
+        if not val:
+            res = "Successfully disabled" if root.disableRule(p1) else "Failed to disable"
+        else:
+            res = "Successfully enabled" if root.enableRule(p1) else "Failed to enable"
+        return res + " rule"
 
 
 class OptionAliasBlock(ArchOption):
@@ -316,12 +423,22 @@ class OptionAliasBlock(ArchOption):
         self.name = "aliasblock"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        _map = {"none": 0, "stack": 1, "register": 2, "all": 3}
-        val = _map.get(p1.lower(), -1)
-        if val < 0:
-            raise LowlevelError(f"Unknown alias block level: {p1}")
-        glb.alias_block_level = val
-        return f"Alias block level set to {p1}"
+        if len(p1) == 0:
+            raise ParseError("Must specify alias block level")
+        old_val = glb.alias_block_level
+        if p1 == "none":
+            glb.alias_block_level = 0
+        elif p1 == "struct":
+            glb.alias_block_level = 1
+        elif p1 == "array":
+            glb.alias_block_level = 2
+        elif p1 == "all":
+            glb.alias_block_level = 3
+        else:
+            raise ParseError("Unknown alias block level: " + p1)
+        if old_val == glb.alias_block_level:
+            return "Alias block level unchanged"
+        return "Alias block level set to " + p1
 
 
 class OptionMaxInstruction(ArchOption):
@@ -330,12 +447,16 @@ class OptionMaxInstruction(ArchOption):
         self.name = "maxinstruction"
 
     def apply(self, glb, p1="", p2="", p3=""):
+        if len(p1) == 0:
+            raise ParseError("Must specify number of instructions")
         try:
-            val = int(p1)
+            new_max = int(p1, 0)
         except ValueError:
-            raise LowlevelError(f"Bad maxinstruction value: {p1}")
-        glb.max_instructions = val
-        return f"Max instructions set to {val}"
+            new_max = -1
+        if new_max < 0:
+            raise ParseError("Bad maxinstruction parameter")
+        glb.max_instructions = new_max
+        return "Maximum instructions per function set"
 
 
 class OptionNamespaceStrategy(ArchOption):
@@ -345,15 +466,16 @@ class OptionNamespaceStrategy(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         from ghidra.output.printlanguage import PrintLanguage
-        _map = {"minimal": PrintLanguage.MINIMAL_NAMESPACES,
-                "all": PrintLanguage.ALL_NAMESPACES,
-                "none": PrintLanguage.NO_NAMESPACES}
-        val = _map.get(p1.lower(), -1)
-        if val < 0:
-            raise LowlevelError(f"Unknown namespace strategy: {p1}")
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            glb.print_.setNamespaceStrategy(val)
-        return f"Namespace strategy set to {p1}"
+        if p1 == "minimal":
+            strategy = PrintLanguage.MINIMAL_NAMESPACES
+        elif p1 == "all":
+            strategy = PrintLanguage.ALL_NAMESPACES
+        elif p1 == "none":
+            strategy = PrintLanguage.NO_NAMESPACES
+        else:
+            raise ParseError("Must specify a valid strategy")
+        glb.print_.setNamespaceStrategy(strategy)
+        return "Namespace strategy set"
 
 
 class OptionJumpTableMax(ArchOption):
@@ -363,11 +485,13 @@ class OptionJumpTableMax(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         try:
-            val = int(p1)
+            val = int(p1, 0)
         except ValueError:
-            raise LowlevelError(f"Bad jumptablemax value: {p1}")
+            val = 0
+        if val == 0:
+            raise ParseError("Must specify integer maximum")
         glb.max_jumptable_size = val
-        return f"Jump table max set to {val}"
+        return "Maximum jumptable size set to " + p1
 
 
 class OptionProtoEval(ArchOption):
@@ -376,16 +500,16 @@ class OptionProtoEval(ArchOption):
         self.name = "protoeval"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        model = glb.getModel(p1) if hasattr(glb, 'getModel') else None
-        if model is not None:
-            if p2 == "current":
-                glb.evalfp_current = model
-            elif p2 == "called":
-                glb.evalfp_called = model
-            else:
-                glb.evalfp_current = model
-                glb.evalfp_called = model
-        return f"Prototype evaluation set to {p1}"
+        if len(p1) == 0:
+            raise ParseError("Must specify prototype model")
+        if p1 == "default":
+            model = glb.defaultfp
+        else:
+            model = glb.getModel(p1)
+            if model is None:
+                raise ParseError("Unknown prototype model: " + p1)
+        glb.evalfp_current = model
+        return "Set current evaluation to " + p1
 
 
 class OptionSetLanguage(ArchOption):
@@ -394,9 +518,8 @@ class OptionSetLanguage(ArchOption):
         self.name = "setlanguage"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        if hasattr(glb, 'setPrintLanguage'):
-            glb.setPrintLanguage(p1)
-        return f"Language set to {p1}"
+        glb.setPrintLanguage(p1)
+        return "Decompiler produces " + p1
 
 
 class OptionSplitDatatypes(ArchOption):
@@ -408,15 +531,34 @@ class OptionSplitDatatypes(ArchOption):
         super().__init__()
         self.name = "splitdatatype"
 
+    @staticmethod
+    def getOptionBit(val: str) -> int:
+        if len(val) == 0:
+            return 0
+        if val == "struct":
+            return OptionSplitDatatypes.option_struct
+        if val == "array":
+            return OptionSplitDatatypes.option_array
+        if val == "pointer":
+            return OptionSplitDatatypes.option_pointer
+        raise LowlevelError("Unknown data-type split option: " + val)
+
     def apply(self, glb, p1="", p2="", p3=""):
-        _map = {"struct": 1, "array": 2, "pointer": 4}
-        bit = _map.get(p1.lower(), 0)
-        val = ArchOption.onOrOff(p2) if p2 else True
-        if val:
-            glb.split_datatype_config |= bit
+        old_config = glb.split_datatype_config
+        glb.split_datatype_config = OptionSplitDatatypes.getOptionBit(p1)
+        glb.split_datatype_config |= OptionSplitDatatypes.getOptionBit(p2)
+        glb.split_datatype_config |= OptionSplitDatatypes.getOptionBit(p3)
+        current_name = glb.allacts.getCurrentName()
+        if (glb.split_datatype_config & (self.option_struct | self.option_array)) == 0:
+            glb.allacts.toggleAction(current_name, "splitcopy", False)
+            glb.allacts.toggleAction(current_name, "splitpointer", False)
         else:
-            glb.split_datatype_config &= ~bit
-        return f"Split datatype {p1} {'on' if val else 'off'}"
+            pointers = (glb.split_datatype_config & self.option_pointer) != 0
+            glb.allacts.toggleAction(current_name, "splitcopy", True)
+            glb.allacts.toggleAction(current_name, "splitpointer", pointers)
+        if old_config == glb.split_datatype_config:
+            return "Split data-type configuration unchanged"
+        return "Split data-type configuration set"
 
 
 class OptionNanIgnore(ArchOption):
@@ -425,16 +567,27 @@ class OptionNanIgnore(ArchOption):
         self.name = "nanignore"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        p1l = p1.lower()
-        if p1l == "all":
-            glb.nan_ignore_all = True
-            glb.nan_ignore_compare = True
-        elif p1l == "compare":
-            glb.nan_ignore_compare = True
-        elif p1l == "none":
+        old_ignore_all = glb.nan_ignore_all
+        old_ignore_compare = glb.nan_ignore_compare
+        if p1 == "none":
             glb.nan_ignore_all = False
             glb.nan_ignore_compare = False
-        return f"NaN ignore set to {p1}"
+        elif p1 == "compare":
+            glb.nan_ignore_all = False
+            glb.nan_ignore_compare = True
+        elif p1 == "all":
+            glb.nan_ignore_all = True
+            glb.nan_ignore_compare = True
+        else:
+            raise LowlevelError("Unknown nanignore option: " + p1)
+        root = glb.allacts.getCurrent()
+        if not glb.nan_ignore_all and not glb.nan_ignore_compare:
+            root.disableRule("ignorenan")
+        else:
+            root.enableRule("ignorenan")
+        if old_ignore_all == glb.nan_ignore_all and old_ignore_compare == glb.nan_ignore_compare:
+            return "NaN ignore configuration unchanged"
+        return "Nan ignore configuration set to: " + p1
 
 
 class OptionWarning(ArchOption):
@@ -443,7 +596,14 @@ class OptionWarning(ArchOption):
         self.name = "warning"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Warning option: {p1}"
+        if len(p1) == 0:
+            raise ParseError("No action/rule specified")
+        val = True if len(p2) == 0 else ArchOption.onOrOff(p2)
+        res = glb.allacts.getCurrent().setWarning(val, p1)
+        if not res:
+            raise RecovError("Bad action/rule specifier: " + p1)
+        prop = "on" if val else "off"
+        return "Warnings for " + p1 + " turned " + prop
 
 
 class OptionReadOnly(ArchOption):
@@ -452,9 +612,12 @@ class OptionReadOnly(ArchOption):
         self.name = "readonly"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        val = ArchOption.onOrOff(p1) if p1 else True
-        glb.readonlypropagate = val
-        return f"Read-only propagation {'on' if val else 'off'}"
+        if len(p1) == 0:
+            raise ParseError('Read-only option must be set "on" or "off"')
+        glb.readonlypropagate = ArchOption.onOrOff(p1)
+        if glb.readonlypropagate:
+            return "Read-only memory locations now propagate as constants"
+        return "Read-only memory locations now do not propagate"
 
 
 class OptionInline(ArchOption):
@@ -463,7 +626,13 @@ class OptionInline(ArchOption):
         self.name = "inline"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Inline: {p1}"
+        infd = glb.symboltab.getGlobalScope().queryFunction(p1)
+        if infd is None:
+            raise RecovError("Unknown function name: " + p1)
+        val = True if len(p2) == 0 else (p2 == "true")
+        infd.getFuncProto().setInline(val)
+        prop = "true" if val else "false"
+        return "Inline property for function " + p1 + " = " + prop
 
 
 class OptionNoReturn(ArchOption):
@@ -472,7 +641,13 @@ class OptionNoReturn(ArchOption):
         self.name = "noreturn"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Noreturn: {p1}"
+        infd = glb.symboltab.getGlobalScope().queryFunction(p1)
+        if infd is None:
+            raise RecovError("Unknown function name: " + p1)
+        val = True if len(p2) == 0 else (p2 == "true")
+        infd.getFuncProto().setNoReturn(val)
+        prop = "true" if val else "false"
+        return "No return property for function " + p1 + " = " + prop
 
 
 class OptionIgnoreUnimplemented(ArchOption):
@@ -481,7 +656,14 @@ class OptionIgnoreUnimplemented(ArchOption):
         self.name = "ignoreunimplemented"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Ignore unimplemented set"
+        from ghidra.analysis.flow import FlowInfo
+
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.flowoptions |= FlowInfo.ignore_unimplemented
+            return "Unimplemented instructions are now ignored (treated as nop)"
+        glb.flowoptions &= ~FlowInfo.ignore_unimplemented
+        return "Unimplemented instructions now generate warnings"
 
 
 class OptionErrorUnimplemented(ArchOption):
@@ -490,7 +672,14 @@ class OptionErrorUnimplemented(ArchOption):
         self.name = "errorunimplemented"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Error on unimplemented set"
+        from ghidra.analysis.flow import FlowInfo
+
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.flowoptions |= FlowInfo.error_unimplemented
+            return "Unimplemented instructions are now a fatal error"
+        glb.flowoptions &= ~FlowInfo.error_unimplemented
+        return "Unimplemented instructions now NOT a fatal error"
 
 
 class OptionErrorReinterpreted(ArchOption):
@@ -499,7 +688,14 @@ class OptionErrorReinterpreted(ArchOption):
         self.name = "errorreinterpreted"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Error on reinterpreted set"
+        from ghidra.analysis.flow import FlowInfo
+
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.flowoptions |= FlowInfo.error_reinterpreted
+            return "Instruction reinterpretation is now a fatal error"
+        glb.flowoptions &= ~FlowInfo.error_reinterpreted
+        return "Instruction reinterpretation is now NOT a fatal error"
 
 
 class OptionErrorTooManyInstructions(ArchOption):
@@ -508,7 +704,14 @@ class OptionErrorTooManyInstructions(ArchOption):
         self.name = "errortoomanyinstructions"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Error on too many instructions set"
+        from ghidra.analysis.flow import FlowInfo
+
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.flowoptions |= FlowInfo.error_toomanyinstructions
+            return "Too many instructions are now a fatal error"
+        glb.flowoptions &= ~FlowInfo.error_toomanyinstructions
+        return "Too many instructions are now NOT a fatal error"
 
 
 class OptionAllowContextSet(ArchOption):
@@ -517,7 +720,10 @@ class OptionAllowContextSet(ArchOption):
         self.name = "allowcontextset"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Allow context set"
+        val = ArchOption.onOrOff(p1)
+        prop = "on" if val else "off"
+        glb.translate.allowContextSet(val)
+        return "Toggled allowcontextset to " + prop
 
 
 class OptionJumpLoad(ArchOption):
@@ -526,7 +732,14 @@ class OptionJumpLoad(ArchOption):
         self.name = "jumpload"
 
     def apply(self, glb, p1="", p2="", p3=""):
-        return f"Jump load: {p1}"
+        from ghidra.analysis.flow import FlowInfo
+
+        val = ArchOption.onOrOff(p1)
+        if val:
+            glb.flowoptions |= FlowInfo.record_jumploads
+            return "Jumptable analysis will record loads required to calculate jump address"
+        glb.flowoptions &= ~FlowInfo.record_jumploads
+        return "Jumptable analysis will NOT record loads"
 
 
 class OptionBraceFormat(ArchOption):
@@ -536,20 +749,27 @@ class OptionBraceFormat(ArchOption):
 
     def apply(self, glb, p1="", p2="", p3=""):
         from ghidra.output.prettyprint import Emit
-        _map = {"same": Emit.same_line, "next": Emit.next_line, "skip": Emit.skip_line}
-        style = _map.get(p2.lower(), Emit.same_line) if p2 else Emit.same_line
-        if hasattr(glb, 'print_') and glb.print_ is not None:
-            pc = glb.print_
-            target = p1.lower()
-            if target == "function":
-                pc.option_brace_func = style if hasattr(pc, 'option_brace_func') else None
-            elif target == "ifelse":
-                pc.option_brace_ifelse = style if hasattr(pc, 'option_brace_ifelse') else None
-            elif target == "loop":
-                pc.option_brace_loop = style if hasattr(pc, 'option_brace_loop') else None
-            elif target == "switch":
-                pc.option_brace_switch = style if hasattr(pc, 'option_brace_switch') else None
-        return f"Brace format for {p1} set to {p2}"
+        if glb.print_.getName() != "c-language":
+            return "Can only set brace formatting for C language"
+        if p2 == "same":
+            style = Emit.same_line
+        elif p2 == "next":
+            style = Emit.next_line
+        elif p2 == "skip":
+            style = Emit.skip_line
+        else:
+            raise ParseError("Unknown brace style: " + p2)
+        if p1 == "function":
+            glb.print_.setBraceFormatFunction(style)
+        elif p1 == "ifelse":
+            glb.print_.setBraceFormatIfElse(style)
+        elif p1 == "loop":
+            glb.print_.setBraceFormatLoop(style)
+        elif p1 == "switch":
+            glb.print_.setBraceFormatSwitch(style)
+        else:
+            raise ParseError("Unknown brace format category: " + p1)
+        return "Brace formatting for " + p1 + " set to " + p2
 
 
 class OptionStructAlign(ArchOption):
@@ -569,15 +789,16 @@ class OptionStructAlign(ArchOption):
 
 # Registry of all option classes
 _ALL_OPTIONS = [
-    OptionExtraPop, OptionDefaultPrototype, OptionInferConstPtr, OptionForLoops,
-    OptionNullPrinting, OptionInPlaceOps, OptionConventionPrinting, OptionNoCastPrinting,
-    OptionHideExtensions, OptionMaxLineWidth, OptionIndentIncrement,
-    OptionCommentIndent, OptionCommentStyle, OptionCommentHeader, OptionCommentInstruction,
-    OptionIntegerFormat, OptionSetAction, OptionCurrentAction, OptionToggleRule,
-    OptionAliasBlock, OptionMaxInstruction, OptionNamespaceStrategy,
-    OptionJumpTableMax, OptionProtoEval, OptionSetLanguage, OptionSplitDatatypes,
-    OptionNanIgnore, OptionWarning, OptionReadOnly, OptionInline, OptionNoReturn,
-    OptionIgnoreUnimplemented, OptionErrorUnimplemented, OptionErrorReinterpreted,
-    OptionErrorTooManyInstructions, OptionAllowContextSet, OptionJumpLoad,
-    OptionBraceFormat, OptionStructAlign,
+    OptionExtraPop, OptionReadOnly, OptionIgnoreUnimplemented,
+    OptionErrorUnimplemented, OptionErrorReinterpreted, OptionErrorTooManyInstructions,
+    OptionDefaultPrototype, OptionInferConstPtr, OptionForLoops, OptionInline,
+    OptionNoReturn, OptionProtoEval, OptionWarning, OptionNullPrinting,
+    OptionInPlaceOps, OptionConventionPrinting, OptionNoCastPrinting,
+    OptionMaxLineWidth, OptionIndentIncrement, OptionCommentIndent,
+    OptionCommentStyle, OptionCommentHeader, OptionCommentInstruction,
+    OptionIntegerFormat, OptionBraceFormat, OptionCurrentAction,
+    OptionAllowContextSet, OptionSetAction, OptionSetLanguage,
+    OptionJumpTableMax, OptionJumpLoad, OptionToggleRule, OptionAliasBlock,
+    OptionMaxInstruction, OptionNamespaceStrategy, OptionSplitDatatypes,
+    OptionNanIgnore,
 ]

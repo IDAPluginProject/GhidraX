@@ -7,12 +7,13 @@ architecture and load image.
 
 from __future__ import annotations
 
+import math
 from typing import Optional, List, Dict, TYPE_CHECKING
 
 from ghidra.core.address import Address, Range, RangeList, RangeProperties, calc_mask
-from ghidra.core.error import LowlevelError
+from ghidra.core.error import LowlevelError, ParseError
 from ghidra.core.space import (
-    AddrSpace, AddrSpaceManager,
+    AddrSpace, AddrSpaceManager, OtherSpace, SpacebaseSpace,
     IPTR_PROCESSOR, IPTR_SPACEBASE, IPTR_INTERNAL,
 )
 from ghidra.core.translate import Translate
@@ -22,22 +23,74 @@ from ghidra.core.globalcontext import ContextDatabase, ContextInternal
 from ghidra.types.datatype import TypeFactory
 from ghidra.types.cast import CastStrategyC
 from ghidra.database.database import Database, ScopeInternal
-from ghidra.database.comment import CommentDatabase, CommentDatabaseInternal
+from ghidra.database.comment import Comment, CommentDatabase, CommentDatabaseInternal
 from ghidra.database.stringmanage import StringManager, StringManagerUnicode
 from ghidra.database.cpool import ConstantPool, ConstantPoolInternal
-from ghidra.fspec.fspec import ProtoModel, FuncProto
+from ghidra.fspec.fspec import ProtoModel, FuncProto, UnknownProtoModel
 from ghidra.ir.typeop import TypeOp, registerTypeOps
 from ghidra.output.printlanguage import PrintLanguage, PrintLanguageCapability
 from ghidra.output.printc import PrintC
 from ghidra.output.prettyprint import EmitMarkup
 from ghidra.transform.action import ActionDatabase
-from ghidra.arch.loadimage import LoadImage
+from ghidra.arch.loadimage import LoadImage, LoadImageFunc
 from ghidra.arch.userop import UserOpManage
-from ghidra.arch.override import Override
+from ghidra.arch.override import Override, ELEM_FLOW, ATTRIB_TYPE
 from ghidra.arch.inject import PcodeInjectLibrary
 
 if TYPE_CHECKING:
     from ghidra.analysis.funcdata import Funcdata
+
+
+ELEM_FLOWOVERRIDELIST = 140
+
+
+# =========================================================================
+# Statistics
+# =========================================================================
+
+class Statistics:
+    """Collect simple cast statistics across processed functions."""
+
+    def __init__(self) -> None:
+        self.numfunc: int = 0
+        self.numvar: int = 0
+        self.coversum: int = 0
+        self.coversumsq: int = 0
+        self.lastcastcount: int = 0
+        self.castcount: int = 0
+        self.castcountsq: int = 0
+
+    def __del__(self) -> None:
+        pass
+
+    def process_cast(self, data: Funcdata) -> None:
+        perfunc = self.castcount - self.lastcastcount
+        self.lastcastcount = self.castcount
+        self.castcountsq += perfunc * perfunc
+
+    def countCast(self) -> None:
+        self.castcount += 1
+
+    def process(self, fd: Funcdata) -> None:
+        self.numfunc += 1
+        self.process_cast(fd)
+
+    def printResults(self, s) -> None:
+        s.write(f"Number of functions: {self.numfunc}\n")
+
+        if self.numfunc == 0:
+            average = math.inf if self.castcount != 0 else math.nan
+            variance = math.inf if self.castcountsq != 0 else math.nan
+        else:
+            average = float(self.castcount) / float(self.numfunc)
+            variance = float(self.castcountsq) / float(self.numfunc)
+        variance -= average * average
+        stddev = math.sqrt(variance) if variance >= 0.0 else math.nan
+
+        s.write(f"Total functions = {self.numfunc}\n")
+        s.write(f"Total casts = {self.castcount}\n")
+        s.write(f"Average casts per function = {format(average, 'g')}\n")
+        s.write(f"        Standard deviation = {format(stddev, 'g')}\n")
 
 
 # =========================================================================
@@ -127,6 +180,8 @@ class Architecture(AddrSpaceManager):
 
     def __init__(self) -> None:
         super().__init__()
+        from ghidra.arch.options import OptionDatabase
+
         self.archid: str = ""
 
         # Configuration data — resetDefaultsInternal sets these
@@ -174,13 +229,15 @@ class Architecture(AddrSpaceManager):
         self.cpool: Optional[ConstantPool] = None
         self.print_: Optional[PrintLanguage] = None
         self.printlist: List[PrintLanguage] = []
-        self.options = None  # OptionDatabase
+        self.options = OptionDatabase(self)
         self.inst: List[Optional[TypeOp]] = []
         self.userops: UserOpManage = UserOpManage()
         self.splitrecords: list = []
         self.lanerecords: list = []
         self.allacts: ActionDatabase = ActionDatabase()
         self.loadersymbols_parsed: bool = False
+        self.stats: Statistics = Statistics()
+        self._debugstream = None
         self.override: Optional[Override] = None
         self.extra_pop: int = 0
 
@@ -189,9 +246,46 @@ class Architecture(AddrSpaceManager):
         self.printlist.append(pc)
         self.print_ = pc
 
+    def __del__(self) -> None:
+        inst = self.__dict__.get("inst")
+        if inst is not None:
+            inst.clear()
+
+        extra_pool_rules = self.__dict__.get("extra_pool_rules")
+        if extra_pool_rules is not None:
+            extra_pool_rules.clear()
+
+        proto_models = self.__dict__.get("protoModels")
+        if proto_models is not None:
+            proto_models.clear()
+
+        printlist = self.__dict__.get("printlist")
+        if printlist is not None:
+            printlist.clear()
+
+        for name in (
+            "symboltab",
+            "print_",
+            "options",
+            "stats",
+            "defaultfp",
+            "evalfp_current",
+            "evalfp_called",
+            "types",
+            "translate",
+            "loader",
+            "pcodeinjectlib",
+            "commentdb",
+            "stringManager",
+            "cpool",
+            "context",
+        ):
+            if name in self.__dict__:
+                setattr(self, name, None)
+
     # --- Initialization ---
 
-    def init(self, store=None) -> None:
+    def init(self, store) -> None:
         """Load the image and configure architecture.
 
         Follows the C++ Architecture::init() ordering exactly.
@@ -209,10 +303,8 @@ class Architecture(AddrSpaceManager):
 
         self.restoreFromSpec(store)
         self.buildCoreTypes(store)
-        if self.print_ is not None:
-            self.print_.initializeFromArchitecture()
-        if self.symboltab is not None:
-            self.symboltab.adjustCaches()
+        self.print_.initializeFromArchitecture()
+        self.symboltab.adjustCaches()
         self.buildSymbols(store)
         self.postSpecFile()
 
@@ -258,22 +350,17 @@ class Architecture(AddrSpaceManager):
 
         Clones behavior from the default model.
         """
-        if self.defaultfp is None:
-            return None
-        model = ProtoModel(modelName, self.defaultfp)
+        model = UnknownProtoModel(modelName, self.defaultfp)
         self.protoModels[modelName] = model
         if modelName == "unknown":
-            if hasattr(model, 'setPrintInDecl'):
-                model.setPrintInDecl(False)
+            model.setPrintInDecl(False)
         return model
 
     def setDefaultModel(self, model: ProtoModel) -> None:
         """Set the default PrototypeModel."""
         if self.defaultfp is not None:
-            if hasattr(self.defaultfp, 'setPrintInDecl'):
-                self.defaultfp.setPrintInDecl(True)
-        if hasattr(model, 'setPrintInDecl'):
-            model.setPrintInDecl(False)
+            self.defaultfp.setPrintInDecl(True)
+        model.setPrintInDecl(False)
         self.defaultfp = model
 
     def addModel(self, model: ProtoModel) -> None:
@@ -284,13 +371,13 @@ class Architecture(AddrSpaceManager):
         parent = self.protoModels.get(parentName)
         if parent is None:
             raise LowlevelError("Requesting non-existent prototype model: " + parentName)
-        if hasattr(parent, 'isMerged') and parent.isMerged():
+        if parent.isMerged():
             raise LowlevelError("Cannot make alias of merged model: " + parentName)
-        if hasattr(parent, 'getAliasParent') and parent.getAliasParent() is not None:
+        if parent.getAliasParent() is not None:
             raise LowlevelError("Cannot make alias of an alias: " + parentName)
         if aliasName in self.protoModels:
             raise LowlevelError("Duplicate ProtoModel name: " + aliasName)
-        self.protoModels[aliasName] = ProtoModel(aliasName, parent)
+        self.protoModels[aliasName] = parent.cloneWithName(aliasName)
 
     # --- Language selection ---
 
@@ -299,25 +386,21 @@ class Architecture(AddrSpaceManager):
         for pl in self.printlist:
             if pl.getName() == nm:
                 self.print_ = pl
-                if hasattr(pl, 'adjustTypeOperators'):
-                    pl.adjustTypeOperators()
+                pl.adjustTypeOperators()
                 return
         capability = PrintLanguageCapability.findCapability(nm)
         if capability is None:
             raise LowlevelError("Unknown print language: " + nm)
-        printMarkup = self.print_.emitsMarkup() if self.print_ is not None and hasattr(self.print_, 'emitsMarkup') else False
-        t = self.print_.getOutputStream() if self.print_ is not None and hasattr(self.print_, 'getOutputStream') else None
+        printMarkup = self.print_.emitsMarkup()
+        t = self.print_.getOutputStream()
         pl = capability.buildLanguage(self)
-        if t is not None and hasattr(pl, 'setOutputStream'):
-            pl.setOutputStream(t)
-        if hasattr(pl, 'initializeFromArchitecture'):
-            pl.initializeFromArchitecture()
-        if printMarkup and hasattr(pl, 'setMarkup'):
+        pl.setOutputStream(t)
+        pl.initializeFromArchitecture()
+        if printMarkup:
             pl.setMarkup(True)
         self.printlist.append(pl)
         self.print_ = pl
-        if hasattr(pl, 'adjustTypeOperators'):
-            pl.adjustTypeOperators()
+        pl.adjustTypeOperators()
 
     def getPrintLanguage(self) -> Optional[PrintLanguage]:
         return self.print_
@@ -326,34 +409,34 @@ class Architecture(AddrSpaceManager):
 
     def clearAnalysis(self, fd: Funcdata) -> None:
         """Throw out the syntax tree and derived information about a single function."""
-        if hasattr(fd, 'clear'):
-            fd.clear()
-        if self.commentdb is not None and hasattr(self.commentdb, 'clearType'):
-            self.commentdb.clearType(fd.getAddress(), 0x6)  # warning|warningheader
+        fd.clear()
+        self.commentdb.clearType(
+            fd.getAddress(),
+            Comment.CommentType.warning | Comment.CommentType.warningheader,
+        )
 
-    def readLoaderSymbols(self, delim: str = "") -> None:
+    def readLoaderSymbols(self, delim: str) -> None:
         """Read any symbols from loader into database."""
         if self.loadersymbols_parsed:
             return
+        self.loader.openSymbols()
         self.loadersymbols_parsed = True
-        if self.loader is not None and hasattr(self.loader, 'openSymbols'):
-            self.loader.openSymbols()
-            if hasattr(self.loader, 'getNextSymbol'):
-                while True:
-                    record = self.loader.getNextSymbol()
-                    if record is None:
-                        break
-                    # Would resolve scope and add function
-            if hasattr(self.loader, 'closeSymbols'):
-                self.loader.closeSymbols()
+        record = LoadImageFunc()
+        while self.loader.getNextSymbol(record):
+            basename: List[str] = []
+            scope = self.symboltab.findCreateScopeFromSymbolName(
+                record.name, delim, basename, None
+            )
+            scope.addFunction(record.address, basename[0])
+        self.loader.closeSymbols()
 
-    def collectBehaviors(self) -> List[Optional[OpBehavior]]:
+    def collectBehaviors(self, behave: List[Optional[OpBehavior]]) -> None:
         """For all registered p-code opcodes, return the corresponding OpBehavior."""
-        behave: List[Optional[OpBehavior]] = [None] * len(self.inst)
+        behave[:] = [None] * len(self.inst)
         for i, op in enumerate(self.inst):
-            if op is not None:
-                behave[i] = op.getBehavior()
-        return behave
+            if op is None:
+                continue
+            behave[i] = op.getBehavior()
 
     def getSegmentOp(self, spc: AddrSpace):
         """Retrieve the segment op for the given space if any."""
@@ -363,26 +446,23 @@ class Architecture(AddrSpaceManager):
         segdef = self.userops.getSegmentOp(idx)
         if segdef is None:
             return None
-        if hasattr(segdef, 'getResolve') and segdef.getResolve().space is not None:
+        if segdef.getResolve().space is not None:
             return segdef
         return None
 
     def setPrototype(self, pieces) -> None:
         """Establish details of the prototype for a given function symbol."""
-        if self.symboltab is None:
-            return
-        basename = getattr(pieces, 'name', '')
-        scope = self.symboltab.getGlobalScope()
+        basename: List[str] = []
+        scope = self.symboltab.resolveScopeFromSymbolName(pieces.name, "::", basename, None)
         if scope is None:
-            return
-        fd = scope.queryFunction(basename)
-        if fd is not None and hasattr(fd, 'getFuncProto'):
-            fd.getFuncProto().setPieces(pieces)
+            raise ParseError("Unknown namespace: " + pieces.name)
+        fd = scope.queryFunction(basename[0])
+        if fd is None:
+            raise ParseError("Unknown function name: " + pieces.name)
+        fd.getFuncProto().setPieces(pieces)
 
     def globalify(self) -> None:
         """Set all IPTR_PROCESSOR and IPTR_SPACEBASE spaces to be global."""
-        if self.symboltab is None:
-            return
         scope = self.symboltab.getGlobalScope()
         nm = self.numSpaces()
         for i in range(nm):
@@ -396,45 +476,39 @@ class Architecture(AddrSpaceManager):
 
     def addToGlobalScope(self, props: RangeProperties) -> None:
         """Add a memory range parsed from a <global> tag to the global scope."""
-        if self.symboltab is None:
-            return
         scope = self.symboltab.getGlobalScope()
         rng = Range.from_properties(props, self)
         spc = rng.getSpace()
         self.inferPtrSpaces.append(spc)
         self.symboltab.addRange(scope, spc, rng.getFirst(), rng.getLast())
-        if hasattr(spc, 'isOverlayBase') and spc.isOverlayBase():
+        if spc.isOverlayBase():
             num = self.numSpaces()
             for i in range(num):
                 ospc = self.getSpace(i)
-                if ospc is None or not hasattr(ospc, 'isOverlay') or not ospc.isOverlay():
+                if ospc is None or not ospc.isOverlay():
                     continue
-                if hasattr(ospc, 'getContain') and ospc.getContain() is not spc:
+                if ospc.getContain() is not spc:
                     continue
                 self.symboltab.addRange(scope, ospc, rng.getFirst(), rng.getLast())
 
     def addOtherSpace(self) -> None:
         """Add OTHER space and all of its overlays to the symboltab."""
-        if self.symboltab is None:
-            return
         scope = self.symboltab.getGlobalScope()
-        otherSpace = self.getSpaceByName("OTHER")
-        if otherSpace is None:
-            return
+        otherSpace = self.getSpaceByName(OtherSpace.NAME)
         self.symboltab.addRange(scope, otherSpace, 0, otherSpace.getHighest())
-        if hasattr(otherSpace, 'isOverlayBase') and otherSpace.isOverlayBase():
+        if otherSpace.isOverlayBase():
             num = self.numSpaces()
             for i in range(num):
                 ospc = self.getSpace(i)
-                if ospc is None or not hasattr(ospc, 'isOverlay') or not ospc.isOverlay():
+                if not ospc.isOverlay():
                     continue
-                if hasattr(ospc, 'getContain') and ospc.getContain() is not otherSpace:
+                if ospc.getContain() is not otherSpace:
                     continue
                 self.symboltab.addRange(scope, ospc, 0, otherSpace.getHighest())
 
     def highPtrPossible(self, loc: Address, size: int) -> bool:
         """Are pointers possible to the given location?"""
-        if loc.getSpace() is not None and loc.getSpace().getType() == IPTR_INTERNAL:
+        if loc.getSpace().getType() == IPTR_INTERNAL:
             return False
         return not self.nohighptr.inRange(loc, size)
 
@@ -444,8 +518,6 @@ class Architecture(AddrSpaceManager):
         for i in range(sz):
             spc = self.getSpace(i)
             if spc is None:
-                continue
-            if not hasattr(spc, 'numSpacebase'):
                 continue
             numbase = spc.numSpacebase()
             for j in range(numbase):
@@ -496,7 +568,21 @@ class Architecture(AddrSpaceManager):
                      truncSize: int = 0, isreversejustified: bool = False,
                      stackGrowth: bool = True, isFormal: bool = False) -> None:
         """Create a new address space associated with a pointer register."""
-        pass  # Requires SpacebaseSpace which is architecture-specific
+        ind = self.numSpaces()
+        spc = SpacebaseSpace(
+            self,
+            self.translate,
+            nm,
+            ind,
+            truncSize,
+            basespace,
+            ptrdata.space.getDelay() + 1,
+            isFormal,
+        )
+        if isreversejustified:
+            self.setReverseJustified(spc)
+        self.insertSpace(spc)
+        self.addSpacebasePointer(spc, ptrdata, truncSize, stackGrowth)
 
     def addNoHighPtr(self, rng: Range) -> None:
         """Add a new region where pointers do not exist."""
@@ -508,19 +594,96 @@ class Architecture(AddrSpaceManager):
 
     def printMessage(self, message: str) -> None:
         """Print an error message to console."""
-        print(f"[Architecture] {message}")
+        raise NotImplementedError("Architecture.printMessage() must be implemented by subclasses")
 
     def decodeFlowOverride(self, decoder) -> None:
         """Decode flow overrides from a stream."""
-        pass
+        elemId = decoder.openElement(ELEM_FLOWOVERRIDELIST)
+        while True:
+            subId = decoder.openElement()
+            if subId != ELEM_FLOW:
+                break
+            flowType = decoder.readString(ATTRIB_TYPE)
+            funcaddr = Address.decode(decoder)
+            overaddr = Address.decode(decoder)
+            fd = self.symboltab.getGlobalScope().queryFunction(funcaddr)
+            if fd is not None:
+                fd.getOverride().insertFlowOverride(
+                    overaddr, Override.stringToType(flowType)
+                )
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
 
     def encode(self, encoder) -> None:
         """Encode this architecture to a stream."""
-        pass
+        from ghidra.core.marshal import ATTRIB_LOADERSYMBOLS, ELEM_SAVE_STATE
+
+        encoder.openElement(ELEM_SAVE_STATE)
+        encoder.writeBool(ATTRIB_LOADERSYMBOLS, self.loadersymbols_parsed)
+        self.types.encode(encoder)
+        self.symboltab.encode(encoder)
+        self.context.encode(encoder)
+        self.commentdb.encode(encoder)
+        self.stringManager.encode(encoder)
+        if not self.cpool.empty():
+            self.cpool.encode(encoder)
+        encoder.closeElement(ELEM_SAVE_STATE)
 
     def restoreXml(self, store) -> None:
         """Restore the Architecture state from XML documents."""
-        pass
+        from ghidra.core.marshal import (
+            ATTRIB_LOADERSYMBOLS,
+            ELEM_COMMENTDB,
+            ELEM_CONSTANTPOOL,
+            ELEM_CONTEXT_POINTS,
+            ELEM_DB,
+            ELEM_INJECTDEBUG,
+            ELEM_OPTIONSLIST,
+            ELEM_SAVE_STATE,
+            ELEM_STRINGMANAGE,
+            ELEM_TYPEGRP,
+            XmlDecode,
+        )
+
+        el = store.getTag(ELEM_SAVE_STATE.getName())
+        if el is None:
+            raise LowlevelError("Could not find save_state tag")
+
+        decoder = XmlDecode(self, el)
+        elemId = decoder.openElement(ELEM_SAVE_STATE)
+        self.loadersymbols_parsed = False
+        while True:
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_LOADERSYMBOLS.id:
+                self.loadersymbols_parsed = decoder.readBool()
+
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_TYPEGRP.id:
+                self.types.decode(decoder)
+            elif subId == ELEM_DB.id:
+                self.symboltab.decode(decoder)
+            elif subId == ELEM_CONTEXT_POINTS.id:
+                self.context.decode(decoder)
+            elif subId == ELEM_COMMENTDB.id:
+                self.commentdb.decode(decoder)
+            elif subId == ELEM_STRINGMANAGE.id:
+                self.stringManager.decode(decoder)
+            elif subId == ELEM_CONSTANTPOOL.id:
+                self.cpool.decode(decoder, self.types)
+            elif subId == ELEM_OPTIONSLIST.id:
+                self.options.decode(decoder)
+            elif subId == ELEM_FLOWOVERRIDELIST:
+                self.decodeFlowOverride(decoder)
+            elif subId == ELEM_INJECTDEBUG.id:
+                self.pcodeinjectlib.decodeDebug(decoder)
+            else:
+                raise LowlevelError("XML error restoring architecture")
+        decoder.closeElement(elemId)
 
     def decompileFunction(self, fd) -> str:
         """Run the full decompilation pipeline on a Funcdata and return C output."""
@@ -541,72 +704,70 @@ class Architecture(AddrSpaceManager):
 
     # --- Protected factory routines ---
 
-    def buildLoader(self, store=None) -> None:
+    def buildLoader(self, store) -> None:
         """Build the LoadImage object and load the executable image."""
-        pass
+        raise NotImplementedError("Architecture.buildLoader is pure virtual in C++")
 
-    def buildTranslator(self, store=None):
+    def buildTranslator(self, store):
         """Build the Translator object."""
-        return self.translate
+        raise NotImplementedError("Architecture.buildTranslator is pure virtual in C++")
 
     def buildPcodeInjectLibrary(self):
         """Build the injection library."""
-        return PcodeInjectLibrary()
+        raise NotImplementedError("Architecture.buildPcodeInjectLibrary is pure virtual in C++")
 
-    def buildTypegrp(self, store=None) -> None:
+    def buildTypegrp(self, store) -> None:
         """Build the data-type factory and prepopulate with core types."""
-        self.types = TypeFactory()
-        self.types.setupCoreTypes()
+        raise NotImplementedError("Architecture.buildTypegrp is pure virtual in C++")
 
-    def buildCoreTypes(self, store=None) -> None:
+    def buildCoreTypes(self, store) -> None:
         """Add core primitive data-types."""
-        if self.types is not None:
-            self.types.setupCoreTypes()
+        raise NotImplementedError("Architecture.buildCoreTypes is pure virtual in C++")
 
-    def buildCommentDB(self, store=None) -> None:
+    def buildCommentDB(self, store) -> None:
         """Build the comment database."""
-        self.commentdb = CommentDatabaseInternal()
+        raise NotImplementedError("Architecture.buildCommentDB is pure virtual in C++")
 
-    def buildStringManager(self, store=None) -> None:
+    def buildStringManager(self, store) -> None:
         """Build container for decoded strings."""
-        self.stringManager = StringManagerUnicode(self, 256)
+        raise NotImplementedError("Architecture.buildStringManager is pure virtual in C++")
 
-    def buildConstantPool(self, store=None) -> None:
+    def buildConstantPool(self, store) -> None:
         """Build the constant pool."""
-        self.cpool = ConstantPoolInternal()
+        raise NotImplementedError("Architecture.buildConstantPool is pure virtual in C++")
 
-    def buildDatabase(self, store=None):
+    def buildDatabase(self, store):
         """Build the database and global scope."""
-        self.symboltab = Database(self)
+        self.symboltab = Database(self, True)
         globscope = ScopeInternal(0, "", self)
         self.symboltab.attachScope(globscope, None)
         return globscope
 
-    def buildInstructions(self, store=None) -> None:
+    def buildInstructions(self, store) -> None:
         """Register the p-code operations."""
         self.inst = registerTypeOps(self.types, self.translate)
 
-    def buildAction(self, store=None) -> None:
+    def buildAction(self, store) -> None:
         """Build the Action framework with the universal decompilation pipeline."""
         self.parseExtraRules(store)
         self.allacts.universalAction(self)
         self.allacts.resetDefaults()
 
-    def buildContext(self, store=None) -> None:
+    def buildContext(self, store) -> None:
         """Build the Context database."""
-        self.context = ContextInternal()
+        raise NotImplementedError("Architecture.buildContext is pure virtual in C++")
 
-    def buildSymbols(self, store=None) -> None:
+    def buildSymbols(self, store) -> None:
         """Build any symbols from spec files."""
-        pass
+        raise NotImplementedError("Architecture.buildSymbols is pure virtual in C++")
 
-    def buildSpecFile(self, store=None) -> None:
+    def buildSpecFile(self, store) -> None:
         """Load any relevant specification files."""
-        pass
+        raise NotImplementedError("Architecture.buildSpecFile is pure virtual in C++")
 
-    def modifySpaces(self, trans=None) -> None:
+    def modifySpaces(self, trans) -> None:
         """Modify address spaces as required by this Architecture."""
-        pass
+        raise NotImplementedError("Architecture.modifySpaces is pure virtual in C++")
 
     def postSpecFile(self) -> None:
         """Let components initialize after Translate is built."""
@@ -614,40 +775,68 @@ class Architecture(AddrSpaceManager):
 
     def resolveArchitecture(self) -> None:
         """Figure out the processor and compiler of the target executable."""
-        pass
+        raise NotImplementedError("Architecture.resolveArchitecture is pure virtual in C++")
 
-    def restoreFromSpec(self, store=None) -> None:
+    def restoreFromSpec(self, store) -> None:
         """Fully initialize the Translate object."""
+        from ctypes import sizeof, c_void_p
+        from sys import byteorder
+        from ghidra.core.space import AddrSpace, IPTR_FSPEC, IPTR_IOP, JoinSpace
+
         newtrans = self.buildTranslator(store)
-        if newtrans is not None:
-            if hasattr(newtrans, 'initialize'):
-                newtrans.initialize(store)
-            self.translate = newtrans
-            self.modifySpaces(newtrans)
-            self.copySpaces(newtrans)
+        newtrans.initialize(store)
+        self.translate = newtrans
+        self.modifySpaces(newtrans)
+        self.copySpaces(newtrans)
+        host_big_end = byteorder == "big"
+        self.insertSpace(
+            AddrSpace(
+                self,
+                self.translate,
+                IPTR_FSPEC,
+                "fspec",
+                host_big_end,
+                sizeof(c_void_p),
+                1,
+                self.numSpaces(),
+                0,
+                1,
+                1,
+            )
+        )
+        self.insertSpace(
+            AddrSpace(
+                self,
+                self.translate,
+                IPTR_IOP,
+                "iop",
+                host_big_end,
+                sizeof(c_void_p),
+                1,
+                self.numSpaces(),
+                0,
+                1,
+                1,
+            )
+        )
+        self.insertSpace(JoinSpace(self, self.translate, self.numSpaces()))
         self.userops.initialize(self)
-        if self.translate is not None and hasattr(self.translate, 'getAlignment'):
-            align = self.translate.getAlignment()
-            if align <= 8:
-                self.min_funcsymbol_size = align
+        if self.translate.getAlignment() <= 8:
+            self.min_funcsymbol_size = self.translate.getAlignment()
         self.pcodeinjectlib = self.buildPcodeInjectLibrary()
         self.parseProcessorConfig(store)
-        if self.translate is not None and hasattr(self.translate, 'setDefaultFloatFormats'):
-            self.translate.setDefaultFloatFormats()
+        newtrans.setDefaultFloatFormats()
         self.parseCompilerConfig(store)
         self.buildAction(store)
 
     def fillinReadOnlyFromLoader(self) -> None:
         """Load info about read-only sections."""
-        if self.loader is None:
-            return
-        if not hasattr(self.loader, 'getReadonly'):
-            return
+        from ghidra.ir.varnode import Varnode
+
         rangelist = RangeList()
         self.loader.getReadonly(rangelist)
         for rng in rangelist:
-            if self.symboltab is not None:
-                self.symboltab.setPropertyRange(0x1, rng)  # Varnode::readonly
+            self.symboltab.setPropertyRange(Varnode.readonly, rng)
 
     def initializeSegments(self) -> None:
         """Set up segment resolvers."""
@@ -664,10 +853,8 @@ class Architecture(AddrSpaceManager):
         copyList = list(self.inferPtrSpaces)
         dcs = self.getDefaultCodeSpace()
         dds = self.getDefaultDataSpace()
-        if dcs is not None:
-            copyList.append(dcs)
-        if dds is not None:
-            copyList.append(dds)
+        copyList.append(dcs)
+        copyList.append(dds)
         self.inferPtrSpaces.clear()
         copyList.sort(key=lambda s: s.getIndex())
         lastSpace = None
@@ -679,9 +866,9 @@ class Architecture(AddrSpaceManager):
                 continue
             if spc.getType() == IPTR_SPACEBASE:
                 continue
-            if hasattr(spc, 'isOtherSpace') and spc.isOtherSpace():
+            if spc.isOtherSpace():
                 continue
-            if hasattr(spc, 'isOverlay') and spc.isOverlay():
+            if spc.isOverlay():
                 continue
             self.inferPtrSpaces.append(spc)
         defPos = -1
@@ -689,7 +876,7 @@ class Architecture(AddrSpaceManager):
             if spc is dds:
                 defPos = i
             segOp = self.getSegmentOp(spc)
-            if segOp is not None and hasattr(segOp, 'getInnerSize'):
+            if segOp is not None:
                 val = segOp.getInnerSize()
                 self.markNearPointers(spc, val)
         if defPos > 0:
@@ -698,17 +885,224 @@ class Architecture(AddrSpaceManager):
 
     # --- Decode/parse configuration methods ---
 
-    def parseProcessorConfig(self, store=None) -> None:
+    def parseProcessorConfig(self, store) -> None:
         """Apply processor specific configuration."""
-        pass
+        from ghidra.core.marshal import (
+            ATTRIB_SPACE,
+            ELEM_ADDRESS_SHIFT_AMOUNT,
+            ELEM_CONTEXT_DATA,
+            ELEM_DATA_SPACE,
+            ELEM_DEFAULT_MEMORY_BLOCKS,
+            ELEM_DEFAULT_SYMBOLS,
+            ELEM_INCIDENTALCOPY,
+            ELEM_INFERPTRBOUNDS,
+            ELEM_JUMPASSIST,
+            ELEM_PROCESSOR_SPEC,
+            ELEM_PROGRAMCOUNTER,
+            ELEM_PROPERTIES,
+            ELEM_REGISTER_DATA,
+            ELEM_SEGMENTED_ADDRESS,
+            ELEM_SEGMENTOP,
+            ELEM_VOLATILE,
+            XmlDecode,
+        )
 
-    def parseCompilerConfig(self, store=None) -> None:
+        el = store.getTag("processor_spec")
+        if el is None:
+            raise LowlevelError("No processor configuration tag found")
+        decoder = XmlDecode(self, el)
+        elemId = decoder.openElement(ELEM_PROCESSOR_SPEC)
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_PROGRAMCOUNTER.id:
+                decoder.openElement()
+                decoder.closeElementSkipping(subId)
+            elif subId == ELEM_VOLATILE.id:
+                self.decodeVolatile(decoder)
+            elif subId == ELEM_INCIDENTALCOPY.id:
+                self.decodeIncidentalCopy(decoder)
+            elif subId == ELEM_CONTEXT_DATA.id:
+                self.context.decodeFromSpec(decoder)
+            elif subId == ELEM_JUMPASSIST.id:
+                self.userops.decodeJumpAssist(decoder, self)
+            elif subId == ELEM_SEGMENTOP.id:
+                self.userops.decodeSegmentOp(decoder, self)
+            elif subId == ELEM_REGISTER_DATA.id:
+                self.decodeRegisterData(decoder)
+            elif subId == ELEM_DATA_SPACE.id:
+                subElemId = decoder.openElement()
+                spc = decoder.readSpace(ATTRIB_SPACE)
+                decoder.closeElement(subElemId)
+                self.setDefaultDataSpace(spc.getIndex())
+            elif subId == ELEM_INFERPTRBOUNDS.id:
+                self.decodeInferPtrBounds(decoder)
+            elif subId == ELEM_SEGMENTED_ADDRESS.id:
+                decoder.openElement()
+                decoder.closeElementSkipping(subId)
+            elif subId == ELEM_DEFAULT_SYMBOLS.id:
+                decoder.openElement()
+                store.registerTag(decoder._currentElement())
+                decoder.closeElementSkipping(subId)
+            elif subId == ELEM_DEFAULT_MEMORY_BLOCKS.id:
+                decoder.openElement()
+                decoder.closeElementSkipping(subId)
+            elif subId == ELEM_ADDRESS_SHIFT_AMOUNT.id:
+                decoder.openElement()
+                decoder.closeElementSkipping(subId)
+            elif subId == ELEM_PROPERTIES.id:
+                decoder.openElement()
+                decoder.closeElementSkipping(subId)
+            else:
+                raise LowlevelError("Unknown element in <processor_spec>")
+        decoder.closeElement(elemId)
+
+    def parseCompilerConfig(self, store) -> None:
         """Apply compiler specific configuration."""
-        pass
+        from ghidra.analysis.prefersplit import PreferSplitManager
+        from ghidra.arch.inject import InjectPayload
+        from ghidra.arch.override import ELEM_DEADCODEDELAY
+        from ghidra.core.marshal import (
+            ATTRIB_NAME,
+            ATTRIB_PARENT,
+            ELEM_AGGRESSIVETRIM,
+            ELEM_CALLOTHERFIXUP,
+            ELEM_CALLFIXUP,
+            ELEM_COMPILER_SPEC,
+            ELEM_CONTEXT_DATA,
+            ELEM_DATA_ORGANIZATION,
+            ELEM_DEFAULT_PROTO,
+            ELEM_ENUM,
+            ELEM_EVAL_CALLED_PROTOTYPE,
+            ELEM_EVAL_CURRENT_PROTOTYPE,
+            ELEM_FUNCPTR,
+            ELEM_GLOBAL,
+            ELEM_INFERPTRBOUNDS,
+            ELEM_MODELALIAS,
+            ELEM_NOHIGHPTR,
+            ELEM_PREFERSPLIT,
+            ELEM_PROTOTYPE,
+            ELEM_READONLY,
+            ELEM_RESOLVEPROTOTYPE,
+            ELEM_RETURNADDRESS,
+            ELEM_SEGMENTOP,
+            ELEM_SPACEBASE,
+            ELEM_SPECEXTENSIONS,
+            ELEM_STACKPOINTER,
+            XmlDecode,
+        )
 
-    def parseExtraRules(self, store=None) -> None:
+        globalRanges = []
+        el = store.getTag("compiler_spec")
+        if el is None:
+            raise LowlevelError("No compiler configuration tag found")
+        decoder = XmlDecode(self, el)
+        elemId = decoder.openElement(ELEM_COMPILER_SPEC)
+        while True:
+            subId = decoder.peekElement()
+            if subId == 0:
+                break
+            if subId == ELEM_DEFAULT_PROTO.id:
+                self.decodeDefaultProto(decoder)
+            elif subId == ELEM_PROTOTYPE.id:
+                self.decodeProto(decoder)
+            elif subId == ELEM_STACKPOINTER.id:
+                self.decodeStackPointer(decoder)
+            elif subId == ELEM_RETURNADDRESS.id:
+                self.decodeReturnAddress(decoder)
+            elif subId == ELEM_SPACEBASE.id:
+                self.decodeSpacebase(decoder)
+            elif subId == ELEM_NOHIGHPTR.id:
+                self.decodeNoHighPtr(decoder)
+            elif subId == ELEM_PREFERSPLIT.id:
+                self.decodePreferSplit(decoder)
+            elif subId == ELEM_AGGRESSIVETRIM.id:
+                self.decodeAggressiveTrim(decoder)
+            elif subId == ELEM_DATA_ORGANIZATION.id:
+                self.types.decodeDataOrganization(decoder)
+            elif subId == ELEM_ENUM.id:
+                self.types.parseEnumConfig(decoder)
+            elif subId == ELEM_GLOBAL.id:
+                self.decodeGlobal(decoder, globalRanges)
+            elif subId == ELEM_SEGMENTOP.id:
+                self.userops.decodeSegmentOp(decoder, self)
+            elif subId == ELEM_READONLY.id:
+                self.decodeReadOnly(decoder)
+            elif subId == ELEM_CONTEXT_DATA.id:
+                self.context.decodeFromSpec(decoder)
+            elif subId == ELEM_RESOLVEPROTOTYPE.id:
+                self.decodeProto(decoder)
+            elif subId == ELEM_EVAL_CALLED_PROTOTYPE.id:
+                self.decodeProtoEval(decoder)
+            elif subId == ELEM_EVAL_CURRENT_PROTOTYPE.id:
+                self.decodeProtoEval(decoder)
+            elif subId == ELEM_CALLFIXUP.id:
+                self.pcodeinjectlib.decodeInject(self.archid + " : compiler spec", "", InjectPayload.CALLFIXUP_TYPE, decoder)
+            elif subId == ELEM_CALLOTHERFIXUP.id:
+                self.userops.decodeCallOtherFixup(decoder, self)
+            elif subId == ELEM_FUNCPTR.id:
+                self.decodeFuncPtrAlign(decoder)
+            elif subId == ELEM_DEADCODEDELAY:
+                self.decodeDeadcodeDelay(decoder)
+            elif subId == ELEM_INFERPTRBOUNDS.id:
+                self.decodeInferPtrBounds(decoder)
+            elif subId == ELEM_MODELALIAS.id:
+                subElemId = decoder.openElement()
+                aliasName = decoder.readString(ATTRIB_NAME)
+                parentName = decoder.readString(ATTRIB_PARENT)
+                decoder.closeElement(subElemId)
+                self.createModelAlias(aliasName, parentName)
+        decoder.closeElement(elemId)
+
+        el = store.getTag("specextensions")
+        if el is not None:
+            decoderExt = XmlDecode(self, el)
+            elemId = decoderExt.openElement(ELEM_SPECEXTENSIONS)
+            while True:
+                subId = decoderExt.peekElement()
+                if subId == 0:
+                    break
+                if subId == ELEM_PROTOTYPE.id:
+                    self.decodeProto(decoderExt)
+                elif subId == ELEM_CALLFIXUP.id:
+                    self.pcodeinjectlib.decodeInject(self.archid + " : compiler spec", "", InjectPayload.CALLFIXUP_TYPE, decoder)
+                elif subId == ELEM_CALLOTHERFIXUP.id:
+                    self.userops.decodeCallOtherFixup(decoder, self)
+                elif subId == ELEM_GLOBAL.id:
+                    self.decodeGlobal(decoder, globalRanges)
+            decoderExt.closeElement(elemId)
+
+        for rangeProp in globalRanges:
+            self.addToGlobalScope(rangeProp)
+
+        self.addOtherSpace()
+
+        if self.defaultfp is None:
+            if len(self.protoModels) > 0:
+                firstName = min(self.protoModels)
+                self.setDefaultModel(self.protoModels[firstName])
+            else:
+                raise LowlevelError("No default prototype specified")
+
+        if "__thiscall" not in self.protoModels:
+            self.createModelAlias("__thiscall", self.defaultfp.getName())
+
+        self.initializeSegments()
+        PreferSplitManager.initialize(self.splitrecords)
+        self.types.setupSizes()
+
+    def parseExtraRules(self, store) -> None:
         """Apply any Rule tags."""
-        pass
+        from ghidra.core.marshal import ELEM_EXPERIMENTAL_RULES, XmlDecode
+
+        expertag = store.getTag("experimental_rules")
+        if expertag is not None:
+            decoder = XmlDecode(self, expertag)
+            elemId = decoder.openElement(ELEM_EXPERIMENTAL_RULES)
+            while decoder.peekElement() != 0:
+                self.decodeDynamicRule(decoder)
+            decoder.closeElement(elemId)
 
     def decodeDynamicRule(self, decoder) -> None:
         """Recover information out of a <rule> element and build the new Rule object.
@@ -716,7 +1110,6 @@ class Architecture(AddrSpaceManager):
         C++ ref: Architecture::decodeDynamicRule (architecture.cc lines 705-734)
         """
         from ghidra.core.marshal import ELEM_RULE, ATTRIB_NAME, ATTRIB_GROUP, ATTRIB_ENABLE
-        from ghidra.core.error import LowlevelError
         elemId = decoder.openElement(ELEM_RULE)
         rulename = ""
         groupname = ""
@@ -731,18 +1124,21 @@ class Architecture(AddrSpaceManager):
                 groupname = decoder.readString()
             elif attribId == ATTRIB_ENABLE:
                 enabled = decoder.readBool()
+            else:
+                raise LowlevelError("Dynamic rule tag contains illegal attribute")
         if not rulename:
             raise LowlevelError("Dynamic rule has no name")
         if not groupname:
             raise LowlevelError("Dynamic rule has no group")
-        if enabled:
-            try:
-                from ghidra.transform.rulecompile import RuleGeneric
-                content = decoder.readString() if hasattr(decoder, 'readString') else ""
-                dynrule = RuleGeneric.build(rulename, groupname, content)
-                self.extra_pool_rules.append(dynrule)
-            except Exception:
-                pass  # Dynamic rules not enabled or compilation failed
+        if not enabled:
+            return
+        try:
+            from ghidra.transform.rulecompile import RuleGeneric
+        except ImportError as exc:
+            raise LowlevelError("Dynamic rules have not been enabled for this decompiler") from exc
+        content = decoder._currentElement().getContent()
+        dynrule = RuleGeneric.build(rulename, groupname, content)
+        self.extra_pool_rules.append(dynrule)
         decoder.closeElement(elemId)
 
     def decodeProto(self, decoder) -> Optional[ProtoModel]:
@@ -752,14 +1148,16 @@ class Architecture(AddrSpaceManager):
         """
         elemId = decoder.peekElement()
         from ghidra.fspec.fspec import ProtoModelMerged
-        from ghidra.core.marshal import ELEM_RESOLVEPROTOTYPE
-        if elemId == ELEM_RESOLVEPROTOTYPE:
+        from ghidra.core.marshal import ELEM_PROTOTYPE, ELEM_RESOLVEPROTOTYPE
+        if elemId == ELEM_PROTOTYPE.id:
+            res = ProtoModel(glb=self)
+        elif elemId == ELEM_RESOLVEPROTOTYPE.id:
             res = ProtoModelMerged(self)
         else:
-            res = ProtoModel(self)
+            raise LowlevelError("Expecting <prototype> or <resolveprototype> tag")
         res.decode(decoder)
         nm = res.getName()
-        other = self.getModel(nm) if hasattr(self, 'getModel') else self.protoModels.get(nm)
+        other = self.getModel(nm)
         if other is not None:
             raise LowlevelError("Duplicate ProtoModel name: " + nm)
         self.protoModels[nm] = res
@@ -770,18 +1168,13 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeProtoEval``
         """
+        from ghidra.core.marshal import ATTRIB_NAME, ELEM_EVAL_CALLED_PROTOTYPE
         elemId = decoder.openElement()
-        modelName = decoder.readString() if hasattr(decoder, 'readString') else ""
-        res = self.getModel(modelName) if hasattr(self, 'getModel') else self.protoModels.get(modelName)
+        modelName = decoder.readString(ATTRIB_NAME)
+        res = self.getModel(modelName)
         if res is None:
             raise LowlevelError("Unknown prototype model name: " + modelName)
-        # Determine if this is eval_called_prototype or eval_current_prototype
-        # based on the element id or name
-        elemName = ""
-        if hasattr(decoder, 'getElementName'):
-            elemName = decoder.getElementName()
-        isCalled = ("called" in elemName.lower()) if elemName else True
-        if isCalled:
+        if elemId == ELEM_EVAL_CALLED_PROTOTYPE.id:
             if self.evalfp_called is not None:
                 raise LowlevelError("Duplicate <eval_called_prototype> tag")
             self.evalfp_called = res
@@ -796,7 +1189,9 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeDefaultProto``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_DEFAULT_PROTO
+
+        elemId = decoder.openElement(ELEM_DEFAULT_PROTO)
         while decoder.peekElement() != 0:
             if self.defaultfp is not None:
                 raise LowlevelError("More than one default prototype model")
@@ -804,14 +1199,14 @@ class Architecture(AddrSpaceManager):
             self.setDefaultModel(model)
         decoder.closeElement(elemId)
 
-    def decodeGlobal(self, decoder, rangeProps: list = None) -> None:
+    def decodeGlobal(self, decoder, rangeProps: list) -> None:
         """Parse information about global ranges.
 
         C++ ref: ``Architecture::decodeGlobal``
         """
-        if rangeProps is None:
-            rangeProps = []
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_GLOBAL
+
+        elemId = decoder.openElement(ELEM_GLOBAL)
         while decoder.peekElement() != 0:
             rp = RangeProperties()
             rp.decode(decoder)
@@ -827,12 +1222,13 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeReadOnly``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_READONLY
+
+        elemId = decoder.openElement(ELEM_READONLY)
         while decoder.peekElement() != 0:
             rng = Range()
             rng.decode(decoder)
-            if self.symboltab is not None:
-                self.symboltab.setPropertyRange(0x1, rng)  # Varnode::readonly
+            self.symboltab.setPropertyRange(0x1, rng)  # Varnode::readonly
         decoder.closeElement(elemId)
 
     def decodeVolatile(self, decoder) -> None:
@@ -840,14 +1236,14 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeVolatile``
         """
-        elemId = decoder.openElement()
-        if hasattr(self.userops, 'decodeVolatile'):
-            self.userops.decodeVolatile(decoder, self)
+        from ghidra.core.marshal import ELEM_VOLATILE
+
+        elemId = decoder.openElement(ELEM_VOLATILE)
+        self.userops.decodeVolatile(decoder, self)
         while decoder.peekElement() != 0:
             rng = Range()
             rng.decode(decoder)
-            if self.symboltab is not None:
-                self.symboltab.setPropertyRange(0x4, rng)  # Varnode::volatil
+            self.symboltab.setPropertyRange(0x4, rng)  # Varnode::volatil
         decoder.closeElement(elemId)
 
     def decodeReturnAddress(self, decoder) -> None:
@@ -855,7 +1251,9 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeReturnAddress``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_RETURNADDRESS
+
+        elemId = decoder.openElement(ELEM_RETURNADDRESS)
         subId = decoder.peekElement()
         if subId != 0:
             if self.defaultReturnAddr.space is not None:
@@ -868,13 +1266,14 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeIncidentalCopy``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_INCIDENTALCOPY
+
+        elemId = decoder.openElement(ELEM_INCIDENTALCOPY)
         while decoder.peekElement() != 0:
             vdata = VarnodeData()
             vdata.decode(decoder)
             rng = Range(vdata.space, vdata.offset, vdata.offset + vdata.size - 1)
-            if self.symboltab is not None:
-                self.symboltab.setPropertyRange(0x100, rng)  # Varnode::incidental_copy
+            self.symboltab.setPropertyRange(0x100, rng)  # Varnode::incidental_copy
         decoder.closeElement(elemId)
 
     def decodeRegisterData(self, decoder) -> None:
@@ -882,86 +1281,88 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeRegisterData``
         """
+        from ghidra.core.marshal import (
+            ATTRIB_VECTOR_LANE_SIZES,
+            ATTRIB_VOLATILE,
+            ELEM_REGISTER,
+            ELEM_REGISTER_DATA,
+        )
+        from ghidra.transform.transform import LanedRegister
+
         maskList = []
-        elemId = decoder.openElement()
+        elemId = decoder.openElement(ELEM_REGISTER_DATA)
         while decoder.peekElement() != 0:
-            subId = decoder.openElement()
+            subId = decoder.openElement(ELEM_REGISTER)
             isVolatile = False
             laneSizes = ""
             while True:
-                attribId = decoder.getNextAttributeId() if hasattr(decoder, 'getNextAttributeId') else 0
+                attribId = decoder.getNextAttributeId()
                 if attribId == 0:
                     break
-                # Check for vector_lane_sizes or volatile attributes
-                if hasattr(decoder, 'readString'):
-                    try:
-                        val = decoder.readString()
-                        if val and any(c.isdigit() for c in val):
-                            laneSizes = val
-                    except Exception:
-                        try:
-                            isVolatile = decoder.readBool()
-                        except Exception:
-                            pass
-            if isVolatile:
-                if hasattr(decoder, 'rewindAttributes'):
-                    decoder.rewindAttributes()
+                if attribId == ATTRIB_VECTOR_LANE_SIZES:
+                    laneSizes = decoder.readString()
+                elif attribId == ATTRIB_VOLATILE:
+                    isVolatile = decoder.readBool()
+            if laneSizes or isVolatile:
+                decoder.rewindAttributes()
                 storage = VarnodeData()
-                if hasattr(storage, 'decodeFromAttributes'):
-                    storage.decodeFromAttributes(decoder)
-                if storage.space is not None:
+                storage.space = None
+                storage.decodeFromAttributes(decoder)
+                if laneSizes:
+                    lanedRegister = LanedRegister()
+                    lanedRegister.parseSizes(storage.size, laneSizes)
+                    sizeIndex = lanedRegister.getWholeSize()
+                    while len(maskList) <= sizeIndex:
+                        maskList.append(0)
+                    maskList[sizeIndex] |= lanedRegister.getSizeBitMask()
+                if isVolatile:
                     rng = Range(storage.space, storage.offset, storage.offset + storage.size - 1)
-                    if self.symboltab is not None:
-                        self.symboltab.setPropertyRange(0x4, rng)  # Varnode::volatil
+                    self.symboltab.setPropertyRange(0x4, rng)  # Varnode::volatil
             decoder.closeElement(subId)
         decoder.closeElement(elemId)
+        self.lanerecords.clear()
+        for i in range(len(maskList)):
+            if maskList[i] == 0:
+                continue
+            self.lanerecords.append(LanedRegister(i, maskList[i]))
 
     def decodeStackPointer(self, decoder) -> None:
         """Apply stack pointer configuration.
 
         C++ ref: ``Architecture::decodeStackPointer``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import (
+            ATTRIB_GROWTH,
+            ATTRIB_REGISTER,
+            ATTRIB_REVERSEJUSTIFY,
+            ATTRIB_SPACE,
+            ELEM_STACKPOINTER,
+        )
+
+        elemId = decoder.openElement(ELEM_STACKPOINTER)
         registerName = ""
         stackGrowth = True  # Default: negative direction
         isreversejustify = False
         basespace = None
         while True:
-            attribId = decoder.getNextAttributeId() if hasattr(decoder, 'getNextAttributeId') else 0
+            attribId = decoder.getNextAttributeId()
             if attribId == 0:
                 break
-            # Read attributes based on available decoder methods
-            # In practice, the decoder reads named attributes
-            if hasattr(decoder, 'readBool'):
-                try:
-                    isreversejustify = decoder.readBool()
-                    continue
-                except Exception:
-                    pass
-            if hasattr(decoder, 'readSpace'):
-                try:
-                    basespace = decoder.readSpace()
-                    continue
-                except Exception:
-                    pass
-            if hasattr(decoder, 'readString'):
-                try:
-                    val = decoder.readString()
-                    if val == "negative" or val == "positive":
-                        stackGrowth = (val == "negative")
-                    else:
-                        registerName = val
-                    continue
-                except Exception:
-                    pass
+            if attribId == ATTRIB_REVERSEJUSTIFY:
+                isreversejustify = decoder.readBool()
+            elif attribId == ATTRIB_GROWTH:
+                stackGrowth = decoder.readString() == "negative"
+            elif attribId == ATTRIB_SPACE:
+                basespace = decoder.readSpace()
+            elif attribId == ATTRIB_REGISTER:
+                registerName = decoder.readString()
         if basespace is None:
-            raise LowlevelError("<stackpointer> element missing 'space' attribute")
-        point = self.translate.getRegister(registerName) if self.translate is not None else VarnodeData()
+            raise LowlevelError(ELEM_STACKPOINTER.getName() + ' element missing "space" attribute')
+        point = self.translate.getRegister(registerName)
         decoder.closeElement(elemId)
         truncSize = point.size
-        if hasattr(basespace, 'isTruncated') and basespace.isTruncated():
-            if point.size > basespace.getAddrSize():
-                truncSize = basespace.getAddrSize()
+        if basespace.isTruncated() and point.size > basespace.getAddrSize():
+            truncSize = basespace.getAddrSize()
         self.addSpacebase(basespace, "stack", point, truncSize, isreversejustify, stackGrowth, True)
 
     def decodeDeadcodeDelay(self, decoder) -> None:
@@ -969,14 +1370,14 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeDeadcodeDelay``
         """
-        elemId = decoder.openElement()
-        spc = decoder.readSpace() if hasattr(decoder, 'readSpace') else None
-        delay = decoder.readSignedInteger() if hasattr(decoder, 'readSignedInteger') else -1
-        if delay >= 0 and spc is not None:
-            if hasattr(self, 'setDeadcodeDelay'):
-                self.setDeadcodeDelay(spc, delay)
-            elif hasattr(spc, 'setDeadcodeDelay'):
-                spc.setDeadcodeDelay(delay)
+        from ghidra.arch.override import ELEM_DEADCODEDELAY
+        from ghidra.core.marshal import ATTRIB_DELAY, ATTRIB_SPACE
+
+        elemId = decoder.openElement(ELEM_DEADCODEDELAY)
+        spc = decoder.readSpace(ATTRIB_SPACE)
+        delay = decoder.readSignedInteger(ATTRIB_DELAY)
+        if delay >= 0:
+            self.setDeadcodeDelay(spc, delay)
         else:
             raise LowlevelError("Bad <deadcodedelay> tag")
         decoder.closeElement(elemId)
@@ -986,12 +1387,13 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeInferPtrBounds``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_INFERPTRBOUNDS
+
+        elemId = decoder.openElement(ELEM_INFERPTRBOUNDS)
         while decoder.peekElement() != 0:
             rng = Range()
             rng.decode(decoder)
-            if hasattr(self, 'setInferPtrBounds'):
-                self.setInferPtrBounds(rng)
+            self.setInferPtrBounds(rng)
         decoder.closeElement(elemId)
 
     def decodeFuncPtrAlign(self, decoder) -> None:
@@ -999,8 +1401,10 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeFuncPtrAlign``
         """
-        elemId = decoder.openElement()
-        align = decoder.readSignedInteger() if hasattr(decoder, 'readSignedInteger') else 0
+        from ghidra.core.marshal import ATTRIB_ALIGN, ELEM_FUNCPTR
+
+        elemId = decoder.openElement(ELEM_FUNCPTR)
+        align = decoder.readSignedInteger(ATTRIB_ALIGN)
         decoder.closeElement(elemId)
         if align == 0:
             self.funcptr_align = 0
@@ -1012,15 +1416,28 @@ class Architecture(AddrSpaceManager):
         self.funcptr_align = bits
 
     def decodeSpacebase(self, decoder) -> None:
-        """Create an additional indexed space."""
-        pass
+        """Create an additional indexed space.
+
+        C++ ref: ``Architecture::decodeSpacebase``
+        """
+        from ghidra.core.marshal import ATTRIB_NAME, ATTRIB_REGISTER, ATTRIB_SPACE, ELEM_SPACEBASE
+
+        elemId = decoder.openElement(ELEM_SPACEBASE)
+        nameString = decoder.readString(ATTRIB_NAME)
+        registerName = decoder.readString(ATTRIB_REGISTER)
+        basespace = decoder.readSpace(ATTRIB_SPACE)
+        decoder.closeElement(elemId)
+        point = self.translate.getRegister(registerName)
+        self.addSpacebase(basespace, nameString, point, point.size, False, False, False)
 
     def decodeNoHighPtr(self, decoder) -> None:
         """Apply memory alias configuration.
 
         C++ ref: ``Architecture::decodeNoHighPtr``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ELEM_NOHIGHPTR
+
+        elemId = decoder.openElement(ELEM_NOHIGHPTR)
         while decoder.peekElement() != 0:
             rng = Range()
             rng.decode(decoder)
@@ -1032,15 +1449,21 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodePreferSplit``
         """
-        elemId = decoder.openElement()
-        style = decoder.readString() if hasattr(decoder, 'readString') else "inhalf"
+        from ghidra.analysis.prefersplit import PreferSplitRecord
+        from ghidra.core.marshal import ATTRIB_STYLE, ELEM_PREFERSPLIT
+
+        elemId = decoder.openElement(ELEM_PREFERSPLIT)
+        style = decoder.readString(ATTRIB_STYLE)
         if style != "inhalf":
             raise LowlevelError("Unknown prefersplit style: " + style)
         while decoder.peekElement() != 0:
             record_storage = VarnodeData()
             record_storage.decode(decoder)
-            splitoffset = record_storage.size // 2
-            self.splitrecords.append((record_storage, splitoffset))
+            rec = PreferSplitRecord()
+            rec.storage = Address(record_storage.space, record_storage.offset)
+            rec.totalSize = record_storage.size
+            rec.splitSize = record_storage.size // 2
+            self.splitrecords.append(rec)
         decoder.closeElement(elemId)
 
     def decodeAggressiveTrim(self, decoder) -> None:
@@ -1048,13 +1471,14 @@ class Architecture(AddrSpaceManager):
 
         C++ ref: ``Architecture::decodeAggressiveTrim``
         """
-        elemId = decoder.openElement()
+        from ghidra.core.marshal import ATTRIB_SIGNEXT, ELEM_AGGRESSIVETRIM
+
+        elemId = decoder.openElement(ELEM_AGGRESSIVETRIM)
         while True:
-            attribId = decoder.getNextAttributeId() if hasattr(decoder, 'getNextAttributeId') else 0
+            attribId = decoder.getNextAttributeId()
             if attribId == 0:
                 break
-            # ATTRIB_SIGNEXT check
-            if hasattr(decoder, 'readBool'):
+            if attribId == ATTRIB_SIGNEXT:
                 self.aggressive_ext_trim = decoder.readBool()
         decoder.closeElement(elemId)
 
@@ -1109,9 +1533,7 @@ class Architecture(AddrSpaceManager):
 
     def printDebug(self, message: str) -> None:
         """Print message to the debug stream."""
-        s = getattr(self, '_debugstream', None)
-        if s is not None:
-            s.write(message + '\n')
+        self._debugstream.write(message + '\n')
 
     def __repr__(self) -> str:
         return f"Architecture({self.archid!r})"
@@ -1146,7 +1568,7 @@ class SegmentedResolver:
                 fullEncoding = (base << (8 * innersz)) + (val & calc_mask(innersz))
                 seginput = [base, val]
                 val = self.segop.execute(seginput)
-                return Address(self.spc, val), fullEncoding
+                return Address(self.spc, AddrSpace.addressToByte(val, self.spc.getWordSize())), fullEncoding
         else:
             fullEncoding = val
             outersz = self.segop.getBaseSize()
@@ -1154,5 +1576,5 @@ class SegmentedResolver:
             inner = val & calc_mask(innersz)
             seginput = [base, inner]
             val = self.segop.execute(seginput)
-            return Address(self.spc, val), fullEncoding
+            return Address(self.spc, AddrSpace.addressToByte(val, self.spc.getWordSize())), fullEncoding
         return Address(), 0

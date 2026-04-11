@@ -9,7 +9,8 @@ saveall signatures, produce signatures.
 from __future__ import annotations
 
 import io
-from typing import Optional, TYPE_CHECKING
+import struct
+from typing import BinaryIO, Optional, TYPE_CHECKING
 
 from ghidra.console.interface import (
     IfaceCapability, IfaceStatus,
@@ -17,9 +18,29 @@ from ghidra.console.interface import (
 )
 from ghidra.console.ifacedecomp import IfaceDecompCommand
 from ghidra.analysis.signature import SigManager, GraphSigManager
+from ghidra.core.marshal import XmlEncode
+from ghidra.core.error import LowlevelError
 
 if TYPE_CHECKING:
     from ghidra.analysis.funcdata import Funcdata
+
+
+class _SignatureOutputStream:
+    """Binary-backed stream that accepts both bytes and str writes."""
+
+    def __init__(self, stream: BinaryIO) -> None:
+        self._stream = stream
+
+    def write(self, data) -> int:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return self._stream.write(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+    def close(self) -> None:
+        self._stream.close()
 
 
 # =========================================================================
@@ -40,8 +61,7 @@ class IfcSignatureSettings(IfaceDecompCommand):
         if mysetting == 0:
             raise IfaceParseError("Must specify settings integer")
         SigManager.setSettings(mysetting)
-        if self.status is not None and hasattr(self.status, 'optr') and self.status.optr is not None:
-            self.status.optr.write(f"Signature settings set to 0x{mysetting:x}\n")
+        self.status.optr.write(f"Signature settings set to 0x{mysetting:x}\n")
 
 
 # =========================================================================
@@ -54,18 +74,17 @@ class IfcPrintSignatures(IfaceDecompCommand):
     def execute(self, args: str) -> None:
         if self.dcp is None or self.dcp.fd is None:
             raise IfaceExecutionError("No function selected")
-        if hasattr(self.dcp.fd, 'isProcComplete') and not self.dcp.fd.isProcComplete():
+        if not self.dcp.fd.isProcComplete():
             raise IfaceExecutionError("Function has not been fully analyzed")
 
         smanage = GraphSigManager()
-        optr = self.status.fileoptr if self.status and hasattr(self.status, 'fileoptr') else io.StringIO()
+        smanage.initializeFromStream(io.StringIO(args))
 
-        name = self.dcp.fd.getName() if hasattr(self.dcp.fd, 'getName') else "unknown"
-        optr.write(f"Signatures for {name}\n")
+        self.status.fileoptr.write(f"Signatures for {self.dcp.fd.getName()}\n")
 
         smanage.setCurrentFunction(self.dcp.fd)
         smanage.generate()
-        smanage.print(optr)
+        smanage.print(self.status.fileoptr)
 
 
 # =========================================================================
@@ -78,31 +97,27 @@ class IfcSaveSignatures(IfaceDecompCommand):
     def execute(self, args: str) -> None:
         if self.dcp is None or self.dcp.fd is None:
             raise IfaceExecutionError("No function selected")
-        if hasattr(self.dcp.fd, 'isProcComplete') and not self.dcp.fd.isProcComplete():
+        if not self.dcp.fd.isProcComplete():
             raise IfaceExecutionError("Function has not been fully analyzed")
 
-        sigfilename = args.strip()
+        pieces = args.split(None, 1)
+        sigfilename = pieces[0] if pieces else ""
         if not sigfilename:
             raise IfaceExecutionError("Need name of file to save signatures to")
 
         smanage = GraphSigManager()
+        smanage.initializeFromStream(io.StringIO(pieces[1] if len(pieces) > 1 else ""))
         smanage.setCurrentFunction(self.dcp.fd)
         smanage.generate()
 
         try:
             with open(sigfilename, 'w', encoding='utf-8') as f:
-                vec = []
-                smanage.getSignatureVector(vec)
-                f.write("<signatures>")
-                for h in vec:
-                    f.write(f'<sig hash="{h}"/>')
-                f.write("</signatures>\n")
+                encoder = XmlEncode(f)
+                smanage.encode(encoder)
         except OSError as exc:
             raise IfaceExecutionError(f"Unable to open signature save file: {sigfilename}") from exc
 
-        optr = self.status.fileoptr if self.status and hasattr(self.status, 'fileoptr') else io.StringIO()
-        name = self.dcp.fd.getName() if hasattr(self.dcp.fd, 'getName') else "unknown"
-        optr.write(f"Successfully saved signatures for {name}\n")
+        self.status.fileoptr.write(f"Successfully saved signatures for {self.dcp.fd.getName()}\n")
 
 
 # =========================================================================
@@ -116,33 +131,72 @@ class IfcSaveAllSignatures(IfaceDecompCommand):
         super().__init__()
         self._smanage: Optional[GraphSigManager] = None
 
+    def __del__(self) -> None:
+        self._smanage = None
+
     def execute(self, args: str) -> None:
-        if self.dcp is None or not hasattr(self.dcp, 'conf') or self.dcp.conf is None:
+        if self.dcp is None or self.dcp.conf is None:
             raise IfaceExecutionError("No architecture loaded")
 
-        sigfilename = args.strip()
+        pieces = args.split(None, 1)
+        sigfilename = pieces[0] if pieces else ""
         if not sigfilename:
             raise IfaceExecutionError("Need name of file to save signatures to")
 
+        if self._smanage is not None:
+            self._smanage = None
         self._smanage = GraphSigManager()
-        # Placeholder: would iterate all functions and call iterationCallback
-        raise IfaceExecutionError("saveall signatures not yet fully implemented")
+        self._smanage.initializeFromStream(io.StringIO(pieces[1] if len(pieces) > 1 else ""))
+
+        saveoldfileptr = self.status.fileoptr
+        try:
+            rawstream = open(sigfilename, "wb")
+        except OSError as exc:
+            raise IfaceExecutionError(f"Unable to open signature save file: {sigfilename}") from exc
+        self.status.fileoptr = _SignatureOutputStream(rawstream)
+
+        oldactname = self.dcp.conf.allacts.getCurrentName()
+        try:
+            self.dcp.conf.allacts.setCurrent("normalize")
+            self.iterateFunctionsAddrOrder()
+        finally:
+            self.status.fileoptr.close()
+            self.status.fileoptr = saveoldfileptr
+            self.dcp.conf.allacts.setCurrent(oldactname)
+            self._smanage = None
 
     def iterationCallback(self, fd) -> None:
-        """Called for each function during iteration."""
-        if fd is None or (hasattr(fd, 'hasNoCode') and fd.hasNoCode()):
+        if fd.hasNoCode():
+            self.status.optr.write(f"No code for {fd.getName()}\n")
             return
-        if self._smanage is None:
+
+        try:
+            self.dcp.conf.clearAnalysis(fd)
+            curact = self.dcp.conf.allacts.getCurrent()
+            curact.reset(fd)
+            curact.perform(fd)
+            self.status.optr.write(f"Decompiled {fd.getName()}({fd.getSize()})\n")
+        except LowlevelError as err:
+            self.status.optr.write(f"Skipping {fd.getName()}: {err.explain}\n")
             return
 
         self._smanage.setCurrentFunction(fd)
         self._smanage.generate()
 
         numsigs = self._smanage.numSignatures()
-        if numsigs > 0 and self.status and hasattr(self.status, 'fileoptr'):
-            pass
+        if numsigs != 0:
+            addr = fd.getAddress()
+            name = fd.getName().encode("utf-8")
+            self.status.fileoptr.write(struct.pack("<I", addr.getSpace().getIndex()))
+            self.status.fileoptr.write(struct.pack("<Q", addr.getOffset()))
+            self.status.fileoptr.write(struct.pack("<I", numsigs))
+            self.status.fileoptr.write(struct.pack("<I", len(name)))
+            self.status.fileoptr.write(name)
+            encoder = XmlEncode(self.status.fileoptr)
+            self._smanage.encode(encoder)
 
         self._smanage.clear()
+        self.dcp.conf.clearAnalysis(fd)
 
 
 # =========================================================================
@@ -153,21 +207,28 @@ class IfcProduceSignatures(IfcSaveAllSignatures):
     """Calculate combined hash signatures for all functions: `produce signatures <filename>`"""
 
     def iterationCallback(self, fd) -> None:
-        """Called for each function — writes name + overall hash."""
-        if fd is None or (hasattr(fd, 'hasNoCode') and fd.hasNoCode()):
+        if fd.hasNoCode():
+            self.status.optr.write(f"No code for {fd.getName()}\n")
             return
-        if self._smanage is None:
+
+        try:
+            self.dcp.conf.clearAnalysis(fd)
+            curact = self.dcp.conf.allacts.getCurrent()
+            curact.reset(fd)
+            curact.perform(fd)
+            self.status.optr.write(f"Decompiled {fd.getName()}({fd.getSize()})\n")
+        except LowlevelError as err:
+            self.status.optr.write(f"Skipping {fd.getName()}: {err.explain}\n")
             return
 
         self._smanage.setCurrentFunction(fd)
         self._smanage.generate()
 
         finalsig = self._smanage.getOverallHash()
-        if self.status and hasattr(self.status, 'fileoptr') and self.status.fileoptr is not None:
-            name = fd.getName() if hasattr(fd, 'getName') else "unknown"
-            self.status.fileoptr.write(f"{name} = 0x{finalsig:016x}\n")
+        self.status.fileoptr.write(f"{fd.getName()} = 0x{finalsig:016x}\n")
 
         self._smanage.clear()
+        self.dcp.conf.clearAnalysis(fd)
 
 
 # =========================================================================
@@ -181,6 +242,12 @@ class IfaceAnalyzeSigsCapability(IfaceCapability):
 
     def __init__(self) -> None:
         super().__init__("analyzesigs")
+
+    def __copy__(self):
+        raise TypeError("IfaceAnalyzeSigsCapability is non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("IfaceAnalyzeSigsCapability is non-copyable")
 
     @classmethod
     def getInstance(cls) -> IfaceAnalyzeSigsCapability:

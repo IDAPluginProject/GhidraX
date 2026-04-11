@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Optional
 from xml.etree.ElementTree import Element, parse as xml_parse, fromstring as xml_fromstring
 
 from ghidra.core.opcodes import OpCode, get_opname, get_opcode
+from ghidra.core.xml import a_v, a_v_b, a_v_i, a_v_u, xml_escape
 
 if TYPE_CHECKING:
     from ghidra.core.space import AddrSpace, AddrSpaceManager
@@ -30,11 +31,15 @@ class AttributeId:
     _lookup: dict[str, int] = {}
     _list: list[AttributeId] = []
 
+    @staticmethod
+    def getList() -> list[AttributeId]:
+        return AttributeId._list
+
     def __init__(self, name: str, id_: int, scope: int = 0) -> None:
         self.name: str = name
         self.id: int = id_
-        AttributeId._lookup[name] = id_
-        AttributeId._list.append(self)
+        if scope == 0:
+            AttributeId.getList().append(self)
 
     def getName(self) -> str:
         return self.name
@@ -63,11 +68,16 @@ class AttributeId:
 
     @staticmethod
     def find(name: str, scope: int = 0) -> int:
-        return AttributeId._lookup.get(name, 0)
+        if scope == 0:
+            return AttributeId._lookup.get(name, ATTRIB_UNKNOWN.getId())
+        return ATTRIB_UNKNOWN.getId()
 
     @staticmethod
     def initialize() -> None:
-        pass  # All registrations happen at import-time in Python
+        thelist = AttributeId.getList()
+        for attrib in thelist:
+            AttributeId._lookup[attrib.name] = attrib.id
+        thelist.clear()
 
 
 # =========================================================================
@@ -82,11 +92,15 @@ class ElementId:
     _lookup: dict[str, int] = {}
     _list: list[ElementId] = []
 
+    @staticmethod
+    def getList() -> list[ElementId]:
+        return ElementId._list
+
     def __init__(self, name: str, id_: int, scope: int = 0) -> None:
         self.name: str = name
         self.id: int = id_
-        ElementId._lookup[name] = id_
-        ElementId._list.append(self)
+        if scope == 0:
+            ElementId.getList().append(self)
 
     def getName(self) -> str:
         return self.name
@@ -115,11 +129,16 @@ class ElementId:
 
     @staticmethod
     def find(name: str, scope: int = 0) -> int:
-        return ElementId._lookup.get(name, 0)
+        if scope == 0:
+            return ElementId._lookup.get(name, ELEM_UNKNOWN.getId())
+        return ELEM_UNKNOWN.getId()
 
     @staticmethod
     def initialize() -> None:
-        pass
+        thelist = ElementId.getList()
+        for elem in thelist:
+            ElementId._lookup[elem.name] = elem.id
+        thelist.clear()
 
 
 # =========================================================================
@@ -169,9 +188,11 @@ ATTRIB_UNAFF = AttributeId("unaff", 34)
 
 # From translate.cc
 ATTRIB_CODE = AttributeId("code", 43)
+ATTRIB_CHAR = AttributeId("char", 49)
 ATTRIB_CONTAIN = AttributeId("contain", 44)
 ATTRIB_DEFAULTSPACE = AttributeId("defaultspace", 45)
 ATTRIB_UNIQBASE = AttributeId("uniqbase", 46)
+ATTRIB_UTF = AttributeId("utf", 59)
 
 # From space.cc
 ATTRIB_BASE = AttributeId("base", 89)
@@ -215,6 +236,10 @@ ELEM_TARGET = ElementId("target", 7)
 ELEM_VAL = ElementId("val", 8)
 ELEM_VALUE = ElementId("value", 9)
 ELEM_VOID = ElementId("void", 10)
+
+# From type.cc
+ELEM_CORETYPES = ElementId("coretypes", 41)
+ELEM_TYPEGRP = ElementId("typegrp", 62)
 
 # From database.cc
 ATTRIB_CAT = AttributeId("cat", 61)
@@ -271,6 +296,10 @@ ELEM_HIGHLIST = ElementId("highlist", 117)
 ELEM_JUMPTABLELIST = ElementId("jumptablelist", 118)
 ELEM_VARNODES = ElementId("varnodes", 119)
 
+# From architecture.cc
+ATTRIB_LOADERSYMBOLS = AttributeId("loadersymbols", 108)
+ELEM_SAVE_STATE = ElementId("save_state", 154)
+
 # From fspec.cc
 ELEM_PROTOTYPE = ElementId("prototype", 169)
 
@@ -278,6 +307,7 @@ ELEM_PROTOTYPE = ElementId("prototype", 169)
 ELEM_COMMENT = ElementId("comment", 86)
 ELEM_COMMENTDB = ElementId("commentdb", 87)
 ELEM_TEXT = ElementId("text", 88)
+ELEM_DEFAULT_SYMBOLS = ElementId("default_symbols", 136)
 
 # From cpool.cc
 ATTRIB_A = AttributeId("a", 80)
@@ -320,12 +350,85 @@ ELEM_OVERRIDE = ElementId("override", 223)
 
 # From varmap.cc
 ELEM_LOCALDB = ElementId("localdb", 228)
+ELEM_OPTIONSLIST = ElementId("optionslist", 201)
+ELEM_PARAM1 = ElementId("param1", 202)
+ELEM_PARAM2 = ElementId("param2", 203)
+ELEM_PARAM3 = ElementId("param3", 204)
 
 # From architecture.cc
+ATTRIB_ENABLE = AttributeId("enable", 104)
+ATTRIB_GROUP = AttributeId("group", 105)
+ATTRIB_GROWTH = AttributeId("growth", 106)
+ATTRIB_REGISTER = AttributeId("register", 110)
 ATTRIB_REVERSEJUSTIFY = AttributeId("reversejustify", 111)
-ATTRIB_GROUP = AttributeId("group", 112)
-ATTRIB_ENABLE = AttributeId("enable", 113)
+ATTRIB_SIGNEXT = AttributeId("signext", 112)
+ATTRIB_STYLE = AttributeId("style", 113)
+ATTRIB_PARENT = AttributeId("parent", 109)
+ELEM_ADDRESS_SHIFT_AMOUNT = ElementId("address_shift_amount", 130)
+ELEM_AGGRESSIVETRIM = ElementId("aggressivetrim", 131)
+ELEM_COMPILER_SPEC = ElementId("compiler_spec", 132)
+ELEM_DATA_SPACE = ElementId("data_space", 133)
+ELEM_DEFAULT_MEMORY_BLOCKS = ElementId("default_memory_blocks", 134)
+ELEM_DEFAULT_PROTO = ElementId("default_proto", 135)
+ELEM_EVAL_CALLED_PROTOTYPE = ElementId("eval_called_prototype", 137)
+ELEM_EVAL_CURRENT_PROTOTYPE = ElementId("eval_current_prototype", 138)
+ELEM_EXPERIMENTAL_RULES = ElementId("experimental_rules", 139)
+ELEM_FUNCPTR = ElementId("funcptr", 141)
+ELEM_GLOBAL = ElementId("global", 142)
+ELEM_INCIDENTALCOPY = ElementId("incidentalcopy", 143)
+ELEM_INFERPTRBOUNDS = ElementId("inferptrbounds", 144)
+ELEM_MODELALIAS = ElementId("modelalias", 145)
+ELEM_NOHIGHPTR = ElementId("nohighptr", 146)
+ELEM_PROCESSOR_SPEC = ElementId("processor_spec", 147)
+ELEM_PROGRAMCOUNTER = ElementId("programcounter", 148)
+ELEM_PROPERTIES = ElementId("properties", 149)
+ELEM_READONLY = ElementId("readonly", 151)
+ELEM_REGISTER_DATA = ElementId("register_data", 152)
+ELEM_SEGMENTED_ADDRESS = ElementId("segmented_address", 155)
+ELEM_SPACEBASE = ElementId("spacebase", 156)
+ELEM_SPECEXTENSIONS = ElementId("specextensions", 157)
+ELEM_STACKPOINTER = ElementId("stackpointer", 158)
+ELEM_VOLATILE = ElementId("volatile", 159)
 ELEM_RULE = ElementId("rule", 153)
+
+# From options.cc
+ELEM_ALIASBLOCK = ElementId("aliasblock", 174)
+ELEM_ALLOWCONTEXTSET = ElementId("allowcontextset", 175)
+ELEM_ANALYZEFORLOOPS = ElementId("analyzeforloops", 176)
+ELEM_COMMENTHEADER = ElementId("commentheader", 177)
+ELEM_COMMENTINDENT = ElementId("commentindent", 178)
+ELEM_COMMENTINSTRUCTION = ElementId("commentinstruction", 179)
+ELEM_COMMENTSTYLE = ElementId("commentstyle", 180)
+ELEM_CONVENTIONPRINTING = ElementId("conventionprinting", 181)
+ELEM_CURRENTACTION = ElementId("currentaction", 182)
+ELEM_DEFAULTPROTOTYPE = ElementId("defaultprototype", 183)
+ELEM_ERRORREINTERPRETED = ElementId("errorreinterpreted", 184)
+ELEM_ERRORTOOMANYINSTRUCTIONS = ElementId("errortoomanyinstructions", 185)
+ELEM_ERRORUNIMPLEMENTED = ElementId("errorunimplemented", 186)
+ELEM_EXTRAPOP = ElementId("extrapop", 187)
+ELEM_IGNOREUNIMPLEMENTED = ElementId("ignoreunimplemented", 188)
+ELEM_INDENTINCREMENT = ElementId("indentincrement", 189)
+ELEM_INFERCONSTPTR = ElementId("inferconstptr", 190)
+ELEM_INLINE = ElementId("inline", 191)
+ELEM_INPLACEOPS = ElementId("inplaceops", 192)
+ELEM_INTEGERFORMAT = ElementId("integerformat", 193)
+ELEM_JUMPLOAD = ElementId("jumpload", 194)
+ELEM_MAXINSTRUCTION = ElementId("maxinstruction", 195)
+ELEM_MAXLINEWIDTH = ElementId("maxlinewidth", 196)
+ELEM_NAMESPACESTRATEGY = ElementId("namespacestrategy", 197)
+ELEM_NOCASTPRINTING = ElementId("nocastprinting", 198)
+ELEM_NORETURN = ElementId("noreturn", 199)
+ELEM_NULLPRINTING = ElementId("nullprinting", 200)
+ELEM_PROTOEVAL = ElementId("protoeval", 205)
+ELEM_SETACTION = ElementId("setaction", 206)
+ELEM_SETLANGUAGE = ElementId("setlanguage", 207)
+ELEM_STRUCTALIGN = ElementId("structalign", 208)
+ELEM_TOGGLERULE = ElementId("togglerule", 209)
+ELEM_WARNING = ElementId("warning", 210)
+ELEM_SPLITDATATYPE = ElementId("splitdatatype", 270)
+ELEM_JUMPTABLEMAX = ElementId("jumptablemax", 271)
+ELEM_NANIGNORE = ElementId("nanignore", 272)
+ELEM_BRACEFORMAT = ElementId("braceformat", 284)
 
 # From fspec.cc
 ATTRIB_MAXSIZE = AttributeId("maxsize", 120)
@@ -358,8 +461,10 @@ ELEM_INTERNAL_STORAGE = ElementId("internal_storage", 171)
 ELEM_LOCALRANGE = ElementId("localrange", 172)
 ELEM_PARAMRANGE = ElementId("paramrange", 173)
 ELEM_PCODE = ElementId("pcode", 174)
+ELEM_ENUM = ElementId("enum", 48)
 
 # From marshal.cc (high-numbered)
+ATTRIB_ADDRESS = AttributeId("address", 148)
 ATTRIB_STORAGE = AttributeId("storage", 149)
 ATTRIB_STACKSPILL = AttributeId("stackspill", 150)
 
@@ -388,6 +493,7 @@ ELEM_CONSUME_REMAINING = ElementId("consume_remaining", 288)
 
 # from transform.cc
 ATTRIB_VECTOR_LANE_SIZES = AttributeId("vector_lane_sizes", 130)
+ELEM_DATA_ORGANIZATION = ElementId("data_organization", 42)
 
 # from loadimage_xml.cc
 ATTRIB_ARCH = AttributeId("arch", 135)
@@ -414,6 +520,9 @@ ELEM_JUMPASSIST = ElementId("jumpassist", 128)
 ELEM_SEGMENTOP = ElementId("segmentop", 129)
 
 # from pcodeinject.cc
+ATTRIB_DYNAMIC = AttributeId("dynamic", 70)
+ATTRIB_INCIDENTALCOPY = AttributeId("incidentalcopy", 71)
+ATTRIB_INJECT = AttributeId("inject", 72)
 ATTRIB_PARAMSHIFT = AttributeId("paramshift", 73)
 ATTRIB_TARGETOP = AttributeId("targetop", 74)
 ELEM_ADDR_PCODE = ElementId("addr_pcode", 89)
@@ -435,6 +544,9 @@ ELEM_PARAMMEASURES = ElementId("parammeasures", 106)
 ELEM_PROTO = ElementId("proto", 107)
 ELEM_RANK = ElementId("rank", 108)
 
+AttributeId.initialize()
+ElementId.initialize()
+
 # =========================================================================
 # Decoder (abstract base)
 # =========================================================================
@@ -450,6 +562,9 @@ class Decoder(ABC):
 
     def getAddrSpaceManager(self) -> Optional[AddrSpaceManager]:
         return self.spcManager
+
+    def __del__(self) -> None:
+        pass
 
     @abstractmethod
     def ingestStream(self, s: str) -> None: ...
@@ -509,6 +624,9 @@ class Decoder(ABC):
 class Encoder(ABC):
     """A class for writing structured data to a stream."""
 
+    def __del__(self) -> None:
+        pass
+
     @abstractmethod
     def openElement(self, elemId: ElementId) -> None: ...
 
@@ -558,6 +676,16 @@ class XmlDecode(Decoder):
         self._scope: int = scope
         self._attrKeys: list[str] = []
 
+    def getCurrentXmlElement(self) -> Element:
+        return self._currentElement()
+
+    def __del__(self) -> None:
+        self._root = None
+        self._elStack.clear()
+        self._iterStack.clear()
+        self._childIndexStack.clear()
+        self._attrKeys = []
+
     def ingestStream(self, s: str) -> None:
         self._root = xml_fromstring(s)
 
@@ -569,13 +697,14 @@ class XmlDecode(Decoder):
         for i, k in enumerate(keys):
             if k == attrib_name:
                 return i
-        return -1
+        from ghidra.core.error import DecoderError
+        raise DecoderError("Attribute missing: " + attrib_name)
 
     def peekElement(self) -> int:
         if not self._elStack:
-            if self._root is not None:
-                return ElementId.find(self._root.tag, self._scope)
-            return 0
+            if self._root is None:
+                return 0
+            return ElementId.find(self._root.tag, self._scope)
         parent = self._currentElement()
         children = list(parent)
         idx = self._childIndexStack[-1]
@@ -585,35 +714,48 @@ class XmlDecode(Decoder):
         return ElementId.find(child.tag, self._scope)
 
     def openElement(self, elemId: Optional[ElementId] = None) -> int:
+        from ghidra.core.error import DecoderError
+
         if not self._elStack:
+            if self._root is None:
+                if elemId is None:
+                    return 0
+                raise DecoderError(f"Expecting <{elemId.name}> but reached end of document")
             el = self._root
+            self._root = None
         else:
             parent = self._currentElement()
             children = list(parent)
             idx = self._childIndexStack[-1]
             if idx >= len(children):
-                from ghidra.core.error import DecoderError
-                raise DecoderError("No more child elements")
+                if elemId is None:
+                    return 0
+                raise DecoderError(
+                    f"Expecting <{elemId.name}> but no remaining children in current element"
+                )
             el = children[idx]
             self._childIndexStack[-1] = idx + 1
+
+        found_id = ElementId.find(el.tag, self._scope)
+        if elemId is not None and el.tag != elemId.name:
+            raise DecoderError(f"Expecting <{elemId.name}> but got <{el.tag}>")
 
         self._elStack.append(el)
         self._childIndexStack.append(0)
         self._attributeIndex = -1
         self._attrKeys = list(el.attrib.keys())
-
-        found_id = ElementId.find(el.tag, self._scope)
-        if elemId is not None and found_id != elemId.id:
-            from ghidra.core.error import DecoderError
-            raise DecoderError(f"Expected element <{elemId.name}>, got <{el.tag}>")
+        if elemId is not None:
+            return elemId.id
         return found_id
 
     def closeElement(self, id_: int) -> None:
         self._elStack.pop()
         self._childIndexStack.pop()
-        self._attributeIndex = -1
+        self._attributeIndex = 1000
         if self._elStack:
             self._attrKeys = list(self._elStack[-1].attrib.keys())
+        else:
+            self._attrKeys = []
 
     def closeElementSkipping(self, id_: int) -> None:
         self.closeElement(id_)
@@ -621,31 +763,32 @@ class XmlDecode(Decoder):
     def getNextAttributeId(self) -> int:
         el = self._currentElement()
         keys = list(el.attrib.keys())
-        self._attributeIndex += 1
-        if self._attributeIndex >= len(keys):
-            self._attributeIndex = len(keys)
+        next_index = self._attributeIndex + 1
+        if next_index >= len(keys):
             return 0
+        self._attributeIndex = next_index
         attr_name = keys[self._attributeIndex]
         return AttributeId.find(attr_name, self._scope)
 
     def getIndexedAttributeId(self, attribId: AttributeId) -> int:
-        """Return the id for an indexed attribute, matching C++ XmlDecode::getIndexedAttributeId."""
+        from ghidra.core.error import LowlevelError
+
         el = self._currentElement()
         keys = list(el.attrib.keys())
         if self._attributeIndex < 0 or self._attributeIndex >= len(keys):
-            return 0  # ATTRIB_UNKNOWN
+            return ATTRIB_UNKNOWN.getId()
         attribName = keys[self._attributeIndex]
         baseName = attribId.name
         if not attribName.startswith(baseName):
-            return 0  # ATTRIB_UNKNOWN
+            return ATTRIB_UNKNOWN.getId()
         suffix = attribName[len(baseName):]
         try:
             val = int(suffix)
         except (ValueError, TypeError):
-            return 0
+            val = 0
         if val == 0:
-            return 0
-        return attribId._id + (val - 1)
+            raise LowlevelError("Bad indexed attribute: " + attribId.getName())
+        return attribId.id + (val - 1)
 
     def rewindAttributes(self) -> None:
         self._attributeIndex = -1
@@ -653,14 +796,14 @@ class XmlDecode(Decoder):
     def _getAttributeValue(self, attribId: Optional[AttributeId] = None) -> str:
         el = self._currentElement()
         if attribId is not None:
-            val = el.attrib.get(attribId.name)
-            if val is None:
-                if attribId == ATTRIB_CONTENT:
-                    return el.text or ""
-                from ghidra.core.error import DecoderError
-                raise DecoderError(f"Attribute '{attribId.name}' not found")
-            self.rewindAttributes()
-            return val
+            if attribId == ATTRIB_CONTENT:
+                val = el.attrib.get(attribId.name)
+                if val is not None:
+                    return val
+                return el.text or ""
+            index = self._findMatchingAttribute(el, attribId.name)
+            keys = list(el.attrib.keys())
+            return el.attrib[keys[index]]
         # Use current attribute index
         keys = list(el.attrib.keys())
         if 0 <= self._attributeIndex < len(keys):
@@ -669,8 +812,10 @@ class XmlDecode(Decoder):
         raise DecoderError("No current attribute to read")
 
     def readBool(self, attribId: Optional[AttributeId] = None) -> bool:
+        from ghidra.core.xml import xml_readbool
+
         val = self._getAttributeValue(attribId)
-        return val.lower() in ("true", "1", "yes", "y")
+        return xml_readbool(val)
 
     def readSignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
         val = self._getAttributeValue(attribId)
@@ -682,11 +827,10 @@ class XmlDecode(Decoder):
             if val == expect_str:
                 return expectval
             return int(val, 0)
-        else:
-            val = self._getAttributeValue()
-            if val == expect_or_attribId:
-                return expect_str if expect_str is not None else expectval
-            return int(val, 0)
+        val = self._getAttributeValue()
+        if val == expect_or_attribId:
+            return expect_str if expect_str is not None else expectval
+        return int(val, 0)
 
     def readUnsignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
         val = self._getAttributeValue(attribId)
@@ -696,15 +840,24 @@ class XmlDecode(Decoder):
         return self._getAttributeValue(attribId)
 
     def readSpace(self, attribId: Optional[AttributeId] = None) -> AddrSpace:
+        from ghidra.core.error import DecoderError
+
         name = self._getAttributeValue(attribId)
         if self.spcManager is None:
-            from ghidra.core.error import DecoderError
             raise DecoderError("No address space manager for readSpace")
-        return self.spcManager.getSpaceByName(name)
+        res = self.spcManager.getSpaceByName(name)
+        if res is None:
+            raise DecoderError("Unknown address space name: " + name)
+        return res
 
     def readOpcode(self, attribId: Optional[AttributeId] = None) -> OpCode:
+        from ghidra.core.error import DecoderError
+
         val = self._getAttributeValue(attribId)
-        return get_opcode(val)
+        opc = get_opcode(val)
+        if opc == OpCode.CPUI_BLANK:
+            raise DecoderError("Bad encoded OpCode")
+        return opc
 
 
 # =========================================================================
@@ -714,8 +867,11 @@ class XmlDecode(Decoder):
 class XmlEncode(Encoder):
     """An XML-based encoder that writes to a StringIO stream."""
 
-    def __init__(self, stream: Optional[io.StringIO] = None, do_format: bool = True) -> None:
-        self._stream: io.StringIO = stream if stream is not None else io.StringIO()
+    _SPACES = "\n                        "
+    _MAX_SPACES = 24 + 1
+
+    def __init__(self, stream, do_format: bool = True) -> None:
+        self._stream = stream
         self._depth: int = 0
         self._tagStatus: int = 2  # 0=tag_start, 1=tag_content, 2=tag_stop
         self._doFormatting: bool = do_format
@@ -727,15 +883,20 @@ class XmlEncode(Encoder):
     def toString(self) -> str:
         return self._stream.getvalue()
 
-    def _newLine(self) -> None:
-        if self._doFormatting:
-            self._stream.write("\n")
-            self._stream.write("  " * self._depth)
+    def newLine(self) -> None:
+        if not self._doFormatting:
+            return
+        num_spaces = self._depth * 2 + 1
+        if num_spaces > self._MAX_SPACES:
+            num_spaces = self._MAX_SPACES
+        self._stream.write(self._SPACES[:num_spaces])
 
     def openElement(self, elemId: ElementId) -> None:
         if self._tagStatus == 0:
             self._stream.write(">")
-        self._newLine()
+        else:
+            self._tagStatus = 0
+        self.newLine()
         self._stream.write(f"<{elemId.name}")
         self._elemStack.append(elemId.name)
         self._depth += 1
@@ -743,40 +904,76 @@ class XmlEncode(Encoder):
 
     def closeElement(self, elemId: ElementId) -> None:
         self._depth -= 1
-        name = self._elemStack.pop()
+        self._elemStack.pop()
         if self._tagStatus == 0:
             self._stream.write("/>")
+            self._tagStatus = 2
+            return
+        if self._tagStatus != 1:
+            self.newLine()
         else:
-            self._newLine()
-            self._stream.write(f"</{name}>")
+            self._tagStatus = 2
+        self._stream.write(f"</{elemId.name}>")
         self._tagStatus = 2  # tag_stop
 
     def writeBool(self, attribId: AttributeId, val: bool) -> None:
-        self._stream.write(f' {attribId.name}="{str(val).lower()}"')
+        if attribId == ATTRIB_CONTENT:
+            if self._tagStatus == 0:
+                self._stream.write(">")
+            self._stream.write("true" if val else "false")
+            self._tagStatus = 1
+            return
+        self._stream.write(a_v_b(attribId.name, val))
 
     def writeSignedInteger(self, attribId: AttributeId, val: int) -> None:
-        self._stream.write(f' {attribId.name}="0x{val & 0xFFFFFFFFFFFFFFFF:x}"')
+        if attribId == ATTRIB_CONTENT:
+            if self._tagStatus == 0:
+                self._stream.write(">")
+            self._stream.write(str(val))
+            self._tagStatus = 1
+            return
+        self._stream.write(a_v_i(attribId.name, val))
 
     def writeUnsignedInteger(self, attribId: AttributeId, val: int) -> None:
-        self._stream.write(f' {attribId.name}="0x{val:x}"')
+        if attribId == ATTRIB_CONTENT:
+            if self._tagStatus == 0:
+                self._stream.write(">")
+            self._stream.write(f"0x{val:x}")
+            self._tagStatus = 1
+            return
+        self._stream.write(a_v_u(attribId.name, val))
 
     def writeString(self, attribId: AttributeId, val: str) -> None:
         if attribId == ATTRIB_CONTENT:
             if self._tagStatus == 0:
                 self._stream.write(">")
-                self._tagStatus = 1
-            self._stream.write(val)
-        else:
-            self._stream.write(f' {attribId.name}="{val}"')
+            self._stream.write(xml_escape(val))
+            self._tagStatus = 1
+            return
+        self._stream.write(a_v(attribId.name, val))
 
     def writeStringIndexed(self, attribId: AttributeId, index: int, val: str) -> None:
-        self._stream.write(f' {attribId.name}{index}="{val}"')
+        self._stream.write(f' {attribId.name}{index + 1}="{xml_escape(val)}"')
 
     def writeSpace(self, attribId: AttributeId, spc: AddrSpace) -> None:
-        self._stream.write(f' {attribId.name}="{spc.getName()}"')
+        name = spc.getName()
+        if attribId == ATTRIB_CONTENT:
+            if self._tagStatus == 0:
+                self._stream.write(">")
+            self._stream.write(xml_escape(name))
+            self._tagStatus = 1
+            return
+        self._stream.write(a_v(attribId.name, name))
 
     def writeOpcode(self, attribId: AttributeId, opc: OpCode) -> None:
-        self._stream.write(f' {attribId.name}="{get_opname(opc)}"')
+        name = get_opname(opc)
+        if attribId == ATTRIB_CONTENT:
+            if self._tagStatus == 0:
+                self._stream.write(">")
+            self._stream.write(name)
+            self._tagStatus = 1
+            return
+        self._stream.write(f' {attribId.name}="{name}"')
 
 
 # =========================================================================
@@ -815,336 +1012,470 @@ class _PF:
 # =========================================================================
 
 class PackedDecode(Decoder):
-    """A byte-based decoder for Ghidra's packed binary format.
+    """A byte-based decoder for Ghidra's packed binary format."""
 
-    C++ ref: ``PackedDecode`` in marshal.hh / marshal.cc
-    """
+    BUFFER_SIZE = 1024
 
-    def __init__(self, spc_manager: Optional[AddrSpaceManager] = None) -> None:
+    class ByteChunk:
+        def __init__(self, start: bytearray, end: int) -> None:
+            self.start = start
+            self.end = end
+
+    class Position:
+        def __init__(self, seq_iter: int = 0, current: int = 0, end: int = 0) -> None:
+            self.seqIter = seq_iter
+            self.current = current
+            self.end = end
+
+    def __init__(self, spc_manager: Optional[AddrSpaceManager]) -> None:
         super().__init__(spc_manager)
-        self._buf: bytes = b""
-        self._pos: int = 0          # endPos equivalent — next element boundary
-        self._startPos: int = 0     # start of current element's attributes
-        self._curPos: int = 0       # current attribute scan position
-        self._attributeRead: bool = True
+        self._inStream: list[PackedDecode.ByteChunk] = []
+        self._startPos = PackedDecode.Position()
+        self._curPos = PackedDecode.Position()
+        self._endPos = PackedDecode.Position()
+        self._attributeRead = True
 
-    # ------------------------------------------------------------------
-    # Ingestion
-    # ------------------------------------------------------------------
+    def __del__(self) -> None:
+        if hasattr(self, "_inStream"):
+            self._inStream.clear()
 
-    def ingestStream(self, s: str) -> None:
-        if isinstance(s, (bytes, bytearray)):
-            self._buf = bytes(s)
+    def _copyPosition(self, pos: Position) -> Position:
+        return PackedDecode.Position(pos.seqIter, pos.current, pos.end)
+
+    def _resetStreamState(self) -> None:
+        self._inStream = []
+        self._startPos = PackedDecode.Position()
+        self._curPos = PackedDecode.Position()
+        self._endPos = PackedDecode.Position()
+        self._attributeRead = True
+
+    def _setPositionToStreamStart(self, pos: Position) -> None:
+        pos.seqIter = 0
+        if not self._inStream:
+            pos.current = 0
+            pos.end = 0
+            return
+        pos.current = 0
+        pos.end = self._inStream[0].end
+
+    def _raiseUnexpectedEndOfStream(self) -> None:
+        from ghidra.core.error import DecoderError
+
+        raise DecoderError("Unexpected end of stream")
+
+    def _ingestRawBytes(self, data: bytes) -> None:
+        self._resetStreamState()
+        last_count = 0
+        offset = 0
+        while offset < len(data):
+            buf = self.allocateNextInputBuffer(1)
+            last_count = min(self.BUFFER_SIZE, len(data) - offset)
+            buf[:last_count] = data[offset:offset + last_count]
+            offset += last_count
+        self.endIngest(last_count)
+        self._startPos = self._copyPosition(self._endPos)
+        self._curPos = self._copyPosition(self._endPos)
+        self._attributeRead = True
+
+    def ingestStream(self, s) -> None:
+        raw = s.read() if hasattr(s, "read") else s
+        if isinstance(raw, str):
+            data = raw.encode("latin-1")
         else:
-            self._buf = s.encode("latin-1")
-        self._pos = 0
+            data = bytes(raw)
+        zero_pos = data.find(b"\0")
+        if zero_pos != -1:
+            data = data[:zero_pos]
+        self._ingestRawBytes(data)
 
     def ingestBytes(self, data: bytes) -> None:
-        """Ingest raw packed bytes (convenience for protocol layer)."""
-        # Append an ELEMENT_END sentinel so reads past the end don't crash
-        self._buf = bytes(data) + bytes([_PF.ELEMENT_END])
-        self._pos = 0
+        self._ingestRawBytes(bytes(data))
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def getByte(self, pos: Position) -> int:
+        if pos.seqIter >= len(self._inStream) or pos.current >= pos.end:
+            self._raiseUnexpectedEndOfStream()
+        return self._inStream[pos.seqIter].start[pos.current]
 
-    def _getByte(self, pos: int) -> int:
-        if pos >= len(self._buf):
-            from ghidra.core.error import DecoderError
-            raise DecoderError("Unexpected end of packed stream")
-        return self._buf[pos]
+    def getBytePlus1(self, pos: Position) -> int:
+        if pos.seqIter >= len(self._inStream) or pos.current >= pos.end:
+            self._raiseUnexpectedEndOfStream()
+        ptr = pos.current + 1
+        if ptr == pos.end:
+            next_iter = pos.seqIter + 1
+            if next_iter == len(self._inStream) or self._inStream[next_iter].end == 0:
+                self._raiseUnexpectedEndOfStream()
+            return self._inStream[next_iter].start[0]
+        if ptr > pos.end:
+            self._raiseUnexpectedEndOfStream()
+        return self._inStream[pos.seqIter].start[ptr]
 
-    def _readInteger(self, length: int) -> int:
-        """Read a variable-length integer (7 bits per byte, MSB first)."""
-        val = 0
-        for _ in range(length):
-            val <<= _PF.RAWDATA_BITSPERBYTE
-            val |= (self._buf[self._curPos] & _PF.RAWDATA_MASK)
-            self._curPos += 1
-        return val
+    def getNextByte(self, pos: Position) -> int:
+        res = self.getByte(pos)
+        pos.current += 1
+        if pos.current != pos.end:
+            return res
+        pos.seqIter += 1
+        if pos.seqIter == len(self._inStream):
+            self._raiseUnexpectedEndOfStream()
+        pos.current = 0
+        pos.end = self._inStream[pos.seqIter].end
+        return res
 
-    def _readHeaderId(self, pos: int) -> tuple[int, int]:
-        """Read element/attribute id from header byte at pos. Returns (id, new_pos)."""
-        header = self._buf[pos]
-        eid = header & _PF.ELEMENTID_MASK
-        pos += 1
-        if header & _PF.HEADEREXTEND_MASK:
-            eid <<= _PF.RAWDATA_BITSPERBYTE
-            eid |= (self._buf[pos] & _PF.RAWDATA_MASK)
-            pos += 1
-        return eid, pos
+    def advancePosition(self, pos: Position, skip: int) -> None:
+        while pos.end - pos.current <= skip:
+            skip -= pos.end - pos.current
+            pos.seqIter += 1
+            if pos.seqIter == len(self._inStream):
+                self._raiseUnexpectedEndOfStream()
+            pos.current = 0
+            pos.end = self._inStream[pos.seqIter].end
+        pos.current += skip
 
-    def _skipAttribute(self) -> None:
-        """Skip the attribute at _curPos (header + type + data)."""
-        header = self._buf[self._curPos]
-        self._curPos += 1
-        if header & _PF.HEADEREXTEND_MASK:
-            self._curPos += 1  # skip extension byte
-        typeByte = self._buf[self._curPos]
-        self._curPos += 1
+    def readInteger(self, length: int) -> int:
+        res = 0
+        while length > 0:
+            res <<= _PF.RAWDATA_BITSPERBYTE
+            res |= self.getNextByte(self._curPos) & _PF.RAWDATA_MASK
+            length -= 1
+        return res
+
+    def readLengthCode(self, typeByte: int) -> int:
+        return typeByte & _PF.LENGTHCODE_MASK
+
+    def findMatchingAttribute(self, attribId: AttributeId) -> None:
+        self._curPos = self._copyPosition(self._startPos)
+        while True:
+            header1 = self.getByte(self._curPos)
+            if (header1 & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
+                break
+            attr_id = header1 & _PF.ELEMENTID_MASK
+            if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+                attr_id <<= _PF.RAWDATA_BITSPERBYTE
+                attr_id |= self.getBytePlus1(self._curPos) & _PF.RAWDATA_MASK
+            if attribId.getId() == attr_id:
+                return
+            self.skipAttribute()
+        from ghidra.core.error import DecoderError
+
+        raise DecoderError("Attribute " + attribId.getName() + " is not present")
+
+    def skipAttribute(self) -> None:
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
         attribType = typeByte >> _PF.TYPECODE_SHIFT
         if attribType == _PF.TYPECODE_BOOLEAN or attribType == _PF.TYPECODE_SPECIALSPACE:
             return
-        length = typeByte & _PF.LENGTHCODE_MASK
+        length = self.readLengthCode(typeByte)
         if attribType == _PF.TYPECODE_STRING:
-            length = self._readInteger(length)  # string length in bytes
-        self._curPos += length
+            length = self.readInteger(length)
+        self.advancePosition(self._curPos, length)
 
-    def _findMatchingAttribute(self, attribId: AttributeId) -> None:
-        """Scan from _startPos to find the attribute with the given id."""
-        self._curPos = self._startPos
-        while True:
-            if self._curPos >= len(self._buf):
-                break
-            header = self._buf[self._curPos]
-            if (header & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
-                break
-            eid = header & _PF.ELEMENTID_MASK
-            nextPos = self._curPos + 1
-            if header & _PF.HEADEREXTEND_MASK:
-                eid <<= _PF.RAWDATA_BITSPERBYTE
-                eid |= (self._buf[nextPos] & _PF.RAWDATA_MASK)
-            if eid == attribId.id:
-                return  # found — _curPos points to start of this attribute
-            self._skipAttribute()
-        from ghidra.core.error import DecoderError
-        raise DecoderError(f"Attribute {attribId.name} is not present")
-
-    def _readTypeByte(self) -> int:
-        """Consume attribute header + return type byte. Sets _attributeRead."""
-        header = self._buf[self._curPos]
-        self._curPos += 1
-        if header & _PF.HEADEREXTEND_MASK:
-            self._curPos += 1
-        typeByte = self._buf[self._curPos]
-        self._curPos += 1
-        return typeByte
+    def skipAttributeRemaining(self, typeByte: int) -> None:
+        attribType = typeByte >> _PF.TYPECODE_SHIFT
+        if attribType == _PF.TYPECODE_BOOLEAN or attribType == _PF.TYPECODE_SPECIALSPACE:
+            return
+        length = self.readLengthCode(typeByte)
+        if attribType == _PF.TYPECODE_STRING:
+            length = self.readInteger(length)
+        self.advancePosition(self._curPos, length)
 
     # ------------------------------------------------------------------
     # Decoder interface
     # ------------------------------------------------------------------
 
+    def allocateNextInputBuffer(self, pad: int) -> bytearray:
+        buf = bytearray(self.BUFFER_SIZE + pad)
+        self._inStream.append(PackedDecode.ByteChunk(buf, self.BUFFER_SIZE))
+        return buf
+
+    def endIngest(self, bufPos: int) -> None:
+        self._setPositionToStreamStart(self._endPos)
+        if not self._inStream:
+            return
+        if bufPos == self.BUFFER_SIZE:
+            endbuf = bytearray(1)
+            self._inStream.append(PackedDecode.ByteChunk(endbuf, 1))
+            bufPos = 0
+        buf = self._inStream[-1].start
+        buf[bufPos] = _PF.ELEMENT_END
+
     def peekElement(self) -> int:
-        if self._pos >= len(self._buf):
+        if not self._inStream or self._endPos.seqIter >= len(self._inStream):
             return 0
-        header = self._buf[self._pos]
-        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_START:
+        header1 = self.getByte(self._endPos)
+        if (header1 & _PF.HEADER_MASK) != _PF.ELEMENT_START:
             return 0
-        eid, _ = self._readHeaderId(self._pos)
-        return eid
+        elem_id = header1 & _PF.ELEMENTID_MASK
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            elem_id <<= _PF.RAWDATA_BITSPERBYTE
+            elem_id |= self.getBytePlus1(self._endPos) & _PF.RAWDATA_MASK
+        return elem_id
 
     def openElement(self, elemId: Optional[ElementId] = None) -> int:
-        if self._pos >= len(self._buf):
-            if elemId is not None:
+        if elemId is not None:
+            elem_id = self.openElement()
+            if elem_id != elemId.getId():
                 from ghidra.core.error import DecoderError
-                raise DecoderError(f"Expecting <{elemId.name}> but reached end of stream")
-            return 0
-        header = self._buf[self._pos]
-        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_START:
-            if elemId is not None:
-                from ghidra.core.error import DecoderError
-                raise DecoderError(f"Expecting <{elemId.name}> but did not scan an element")
-            return 0
-        eid, newPos = self._readHeaderId(self._pos)
-        self._pos = newPos
-        self._startPos = self._pos
-        self._curPos = self._pos
-        # Skip over all attributes to find the end position
-        while self._curPos < len(self._buf):
-            h = self._buf[self._curPos]
-            if (h & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
-                break
-            self._skipAttribute()
-        self._pos = self._curPos  # endPos = past all attributes
-        self._curPos = self._startPos
-        self._attributeRead = True
 
-        if elemId is not None and eid != elemId.id:
-            from ghidra.core.error import DecoderError
-            raise DecoderError(f"Expecting <{elemId.name}> but id did not match")
-        return eid
+                if elem_id == 0:
+                    raise DecoderError(
+                        "Expecting <" + elemId.getName() + "> but did not scan an element"
+                    )
+                raise DecoderError(
+                    "Expecting <" + elemId.getName() + "> but id did not match"
+                )
+            return elem_id
+
+        if not self._inStream or self._endPos.seqIter >= len(self._inStream):
+            return 0
+        header1 = self.getByte(self._endPos)
+        if (header1 & _PF.HEADER_MASK) != _PF.ELEMENT_START:
+            return 0
+        self.getNextByte(self._endPos)
+        elem_id = header1 & _PF.ELEMENTID_MASK
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            elem_id <<= _PF.RAWDATA_BITSPERBYTE
+            elem_id |= self.getNextByte(self._endPos) & _PF.RAWDATA_MASK
+        self._startPos = self._copyPosition(self._endPos)
+        self._curPos = self._copyPosition(self._endPos)
+        header1 = self.getByte(self._curPos)
+        while (header1 & _PF.HEADER_MASK) == _PF.ATTRIBUTE:
+            self.skipAttribute()
+            header1 = self.getByte(self._curPos)
+        self._endPos = self._copyPosition(self._curPos)
+        self._curPos = self._copyPosition(self._startPos)
+        self._attributeRead = True
+        return elem_id
 
     def closeElement(self, id_: int) -> None:
-        if self._pos >= len(self._buf):
+        header1 = self.getNextByte(self._endPos)
+        if (header1 & _PF.HEADER_MASK) != _PF.ELEMENT_END:
             from ghidra.core.error import DecoderError
-            raise DecoderError("Expecting element close but reached end of stream")
-        header = self._buf[self._pos]
-        if (header & _PF.HEADER_MASK) != _PF.ELEMENT_END:
-            from ghidra.core.error import DecoderError
+
             raise DecoderError("Expecting element close")
-        closeId, newPos = self._readHeaderId(self._pos)
-        if closeId != id_:
+        close_id = header1 & _PF.ELEMENTID_MASK
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            close_id <<= _PF.RAWDATA_BITSPERBYTE
+            close_id |= self.getNextByte(self._endPos) & _PF.RAWDATA_MASK
+        if id_ != close_id:
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Did not see expected closing element")
-        self._pos = newPos
 
     def closeElementSkipping(self, id_: int) -> None:
-        stack = [id_]
-        while stack:
-            if self._pos >= len(self._buf):
-                from ghidra.core.error import DecoderError
-                raise DecoderError("Unexpected end of stream during skip")
-            header = self._buf[self._pos] & _PF.HEADER_MASK
-            if header == _PF.ELEMENT_END:
-                self.closeElement(stack.pop())
-            elif header == _PF.ELEMENT_START:
-                stack.append(self.openElement())
+        idstack = [id_]
+        while idstack:
+            header1 = self.getByte(self._endPos) & _PF.HEADER_MASK
+            if header1 == _PF.ELEMENT_END:
+                self.closeElement(idstack[-1])
+                idstack.pop()
+            elif header1 == _PF.ELEMENT_START:
+                idstack.append(self.openElement())
             else:
                 from ghidra.core.error import DecoderError
-                raise DecoderError("Corrupt packed stream")
+
+                raise DecoderError("Corrupt stream")
 
     def getNextAttributeId(self) -> int:
         if not self._attributeRead:
-            self._skipAttribute()
-        if self._curPos >= len(self._buf):
+            self.skipAttribute()
+        if self._curPos.seqIter >= len(self._inStream):
             return 0
-        header = self._buf[self._curPos]
-        if (header & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
+        header1 = self.getByte(self._curPos)
+        if (header1 & _PF.HEADER_MASK) != _PF.ATTRIBUTE:
             return 0
-        eid = header & _PF.ELEMENTID_MASK
-        if header & _PF.HEADEREXTEND_MASK:
-            eid <<= _PF.RAWDATA_BITSPERBYTE
-            eid |= (self._buf[self._curPos + 1] & _PF.RAWDATA_MASK)
+        attr_id = header1 & _PF.ELEMENTID_MASK
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            attr_id <<= _PF.RAWDATA_BITSPERBYTE
+            attr_id |= self.getBytePlus1(self._curPos) & _PF.RAWDATA_MASK
         self._attributeRead = False
-        return eid
+        return attr_id
 
     def getIndexedAttributeId(self, attribId: AttributeId) -> int:
-        return 0
+        return ATTRIB_UNKNOWN.getId()
 
     def rewindAttributes(self) -> None:
-        self._curPos = self._startPos
+        self._curPos = self._copyPosition(self._startPos)
         self._attributeRead = True
 
     def readBool(self, attribId: Optional[AttributeId] = None) -> bool:
         if attribId is not None:
-            self._findMatchingAttribute(attribId)
-        typeByte = self._readTypeByte()
+            self.findMatchingAttribute(attribId)
+            res = self.readBool()
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
         self._attributeRead = True
         if (typeByte >> _PF.TYPECODE_SHIFT) != _PF.TYPECODE_BOOLEAN:
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Expecting boolean attribute")
-        result = (typeByte & _PF.LENGTHCODE_MASK) != 0
-        if attribId is not None:
-            self._curPos = self._startPos
-        return result
+        return (typeByte & _PF.LENGTHCODE_MASK) != 0
 
     def readSignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
         if attribId is not None:
-            self._findMatchingAttribute(attribId)
-        typeByte = self._readTypeByte()
+            self.findMatchingAttribute(attribId)
+            res = self.readSignedInteger()
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
         typeCode = typeByte >> _PF.TYPECODE_SHIFT
         if typeCode == _PF.TYPECODE_SIGNEDINT_POSITIVE:
-            res = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+            res = self.readInteger(self.readLengthCode(typeByte))
         elif typeCode == _PF.TYPECODE_SIGNEDINT_NEGATIVE:
-            res = -self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+            res = -self.readInteger(self.readLengthCode(typeByte))
         else:
+            self.skipAttributeRemaining(typeByte)
+            self._attributeRead = True
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Expecting signed integer attribute")
         self._attributeRead = True
-        if attribId is not None:
-            self._curPos = self._startPos
         return res
 
-    def readSignedIntegerExpectString(self, expect_or_attribId,
-                                       expect_str: Optional[str] = None,
-                                       expectval: int = 0) -> int:
+    def readSignedIntegerExpectString(
+        self,
+        expect_or_attribId,
+        expect_str: Optional[str] = None,
+        expectval: int = 0,
+    ) -> int:
         if isinstance(expect_or_attribId, AttributeId):
-            self._findMatchingAttribute(expect_or_attribId)
-            # Peek type
-            savedPos = self._curPos
-            _h = self._buf[self._curPos]
-            skip = 2 if (_h & _PF.HEADEREXTEND_MASK) else 1
-            typeByte = self._buf[self._curPos + skip]
-            typeCode = typeByte >> _PF.TYPECODE_SHIFT
-            if typeCode == _PF.TYPECODE_STRING:
-                val = self.readString()
-                self._curPos = self._startPos
-                if val != expect_str:
-                    from ghidra.core.error import DecoderError
-                    raise DecoderError(f'Expecting string "{expect_str}" but read "{val}"')
-                return expectval
-            else:
-                self._curPos = savedPos
-                res = self.readSignedInteger()
-                self._curPos = self._startPos
-                return res
-        else:
-            # expect_or_attribId is the expected string
-            savedPos = self._curPos
-            _h = self._buf[self._curPos]
-            skip = 2 if (_h & _PF.HEADEREXTEND_MASK) else 1
-            typeByte = self._buf[self._curPos + skip]
-            typeCode = typeByte >> _PF.TYPECODE_SHIFT
-            if typeCode == _PF.TYPECODE_STRING:
-                val = self.readString()
-                if val != expect_or_attribId:
-                    from ghidra.core.error import DecoderError
-                    raise DecoderError(f'Expecting string "{expect_or_attribId}" but read "{val}"')
-                return expect_str if expect_str is not None else expectval
-            else:
-                self._curPos = savedPos
-                return self.readSignedInteger()
+            self.findMatchingAttribute(expect_or_attribId)
+            res = self.readSignedIntegerExpectString(expect_str, expectval)
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+
+        tmpPos = self._copyPosition(self._curPos)
+        header1 = self.getNextByte(tmpPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(tmpPos)
+        typeByte = self.getNextByte(tmpPos)
+        if (typeByte >> _PF.TYPECODE_SHIFT) == _PF.TYPECODE_STRING:
+            val = self.readString()
+            if val != expect_or_attribId:
+                from ghidra.core.error import DecoderError
+
+                raise DecoderError(
+                    f'Expecting string "{expect_or_attribId}" but read "{val}"'
+                )
+            return expect_str if expect_str is not None else expectval
+        return self.readSignedInteger()
 
     def readUnsignedInteger(self, attribId: Optional[AttributeId] = None) -> int:
         if attribId is not None:
-            self._findMatchingAttribute(attribId)
-        typeByte = self._readTypeByte()
-        typeCode = typeByte >> _PF.TYPECODE_SHIFT
-        if typeCode != _PF.TYPECODE_UNSIGNEDINT:
+            self.findMatchingAttribute(attribId)
+            res = self.readUnsignedInteger()
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
+        if (typeByte >> _PF.TYPECODE_SHIFT) != _PF.TYPECODE_UNSIGNEDINT:
+            self.skipAttributeRemaining(typeByte)
+            self._attributeRead = True
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Expecting unsigned integer attribute")
-        res = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
+        res = self.readInteger(self.readLengthCode(typeByte))
         self._attributeRead = True
-        if attribId is not None:
-            self._curPos = self._startPos
         return res
 
     def readString(self, attribId: Optional[AttributeId] = None) -> str:
         if attribId is not None:
-            self._findMatchingAttribute(attribId)
-        typeByte = self._readTypeByte()
-        typeCode = typeByte >> _PF.TYPECODE_SHIFT
-        if typeCode != _PF.TYPECODE_STRING:
+            self.findMatchingAttribute(attribId)
+            res = self.readString()
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
+        if (typeByte >> _PF.TYPECODE_SHIFT) != _PF.TYPECODE_STRING:
+            self.skipAttributeRemaining(typeByte)
+            self._attributeRead = True
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Expecting string attribute")
-        strLen = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
-        result = self._buf[self._curPos:self._curPos + strLen].decode("utf-8", errors="replace")
-        self._curPos += strLen
+        length = self.readInteger(self.readLengthCode(typeByte))
         self._attributeRead = True
-        if attribId is not None:
-            self._curPos = self._startPos
-        return result
+        if length == 0:
+            return ""
+
+        curLen = self._curPos.end - self._curPos.current
+        if curLen >= length:
+            chunk = self._inStream[self._curPos.seqIter].start
+            res = bytes(chunk[self._curPos.current:self._curPos.current + length])
+            self.advancePosition(self._curPos, length)
+            return res.decode("utf-8", errors="replace")
+
+        res = bytearray()
+        while length > 0:
+            curLen = self._curPos.end - self._curPos.current
+            if curLen > length:
+                curLen = length
+            chunk = self._inStream[self._curPos.seqIter].start
+            res.extend(chunk[self._curPos.current:self._curPos.current + curLen])
+            length -= curLen
+            self.advancePosition(self._curPos, curLen)
+        return bytes(res).decode("utf-8", errors="replace")
 
     def readSpace(self, attribId: Optional[AttributeId] = None) -> AddrSpace:
         if attribId is not None:
-            self._findMatchingAttribute(attribId)
-        typeByte = self._readTypeByte()
+            self.findMatchingAttribute(attribId)
+            res = self.readSpace()
+            self._curPos = self._copyPosition(self._startPos)
+            return res
+
+        header1 = self.getNextByte(self._curPos)
+        if (header1 & _PF.HEADEREXTEND_MASK) != 0:
+            self.getNextByte(self._curPos)
+        typeByte = self.getNextByte(self._curPos)
         typeCode = typeByte >> _PF.TYPECODE_SHIFT
-        spc = None
         if typeCode == _PF.TYPECODE_ADDRESSSPACE:
-            idx = self._readInteger(typeByte & _PF.LENGTHCODE_MASK)
-            if self.spcManager is not None:
-                spc = self.spcManager.getSpace(idx)
+            idx = self.readInteger(self.readLengthCode(typeByte))
+            spc = self.spcManager.getSpace(idx) if self.spcManager is not None else None
+            if spc is None:
+                from ghidra.core.error import DecoderError
+
+                raise DecoderError("Unknown address space index")
         elif typeCode == _PF.TYPECODE_SPECIALSPACE:
-            code = typeByte & _PF.LENGTHCODE_MASK
-            if self.spcManager is not None:
-                if code == _PF.SPECIALSPACE_STACK:
-                    spc = self.spcManager.getStackSpace()
-                elif code == _PF.SPECIALSPACE_JOIN:
-                    spc = self.spcManager.getJoinSpace()
-        if spc is None:
+            specialCode = self.readLengthCode(typeByte)
+            if specialCode == _PF.SPECIALSPACE_STACK:
+                spc = self.spcManager.getStackSpace() if self.spcManager is not None else None
+            elif specialCode == _PF.SPECIALSPACE_JOIN:
+                spc = self.spcManager.getJoinSpace() if self.spcManager is not None else None
+            else:
+                from ghidra.core.error import DecoderError
+
+                raise DecoderError("Cannot marshal special address space")
+        else:
+            self.skipAttributeRemaining(typeByte)
+            self._attributeRead = True
             from ghidra.core.error import DecoderError
-            raise DecoderError("Cannot resolve address space")
+
+            raise DecoderError("Expecting space attribute")
         self._attributeRead = True
-        if attribId is not None:
-            self._curPos = self._startPos
         return spc
 
     def readOpcode(self, attribId: Optional[AttributeId] = None) -> OpCode:
-        val = self.readSignedInteger(attribId)
+        if attribId is not None:
+            self.findMatchingAttribute(attribId)
+            opc = self.readOpcode()
+            self._curPos = self._copyPosition(self._startPos)
+            return opc
+        val = self.readSignedInteger()
         if val < 0 or val >= OpCode.CPUI_MAX.value:
             from ghidra.core.error import DecoderError
+
             raise DecoderError("Bad encoded OpCode")
         return OpCode(val)
 
@@ -1159,8 +1490,8 @@ class PackedEncode(Encoder):
     C++ ref: ``PackedEncode`` in marshal.hh / marshal.cc
     """
 
-    def __init__(self, stream: Optional[io.BytesIO] = None) -> None:
-        self._stream: io.BytesIO = stream if stream is not None else io.BytesIO()
+    def __init__(self, stream: io.BytesIO) -> None:
+        self._stream: io.BytesIO = stream
 
     def getBytes(self) -> bytes:
         return self._stream.getvalue()

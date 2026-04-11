@@ -10,6 +10,7 @@ Provides:
 """
 from __future__ import annotations
 
+import io
 from typing import Dict, List, Optional, TYPE_CHECKING
 
 from ghidra.core.error import LowlevelError
@@ -437,6 +438,7 @@ class RuleCompile:
         self._finalrule: Optional[ConstraintGroup] = None
         self._cur_tok: int = _Tok.EOF
         self._cur_val: object = None
+        self._error_stream: Optional[io.TextIOBase] = None
 
     def numErrors(self) -> int:
         return self._errors
@@ -456,10 +458,15 @@ class RuleCompile:
     def namemap(self) -> Dict[str, int]:
         return self._namemap
 
+    def setErrorStream(self, stream: io.TextIOBase) -> None:
+        self._error_stream = stream
+
     # -- Error reporting ---------------------------------------------------
 
     def ruleError(self, msg: str) -> None:
         self._errors += 1
+        if self._error_stream is not None:
+            self._error_stream.write(f"{msg}\n")
 
     # -- Name management ---------------------------------------------------
 
@@ -724,8 +731,10 @@ class RuleCompile:
         self._next()
         try:
             self._finalrule = self._parse_fullrule()
-        except Exception:
+        except Exception as err:
             self._errors += 1
+            if self._error_stream is not None:
+                self._error_stream.write(f"{err}\n")
 
     def _parse_fullrule(self) -> ConstraintGroup:
         self._expect(ord('{'))

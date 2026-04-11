@@ -1334,18 +1334,178 @@ def parse_C(glb, s) -> None:
         raise ParseError("Did not parse a datatype")
 
 
+def parse_protopieces(pieces, s, glb) -> None:
+    """Parse a single function prototype declaration into *pieces*."""
+    parser = CParse(glb, 4096)
+    if not parser.parseStream(s, CParse.doc_declaration):
+        from ghidra.core.error import ParseError
+        raise ParseError(parser.getError())
+    decls = parser.getResultDeclarations()
+    if not decls:
+        from ghidra.core.error import ParseError
+        raise ParseError("Did not parse a datatype")
+    if len(decls) > 1:
+        from ghidra.core.error import ParseError
+        raise ParseError("Parsed multiple declarations")
+    decl = decls[0]
+    if not decl.isValid():
+        from ghidra.core.error import ParseError
+        raise ParseError("Parsed type is invalid")
+    if not decl.getPrototype(pieces, glb):
+        from ghidra.core.error import ParseError
+        raise ParseError("Did not parse a prototype")
+
+
 def parse_toseparator(s) -> str:
     """Read from *s* until a C separator is encountered."""
     parts: List[str] = []
-    # skip leading whitespace
     while True:
+        pos = s.tell()
         ch = s.read(1)
         if not ch:
-            return ''
+            return ""
         if not ch.isspace():
+            s.seek(pos)
             break
-    # read until non-alnum/non-underscore
-    while ch and (ch.isalnum() or ch == '_'):
-        parts.append(ch)
+    while True:
+        pos = s.tell()
         ch = s.read(1)
+        if not ch:
+            break
+        if ch.isalnum() or ch == "_":
+            parts.append(ch)
+            continue
+        s.seek(pos)
+        break
     return ''.join(parts)
+
+
+def _skip_ws(s) -> None:
+    while True:
+        pos = s.tell()
+        ch = s.read(1)
+        if not ch:
+            return
+        if not ch.isspace():
+            s.seek(pos)
+            return
+
+
+def _peek_char(s) -> str:
+    pos = s.tell()
+    ch = s.read(1)
+    s.seek(pos)
+    return ch
+
+
+def _read_required_char(s, expected: str, msg: str) -> None:
+    _skip_ws(s)
+    ch = s.read(1)
+    if ch != expected:
+        from ghidra.core.error import ParseError
+        raise ParseError(msg)
+
+
+def _read_until_one_of(s, separators: set[str]) -> str:
+    _skip_ws(s)
+    parts: List[str] = []
+    while True:
+        ch = _peek_char(s)
+        if not ch or ch in separators:
+            break
+        parts.append(s.read(1))
+    return ''.join(parts).strip()
+
+
+def _read_number_token(s) -> str:
+    _skip_ws(s)
+    parts: List[str] = []
+    while True:
+        ch = _peek_char(s)
+        if not ch or ch.isspace() or ch in ")]":
+            break
+        parts.append(s.read(1))
+    return ''.join(parts)
+
+
+def parse_machaddr(s, defaultsize: int, typegrp, ignorecolon: bool = False):
+    """Parse a machine address from an ASCII stream.
+
+    Returns ``(Address, size)`` mirroring the C++ out-parameter form.
+    """
+    from ghidra.core.address import Address
+    from ghidra.core.error import ParseError
+
+    manage = typegrp.getArch()
+    size = -1
+    _skip_ws(s)
+    tok = _peek_char(s)
+
+    if tok == '[':
+        s.read(1)
+        token = _read_until_one_of(s, {',', ']'})
+        space = manage.getSpaceByName(token)
+        if space is None:
+            raise ParseError("Bad address base")
+        _read_required_char(s, ',', "Missing ',' in address")
+        token = _read_until_one_of(s, {',', ']'})
+        _skip_ws(s)
+        tok = s.read(1)
+        if tok == ',':
+            size_token = _read_number_token(s)
+            size = int(size_token, 0)
+            _skip_ws(s)
+            tok = s.read(1)
+        if tok != ']':
+            raise ParseError("Missing ']' in address")
+    else:
+        if tok == '0':
+            space = manage.getDefaultCodeSpace()
+        else:
+            space = manage.getSpaceByShortcut(tok)
+            s.read(1)
+        if space is None:
+            token = s.read().split()[0] if _peek_char(s) else ""
+            raise ParseError(f"Bad address: {tok}{token}")
+        allowed = "_+" if ignorecolon else "_+:"
+        token = ""
+        while True:
+            ch = _peek_char(s)
+            if not ch or not (ch.isalnum() or ch in allowed):
+                break
+            token += s.read(1)
+
+    res = Address(space, 0)
+    oversize = res.read(token)
+    if oversize == -1:
+        raise ParseError("Bad machine address")
+    return res, (oversize if size == -1 else size)
+
+
+def parse_varnode(s, typegrp):
+    """Parse a varnode specification from an ASCII stream.
+
+    Returns ``(Address, size, pc, uniq)``.
+    """
+    from ghidra.core.address import Address
+    from ghidra.core.error import ParseError
+
+    loc, size = parse_machaddr(s, 0, typegrp)
+    _read_required_char(s, '(', "Missing '('")
+    _skip_ws(s)
+    tok = _peek_char(s)
+    pc = Address()
+    if tok == 'i':
+        s.read(1)
+    elif tok != ':':
+        pc, _ = parse_machaddr(s, 0, typegrp, True)
+
+    _skip_ws(s)
+    if _peek_char(s) == ':':
+        s.read(1)
+        uq = int(_read_number_token(s), 16)
+    else:
+        uq = -1
+
+    _read_required_char(s, ')', "Missing ')'")
+    return loc, size, pc, uq

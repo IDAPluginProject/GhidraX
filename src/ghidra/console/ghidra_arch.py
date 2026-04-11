@@ -8,6 +8,7 @@ comments, registers, p-code injection, etc.).
 
 from __future__ import annotations
 
+import io
 from typing import BinaryIO, Optional, List, TYPE_CHECKING
 
 from ghidra.arch.architecture import Architecture
@@ -17,6 +18,7 @@ from ghidra.arch.loadimage import DataUnavailError
 from ghidra.console.protocol import (
     JavaError,
     read_to_any_burst, read_string_stream,
+    read_string_stream_decoder, read_all,
     read_bool_stream, read_all_response, read_bytes_response,
     read_to_response, read_response_end,
     write_string_stream,
@@ -25,9 +27,11 @@ from ghidra.console.protocol import (
 )
 
 if TYPE_CHECKING:
+    from ghidra.arch.inject import InjectContext
     from ghidra.types.datatype import Datatype
     from ghidra.core.space import AddrSpace
     from ghidra.core.marshal import Encoder, Decoder
+    from ghidra.core.pcoderaw import VarnodeData
 
 
 class ArchitectureGhidra(Architecture):
@@ -55,6 +59,7 @@ class ArchitectureGhidra(Architecture):
 
         if self.print_ is not None:
             self.print_.setMarkup(True)
+            self.print_.setOutputStream(sout)
             # Output goes to sout — we'll wire this after init
 
     # ------------------------------------------------------------------
@@ -96,88 +101,172 @@ class ArchitectureGhidra(Architecture):
     # build*() overrides — create Ghidra-backed subsystems
     # ------------------------------------------------------------------
 
-    def buildLoader(self, store=None) -> None:
+    def buildLoader(self, store) -> None:
         from ghidra.console.subsystems import LoadImageGhidra
         self.loader = LoadImageGhidra(self)
 
-    def buildSpecFile(self, store=None) -> None:
+    def buildTranslator(self, store):
+        from ghidra.console.subsystems import GhidraTranslate
+        return GhidraTranslate(self)
+
+    def buildSpecFile(self, store) -> None:
         """Parse the spec XML strings passed from Ghidra.
 
         C++ ref: ``ArchitectureGhidra::buildSpecFile``
         """
-        if store is None:
-            return
-        # In C++, the four XML strings (pspec, cspec, tspec, corespec) are
-        # parsed into Document objects and registered with the DocumentStorage.
-        # We replicate this by parsing them and registering root elements.
-        import xml.etree.ElementTree as ET
-
-        for xml_str, tag_hint in [
-            (self._pspecxml, "processor_spec"),
-            (self._cspecxml, "compiler_spec"),
-            (self._tspecxml, "sleigh"),
-            (self._corespecxml, "coretypes"),
-        ]:
-            if xml_str:
-                try:
-                    root = ET.fromstring(xml_str)
-                    if store is not None and hasattr(store, 'registerTag'):
-                        store.registerTag(root)
-                except ET.ParseError:
-                    pass
+        for xml_str in (
+            self._pspecxml,
+            self._cspecxml,
+            self._tspecxml,
+            self._corespecxml,
+        ):
+            doc = store.parseDocument(xml_str)
+            store.registerTag(doc.getRoot())
 
         self._pspecxml = ""
         self._cspecxml = ""
         self._tspecxml = ""
         self._corespecxml = ""
 
-    def buildContext(self, store=None) -> None:
+    def buildContext(self, store) -> None:
         from ghidra.console.subsystems import ContextGhidra
         self.context = ContextGhidra(self)
 
-    def buildTypegrp(self, store=None) -> None:
+    def buildTypegrp(self, store) -> None:
         from ghidra.console.subsystems import TypeFactoryGhidra
         self.types = TypeFactoryGhidra(self)
 
-    def buildCommentDB(self, store=None) -> None:
+    def buildCommentDB(self, store) -> None:
         from ghidra.console.subsystems import CommentDatabaseGhidra
         self.commentdb = CommentDatabaseGhidra(self)
 
-    def buildStringManager(self, store=None) -> None:
+    def buildStringManager(self, store) -> None:
         from ghidra.console.subsystems import GhidraStringManager
         self.stringManager = GhidraStringManager(self, 2048)
 
-    def buildConstantPool(self, store=None) -> None:
+    def buildConstantPool(self, store) -> None:
         from ghidra.console.subsystems import ConstantPoolGhidra
         self.cpool = ConstantPoolGhidra(self)
 
-    def buildDatabase(self, store=None) -> None:
+    def buildDatabase(self, store):
         from ghidra.console.subsystems import ScopeGhidra
         from ghidra.database.database import Database
         self.symboltab = Database(self, False)
         globalscope = ScopeGhidra(self)
         self.symboltab.attachScope(globalscope, None)
+        return globalscope
 
-    def buildCoreTypes(self, store=None) -> None:
+    def buildCoreTypes(self, store) -> None:
         """Build core data types (from Ghidra's coretypes spec or defaults).
 
         C++ ref: ``ArchitectureGhidra::buildCoreTypes``
         """
-        if self.types is None:
+        from ghidra.types.datatype import (
+            TYPE_VOID, TYPE_BOOL, TYPE_UINT, TYPE_INT, TYPE_FLOAT,
+            TYPE_UNKNOWN, TYPE_CODE,
+        )
+
+        el = store.getTag("coretypes")
+        if el is not None:
+            from ghidra.core.marshal import XmlDecode
+
+            decoder = XmlDecode(self, el)
+            self.types.decodeCoreTypes(decoder)
+        else:
+            self.types.setCoreType("void", 1, TYPE_VOID, False)
+            self.types.setCoreType("bool", 1, TYPE_BOOL, False)
+            self.types.setCoreType("byte", 1, TYPE_UINT, False)
+            self.types.setCoreType("word", 2, TYPE_UINT, False)
+            self.types.setCoreType("dword", 4, TYPE_UINT, False)
+            self.types.setCoreType("qword", 8, TYPE_UINT, False)
+            self.types.setCoreType("char", 1, TYPE_INT, True)
+            self.types.setCoreType("sbyte", 1, TYPE_INT, False)
+            self.types.setCoreType("sword", 2, TYPE_INT, False)
+            self.types.setCoreType("sdword", 4, TYPE_INT, False)
+            self.types.setCoreType("sqword", 8, TYPE_INT, False)
+            self.types.setCoreType("float", 4, TYPE_FLOAT, False)
+            self.types.setCoreType("float8", 8, TYPE_FLOAT, False)
+            self.types.setCoreType("float10", 10, TYPE_FLOAT, False)
+            self.types.setCoreType("float16", 16, TYPE_FLOAT, False)
+            self.types.setCoreType("undefined", 1, TYPE_UNKNOWN, False)
+            self.types.setCoreType("undefined2", 2, TYPE_UNKNOWN, False)
+            self.types.setCoreType("undefined4", 4, TYPE_UNKNOWN, False)
+            self.types.setCoreType("undefined8", 8, TYPE_UNKNOWN, False)
+            self.types.setCoreType("code", 1, TYPE_CODE, False)
+            self.types.setCoreType("wchar", 2, TYPE_INT, True)
+            self.types.cacheCoreTypes()
+
+    def buildSymbols(self, store) -> None:
+        from ghidra.core.address import Range
+        from ghidra.core.error import LowlevelError
+        from ghidra.core.marshal import (
+            ATTRIB_ADDRESS,
+            ATTRIB_NAME,
+            ATTRIB_SIZE,
+            ATTRIB_VOLATILE,
+            ELEM_DEFAULT_SYMBOLS,
+            ELEM_SYMBOL,
+            XmlDecode,
+        )
+        from ghidra.ir.varnode import Varnode
+
+        symtag = store.getTag(ELEM_DEFAULT_SYMBOLS.getName())
+        if symtag is None:
             return
-        # Try to use coretypes from the spec if available
-        # Fall back to standard core types
-        self.types.setupCoreTypes()
+        decoder = XmlDecode(self, symtag)
+        el = decoder.openElement(ELEM_DEFAULT_SYMBOLS)
+        lastAddr = Address()
+        lastSize = -1
+        while decoder.peekElement() != 0:
+            subel = decoder.openElement(ELEM_SYMBOL)
+            addrString = ""
+            name = ""
+            size = 0
+            volatileState = -1
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME:
+                    name = decoder.readString()
+                elif attribId == ATTRIB_ADDRESS:
+                    addrString = decoder.readString()
+                elif attribId == ATTRIB_VOLATILE:
+                    volatileState = 1 if decoder.readBool() else 0
+                elif attribId == ATTRIB_SIZE:
+                    size = decoder.readSignedInteger()
+            decoder.closeElement(subel)
+            if len(name) == 0:
+                raise LowlevelError("Missing name attribute in <symbol> element")
+            if len(addrString) == 0:
+                raise LowlevelError("Missing address attribute in <symbol> element")
+            if volatileState < 0:
+                continue
+            if addrString == "next" and lastSize != -1:
+                addr = lastAddr + lastSize
+            else:
+                addr = self.parseAddressSimple(addrString)
+            if size == 0:
+                size = addr.getSpace().getWordSize()
+            range_ = Range(addr.getSpace(), addr.getOffset(), addr.getOffset() + (size - 1))
+            if volatileState == 0:
+                self.symboltab.clearPropertyRange(Varnode.volatil, range_)
+            else:
+                self.symboltab.setPropertyRange(Varnode.volatil, range_)
+            lastAddr = addr
+            lastSize = size
+        decoder.closeElement(el)
 
     def resolveArchitecture(self) -> None:
         self.archid = "ghidra"
 
+    def modifySpaces(self, trans) -> None:
+        return None
+
     def postSpecFile(self) -> None:
         super().postSpecFile()
-        if self.symboltab is not None:
-            scope = self.symboltab.getGlobalScope()
-            if hasattr(scope, 'lockDefaultProperties'):
-                scope.lockDefaultProperties()
+        scope = self.symboltab.getGlobalScope()
+        scope.lockDefaultProperties()
 
     def buildPcodeInjectLibrary(self):
         from ghidra.console.subsystems import PcodeInjectLibraryGhidra
@@ -187,27 +276,43 @@ class ArchitectureGhidra(Architecture):
     # Query methods — decompiler → Ghidra client
     # ------------------------------------------------------------------
 
-    def getRegisterXml(self, regname: str) -> Optional[bytes]:
-        """Ask Ghidra for register info by name.
-
-        C++ ref: ``ArchitectureGhidra::getRegister``
-        """
+    def _query_packed_response(self, xml: str) -> Optional[bytes]:
         send_query_open(self._sout)
-        write_string_stream(self._sout, f"<command_getregister name=\"{_xml_escape(regname)}\"/>")
+        write_string_stream(self._sout, xml)
         send_query_close(self._sout)
         self._sout.flush()
         return read_all_response(self._sin)
 
-    def getRegisterName(self, space, offset: int, size: int) -> str:
+    def _ingest_packed_response(self, response: Optional[bytes], decoder: Decoder) -> bool:
+        if response is None:
+            return False
+        ingest_bytes = getattr(decoder, "ingestBytes", None)
+        if ingest_bytes is not None:
+            ingest_bytes(response)
+        else:
+            decoder.ingestStream(response)
+        return True
+
+    def getRegister(self, regname: str, decoder: Decoder) -> bool:
+        """Ask Ghidra for register info by name.
+
+        C++ ref: ``ArchitectureGhidra::getRegister``
+        """
+        response = self._query_packed_response(
+            f"<command_getregister name=\"{_xml_escape(regname)}\"/>"
+        )
+        return self._ingest_packed_response(response, decoder)
+
+    def getRegisterName(self, vndata: VarnodeData) -> str:
         """Ask Ghidra for register name by storage location.
 
         C++ ref: ``ArchitectureGhidra::getRegisterName``
         """
-        space_name = getattr(space, 'name', str(space))
+        space_name = vndata.space.getName()
+        addr = Address(vndata.space, vndata.offset)
         send_query_open(self._sout)
         xml = (f'<command_getregistername>'
-               f'<addr space="{_xml_escape(space_name)}" '
-               f'offset="0x{offset:x}" size="{size}"/>'
+               f'{_encode_addr(addr, vndata.size)}'
                f'</command_getregistername>')
         write_string_stream(self._sout, xml)
         send_query_close(self._sout)
@@ -218,19 +323,15 @@ class ArchitectureGhidra(Architecture):
         read_response_end(self._sin)
         return name
 
-    def getTrackedRegistersXml(self, addr: Address) -> Optional[bytes]:
+    def getTrackedRegisters(self, addr: Address, decoder: Decoder) -> bool:
         """Get tracked register values at addr.
 
         C++ ref: ``ArchitectureGhidra::getTrackedRegisters``
         """
-        send_query_open(self._sout)
-        xml = (f'<command_gettrackedregisters>'
-               f'{_encode_addr(addr)}'
-               f'</command_gettrackedregisters>')
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_gettrackedregisters>{_encode_addr(addr)}</command_gettrackedregisters>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
     def getUserOpName(self, index: int) -> str:
         """Get user-defined p-code op name.
@@ -248,57 +349,45 @@ class ArchitectureGhidra(Architecture):
         read_response_end(self._sin)
         return name
 
-    def getPcodeXml(self, addr: Address) -> Optional[bytes]:
+    def getPcode(self, addr: Address, decoder: Decoder) -> bool:
         """Get p-code for instruction at addr.
 
         C++ ref: ``ArchitectureGhidra::getPcode``
         """
-        send_query_open(self._sout)
-        xml = f'<command_getpcode>{_encode_addr(addr)}</command_getpcode>'
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getpcode>{_encode_addr(addr)}</command_getpcode>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
-    def getMappedSymbolsXml(self, addr: Address) -> Optional[bytes]:
+    def getMappedSymbolsXML(self, addr: Address, decoder: Decoder) -> bool:
         """Get mapped symbols at addr.
 
         C++ ref: ``ArchitectureGhidra::getMappedSymbolsXML``
         """
-        send_query_open(self._sout)
-        xml = (f'<command_getmappedsymbols>'
-               f'{_encode_addr(addr)}'
-               f'</command_getmappedsymbols>')
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getmappedsymbols>{_encode_addr(addr)}</command_getmappedsymbols>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
-    def getExternalRefXml(self, addr: Address) -> Optional[bytes]:
+    def getExternalRef(self, addr: Address, decoder: Decoder) -> bool:
         """Get external function reference at addr.
 
         C++ ref: ``ArchitectureGhidra::getExternalRef``
         """
-        send_query_open(self._sout)
-        xml = (f'<command_getexternalref>'
-               f'{_encode_addr(addr)}'
-               f'</command_getexternalref>')
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getexternalref>{_encode_addr(addr)}</command_getexternalref>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
-    def getNamespacePathXml(self, ns_id: int) -> Optional[bytes]:
+    def getNamespacePath(self, ns_id: int, decoder: Decoder) -> bool:
         """Get namespace path from root to the given id.
 
         C++ ref: ``ArchitectureGhidra::getNamespacePath``
         """
-        send_query_open(self._sout)
-        xml = f'<command_getnamespacepath id="0x{ns_id:x}"/>'
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getnamespacepath id="0x{ns_id:x}"/>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
     def isNameUsed(self, nm: str, startId: int, stopId: int) -> bool:
         """Check if a name is used along the namespace path.
@@ -333,31 +422,25 @@ class ArchitectureGhidra(Architecture):
         read_response_end(self._sin)
         return label
 
-    def getDataTypeXml(self, name: str, id_: int) -> Optional[bytes]:
+    def getDataType(self, name: str, id_: int, decoder: Decoder) -> bool:
         """Get data type description.
 
         C++ ref: ``ArchitectureGhidra::getDataType``
         """
-        send_query_open(self._sout)
-        xml = f'<command_getdatatype name="{_xml_escape(name)}" id="{id_}"/>'
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getdatatype name="{_xml_escape(name)}" id="{id_}"/>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
-    def getCommentsXml(self, funcaddr: Address, flags: int) -> Optional[bytes]:
+    def getComments(self, funcaddr: Address, flags: int, decoder: Decoder) -> bool:
         """Get comments for a function.
 
         C++ ref: ``ArchitectureGhidra::getComments``
         """
-        send_query_open(self._sout)
-        xml = (f'<command_getcomments type="{flags}">'
-               f'{_encode_addr(funcaddr)}'
-               f'</command_getcomments>')
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getcomments type="{flags}">{_encode_addr(funcaddr)}</command_getcomments>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
     def getBytes(self, size: int, addr: Address) -> Optional[bytes]:
         """Get bytes from the load image.
@@ -378,13 +461,13 @@ class ArchitectureGhidra(Architecture):
                 f"GHIDRA has no data in the loadimage at {addr}")
         return result
 
-    def getStringDataRaw(self, addr: Address, charType, maxBytes: int) -> Optional[tuple[bytes, bool]]:
+    def getStringData(self, addr: Address, charType, maxBytes: int) -> Optional[tuple[bytes, bool]]:
         """Get string data at addr.
 
         C++ ref: ``ArchitectureGhidra::getStringData``
         """
-        ct_name = charType.getName() if hasattr(charType, 'getName') else "char"
-        ct_id = charType.getUnsizedId() if hasattr(charType, 'getUnsizedId') else 0
+        ct_name = charType.getName()
+        ct_id = charType.getUnsizedId()
         send_query_open(self._sout)
         xml = (f'<command_getstringdata maxsize="{maxBytes}" '
                f'type="{_xml_escape(ct_name)}" id="{ct_id}">'
@@ -412,17 +495,63 @@ class ArchitectureGhidra(Architecture):
             if end_burst != BURST_BYTE_CLOSE:
                 raise JavaError("alignment", "Expecting byte alignment end")
             burst2 = read_to_any_burst(self._sin)
-            # burst2 should be query-response-close
+            if (burst2 & 1) != 1:
+                raise JavaError("alignment", "Expecting end of query response")
             return (bytes(result), is_trunc)
         if (burst & 1) == 1:
             return None
         raise JavaError("alignment", "Expecting end of query response")
 
-    def getPcodeInjectXml(self, name: str, inject_type: int, context_xml: str) -> Optional[bytes]:
+    def getStringDataRaw(self, addr: Address, charType, maxBytes: int) -> Optional[tuple[bytes, bool]]:
+        return self.getStringData(addr, charType, maxBytes)
+
+    @staticmethod
+    def segvHandler(sig: int) -> None:
+        raise SystemExit(1)
+
+    @staticmethod
+    def readToAnyBurst(sin: BinaryIO) -> int:
+        return read_to_any_burst(sin)
+
+    @staticmethod
+    def readBoolStream(sin: BinaryIO) -> bool:
+        return read_bool_stream(sin)
+
+    @staticmethod
+    def readStringStream(sin: BinaryIO, decoder: Optional[Decoder] = None) -> str | bool:
+        if decoder is None:
+            return read_string_stream(sin)
+        return read_string_stream_decoder(sin, decoder)
+
+    @staticmethod
+    def writeStringStream(sout: BinaryIO, msg: str) -> None:
+        write_string_stream(sout, msg)
+
+    @staticmethod
+    def readToResponse(sin: BinaryIO) -> None:
+        read_to_response(sin)
+
+    @staticmethod
+    def readResponseEnd(sin: BinaryIO) -> None:
+        read_response_end(sin)
+
+    @staticmethod
+    def readAll(sin: BinaryIO, decoder: Decoder) -> bool:
+        return read_all(sin, decoder)
+
+    @staticmethod
+    def passJavaException(sout: BinaryIO, tp: str, msg: str) -> None:
+        from ghidra.console.protocol import pass_java_exception
+
+        pass_java_exception(sout, tp, msg)
+
+    def getPcodeInject(self, name: str, inject_type: int, con: InjectContext, decoder: Decoder) -> bool:
         """Get p-code injection.
 
         C++ ref: ``ArchitectureGhidra::getPcodeInject``
         """
+        from ghidra.core.marshal import XmlEncode
+
         if inject_type == 1:  # CALLFIXUP_TYPE
             tag = "command_getcallfixup"
         elif inject_type == 2:  # CALLOTHERFIXUP_TYPE
@@ -432,25 +561,24 @@ class ArchitectureGhidra(Architecture):
         else:  # EXECUTABLEPCODE_TYPE
             tag = "command_getpcodeexecutable"
 
-        send_query_open(self._sout)
-        xml = f'<{tag} name="{_xml_escape(name)}">{context_xml}</{tag}>'
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        stream = io.StringIO()
+        encoder = XmlEncode(stream, do_format=False)
+        con.encode(encoder)
+        response = self._query_packed_response(
+            f'<{tag} name="{_xml_escape(name)}">{stream.getvalue()}</{tag}>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
-    def getCPoolRefXml(self, refs: List[int]) -> Optional[bytes]:
+    def getCPoolRef(self, refs: List[int], decoder: Decoder) -> bool:
         """Get constant pool reference.
 
         C++ ref: ``ArchitectureGhidra::getCPoolRef``
         """
-        send_query_open(self._sout)
         inner = "".join(f'<value content="0x{r:x}"/>' for r in refs)
-        xml = f'<command_getcpoolref size="{len(refs)}">{inner}</command_getcpoolref>'
-        write_string_stream(self._sout, xml)
-        send_query_close(self._sout)
-        self._sout.flush()
-        return read_all_response(self._sin)
+        response = self._query_packed_response(
+            f'<command_getcpoolref size="{len(refs)}">{inner}</command_getcpoolref>'
+        )
+        return self._ingest_packed_response(response, decoder)
 
     # ------------------------------------------------------------------
     # Static utility

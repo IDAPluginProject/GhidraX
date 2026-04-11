@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import Dict, Optional, Set, TYPE_CHECKING
 
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
+from ghidra.core.space import AddrSpace
+from ghidra.core.xml import DecoderError
 from ghidra.core.marshal import (
     ATTRIB_ARCH, ATTRIB_NAME, ATTRIB_READONLY, ATTRIB_CONTENT,
     ELEM_BINARYIMAGE, ELEM_BYTECHUNK, ELEM_SYMBOL,
@@ -28,16 +31,20 @@ class LoadImageXml(LoadImage):
     containing hex-encoded byte data and optional <symbol> children.
     """
 
-    def __init__(self, filename: str = "", archtype: str = "",
-                 manage: Optional[AddrSpaceManager] = None) -> None:
+    def __init__(self, filename: str, rootel) -> None:
         super().__init__(filename)
-        self._archtype: str = archtype
-        self._manage: Optional[AddrSpaceManager] = manage
+        self._archtype: str = ""
+        self._manage: Optional[AddrSpaceManager] = None
+        self._rootel = rootel
         self._chunks: Dict[Address, bytearray] = {}
         self._readonlyset: Set[Address] = set()
         self._addrtosymbol: Dict[Address, str] = {}
         self._symbol_iter: Optional[list] = None
         self._symbol_pos: int = 0
+
+        if rootel.getName() != "binaryimage":
+            raise LowlevelError("Missing binaryimage tag in " + filename)
+        self._archtype = rootel.getAttributeValue("arch")
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -54,16 +61,44 @@ class LoadImageXml(LoadImage):
         self._addrtosymbol[addr] = name
 
     def open(self, manage: AddrSpaceManager) -> None:
-        """Set the address space manager."""
+        """Set the address space manager and parse any stored XML root."""
         self._manage = manage
+        self._archtype = self._rootel.getAttributeValue("arch")
+
+        for child in self._rootel.getChildren():
+            tag = child.getName()
+            base = manage.getSpaceByName(child.getAttributeValue("space"))
+            offset = int(child.getAttributeValue("offset"), 0)
+            addr = Address(base, offset)
+
+            if tag == "symbol":
+                self._addrtosymbol[addr] = child.getAttributeValue("name")
+                continue
+
+            if tag != "bytechunk":
+                raise LowlevelError("Unknown LoadImageXml tag")
+
+            chunk = self._chunks.setdefault(addr, bytearray())
+            chunk.clear()
+            try:
+                readonly = child.getAttributeValue("readonly").lower() == "true"
+            except DecoderError:
+                readonly = False
+            if readonly:
+                self._readonlyset.add(addr)
+
+            chunk.extend(bytes.fromhex(child.getAttributeValue("content")))
+
+        self.pad()
 
     def clear(self) -> None:
         """Clear all caches."""
         self._archtype = ""
         self._manage = None
         self._chunks.clear()
-        self._readonlyset.clear()
         self._addrtosymbol.clear()
+        self._symbol_iter = None
+        self._symbol_pos = 0
 
     # ------------------------------------------------------------------
     # Padding — mirrors C++ pad() logic
@@ -100,13 +135,10 @@ class LoadImageXml(LoadImage):
 
         for idx, addr in enumerate(sorted_addrs):
             chunk = self._chunks[addr]
-            end_offset = addr.getOffset() + len(chunk)
-
-            # Check for wrap-around
-            if end_offset < addr.getOffset():
+            endaddr = addr + len(chunk)
+            if endaddr < addr:
                 continue
 
-            endaddr = Address(addr.getSpace(), end_offset)
             maxsize = 512
             space = endaddr.getSpace()
             room = space.getHighest() - endaddr.getOffset() + 1
@@ -128,8 +160,8 @@ class LoadImageXml(LoadImage):
 
         # Merge pad chunks
         for addr, data in pad_chunks.items():
-            if addr not in self._chunks:
-                self._chunks[addr] = data
+            vec = self._chunks.setdefault(addr, bytearray())
+            vec.extend(data)
 
     # ------------------------------------------------------------------
     # LoadImage interface
@@ -177,9 +209,7 @@ class LoadImageXml(LoadImage):
                 break
 
         if remaining > 0 or emptyhit:
-            raise DataUnavailError(
-                f"Bytes at {curaddr.getSpace().getName()}:{curaddr.getOffset():#x} are not mapped"
-            )
+            raise DataUnavailError(f"Bytes at {curaddr.printRaw()} are not mapped")
 
     @staticmethod
     def _overlap(addr: Address, chunk_addr: Address, chunk_size: int) -> int:
@@ -220,14 +250,14 @@ class LoadImageXml(LoadImage):
         new_chunks: Dict[Address, bytearray] = {}
         for addr, data in self._chunks.items():
             spc = addr.getSpace()
-            off = adjust * spc.getWordSize()
+            off = AddrSpace.addressToByte(adjust, spc.getWordSize())
             new_chunks[addr + off] = data
         self._chunks = new_chunks
 
         new_symbols: Dict[Address, str] = {}
         for addr, name in self._addrtosymbol.items():
             spc = addr.getSpace()
-            off = adjust * spc.getWordSize()
+            off = AddrSpace.addressToByte(adjust, spc.getWordSize())
             new_symbols[addr + off] = name
         self._addrtosymbol = new_symbols
 
@@ -245,8 +275,7 @@ class LoadImageXml(LoadImage):
             if not data:
                 continue
             encoder.openElement(ELEM_BYTECHUNK)
-            if hasattr(addr.getSpace(), 'encodeAttributes'):
-                addr.getSpace().encodeAttributes(encoder, addr.getOffset())
+            addr.getSpace().encodeAttributes(encoder, addr.getOffset())
             if addr in self._readonlyset:
                 encoder.writeBool(ATTRIB_READONLY, True)
             hex_str = '\n'
@@ -261,12 +290,14 @@ class LoadImageXml(LoadImage):
         for addr in sorted(self._addrtosymbol.keys()):
             name = self._addrtosymbol[addr]
             encoder.openElement(ELEM_SYMBOL)
-            if hasattr(addr.getSpace(), 'encodeAttributes'):
-                addr.getSpace().encodeAttributes(encoder, addr.getOffset())
+            addr.getSpace().encodeAttributes(encoder, addr.getOffset())
             encoder.writeString(ATTRIB_NAME, name)
             encoder.closeElement(ELEM_SYMBOL)
 
         encoder.closeElement(ELEM_BINARYIMAGE)
+
+    def __del__(self) -> None:
+        self.clear()
 
     # ------------------------------------------------------------------
     # Convenience: build from hex string
@@ -279,6 +310,15 @@ class LoadImageXml(LoadImage):
         cleaned = hex_data.replace('\n', '').replace(' ', '')
         data = bytes.fromhex(cleaned)
         addr = Address(space, offset)
-        img = LoadImageXml(filename="memory", archtype=archtype)
+        img = LoadImageXml.__new__(LoadImageXml)
+        LoadImage.__init__(img, "memory")
+        img._archtype = archtype
+        img._manage = None
+        img._rootel = None
+        img._chunks = {}
+        img._readonlyset = set()
+        img._addrtosymbol = {}
+        img._symbol_iter = None
+        img._symbol_pos = 0
         img.addChunk(addr, data)
         return img

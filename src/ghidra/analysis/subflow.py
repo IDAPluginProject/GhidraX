@@ -9,6 +9,7 @@ and replaces operations to work on the smaller values directly.
 from __future__ import annotations
 from typing import Optional, List, Dict
 from ghidra.core.opcodes import OpCode
+from ghidra.core.space import AddrSpace
 from ghidra.core.address import calc_mask, leastsigbit_set, mostsigbit_set, sign_extend_sized
 from ghidra.ir.typeop import TypeOpFloatInt2Float
 from ghidra.transform.transform import TransformManager, LaneDescription
@@ -1517,9 +1518,7 @@ class SubfloatFlow(TransformManager):
         self.terminatorCount: int = 0
         self.worklist: list = []
         self.maxPrecisionMap: dict = {}
-        arch = fd.getArch() if hasattr(fd, 'getArch') else None
-        translate = arch.translate if arch is not None and hasattr(arch, 'translate') else None
-        self.format = translate.getFloatFormat(prec) if translate is not None and hasattr(translate, 'getFloatFormat') else None
+        self.format = fd.getArch().translate.getFloatFormat(prec)
         if self.format is not None:
             self.setReplacement(root)
 
@@ -1600,14 +1599,10 @@ class SubfloatFlow(TransformManager):
         if vn.isMark():
             return self.getPiece(vn, self.precision * 8, 0)
         if vn.isConstant():
-            form2 = None
-            arch = self.getFunction().getArch() if hasattr(self.getFunction(), 'getArch') else None
-            translate = arch.translate if arch is not None and hasattr(arch, 'translate') else None
-            if translate is not None and hasattr(translate, 'getFloatFormat'):
-                form2 = translate.getFloatFormat(vn.getSize())
+            form2 = self.getFunction().getArch().translate.getFloatFormat(vn.getSize())
             if form2 is None:
                 return None
-            converted = self.format.convertEncoding(vn.getOffset(), form2) if hasattr(self.format, 'convertEncoding') else vn.getOffset()
+            converted = self.format.convertEncoding(vn.getOffset(), form2)
             return self.newConstant(self.precision, 0, converted)
         if vn.isFree():
             return None
@@ -1676,7 +1671,7 @@ class SubfloatFlow(TransformManager):
                 if rvn2 is None:
                     return False
                 if rvn is rvn2:
-                    slot = op.getRepeatSlot(vn, slot, None) if hasattr(op, 'getRepeatSlot') else slot
+                    slot = op.getRepeatSlot(vn, slot, None)
                 if self.preexistingGuard(slot, rvn2):
                     rop = self.newPreexistingOp(2, opc, op)
                     self.opSetInput(rop, rvn, slot)
@@ -1706,12 +1701,12 @@ class SubfloatFlow(TransformManager):
                 return False
             # fall through
         if opc in _FLOAT_BINARY or opc in _FLOAT_UNARY:
-            rop = rvn.defOp
+            rop = rvn.getDef()
             if rop is None:
                 rop = self.newOpReplace(op.numInput(), opc, op)
                 self.opSetOutput(rop, rvn)
             for i in range(op.numInput()):
-                newvar = rop.input[i] if i < len(rop.input) else None
+                newvar = rop.getIn(i)
                 if newvar is None:
                     newvar = self.setReplacement(op.getIn(i))
                     if newvar is None:
@@ -1816,15 +1811,11 @@ class SplitDatatype:
             else:
                 return False
             tmpPointer = addOp.getIn(0)
-            ct = tmpPointer.getTypeReadFacing(addOp) if hasattr(tmpPointer, 'getTypeReadFacing') else None
-            if ct is None:
-                return False
+            ct = tmpPointer.getTypeReadFacing(addOp)
             from ghidra.types.datatype import TYPE_PTR, TYPE_STRUCT, TYPE_ARRAY
             if ct.getMetatype() != TYPE_PTR:
                 return False
-            parent = ct.getPtrTo() if hasattr(ct, 'getPtrTo') else None
-            if parent is None:
-                return False
+            parent = ct.getPtrTo()
             meta = parent.getMetatype()
             if meta != TYPE_STRUCT and meta != TYPE_ARRAY:
                 if (opc != OpCode.CPUI_PTRADD and opc != OpCode.CPUI_COPY) or parent is not impliedBase:
@@ -1832,9 +1823,7 @@ class SplitDatatype:
             self.ptrType = ct
             if opc == OpCode.CPUI_PTRADD:
                 off *= int(addOp.getIn(2).getOffset())
-            wordSize = self.ptrType.getWordSize() if hasattr(self.ptrType, 'getWordSize') else 1
-            if wordSize > 1:
-                off *= wordSize
+            off = AddrSpace.addressToByteInt(off, self.ptrType.getWordSize())
             self.baseOffset += off
             self.pointer = tmpPointer
             return True
@@ -1842,30 +1831,26 @@ class SplitDatatype:
         def find(self, op, valueType) -> bool:
             from ghidra.types.datatype import TYPE_PTR, TYPE_PARTIALSTRUCT, TYPE_ARRAY
             impliedBase = None
-            if hasattr(valueType, 'getMetatype') and valueType.getMetatype() == TYPE_PARTIALSTRUCT:
-                if hasattr(valueType, 'getParent'):
-                    valueType = valueType.getParent()
-            if hasattr(valueType, 'getMetatype') and valueType.getMetatype() == TYPE_ARRAY:
-                if hasattr(valueType, 'getBase'):
-                    valueType = valueType.getBase()
+            if valueType.getMetatype() == TYPE_PARTIALSTRUCT:
+                valueType = valueType.getParent()
+            if valueType.getMetatype() == TYPE_ARRAY:
+                valueType = valueType.getBase()
                 impliedBase = valueType
             self.loadStore = op
             self.baseOffset = 0
             self.firstPointer = op.getIn(1)
             self.pointer = self.firstPointer
-            ct = self.pointer.getTypeReadFacing(op) if hasattr(self.pointer, 'getTypeReadFacing') else None
-            if ct is None:
-                return False
+            ct = self.pointer.getTypeReadFacing(op)
             if ct.getMetatype() != TYPE_PTR:
                 return False
             self.ptrType = ct
-            ptrTo = ct.getPtrTo() if hasattr(ct, 'getPtrTo') else None
+            ptrTo = ct.getPtrTo()
             if ptrTo is not valueType:
                 if impliedBase is not None:
                     return False
                 if not self.backUpPointer(impliedBase):
                     return False
-                ptrTo2 = self.ptrType.getPtrTo() if hasattr(self.ptrType, 'getPtrTo') else None
+                ptrTo2 = self.ptrType.getPtrTo()
                 if ptrTo2 is not valueType:
                     return False
             for _ in range(3):
@@ -1876,11 +1861,9 @@ class SplitDatatype:
             return True
 
         def duplicateToTemp(self, data, followOp) -> None:
-            if hasattr(data, 'buildCopyTemp'):
-                newRoot = data.buildCopyTemp(self.pointer, followOp)
-                if self.ptrType is not None and hasattr(newRoot, 'updateType'):
-                    newRoot.updateType(self.ptrType)
-                self.pointer = newRoot
+            newRoot = data.buildCopyTemp(self.pointer, followOp)
+            newRoot.updateType(self.ptrType)
+            self.pointer = newRoot
 
         def freePointerChain(self, data) -> None:
             while (self.firstPointer is not self.pointer and
@@ -1892,10 +1875,10 @@ class SplitDatatype:
 
     def __init__(self, fd) -> None:
         self._fd = fd
-        arch = fd.getArch() if hasattr(fd, 'getArch') else None
-        self._types = arch.types if arch is not None and hasattr(arch, 'types') else None
+        arch = fd.getArch()
+        self._types = arch.types
         self._dataTypePieces: list = []
-        splitConfig = getattr(arch, 'split_datatype_config', 3) if arch is not None else 3
+        splitConfig = arch.split_datatype_config
         self._splitStructures: bool = (splitConfig & 1) != 0
         self._splitArrays: bool = (splitConfig & 2) != 0
         self._isLoadStore: bool = False
@@ -1904,67 +1887,52 @@ class SplitDatatype:
 
     def _getComponent(self, ct, offset: int):
         """Get component data-type at offset, return (datatype, isHole) or (None, False)."""
-        if ct is None:
-            return None, False
+        from ghidra.types.datatype import TYPE_ARRAY, TYPE_UNKNOWN
         curType = ct
         curOff = offset
         while True:
-            if not hasattr(curType, 'getSubType'):
-                return None, False
-            result = curType.getSubType(curOff)
-            if result is None:
-                hole = ct.getHoleSize(offset) if hasattr(ct, 'getHoleSize') else 0
+            curType, curOff = curType.getSubType(curOff)
+            if curType is None:
+                hole = ct.getHoleSize(offset)
                 if hole > 0:
                     if hole > 8:
                         hole = 8
-                    from ghidra.types.datatype import TYPE_UNKNOWN
-                    return self._types.getBase(hole, TYPE_UNKNOWN) if self._types else None, True
+                    return self._types.getBase(hole, TYPE_UNKNOWN), True
                 return None, False
-            if isinstance(result, tuple):
-                curType, curOff = result
-            else:
-                curType = result
-                curOff = 0
-            if curOff == 0:
-                from ghidra.types.datatype import TYPE_ARRAY
-                if curType.getMetatype() != TYPE_ARRAY:
-                    break
+            if curOff == 0 and curType.getMetatype() != TYPE_ARRAY:
+                break
         return curType, False
 
     def _categorizeDatatype(self, ct) -> int:
         """Categorize: -1=not splittable, 0=struct, 1=array, 2=primitive."""
-        if ct is None:
-            return -1
         from ghidra.types.datatype import (TYPE_ARRAY, TYPE_PARTIALSTRUCT, TYPE_STRUCT,
                                            TYPE_INT, TYPE_UINT, TYPE_UNKNOWN)
         meta = ct.getMetatype()
         if meta == TYPE_ARRAY:
             if not self._splitArrays:
                 return -1
-            subType = ct.getBase() if hasattr(ct, 'getBase') else None
-            if subType is not None and (subType.getMetatype() != TYPE_UNKNOWN or subType.getSize() != 1):
+            subType = ct.getBase()
+            if subType.getMetatype() != TYPE_UNKNOWN or subType.getSize() != 1:
                 return 1
             return 2
         elif meta == TYPE_PARTIALSTRUCT:
-            parent = ct.getParent() if hasattr(ct, 'getParent') else None
-            if parent is not None:
-                pmeta = parent.getMetatype()
-                if pmeta == TYPE_ARRAY:
-                    if not self._splitArrays:
-                        return -1
-                    subType = parent.getBase() if hasattr(parent, 'getBase') else None
-                    if subType is not None and (subType.getMetatype() != TYPE_UNKNOWN or subType.getSize() != 1):
-                        return 1
-                    return 2
-                elif pmeta == TYPE_STRUCT:
-                    if not self._splitStructures:
-                        return -1
-                    return 0
+            subType = ct.getParent()
+            if subType.getMetatype() == TYPE_ARRAY:
+                if not self._splitArrays:
+                    return -1
+                subType = subType.getBase()
+                if subType.getMetatype() != TYPE_UNKNOWN or subType.getSize() != 1:
+                    return 1
+                return 2
+            elif subType.getMetatype() == TYPE_STRUCT:
+                if not self._splitStructures:
+                    return -1
+                return 0
             return -1
         elif meta == TYPE_STRUCT:
             if not self._splitStructures:
                 return -1
-            if hasattr(ct, 'numDepend') and ct.numDepend() > 1:
+            if ct.numDepend() > 1:
                 return 0
             return -1
         elif meta in (TYPE_INT, TYPE_UINT, TYPE_UNKNOWN):
@@ -1999,9 +1967,7 @@ class SplitDatatype:
                 curOut, outHole = self._getComponent(outBase, curOff)
                 if curOut is None:
                     return False
-                curIn = curOut if inConstant else (self._types.getBase(curOut.getSize(), TYPE_UNKNOWN) if self._types else None)
-                if curIn is None:
-                    return False
+                curIn = curOut if inConstant else self._types.getBase(curOut.getSize(), TYPE_UNKNOWN)
                 self._dataTypePieces.append(SplitDatatype.Component(curIn, curOut, curOff))
                 sizeLeft -= curOut.getSize()
                 curOff += curOut.getSize()
@@ -2015,9 +1981,7 @@ class SplitDatatype:
                 curIn, inHole = self._getComponent(inBase, curOff)
                 if curIn is None:
                     return False
-                curOut = self._types.getBase(curIn.getSize(), TYPE_UNKNOWN) if self._types else None
-                if curOut is None:
-                    return False
+                curOut = self._types.getBase(curIn.getSize(), TYPE_UNKNOWN)
                 self._dataTypePieces.append(SplitDatatype.Component(curIn, curOut, curOff))
                 sizeLeft -= curIn.getSize()
                 curOff += curIn.getSize()
@@ -2037,14 +2001,14 @@ class SplitDatatype:
                 while curIn.getSize() != curOut.getSize():
                     if curIn.getSize() > curOut.getSize():
                         if inHole:
-                            curIn = self._types.getBase(curOut.getSize(), TYPE_UNKNOWN) if self._types else None
+                            curIn = self._types.getBase(curOut.getSize(), TYPE_UNKNOWN)
                         else:
                             curIn, inHole = self._getComponent(curIn, 0)
                         if curIn is None:
                             return False
                     else:
                         if outHole:
-                            curOut = self._types.getBase(curIn.getSize(), TYPE_UNKNOWN) if self._types else None
+                            curOut = self._types.getBase(curIn.getSize(), TYPE_UNKNOWN)
                         else:
                             curOut, outHole = self._getComponent(curOut, 0)
                         if curOut is None:
@@ -2073,9 +2037,8 @@ class SplitDatatype:
     def _isArithmeticInput(vn) -> bool:
         """Check if any descendant is arithmetic."""
         for op in vn.beginDescend():
-            if hasattr(op, 'getOpcode') and hasattr(op.getOpcode(), 'isArithmeticOp'):
-                if op.getOpcode().isArithmeticOp():
-                    return True
+            if op.getOpcode().isArithmeticOp():
+                return True
         return False
 
     @staticmethod
@@ -2083,10 +2046,7 @@ class SplitDatatype:
         """Check if defining op is arithmetic."""
         if not vn.isWritten():
             return False
-        defOp = vn.getDef()
-        if hasattr(defOp, 'getOpcode') and hasattr(defOp.getOpcode(), 'isArithmeticOp'):
-            return defOp.getOpcode().isArithmeticOp()
-        return False
+        return vn.getDef().getOpcode().isArithmeticOp()
 
     def _generateConstants(self, vn, inVarnodes: list) -> bool:
         """If vn is an extended precision constant (ZEXT(c) or CONCAT(c1,c2)), split into pieces."""
@@ -2105,7 +2065,7 @@ class SplitDatatype:
         else:
             return False
         fullsize = vn.getSize()
-        isBigEndian = vn.getSpace().isBigEndian() if hasattr(vn.getSpace(), 'isBigEndian') else False
+        isBigEndian = vn.getSpace().isBigEndian()
         if opc == OpCode.CPUI_INT_ZEXT:
             hi = 0
             lo = op.getIn(0).getOffset()
@@ -2124,7 +2084,7 @@ class SplitDatatype:
             else:
                 sa = self._dataTypePieces[i].offset
             if sa >= losize:
-                val = hi >> ((sa - losize) * 8)
+                val = hi >> (sa - losize)
             else:
                 val = lo >> (sa * 8)
                 if sa + dt.getSize() > losize:
@@ -2132,8 +2092,7 @@ class SplitDatatype:
             val &= calc_mask(dt.getSize())
             outVn = self._fd.newConstant(dt.getSize(), val)
             inVarnodes.append(outVn)
-            if hasattr(outVn, 'updateType'):
-                outVn.updateType(dt)
+            outVn.updateType(dt)
         self._fd.opDestroy(op)
         return True
 
@@ -2148,8 +2107,7 @@ class SplitDatatype:
             val = (baseVal >> (8 * off)) & calc_mask(dt.getSize())
             outVn = self._fd.newConstant(dt.getSize(), val)
             inVarnodes.append(outVn)
-            if hasattr(outVn, 'updateType'):
-                outVn.updateType(dt)
+            outVn.updateType(dt)
 
     def _buildInSubpieces(self, rootVn, followOp, inVarnodes: list) -> None:
         """Build input Varnodes by extracting SUBPIECEs from the root."""
@@ -2160,10 +2118,9 @@ class SplitDatatype:
             dt = piece.inType
             off = piece.offset
             addr = baseAddr + off
-            if hasattr(addr, 'renormalize'):
-                addr.renormalize(dt.getSize())
+            addr.renormalize(dt.getSize())
             truncOff = off
-            if hasattr(addr, 'isBigEndian') and addr.isBigEndian():
+            if addr.isBigEndian():
                 truncOff = rootVn.getSize() - off - dt.getSize()
             subpiece = self._fd.newOp(2, followOp.getAddr())
             self._fd.opSetOpcode(subpiece, OpCode.CPUI_SUBPIECE)
@@ -2171,8 +2128,7 @@ class SplitDatatype:
             self._fd.opSetInput(subpiece, self._fd.newConstant(4, truncOff), 1)
             outVn = self._fd.newVarnodeOut(dt.getSize(), addr, subpiece)
             inVarnodes.append(outVn)
-            if hasattr(outVn, 'updateType'):
-                outVn.updateType(dt)
+            outVn.updateType(dt)
             self._fd.opInsertBefore(subpiece, followOp)
 
     def _buildOutVarnodes(self, rootVn, outVarnodes: list) -> None:
@@ -2182,8 +2138,7 @@ class SplitDatatype:
             dt = piece.outType
             off = piece.offset
             addr = baseAddr + off
-            if hasattr(addr, 'renormalize'):
-                addr.renormalize(dt.getSize())
+            addr.renormalize(dt.getSize())
             outVn = self._fd.newVarnode(dt.getSize(), addr, dt)
             outVarnodes.append(outVn)
 
@@ -2194,9 +2149,9 @@ class SplitDatatype:
         baseAddr = rootVn.getAddr()
         addressTied = rootVn.isAddrTied()
         for ov in outVarnodes:
-            if not addressTied and hasattr(ov, 'setProtoPartial'):
+            if not addressTied:
                 ov.setProtoPartial()
-        isBigEndian = hasattr(baseAddr, 'isBigEndian') and baseAddr.isBigEndian()
+        isBigEndian = baseAddr.isBigEndian()
         preOp = previousOp
         concatOp = None
         if isBigEndian:
@@ -2212,10 +2167,9 @@ class SplitDatatype:
                 preOp = concatOp
                 sz = vn.getSize() + outVarnodes[i].getSize()
                 addr = baseAddr
-                if hasattr(addr, 'renormalize'):
-                    addr.renormalize(sz)
+                addr.renormalize(sz)
                 vn = self._fd.newVarnodeOut(sz, addr, concatOp)
-                if not addressTied and hasattr(vn, 'setProtoPartial'):
+                if not addressTied:
                     vn.setProtoPartial()
         else:
             vn = outVarnodes[-1]
@@ -2230,81 +2184,66 @@ class SplitDatatype:
                 preOp = concatOp
                 sz = vn.getSize() + outVarnodes[i].getSize()
                 addr = outVarnodes[i].getAddr()
-                if hasattr(addr, 'renormalize'):
-                    addr.renormalize(sz)
+                addr.renormalize(sz)
                 vn = self._fd.newVarnodeOut(sz, addr, concatOp)
-                if not addressTied and hasattr(vn, 'setProtoPartial'):
+                if not addressTied:
                     vn.setProtoPartial()
-        if concatOp is not None:
-            if hasattr(concatOp, 'setPartialRoot'):
-                concatOp.setPartialRoot()
-            self._fd.opSetOutput(concatOp, rootVn)
-            if not addressTied and hasattr(self._fd, 'getMerge'):
-                self._fd.getMerge().registerProtoPartialRoot(rootVn)
+        concatOp.setPartialRoot()
+        self._fd.opSetOutput(concatOp, rootVn)
+        if not addressTied:
+            self._fd.getMerge().registerProtoPartialRoot(rootVn)
 
     def _buildPointers(self, rootVn, ptrType, baseOffset: int, followOp,
                        ptrVarnodes: list, isInput: bool) -> None:
         """Build a series of PTRSUB/PTRADD ops at different offsets."""
-        baseType = ptrType.getPtrTo() if hasattr(ptrType, 'getPtrTo') else None
-        if baseType is None:
-            return
+        from ghidra.types.datatype import TYPE_ARRAY, TYPE_INT
+
+        baseType = ptrType.getPtrTo()
         for piece in self._dataTypePieces:
             matchType = piece.inType if isInput else piece.outType
             curOff = baseOffset + piece.offset
             tmpType = baseType
             inPtr = rootVn
-            while tmpType.getSize() > matchType.getSize():
+            while True:
                 if curOff < 0 or curOff >= tmpType.getSize():
                     newType = tmpType
                     newOff = curOff % tmpType.getSize()
                     if newOff < 0:
                         newOff += tmpType.getSize()
                 else:
-                    if hasattr(tmpType, 'getSubType'):
-                        result = tmpType.getSubType(curOff)
-                        if result is None:
-                            newType = matchType
-                            newOff = 0
-                        elif isinstance(result, tuple):
-                            newType, newOff = result
-                        else:
-                            newType = result
-                            newOff = 0
-                    else:
+                    newOffRef = [0]
+                    newType = tmpType.getSubType(curOff, newOffRef)
+                    newOff = newOffRef[0]
+                    if newType is None:
                         newType = matchType
                         newOff = 0
-                from ghidra.types.datatype import TYPE_ARRAY
                 if tmpType is newType or tmpType.getMetatype() == TYPE_ARRAY:
                     finalOffset = curOff - newOff
                     sz = newType.getSize()
                     finalOffset = finalOffset // sz
-                    wordSize = ptrType.getWordSize() if hasattr(ptrType, 'getWordSize') else 1
-                    if wordSize > 1:
-                        sz = sz // wordSize
+                    sz = AddrSpace.byteToAddressInt(sz, ptrType.getWordSize())
                     newOp = self._fd.newOp(3, followOp.getAddr())
                     self._fd.opSetOpcode(newOp, OpCode.CPUI_PTRADD)
                     self._fd.opSetInput(newOp, inPtr, 0)
                     indexVn = self._fd.newConstant(inPtr.getSize(), finalOffset)
                     self._fd.opSetInput(newOp, indexVn, 1)
                     self._fd.opSetInput(newOp, self._fd.newConstant(inPtr.getSize(), sz), 2)
+                    indexType = self._types.getBase(indexVn.getSize(), TYPE_INT)
+                    indexVn.updateType(indexType)
                 else:
-                    wordSize = ptrType.getWordSize() if hasattr(ptrType, 'getWordSize') else 1
-                    finalOffset = curOff - newOff
-                    if wordSize > 1:
-                        finalOffset = finalOffset // wordSize
+                    finalOffset = AddrSpace.byteToAddressInt(curOff - newOff, ptrType.getWordSize())
                     newOp = self._fd.newOp(2, followOp.getAddr())
                     self._fd.opSetOpcode(newOp, OpCode.CPUI_PTRSUB)
                     self._fd.opSetInput(newOp, inPtr, 0)
                     self._fd.opSetInput(newOp, self._fd.newConstant(inPtr.getSize(), finalOffset), 1)
                 inPtr = self._fd.newUniqueOut(inPtr.getSize(), newOp)
-                if self._types is not None and hasattr(self._types, 'getTypePointerStripArray'):
-                    wordSize = ptrType.getWordSize() if hasattr(ptrType, 'getWordSize') else 1
-                    tmpPtr = self._types.getTypePointerStripArray(ptrType.getSize(), newType, wordSize)
-                    if tmpPtr is not None and hasattr(inPtr, 'updateType'):
-                        inPtr.updateType(tmpPtr)
+                tmpPtr = self._types.getTypePointerStripArray(ptrType.getSize(), newType, ptrType.getWordSize())
+                inPtr.updateType(tmpPtr)
                 self._fd.opInsertBefore(newOp, followOp)
                 tmpType = newType
                 curOff = newOff
+                if not (tmpType.getSize() > matchType.getSize()):
+                    break
             ptrVarnodes.append(inPtr)
 
     # -- Public methods --
@@ -2324,8 +2263,7 @@ class SplitDatatype:
         inVarnodes: list = []
         outVarnodes: list = []
         if inVn.isConstant():
-            isBigEndian = outVn.getSpace().isBigEndian() if hasattr(outVn.getSpace(), 'isBigEndian') else False
-            self._buildInConstants(inVn, inVarnodes, isBigEndian)
+            self._buildInConstants(inVn, inVarnodes, outVn.getSpace().isBigEndian())
         else:
             self._buildInSubpieces(inVn, copyOp, inVarnodes)
         self._buildOutVarnodes(outVn, outVarnodes)
@@ -2354,9 +2292,7 @@ class SplitDatatype:
                 copyOp = None
         if copyOp is not None:
             outVn = copyOp.getOut()
-        outType = outVn.getTypeDefFacing() if hasattr(outVn, 'getTypeDefFacing') else None
-        if outType is None:
-            return False
+        outType = outVn.getTypeDefFacing()
         if not self._testDatatypeCompatibility(inType, outType, False):
             return False
         if self._isArithmeticInput(outVn):
@@ -2370,14 +2306,11 @@ class SplitDatatype:
         self._buildPointers(root.pointer, root.ptrType, root.baseOffset, loadOp, ptrVarnodes, True)
         self._buildOutVarnodes(outVn, outVarnodes)
         self._buildOutConcats(outVn, insertPoint, outVarnodes)
-        spc = loadOp.getIn(0).getSpaceFromConst() if hasattr(loadOp.getIn(0), 'getSpaceFromConst') else None
+        spc = loadOp.getIn(0).getSpaceFromConst()
         for i in range(len(ptrVarnodes)):
             newLoadOp = self._fd.newOp(2, insertPoint.getAddr())
             self._fd.opSetOpcode(newLoadOp, OpCode.CPUI_LOAD)
-            if spc is not None and hasattr(self._fd, 'newVarnodeSpace'):
-                self._fd.opSetInput(newLoadOp, self._fd.newVarnodeSpace(spc), 0)
-            else:
-                self._fd.opSetInput(newLoadOp, loadOp.getIn(0), 0)
+            self._fd.opSetInput(newLoadOp, self._fd.newVarnodeSpace(spc), 0)
             self._fd.opSetInput(newLoadOp, ptrVarnodes[i], 1)
             self._fd.opSetOutput(newLoadOp, outVarnodes[i])
             self._fd.opInsertBefore(newLoadOp, insertPoint)
@@ -2399,15 +2332,11 @@ class SplitDatatype:
             if inType is None:
                 loadOp = None
         if inType is None:
-            inType = inVn.getTypeReadFacing(storeOp) if hasattr(inVn, 'getTypeReadFacing') else None
-        if inType is None:
-            return False
+            inType = inVn.getTypeReadFacing(storeOp)
         if not self._testDatatypeCompatibility(inType, outType, inVn.isConstant()):
             if loadOp is not None:
                 loadOp = None
-                inType = inVn.getTypeReadFacing(storeOp) if hasattr(inVn, 'getTypeReadFacing') else None
-                if inType is None:
-                    return False
+                inType = inVn.getTypeReadFacing(storeOp)
                 self._dataTypePieces.clear()
                 if not self._testDatatypeCompatibility(inType, outType, inVn.isConstant()):
                     return False
@@ -2422,27 +2351,22 @@ class SplitDatatype:
         if loadOp is not None:
             if not loadRoot.find(loadOp, inType):
                 return False
-        storeSpace = storeOp.getIn(0).getSpaceFromConst() if hasattr(storeOp.getIn(0), 'getSpaceFromConst') else None
+        storeSpace = storeOp.getIn(0).getSpaceFromConst()
         inVarnodes: list = []
         if inVn.isConstant():
-            isBigEndian = storeSpace.isBigEndian() if storeSpace is not None and hasattr(storeSpace, 'isBigEndian') else False
-            self._buildInConstants(inVn, inVarnodes, isBigEndian)
+            self._buildInConstants(inVn, inVarnodes, storeSpace.isBigEndian())
         elif loadOp is not None:
             loadPtrs: list = []
             self._buildPointers(loadRoot.pointer, loadRoot.ptrType, loadRoot.baseOffset, loadOp, loadPtrs, True)
-            loadSpace = loadOp.getIn(0).getSpaceFromConst() if hasattr(loadOp.getIn(0), 'getSpaceFromConst') else None
+            loadSpace = loadOp.getIn(0).getSpaceFromConst()
             for i in range(len(loadPtrs)):
                 newLoadOp = self._fd.newOp(2, loadOp.getAddr())
                 self._fd.opSetOpcode(newLoadOp, OpCode.CPUI_LOAD)
-                if loadSpace is not None and hasattr(self._fd, 'newVarnodeSpace'):
-                    self._fd.opSetInput(newLoadOp, self._fd.newVarnodeSpace(loadSpace), 0)
-                else:
-                    self._fd.opSetInput(newLoadOp, loadOp.getIn(0), 0)
+                self._fd.opSetInput(newLoadOp, self._fd.newVarnodeSpace(loadSpace), 0)
                 self._fd.opSetInput(newLoadOp, loadPtrs[i], 1)
                 dt = self._dataTypePieces[i].inType
                 vnOut = self._fd.newUniqueOut(dt.getSize(), newLoadOp)
-                if hasattr(vnOut, 'updateType'):
-                    vnOut.updateType(dt)
+                vnOut.updateType(dt)
                 inVarnodes.append(vnOut)
                 self._fd.opInsertBefore(newLoadOp, loadOp)
         else:
@@ -2457,10 +2381,7 @@ class SplitDatatype:
         for i in range(1, len(storePtrs)):
             newStoreOp = self._fd.newOp(3, storeOp.getAddr())
             self._fd.opSetOpcode(newStoreOp, OpCode.CPUI_STORE)
-            if storeSpace is not None and hasattr(self._fd, 'newVarnodeSpace'):
-                self._fd.opSetInput(newStoreOp, self._fd.newVarnodeSpace(storeSpace), 0)
-            else:
-                self._fd.opSetInput(newStoreOp, storeOp.getIn(0), 0)
+            self._fd.opSetInput(newStoreOp, self._fd.newVarnodeSpace(storeSpace), 0)
             self._fd.opSetInput(newStoreOp, storePtrs[i], 1)
             self._fd.opSetInput(newStoreOp, inVarnodes[i], 2)
             self._fd.opInsertAfter(newStoreOp, lastStore)
@@ -2474,35 +2395,27 @@ class SplitDatatype:
     @staticmethod
     def getValueDatatype(loadStore, size: int, tlst):
         """Get the value data-type for a LOAD or STORE."""
-        if tlst is None:
-            return None
         ptrVn = loadStore.getIn(1)
-        ptrType = ptrVn.getTypeReadFacing(loadStore) if hasattr(ptrVn, 'getTypeReadFacing') else None
-        if ptrType is None:
-            return None
+        ptrType = ptrVn.getTypeReadFacing(loadStore)
         from ghidra.types.datatype import (TYPE_PTR, TYPE_INT, TYPE_UINT, TYPE_BOOL,
                                            TYPE_FLOAT, TYPE_STRUCT, TYPE_ARRAY)
         if ptrType.getMetatype() != TYPE_PTR:
             return None
-        if hasattr(ptrType, 'isPointerRel') and ptrType.isPointerRel():
-            resType = ptrType.getParent() if hasattr(ptrType, 'getParent') else None
-            baseOffset = ptrType.getByteOffset() if hasattr(ptrType, 'getByteOffset') else 0
+        if ptrType.isPointerRel():
+            resType = ptrType.getParent()
+            baseOffset = ptrType.getByteOffset()
         else:
-            resType = ptrType.getPtrTo() if hasattr(ptrType, 'getPtrTo') else None
+            resType = ptrType.getPtrTo()
             baseOffset = 0
-        if resType is None:
-            return None
         metain = resType.getMetatype()
-        alignSize = resType.getAlignSize() if hasattr(resType, 'getAlignSize') else resType.getSize()
+        alignSize = resType.getAlignSize()
         if alignSize < size:
             if metain in (TYPE_INT, TYPE_UINT, TYPE_BOOL, TYPE_FLOAT, TYPE_PTR):
                 if (size % alignSize) == 0:
                     numEl = size // alignSize
-                    if hasattr(tlst, 'getTypeArray'):
-                        return tlst.getTypeArray(numEl, resType)
+                    return tlst.getTypeArray(numEl, resType)
         elif metain in (TYPE_STRUCT, TYPE_ARRAY):
-            if hasattr(tlst, 'getExactPiece'):
-                return tlst.getExactPiece(resType, baseOffset, size)
+            return tlst.getExactPiece(resType, baseOffset, size)
         return None
 
 
@@ -2536,15 +2449,12 @@ class LaneDivide(TransformManager):
             return self.newSplit(vn, self._description, numLanes, skipLanes)
         if vn.isTypeLock():
             tp = vn.getType()
-            if hasattr(tp, 'getMetatype'):
-                from ghidra.types.datatype import TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION
-                meta = tp.getMetatype()
-                if meta not in (TYPE_ARRAY,):
-                    if meta in (TYPE_STRUCT, TYPE_UNION):
-                        return None
-                    # meta > TYPE_ARRAY means primitive
-                    if meta > TYPE_ARRAY:
-                        return None
+            from ghidra.types.datatype import TYPE_ARRAY, TYPE_STRUCT, TYPE_UNION
+            meta = tp.getMetatype()
+            if meta > TYPE_ARRAY:
+                return None
+            if meta in (TYPE_STRUCT, TYPE_UNION):
+                return None
         vn.setMark()
         res = self.newSplit(vn, self._description, numLanes, skipLanes)
         if not vn.isFree():
@@ -2626,8 +2536,7 @@ class LaneDivide(TransformManager):
             self.opSetOutput(rop, outVars[i])
             self.opSetInput(rop, inVn[i], 0)
             self.opSetInput(rop, self.newIop(op.getIn(1)), 1)
-            if hasattr(rop, 'inheritIndirect'):
-                rop.inheritIndirect(op)
+            rop.inheritIndirect(op)
         return True
 
     def _buildStore(self, op, numLanes, skipLanes) -> bool:
@@ -2636,13 +2545,13 @@ class LaneDivide(TransformManager):
             return False
         spaceConst = op.getIn(0).getOffset()
         spaceConstSize = op.getIn(0).getSize()
-        spc = op.getIn(0).getSpaceFromConst() if hasattr(op.getIn(0), 'getSpaceFromConst') else None
+        spc = op.getIn(0).getSpaceFromConst()
         origPtr = op.getIn(1)
         if origPtr.isFree() and not origPtr.isConstant():
             return False
         basePtr = self.getPreexistingVarnode(origPtr)
         ptrSize = origPtr.getSize()
-        isBig = spc.isBigEndian() if spc is not None and hasattr(spc, 'isBigEndian') else False
+        isBig = spc.isBigEndian()
         bytePos = 0
         for count in range(numLanes):
             i = (numLanes - 1 - count) if isBig else count
@@ -2655,10 +2564,7 @@ class LaneDivide(TransformManager):
                 self.opSetOutput(addOp, ptrVn)
                 self.opSetInput(addOp, basePtr, 0)
                 self.opSetInput(addOp, self.newConstant(ptrSize, 0, bytePos), 1)
-            if spc is not None:
-                self.opSetInput(ropStore, self.newSpaceid(spc), 0)
-            else:
-                self.opSetInput(ropStore, self.newConstant(spaceConstSize, 0, spaceConst), 0)
+            self.opSetInput(ropStore, self.newConstant(spaceConstSize, 0, spaceConst), 0)
             self.opSetInput(ropStore, ptrVn, 1)
             self.opSetInput(ropStore, inVars[i], 2)
             bytePos += self._description.getSize(skipLanes + i)
@@ -2667,13 +2573,13 @@ class LaneDivide(TransformManager):
     def _buildLoad(self, op, outVars, numLanes, skipLanes) -> bool:
         spaceConst = op.getIn(0).getOffset()
         spaceConstSize = op.getIn(0).getSize()
-        spc = op.getIn(0).getSpaceFromConst() if hasattr(op.getIn(0), 'getSpaceFromConst') else None
+        spc = op.getIn(0).getSpaceFromConst()
         origPtr = op.getIn(1)
         if origPtr.isFree() and not origPtr.isConstant():
             return False
         basePtr = self.getPreexistingVarnode(origPtr)
         ptrSize = origPtr.getSize()
-        isBig = spc.isBigEndian() if spc is not None and hasattr(spc, 'isBigEndian') else False
+        isBig = spc.isBigEndian()
         bytePos = 0
         for count in range(numLanes):
             ropLoad = self.newOpReplace(2, OpCode.CPUI_LOAD, op)
@@ -2686,10 +2592,7 @@ class LaneDivide(TransformManager):
                 self.opSetOutput(addOp, ptrVn)
                 self.opSetInput(addOp, basePtr, 0)
                 self.opSetInput(addOp, self.newConstant(ptrSize, 0, bytePos), 1)
-            if spc is not None:
-                self.opSetInput(ropLoad, self.newSpaceid(spc), 0)
-            else:
-                self.opSetInput(ropLoad, self.newConstant(spaceConstSize, 0, spaceConst), 0)
+            self.opSetInput(ropLoad, self.newConstant(spaceConstSize, 0, spaceConst), 0)
             self.opSetInput(ropLoad, ptrVn, 1)
             self.opSetOutput(ropLoad, outVars[i])
             bytePos += self._description.getSize(skipLanes + i)
@@ -3244,6 +3147,8 @@ class RuleSplitCopy:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSplitCopy(self._group)
 
     def getOpList(self) -> list:
@@ -3252,12 +3157,10 @@ class RuleSplitCopy:
     def applyOp(self, op, data) -> int:
         invn = op.getIn(0)
         outvn = op.getOut()
-        inType = invn.getTypeReadFacing(op) if hasattr(invn, 'getTypeReadFacing') else None
-        outType = outvn.getTypeDefFacing() if hasattr(outvn, 'getTypeDefFacing') else None
-        if inType is None or outType is None:
-            return 0
-        metain = inType.getMetatype() if hasattr(inType, 'getMetatype') else -1
-        metaout = outType.getMetatype() if hasattr(outType, 'getMetatype') else -1
+        inType = invn.getTypeReadFacing(op)
+        outType = outvn.getTypeDefFacing()
+        metain = inType.getMetatype()
+        metaout = outType.getMetatype()
         from ghidra.types.datatype import TYPE_PARTIALSTRUCT, TYPE_ARRAY, TYPE_STRUCT
         if (metain not in (TYPE_PARTIALSTRUCT, TYPE_ARRAY, TYPE_STRUCT) and
                 metaout not in (TYPE_PARTIALSTRUCT, TYPE_ARRAY, TYPE_STRUCT)):
@@ -3281,20 +3184,18 @@ class RuleSplitLoad:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSplitLoad(self._group)
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_LOAD)]
 
     def applyOp(self, op, data) -> int:
-        arch = data.getArch() if hasattr(data, 'getArch') else None
-        types = arch.types if arch is not None else None
-        if types is None:
-            return 0
-        inType = SplitDatatype.getValueDatatype(op, op.getOut().getSize(), types)
+        inType = SplitDatatype.getValueDatatype(op, op.getOut().getSize(), data.getArch().types)
         if inType is None:
             return 0
-        metain = inType.getMetatype() if hasattr(inType, 'getMetatype') else -1
+        metain = inType.getMetatype()
         from ghidra.types.datatype import TYPE_PARTIALSTRUCT, TYPE_ARRAY, TYPE_STRUCT
         if metain not in (TYPE_STRUCT, TYPE_ARRAY, TYPE_PARTIALSTRUCT):
             return 0
@@ -3317,20 +3218,18 @@ class RuleSplitStore:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleSplitStore(self._group)
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_STORE)]
 
     def applyOp(self, op, data) -> int:
-        arch = data.getArch() if hasattr(data, 'getArch') else None
-        types = arch.types if arch is not None else None
-        if types is None:
-            return 0
-        outType = SplitDatatype.getValueDatatype(op, op.getIn(2).getSize(), types)
+        outType = SplitDatatype.getValueDatatype(op, op.getIn(2).getSize(), data.getArch().types)
         if outType is None:
             return 0
-        metaout = outType.getMetatype() if hasattr(outType, 'getMetatype') else -1
+        metaout = outType.getMetatype()
         from ghidra.types.datatype import TYPE_PARTIALSTRUCT, TYPE_ARRAY, TYPE_STRUCT
         if metaout not in (TYPE_STRUCT, TYPE_ARRAY, TYPE_PARTIALSTRUCT):
             return 0
@@ -3353,6 +3252,8 @@ class RuleDumptyHumpLate:
         return self._group
 
     def clone(self, grouplist=None):
+        if not grouplist.contains(self.getGroup()):
+            return None
         return RuleDumptyHumpLate(self._group)
 
     def getOpList(self) -> list:
@@ -3394,7 +3295,7 @@ class RuleDumptyHumpLate:
             if op.getIn(1).getOffset() != trunc:
                 data.opSetInput(op, data.newConstant(4, trunc), 1)
             data.opSetInput(op, vn, 0)
-        elif hasattr(out, 'isAutoLive') and out.isAutoLive():
+        elif out.isAutoLive():
             removeOp = op.getIn(0).getDef()
             data.opRemoveInput(op, 1)
             data.opSetOpcode(op, OpCode.CPUI_COPY)
@@ -3402,11 +3303,8 @@ class RuleDumptyHumpLate:
         else:
             removeOp = op
             data.totalReplace(out, vn)
-        if removeOp.getOut().hasNoDescend() and not (hasattr(removeOp.getOut(), 'isAutoLive') and removeOp.getOut().isAutoLive()):
-            if hasattr(data, 'opDestroyRecursive'):
-                data.opDestroyRecursive(removeOp, [])
-            else:
-                data.opDestroy(removeOp)
+        if removeOp.getOut().hasNoDescend() and not removeOp.getOut().isAutoLive():
+            data.opDestroyRecursive(removeOp, [])
         return 1
 
 
@@ -3423,7 +3321,9 @@ class RuleSubfloatConvert:
         return self._group
 
     def clone(self, grouplist=None):
-        return RuleSubfloatConvert(self._group)
+        if not grouplist.contains(self.getGroup()):
+            return None
+        return RuleSubfloatConvert(self.getGroup())
 
     def getOpList(self) -> list:
         return [int(OpCode.CPUI_FLOAT_FLOAT2FLOAT)]
@@ -3437,12 +3337,10 @@ class RuleSubfloatConvert:
             subflow = SubfloatFlow(data, outvn, insize)
             if not subflow.doTrace():
                 return 0
-            if hasattr(subflow, 'apply'):
-                subflow.apply()
+            subflow.apply()
         else:
             subflow = SubfloatFlow(data, invn, outsize)
             if not subflow.doTrace():
                 return 0
-            if hasattr(subflow, 'apply'):
-                subflow.apply()
+            subflow.apply()
         return 1

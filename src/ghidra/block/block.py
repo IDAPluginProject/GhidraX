@@ -11,6 +11,7 @@ from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, List
 
 from ghidra.core.address import Address, RangeList
+from ghidra.core.error import LowlevelError
 
 if TYPE_CHECKING:
     from ghidra.ir.op import PcodeOp
@@ -65,7 +66,7 @@ class BlockEdge:
         endIndex = decoder.readSignedInteger(ATTRIB_END)
         self.point = resolver.findLevelBlock(endIndex)
         if self.point is None:
-            raise RuntimeError("Bad serialized edge in block graph")
+            raise LowlevelError("Bad serialized edge in block graph")
         self.reverse_index = decoder.readSignedInteger(ATTRIB_REV)
         decoder.closeElement(elemId)
 
@@ -193,7 +194,7 @@ class FlowBlock:
     def isGotoOut(self, i: int) -> bool: return (self._outofthis[i].label & (FlowBlock.f_irreducible | FlowBlock.f_goto_edge)) != 0
 
     # ---- Edge manipulation (C++ private/friend) ----
-    def addInEdge(self, b: FlowBlock, lab: int = 0) -> None:
+    def addInEdge(self, b: FlowBlock, lab: int) -> None:
         ourrev = len(b._outofthis)
         brev = len(self._intothis)
         self._intothis.append(BlockEdge(b, lab, ourrev))
@@ -320,7 +321,7 @@ class FlowBlock:
                 i += 1
 
     @staticmethod
-    def _findDups(ref: List[BlockEdge], duplist: List[FlowBlock]) -> None:
+    def findDups(ref: List[BlockEdge], duplist: List[FlowBlock]) -> None:
         for edge in ref:
             if (edge.point._flags & FlowBlock.f_mark2) != 0:
                 continue
@@ -334,11 +335,11 @@ class FlowBlock:
 
     def dedup(self) -> None:
         duplist: List[FlowBlock] = []
-        FlowBlock._findDups(self._intothis, duplist)
+        FlowBlock.findDups(self._intothis, duplist)
         for bl in duplist:
             self.eliminateInDups(bl)
         duplist.clear()
-        FlowBlock._findDups(self._outofthis, duplist)
+        FlowBlock.findDups(self._outofthis, duplist)
         for bl in duplist:
             self.eliminateOutDups(bl)
 
@@ -422,7 +423,7 @@ class FlowBlock:
         if 0 <= i < len(self._outofthis):
             self.setOutEdgeFlag(i, FlowBlock.f_goto_edge)
         else:
-            raise RuntimeError("Could not find block edge to mark unstructured")
+            raise LowlevelError("Could not find block edge to mark unstructured")
         self._flags |= FlowBlock.f_interior_gotoout
         self._outofthis[i].point._flags |= FlowBlock.f_interior_gotoin
 
@@ -503,22 +504,22 @@ class FlowBlock:
             rev = edge.reverse_index
             bl = edge.point
             if len(bl._outofthis) <= rev:
-                raise Exception("Not enough outofthis blocks")
+                raise LowlevelError("Not enough outofthis blocks")
             edger = bl._outofthis[rev]
             if edger.point is not self:
-                raise Exception("Intothis edge mismatch")
+                raise LowlevelError("Intothis edge mismatch")
             if edger.reverse_index != i:
-                raise Exception("Intothis index mismatch")
+                raise LowlevelError("Intothis index mismatch")
         for i, edge in enumerate(self._outofthis):
             rev = edge.reverse_index
             bl = edge.point
             if len(bl._intothis) <= rev:
-                raise Exception("Not enough intothis blocks")
+                raise LowlevelError("Not enough intothis blocks")
             edger = bl._intothis[rev]
             if edger.point is not self:
-                raise Exception("Outofthis edge mismatch")
+                raise LowlevelError("Outofthis edge mismatch")
             if edger.reverse_index != i:
-                raise Exception("Outofthis index mismatch")
+                raise LowlevelError("Outofthis index mismatch")
 
     def getInIndex(self, bl) -> int:
         for i in range(len(self._intothis)):
@@ -555,10 +556,10 @@ class FlowBlock:
 
     # ---- encode / decode ----
     def encodeHeader(self, encoder) -> None:
-        encoder.writeSignedInteger(ATTRIB_ALTINDEX, self._index)
+        encoder.writeSignedInteger(ATTRIB_INDEX, self._index)
 
     def decodeHeader(self, decoder) -> None:
-        self._index = decoder.readSignedInteger(ATTRIB_ALTINDEX)
+        self._index = decoder.readSignedInteger(ATTRIB_INDEX)
 
     def encodeEdges(self, encoder) -> None:
         for edge in self._intothis:
@@ -741,7 +742,7 @@ class BlockGraph(FlowBlock):
     def getSize(self) -> int: return len(self._list)
     def getBlock(self, i: int): return self._list[i]
     def getType(self) -> int: return FlowBlock.t_graph
-    def subBlock(self, i: int): return self._list[i] if 0 <= i < len(self._list) else None
+    def subBlock(self, i: int): return self._list[i]
 
     def getEntryBlock(self) -> Optional[FlowBlock]:
         """Return the entry (first) block, or None if empty."""
@@ -810,21 +811,24 @@ class BlockGraph(FlowBlock):
 
     def forceFalseEdge(self, out0) -> None:
         if self.sizeOut() != 2:
-            raise RuntimeError("Can only preserve binary condition")
+            raise LowlevelError("Can only preserve binary condition")
         if out0._parent is self: out0 = self
         if self._outofthis[0].point is not out0: self.swapEdges()
         if self._outofthis[0].point is not out0:
-            raise RuntimeError("Unable to preserve condition")
+            raise LowlevelError("Unable to preserve condition")
 
     def swapBlocks(self, i: int, j: int) -> None:
         self._list[i], self._list[j] = self._list[j], self._list[i]
 
     @staticmethod
     def markCopyBlock(bl, fl: int) -> None:
-        leaf = bl.getFrontLeaf()
-        if leaf is not None: leaf._flags |= fl
+        bl.getFrontLeaf()._flags |= fl
 
     def clear(self) -> None: self._list.clear()
+
+    def __del__(self) -> None:
+        if hasattr(self, "_list"):
+            self.clear()
 
     def markUnstructured(self) -> None:
         for bl in self._list: bl.markUnstructured()
@@ -878,13 +882,13 @@ class BlockGraph(FlowBlock):
         FlowBlock.encodeBody(self, encoder)
         for bl in self._list:
             encoder.openElement(ELEM_BHEAD)
-            encoder.writeSignedInteger(ATTRIB_ALTINDEX, bl.getIndex())
+            encoder.writeSignedInteger(ATTRIB_INDEX, bl.getIndex())
             bt = bl.getType()
             if bt == FlowBlock.t_if:
                 sz = bl.getSize(); nm = "ifgoto" if sz == 1 else ("properif" if sz == 2 else "ifelse")
             else:
                 nm = FlowBlock.typeToName(bt)
-            encoder.writeString(ATTRIB_OPCODE, nm)
+            encoder.writeString(ATTRIB_TYPE, nm)
             encoder.closeElement(ELEM_BHEAD)
         for bl in self._list: bl.encode(encoder)
 
@@ -893,8 +897,8 @@ class BlockGraph(FlowBlock):
         while True:
             if decoder.peekElement() != ELEM_BHEAD: break
             subId = decoder.openElement()
-            idx = decoder.readSignedInteger(ATTRIB_ALTINDEX)
-            bl = newresolver.createBlock(decoder.readString(ATTRIB_OPCODE))
+            idx = decoder.readSignedInteger(ATTRIB_INDEX)
+            bl = newresolver.createBlock(decoder.readString(ATTRIB_TYPE))
             bl._index = idx; tmplist.append(bl)
             decoder.closeElement(subId)
         newresolver.sortList()
@@ -906,8 +910,12 @@ class BlockGraph(FlowBlock):
     def addLoopEdge(self, begin, outindex: int): begin.setOutEdgeFlag(outindex, FlowBlock.f_loop_edge)
 
     def removeEdge(self, begin, end):
-        for i in range(len(end._intothis)):
-            if end._intothis[i].point is begin: end.removeInEdge(i); return
+        i = 0
+        while i < len(end._intothis):
+            if end._intothis[i].point is begin:
+                break
+            i += 1
+        end.removeInEdge(i)
 
     def switchEdge(self, in_, outbefore, outafter):
         for i in range(len(in_._outofthis)):
@@ -935,7 +943,8 @@ class BlockGraph(FlowBlock):
     def spliceBlock(self, bl):
         outbl = bl.getOut(0) if bl.sizeOut() == 1 else None
         if outbl and outbl.sizeIn() != 1: outbl = None
-        if outbl is None: raise RuntimeError("Can only splice block with 1 out to block with 1 in")
+        if outbl is None:
+            raise LowlevelError("Can only splice a block with 1 output to a block with 1 input")
         fl1 = bl._flags & (FlowBlock.f_unstructured_targ | FlowBlock.f_entry_point)
         fl2 = outbl._flags & FlowBlock.f_switch_out
         bl.removeOutEdge(0)
@@ -952,7 +961,7 @@ class BlockGraph(FlowBlock):
 
     def getStartBlock(self):
         if not self._list or not (self._list[0]._flags & FlowBlock.f_entry_point):
-            raise RuntimeError("No start block registered")
+            raise LowlevelError("No start block registered")
         return self._list[0]
 
     # ---- Factory methods ----
@@ -971,10 +980,8 @@ class BlockGraph(FlowBlock):
         if len(ret._outofthis) > 2: ret._flags |= FlowBlock.f_switch_out
         self.addBlock(ret); return ret
 
-    def newBlockGoto(self, bl, target=None):
-        if target is None:
-            target = bl.getOut(0)
-        ret = BlockGoto(target)
+    def newBlockGoto(self, bl):
+        ret = BlockGoto(bl.getOut(0))
         self.identifyInternal(ret, [bl]); self.addBlock(ret)
         ret.forceOutputNum(1); self.removeEdge(ret, ret.getOut(0)); return ret
 
@@ -982,14 +989,14 @@ class BlockGraph(FlowBlock):
         targetbl = bl.getOut(outedge)
         isdefaultedge = bl.isDefaultBranch(outedge)
         if bl.getType() == FlowBlock.t_multigoto:
-            ret = bl; ret.addGotoEdge(targetbl)
+            ret = bl; ret.addEdge(targetbl)
             self.removeEdge(ret, targetbl)
             if isdefaultedge: ret.setDefaultGoto()
         else:
             ret = BlockMultiGoto(bl)
             origSizeOut = bl.sizeOut()
             self.identifyInternal(ret, [bl]); self.addBlock(ret)
-            ret.addGotoEdge(targetbl)
+            ret.addEdge(targetbl)
             if targetbl is not bl:
                 if ret.sizeOut() != origSizeOut:
                     ret.forceOutputNum(ret.sizeOut() + 1)
@@ -1013,22 +1020,22 @@ class BlockGraph(FlowBlock):
         ret.forceOutputNum(2); ret.forceFalseEdge(out0); return ret
 
     def newBlockIfGoto(self, cond):
+        if not cond.isGotoOut(1):
+            raise LowlevelError("Building ifgoto where true branch is not the goto")
         out0 = cond.getOut(0); ret = BlockIf(); ret.setGotoTarget(cond.getOut(1))
         self.identifyInternal(ret, [cond]); self.addBlock(ret)
         ret.forceOutputNum(2); ret.forceFalseEdge(out0)
         self.removeEdge(ret, ret.getTrueOut()); return ret
 
-    def newBlockIf(self, cond, tc, fc=None):
-        nodes = [cond, tc] if fc is None else [cond, tc, fc]
-        ret = BlockIf(); self.identifyInternal(ret, nodes); self.addBlock(ret)
+    def newBlockIf(self, cond, tc):
+        ret = BlockIf(); self.identifyInternal(ret, [cond, tc]); self.addBlock(ret)
         ret.forceOutputNum(1); return ret
 
     def newBlockIfElse(self, cond, tc, fc):
-        return self.newBlockIf(cond, tc, fc)
+        ret = BlockIf(); self.identifyInternal(ret, [cond, tc, fc]); self.addBlock(ret)
+        ret.forceOutputNum(1); return ret
 
-    def newBlockWhileDo(self, cond, cl=None):
-        if cl is None:
-            cl = cond
+    def newBlockWhileDo(self, cond, cl):
         ret = BlockWhileDo(); self.identifyInternal(ret, [cond, cl]); self.addBlock(ret)
         ret.forceOutputNum(1); return ret
 
@@ -1044,19 +1051,32 @@ class BlockGraph(FlowBlock):
         rootbl = cs[0]; ret = BlockSwitch(rootbl)
         leafbl = rootbl.getExitLeaf()
         if leafbl is None or leafbl.getType() != FlowBlock.t_copy:
-            raise RuntimeError("Could not get switch leaf")
+            raise LowlevelError("Could not get switch leaf")
         ret.grabCaseBasic(leafbl.subBlock(0), cs)
         self.identifyInternal(ret, cs); self.addBlock(ret)
         if hasExit: ret.forceOutputNum(1)
         ret.clearFlag(FlowBlock.f_switch_out); return ret
 
-    def decodeGraph(self, decoder) -> None:
-        resolver = BlockMap()
+    def decode(self, decoder, resolver=None) -> None:
+        if resolver is None:
+            resolver = BlockMap()
         FlowBlock.decode(self, decoder, resolver)
+
+    def decodeGraph(self, decoder) -> None:
+        self.decode(decoder)
 
     def orderBlocks(self):
         if len(self._list) != 1:
-            self._list.sort(key=lambda b: (0 if b.getIndex() == 0 else 1, b.getIndex()))
+            from functools import cmp_to_key
+
+            def _cmp(left, right) -> int:
+                if FlowBlock.compareFinalOrder(left, right):
+                    return -1
+                if FlowBlock.compareFinalOrder(right, left):
+                    return 1
+                return 0
+
+            self._list.sort(key=cmp_to_key(_cmp))
 
     def buildCopy(self, graph):
         startsize = len(self._list)
@@ -1076,7 +1096,7 @@ class BlockGraph(FlowBlock):
         b = po[-1]
         if b.sizeIn() != 0:
             if len(rootlist) != 1 or rootlist[0] is not b:
-                raise RuntimeError("Problems finding root node of graph")
+                raise LowlevelError("Problems finding root node of graph")
             vr = BlockGraph.createVirtualRoot(rootlist); po.append(vr); b = vr
         b._immed_dom = b
         for i in range(b.sizeOut()): b.getOut(i)._immed_dom = b
@@ -1109,20 +1129,34 @@ class BlockGraph(FlowBlock):
         else:
             po[-1]._immed_dom = None
 
-    def buildDomTree(self):
-        child = [[] for _ in range(len(self._list) + 1)]
+    def buildDomTree(self, child=None):
+        owns_child = child is None
+        if child is None:
+            child = []
+        child.clear()
+        child.extend([] for _ in range(len(self._list) + 1))
         for bl in self._list:
             if bl._immed_dom is not None: child[bl._immed_dom._index].append(bl)
             else: child[len(self._list)].append(bl)
-        return child
+        if owns_child:
+            return child
+        return None
 
-    def buildDomDepth(self):
-        depth = [0] * (len(self._list) + 1); mx = 0
+    def buildDomDepth(self, depth=None):
+        owns_depth = depth is None
+        if depth is None:
+            depth = []
+        depth.clear()
+        depth.extend(0 for _ in range(len(self._list) + 1))
+        mx = 0
         for i, bl in enumerate(self._list):
             d = bl._immed_dom
             depth[i] = depth[d.getIndex()] + 1 if d else 1
             if mx < depth[i]: mx = depth[i]
-        depth[len(self._list)] = 0; return (depth, mx)
+        depth[len(self._list)] = 0
+        if owns_depth:
+            return (depth, mx)
+        return mx
 
     def buildDomSubTree(self, res, root):
         ri = root.getIndex(); res.append(root)
@@ -1205,7 +1239,7 @@ class BlockGraph(FlowBlock):
                         elif cb._visitcount < ch._visitcount: cb.setOutEdgeFlag(en, FlowBlock.f_forward_edge)
                         else: cb.setOutEdgeFlag(en, FlowBlock.f_cross_edge)
             if not extra: break
-            if rep == 1: raise RuntimeError("Could not generate spanning tree")
+            if rep == 1: raise LowlevelError("Could not generate spanning tree")
             rootlist[-1], rootlist[orp] = rootlist[orp], rootlist[-1]
             for bl in self._list: bl._index = -1; bl._visitcount = -1; bl._copymap = bl
             preorder.clear(); st.clear(); ist.clear()
@@ -1269,12 +1303,59 @@ class BlockGraph(FlowBlock):
 # BlockBasic
 # =========================================================================
 
+class _BlockBasicOpIterator:
+    __slots__ = ("_block", "_current")
+
+    _END = object()
+
+    def __init__(self, block, current=_END) -> None:
+        self._block = block
+        self._current = current
+
+    @classmethod
+    def begin(cls, block):
+        if block._op:
+            return cls(block, block._op[0])
+        return cls(block)
+
+    @classmethod
+    def end(cls, block):
+        return cls(block)
+
+    def clone(self):
+        return type(self)(self._block, self._current)
+
+    def to_index(self) -> int:
+        if self._current is self._END:
+            return len(self._block._op)
+        return self._block._op.index(self._current)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._current is self._END:
+            raise StopIteration
+        current = self._current
+        idx = self._block._op.index(current)
+        next_idx = idx + 1
+        self._current = self._block._op[next_idx] if next_idx < len(self._block._op) else self._END
+        return current
+
+    def __eq__(self, other) -> bool:
+        return (
+            isinstance(other, _BlockBasicOpIterator)
+            and self._block is other._block
+            and self._current is other._current
+        )
+
+
 class BlockBasic(FlowBlock):
     """A basic block for p-code operations."""
 
     _SEQNUM_MAX = 0xFFFFFFFF
 
-    def __init__(self, fd=None) -> None:
+    def __init__(self, fd) -> None:
         super().__init__()
         self._op: list = []
         self._data = fd
@@ -1298,17 +1379,14 @@ class BlockBasic(FlowBlock):
 
     def insertOp(self, op, pos: int = 0) -> None:
         """Insert a PcodeOp at a specific position."""
-        self._op.insert(pos, op)
-        if hasattr(op, 'setParent'):
-            op.setParent(self)
-        self._assign_order_for_inserted_op(pos, op)
+        self.insert(pos, op)
 
     def getOpList(self):
         """Return the list of PcodeOps."""
         return self._op
 
-    def beginOp(self): return iter(self._op)
-    def endOp(self): return None
+    def beginOp(self): return _BlockBasicOpIterator.begin(self)
+    def endOp(self): return _BlockBasicOpIterator.end(self)
     def emptyOp(self) -> bool: return len(self._op) == 0
     def emit(self, lng) -> None: lng.emitBlockBasic(self)
 
@@ -1362,8 +1440,7 @@ class BlockBasic(FlowBlock):
         # only count statements that would need explicit printing, not every
         # temporary-producing op inside the block.
         statement = 1 if self.sizeOut() >= 2 else 0
-        arch = self._data.getArch() if self._data is not None and hasattr(self._data, "getArch") else None
-        maxref = getattr(arch, "max_implied_ref", 2)
+        maxref = self._data.getArch().max_implied_ref
 
         for inst in self._op:
             if inst.isMarker():
@@ -1445,6 +1522,12 @@ class BlockBasic(FlowBlock):
         count = 0
         for inst in self._op:
             count += step; inst.setOrder(count)
+        self._refresh_basic_iters()
+
+    def _refresh_basic_iters(self) -> None:
+        for idx, inst in enumerate(self._op):
+            if hasattr(inst, "setBasicIter"):
+                inst.setBasicIter(idx)
 
     def _assign_order_for_inserted_op(self, pos: int, inst) -> None:
         if pos <= 0:
@@ -1464,16 +1547,28 @@ class BlockBasic(FlowBlock):
             return
         inst.setOrder((ordafter // 2) + (ordbefore // 2))
 
-    def copyRange(self, bb): self._cover = bb._cover
+    def copyRange(self, bb): self._cover = RangeList(bb._cover)
     def mergeRange(self, bb): self._cover.merge(bb._cover)
 
     def insert(self, pos, inst):
-        self.insertOp(inst, pos)
+        if hasattr(pos, "to_index"):
+            pos = pos.to_index()
+        if pos is None:
+            pos = len(self._op)
+        inst.setParent(self)
+        self._op.insert(pos, inst)
+        self._refresh_basic_iters()
+        self._assign_order_for_inserted_op(pos, inst)
         from ghidra.core.opcodes import OpCode
         if inst.isBranch() and inst.code() == OpCode.CPUI_BRANCHIND:
             self.setFlag(FlowBlock.f_switch_out)
 
-    def removeOp(self, inst): inst.setParent(None); self._op.remove(inst)
+    def removeOp(self, inst):
+        inst.setParent(None)
+        self._op.remove(inst)
+        if hasattr(inst, "setBasicIter"):
+            inst.setBasicIter(None)
+        self._refresh_basic_iters()
 
     def noInterveningStatement(self) -> bool:
         from ghidra.core.opcodes import OpCode
@@ -1511,7 +1606,8 @@ class BlockBasic(FlowBlock):
                 res = op
         return res
 
-    def liftVerifyUnroll(self, varArray: list, slot: int) -> bool:
+    @staticmethod
+    def liftVerifyUnroll(varArray: list, slot: int) -> bool:
         vn = varArray[0]
         if not vn.isWritten(): return False
         op = vn.getDef(); opc = op.code()
@@ -1553,7 +1649,7 @@ class BlockBasic(FlowBlock):
             nextBlock = nextBlock.subBlock(0)
         if self.getOut(0) is nextBlock: return
         if self._op and self._op[-1].isBranch(): return
-        self.getStop().printRaw(s)
+        s.write(self.getStop().printRaw())
         s.write(':   \t[ goto ')
         outBlock.printShortHeader(s)
         s.write(' ]\n')
@@ -1568,38 +1664,38 @@ class BlockBasic(FlowBlock):
 class BlockCopy(FlowBlock):
     """Mirror of a BlockBasic used during control-flow structuring."""
 
-    def __init__(self, bl: Optional[FlowBlock] = None) -> None:
+    def __init__(self, bl: Optional[FlowBlock]) -> None:
         super().__init__()
         self._copy: Optional[FlowBlock] = bl
 
     def subBlock(self, i: int): return self._copy
     def getType(self) -> int: return FlowBlock.t_copy
     def getExitLeaf(self): return self
-    def firstOp(self): return self._copy.firstOp() if self._copy else None
-    def lastOp(self): return self._copy.lastOp() if self._copy else None
-    def isComplex(self) -> bool: return self._copy.isComplex() if self._copy else True
-    def getSplitPoint(self): return self._copy.getSplitPoint() if self._copy else None
+    def firstOp(self): return self._copy.firstOp()
+    def lastOp(self): return self._copy.lastOp()
+    def isComplex(self) -> bool: return self._copy.isComplex()
+    def getSplitPoint(self): return self._copy.getSplitPoint()
     def emit(self, lng) -> None: lng.emitBlockCopy(self)
 
     def negateCondition(self, toporbottom: bool) -> bool:
-        res = self._copy.negateCondition(True) if self._copy else False
+        res = self._copy.negateCondition(True)
         FlowBlock.negateCondition(self, toporbottom); return res
 
     def printHeader(self, s) -> None:
         s.write("Basic(copy) block "); FlowBlock.printHeader(self, s)
 
     def printTree(self, s, level: int) -> None:
-        if self._copy: self._copy.printTree(s, level)
+        self._copy.printTree(s, level)
 
     def encodeHeader(self, encoder) -> None:
         FlowBlock.encodeHeader(self, encoder)
-        encoder.writeSignedInteger(ATTRIB_ALTINDEX, self._copy.getIndex() if self._copy else 0)
+        encoder.writeSignedInteger(ATTRIB_ALTINDEX, self._copy.getIndex())
 
     def printRaw(self, s) -> None:
-        s.write(f"BlockCopy(copy of {self._copy.getIndex() if self._copy else '?'})")
+        self._copy.printRaw(s)
 
-    def printRawImpliedGoto(self, s) -> None:
-        s.write("implied goto")
+    def printRawImpliedGoto(self, s, nextBlock) -> None:
+        self._copy.printRawImpliedGoto(s, nextBlock)
 
 
 # =========================================================================
@@ -1609,7 +1705,7 @@ class BlockCopy(FlowBlock):
 class BlockGoto(BlockGraph):
     """A block that terminates with an unstructured goto branch."""
 
-    def __init__(self, target: Optional[FlowBlock] = None) -> None:
+    def __init__(self, target: Optional[FlowBlock]) -> None:
         super().__init__()
         self._gototarget: Optional[FlowBlock] = target
         self._gototype: int = FlowBlock.f_goto_goto
@@ -1617,14 +1713,14 @@ class BlockGoto(BlockGraph):
     def getGotoTarget(self): return self._gototarget
     def getGotoType(self) -> int: return self._gototype
     def getType(self) -> int: return FlowBlock.t_goto
-    def getExitLeaf(self): return self.getBlock(0).getExitLeaf() if self.getSize() > 0 else None
-    def lastOp(self): return self.getBlock(0).lastOp() if self.getSize() > 0 else None
+    def getExitLeaf(self): return self.getBlock(0).getExitLeaf()
+    def lastOp(self): return self.getBlock(0).lastOp()
     def emit(self, lng) -> None: lng.emitBlockGoto(self)
 
     def gotoPrints(self) -> bool:
         if self.getParent() is not None:
             nextbl = self.getParent().nextFlowAfter(self)
-            gotobl = self._gototarget.getFrontLeaf() if self._gototarget else None
+            gotobl = self._gototarget.getFrontLeaf()
             return gotobl is not nextbl
         return False
 
@@ -1634,8 +1730,7 @@ class BlockGoto(BlockGraph):
             BlockGraph.markCopyBlock(self._gototarget, FlowBlock.f_unstructured_targ)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0:
-            self.getBlock(0).scopeBreak(self._gototarget.getIndex(), curloopexit)
+        self.getBlock(0).scopeBreak(self._gototarget.getIndex(), curloopexit)
         if curloopexit == self._gototarget.getIndex():
             self._gototype = FlowBlock.f_break_goto
 
@@ -1643,21 +1738,20 @@ class BlockGoto(BlockGraph):
         s.write("Plain goto block "); FlowBlock.printHeader(self, s)
 
     def nextFlowAfter(self, bl):
-        return self._gototarget.getFrontLeaf() if self._gototarget else None
+        return self._gototarget.getFrontLeaf()
 
     def encodeBody(self, encoder) -> None:
         BlockGraph.encodeBody(self, encoder)
-        if self._gototarget is not None:
-            encoder.openElement(ELEM_TARGET)
-            leaf = self._gototarget.getFrontLeaf()
-            depth = self._gototarget.calcDepth(leaf)
-            encoder.writeSignedInteger(ATTRIB_INDEX, leaf.getIndex())
-            encoder.writeSignedInteger(ATTRIB_DEPTH, depth)
-            encoder.writeUnsignedInteger(ATTRIB_TYPE, self._gototype)
-            encoder.closeElement(ELEM_TARGET)
+        encoder.openElement(ELEM_TARGET)
+        leaf = self._gototarget.getFrontLeaf()
+        depth = self._gototarget.calcDepth(leaf)
+        encoder.writeSignedInteger(ATTRIB_INDEX, leaf.getIndex())
+        encoder.writeSignedInteger(ATTRIB_DEPTH, depth)
+        encoder.writeUnsignedInteger(ATTRIB_TYPE, self._gototype)
+        encoder.closeElement(ELEM_TARGET)
 
     def printRaw(self, s) -> None:
-        s.write(f"BlockGoto(target={self._gototarget.getIndex() if self._gototarget else '?'})")
+        self.getBlock(0).printRaw(s)
 
 
 # =========================================================================
@@ -1667,35 +1761,31 @@ class BlockGoto(BlockGraph):
 class BlockMultiGoto(BlockGraph):
     """A block with multiple unstructured goto edges."""
 
-    def __init__(self, bl: Optional[FlowBlock] = None) -> None:
+    def __init__(self, bl: Optional[FlowBlock]) -> None:
         super().__init__()
         self._gotoedges: List[FlowBlock] = []
         self._defaultswitch: bool = False
 
     def setDefaultGoto(self) -> None: self._defaultswitch = True
     def hasDefaultGoto(self) -> bool: return self._defaultswitch
-    def addGotoEdge(self, bl: FlowBlock) -> None: self._gotoedges.append(bl)
+    def addEdge(self, bl: FlowBlock) -> None: self._gotoedges.append(bl)
     def numGotos(self) -> int: return len(self._gotoedges)
     def getGoto(self, i: int): return self._gotoedges[i]
     def getType(self) -> int: return FlowBlock.t_multigoto
-    def getExitLeaf(self): return self.getBlock(0).getExitLeaf() if self.getSize() > 0 else None
-    def lastOp(self): return self.getBlock(0).lastOp() if self.getSize() > 0 else None
-    def emit(self, lng) -> None:
-        if self.getSize() > 0: self.getBlock(0).emit(lng)
+    def getExitLeaf(self): return self.getBlock(0).getExitLeaf()
+    def lastOp(self): return self.getBlock(0).lastOp()
+    def emit(self, lng) -> None: self.getBlock(0).emit(lng)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curloopexit)
+        self.getBlock(0).scopeBreak(-1, curloopexit)
 
     def printHeader(self, s) -> None:
         s.write("Multi goto block "); FlowBlock.printHeader(self, s)
 
-    def addEdge(self, bl) -> None:
-        self._gotoedges.append(bl)
-
     def nextFlowAfter(self, bl): return None
 
     def printRaw(self, s) -> None:
-        s.write(f"BlockMultiGoto({len(self._gotoedges)} gotos)")
+        self.getBlock(0).printRaw(s)
 
     def encodeBody(self, encoder) -> None:
         BlockGraph.encodeBody(self, encoder)
@@ -1743,7 +1833,7 @@ class BlockList(BlockGraph):
 class BlockCondition(BlockGraph):
     """Two conditional blocks combined with BOOL_AND or BOOL_OR."""
 
-    def __init__(self, opc: int = 0) -> None:
+    def __init__(self, opc: int) -> None:
         super().__init__()
         self._opc: int = opc
 
@@ -1753,9 +1843,9 @@ class BlockCondition(BlockGraph):
     def emit(self, lng) -> None: lng.emitBlockCondition(self)
 
     def flipInPlaceTest(self, fliplist: list) -> int:
-        s1 = self.getBlock(0).getSplitPoint() if self.getSize() > 0 else None
+        s1 = self.getBlock(0).getSplitPoint()
         if s1 is None: return 2
-        s2 = self.getBlock(1).getSplitPoint() if self.getSize() > 1 else None
+        s2 = self.getBlock(1).getSplitPoint()
         if s2 is None: return 2
         r1 = s1.flipInPlaceTest(fliplist)
         if r1 == 2: return 2
@@ -1769,7 +1859,7 @@ class BlockCondition(BlockGraph):
         self.getBlock(1).getSplitPoint().flipInPlaceExecute()
 
     def lastOp(self):
-        return self.getBlock(1).lastOp() if self.getSize() > 1 else None
+        return self.getBlock(1).lastOp()
 
     def negateCondition(self, toporbottom: bool) -> bool:
         from ghidra.core.opcodes import OpCode
@@ -1779,8 +1869,8 @@ class BlockCondition(BlockGraph):
         FlowBlock.negateCondition(self, toporbottom); return r1 or r2
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curloopexit)
-        if self.getSize() > 1: self.getBlock(1).scopeBreak(-1, curloopexit)
+        self.getBlock(0).scopeBreak(-1, curloopexit)
+        self.getBlock(1).scopeBreak(-1, curloopexit)
 
     def printHeader(self, s) -> None:
         from ghidra.core.opcodes import OpCode
@@ -1788,14 +1878,14 @@ class BlockCondition(BlockGraph):
         FlowBlock.printHeader(self, s)
 
     def isComplex(self) -> bool:
-        return self.getBlock(0).isComplex() if self.getSize() > 0 else True
+        return self.getBlock(0).isComplex()
 
     def nextFlowAfter(self, bl): return None
 
     def encodeHeader(self, encoder) -> None:
         BlockGraph.encodeHeader(self, encoder)
-        from ghidra.core.opcodes import OpCode
-        nm = OpCode.get_opname(self._opc) if hasattr(OpCode, 'get_opname') else str(self._opc)
+        from ghidra.core.opcodes import get_opname
+        nm = get_opname(self._opc)
         encoder.writeString(ATTRIB_OPCODE, nm)
 
 
@@ -1823,7 +1913,7 @@ class BlockIf(BlockGraph):
             BlockGraph.markCopyBlock(self._gototarget, FlowBlock.f_unstructured_targ)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curloopexit)
+        self.getBlock(0).scopeBreak(-1, curloopexit)
         for i in range(1, self.getSize()):
             self.getBlock(i).scopeBreak(curexit, curloopexit)
         if self._gototarget is not None and self._gototarget.getIndex() == curloopexit:
@@ -1855,7 +1945,7 @@ class BlockIf(BlockGraph):
 
     def encodeBody(self, encoder) -> None:
         BlockGraph.encodeBody(self, encoder)
-        if self.getSize() == 1 and self._gototarget is not None:
+        if self.getSize() == 1:
             leaf = self._gototarget.getFrontLeaf()
             depth = self._gototarget.calcDepth(leaf)
             encoder.openElement(ELEM_TARGET)
@@ -1972,8 +2062,8 @@ class BlockWhileDo(BlockGraph):
         if not bump: self.clearFlag(FlowBlock.f_label_bumpup)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curexit)
-        if self.getSize() > 1: self.getBlock(1).scopeBreak(self.getBlock(0).getIndex(), curexit)
+        self.getBlock(0).scopeBreak(-1, curexit)
+        self.getBlock(1).scopeBreak(self.getBlock(0).getIndex(), curexit)
 
     def printHeader(self, s) -> None:
         s.write("Whiledo block ")
@@ -1981,20 +2071,19 @@ class BlockWhileDo(BlockGraph):
         FlowBlock.printHeader(self, s)
 
     def nextFlowAfter(self, bl):
-        if self.getSize() > 0 and self.getBlock(0) is bl: return None
-        nb = self.getBlock(0) if self.getSize() > 0 else None
+        if self.getBlock(0) is bl: return None
+        nb = self.getBlock(0)
         return nb.getFrontLeaf() if nb else None
 
     def finalTransform(self, data) -> None:
         from ghidra.core.opcodes import OpCode
         BlockGraph.finalTransform(self, data)
-        if not hasattr(data.getArch(), 'analyze_for_loops') or not data.getArch().analyze_for_loops:
-            return
+        if not data.getArch().analyze_for_loops: return
         if self.hasOverflowSyntax(): return
         copyBl = self.getFrontLeaf()
         if copyBl is None: return
         head = copyBl.subBlock(0)
-        if head is None or head.getType() != FlowBlock.t_basic: return
+        if head.getType() != FlowBlock.t_basic: return
         lastOp = self.getBlock(1).lastOp()
         if lastOp is None: return
         tail = lastOp.getParent()
@@ -2047,7 +2136,7 @@ class BlockDoWhile(BlockGraph):
         if not bump: self.clearFlag(FlowBlock.f_label_bumpup)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curexit)
+        self.getBlock(0).scopeBreak(-1, curexit)
 
     def printHeader(self, s) -> None:
         s.write("Dowhile block "); FlowBlock.printHeader(self, s)
@@ -2070,14 +2159,13 @@ class BlockInfLoop(BlockGraph):
         if not bump: self.clearFlag(FlowBlock.f_label_bumpup)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0:
-            self.getBlock(0).scopeBreak(self.getBlock(0).getIndex(), curexit)
+        self.getBlock(0).scopeBreak(self.getBlock(0).getIndex(), curexit)
 
     def printHeader(self, s) -> None:
         s.write("Infinite loop block "); FlowBlock.printHeader(self, s)
 
     def nextFlowAfter(self, bl):
-        nb = self.getBlock(0) if self.getSize() > 0 else None
+        nb = self.getBlock(0)
         return nb.getFrontLeaf() if nb else None
 
 
@@ -2101,47 +2189,43 @@ class BlockSwitch(BlockGraph):
             if a.label != b.label: return a.label < b.label
             return a.depth < b.depth
 
-    def __init__(self, ind: Optional[FlowBlock] = None) -> None:
+    def __init__(self, ind) -> None:
         super().__init__()
-        self._jump = ind.getJumptable() if ind is not None else None
+        self._jump = ind.getJumptable()
         self._caseblocks: List[BlockSwitch.CaseOrder] = []
 
-    def getSwitchBlock(self): return self.getBlock(0) if self.getSize() > 0 else None
+    def getSwitchBlock(self): return self.getBlock(0)
     def getNumCaseBlocks(self) -> int: return len(self._caseblocks)
     def getCaseBlock(self, i: int): return self._caseblocks[i].block
     def isDefaultCase(self, i: int) -> bool: return self._caseblocks[i].isdefault
-    def getGotoCaseType(self, i: int) -> int: return self._caseblocks[i].gototype
     def getGotoType(self, i: int) -> int: return self._caseblocks[i].gototype
     def isExit(self, i: int) -> bool: return self._caseblocks[i].isexit
     def getType(self) -> int: return FlowBlock.t_switch
     def emit(self, lng) -> None: lng.emitBlockSwitch(self)
 
     def getNumLabels(self, i: int) -> int:
-        return self._jump.numIndicesByBlock(self._caseblocks[i].basicblock) if self._jump else 0
+        return self._jump.numIndicesByBlock(self._caseblocks[i].basicblock)
 
     def getLabel(self, i: int, j: int) -> int:
-        if self._jump:
-            return self._jump.getLabelByIndex(
-                self._jump.getIndexByBlock(self._caseblocks[i].basicblock, j))
-        return 0
+        return self._jump.getLabelByIndex(
+            self._jump.getIndexByBlock(self._caseblocks[i].basicblock, j))
 
     def getSwitchType(self):
-        if self._jump:
-            op = self._jump.getIndirectOp()
-            return op.getIn(0).getHighTypeReadFacing(op)
-        return None
+        op = self._jump.getIndirectOp()
+        return op.getIn(0).getHighTypeReadFacing(op)
 
     def addCase(self, switchbl, bl, gt: int) -> None:
-        c = BlockSwitch.CaseOrder()
+        self._caseblocks.append(BlockSwitch.CaseOrder())
+        c = self._caseblocks[-1]
         basicbl = bl.getFrontLeaf().subBlock(0)
         c.block = bl; c.basicblock = basicbl
         inindex = basicbl.getInIndex(switchbl)
-        if inindex == -1: raise RuntimeError("Case block detached from switch")
+        if inindex == -1:
+            raise LowlevelError("Case block has become detached from switch")
         c.outindex = basicbl.getInRevIndex(inindex)
         c.gototype = gt
         c.isexit = False if gt != 0 else (bl.sizeOut() == 1)
         c.isdefault = switchbl.isDefaultBranch(c.outindex)
-        self._caseblocks.append(c)
 
     def grabCaseBasic(self, switchbl, cs: list) -> None:
         casemap = [-1] * switchbl.sizeOut()
@@ -2169,7 +2253,7 @@ class BlockSwitch(BlockGraph):
                 BlockGraph.markCopyBlock(c.block, FlowBlock.f_unstructured_targ)
 
     def scopeBreak(self, curexit: int, curloopexit: int) -> None:
-        if self.getSize() > 0: self.getBlock(0).scopeBreak(-1, curexit)
+        self.getBlock(0).scopeBreak(-1, curexit)
         for c in self._caseblocks:
             if c.gototype != 0:
                 if c.block.getIndex() == curexit: c.gototype = FlowBlock.f_break_goto
@@ -2180,7 +2264,7 @@ class BlockSwitch(BlockGraph):
         s.write("Switch block "); FlowBlock.printHeader(self, s)
 
     def nextFlowAfter(self, bl):
-        if self.getSize() > 0 and self.getBlock(0) is bl: return None
+        if self.getBlock(0) is bl: return None
         if bl.getType() != FlowBlock.t_goto: return None
         idx = -1
         for i, c in enumerate(self._caseblocks):
@@ -2200,7 +2284,7 @@ class BlockSwitch(BlockGraph):
                 if self._caseblocks[j].depth != 0: break
                 self._caseblocks[j].depth = -1; j = self._caseblocks[j].chain
         for c in self._caseblocks:
-            if self._jump and self._jump.numIndicesByBlock(c.basicblock) > 0:
+            if self._jump.numIndicesByBlock(c.basicblock) > 0:
                 if c.depth == 0:
                     ind = self._jump.getIndexByBlock(c.basicblock, 0)
                     c.label = self._jump.getLabelByIndex(ind)
@@ -2245,6 +2329,9 @@ class BlockMap:
 
     def sortList(self) -> None:
         self._sortlist.sort(key=lambda bl: bl.getIndex())
+
+    def findLevelBlock(self, index: int):
+        return self.findBlock(self._sortlist, index)
 
     def createBlock(self, name: str) -> FlowBlock:
         bt = FlowBlock.nameToType(name)

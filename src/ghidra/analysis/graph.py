@@ -9,6 +9,9 @@ and DAG-based structuring support.
 from __future__ import annotations
 from typing import List, Optional, Set, Dict, Tuple, TextIO
 
+from ghidra.core.opcodes import OpCode
+from ghidra.core.space import IPTR_FSPEC, IPTR_IOP
+
 
 class DomInfo:
     """Dominance information for a single node in the CFG."""
@@ -480,6 +483,260 @@ _BLOCK_PROPERTIES = (
     "  South=(),\n"
     "  NorthWest=();\n"
 )
+
+
+_DATAFLOW_AUTOMATIC_ARRANGEMENT = (
+    "\n// AutomaticArrangement\n"
+    "  *CMD = AlterLocalPreferences, Name = AutomaticArrangement,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  EnableAutomaticArrangement=true,\n"
+    "  OnlyActOnVerticesWithoutCoordsIfOff=false,\n"
+    "  DontUpdateMediumWithUserArrangement=false,\n"
+    "  UserAddedArrangmentParams=({ServiceName=SimpleHierarchyFromSources,ServiceParams={~SkipPromptForParams=true}}),\n"
+    "  SmallSize=50,\n"
+    "  DontUpdateLargeWithUserArrangement=true,\n"
+    "  NewVertexActionIfOff=ArrangeByMDS,\n"
+    "  MediumSizeArrangement=SimpleHierarchyFromSources,\n"
+    "  SmallSizeArrangement=SimpleHierarchyFromSources,\n"
+    "  MediumSize=800,\n"
+    "  LargeSizeArrangement=ArrangeInCircle,\n"
+    "  DontUpdateSmallWithUserArrangement=false,\n"
+    "  ActionSizeGainIfOff=1.0;\n"
+)
+
+
+_DATAFLOW_VERTEX_COLORS = (
+    "\n// VertexColors\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexColors,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Mapping=({DisplayChoice=Magenta,AttributeValue=branch},\n"
+    "  {DisplayChoice=Blue,AttributeValue=register},\n"
+    "  {DisplayChoice=Black,AttributeValue=unique},\n"
+    "  {DisplayChoice=DarkGreen,AttributeValue=const},\n"
+    "  {DisplayChoice=DarkOrange,AttributeValue=ram},\n"
+    "  {DisplayChoice=Orange,AttributeValue=stack}),\n"
+    "  ChoiceForValueNotCovered=Red,\n"
+    "  Extraction=CompleteValue,\n"
+    "  ExtractionParams={},\n"
+    "  AttributeName=SubClass,\n"
+    "  ChoiceForMissingValue=Red,\n"
+    "  CanOverride=true,\n"
+    "  OverrideAttributeName=Color,\n"
+    "  UsingRange=false;\n"
+)
+
+
+_DATAFLOW_VERTEX_ICONS = (
+    "\n//     VertexIcons\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexIcons,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Mapping=({DisplayChoice=Circle,AttributeValue=var},\n"
+    "  {DisplayChoice=Square,AttributeValue=op}),\n"
+    "  ChoiceForValueNotCovered=Circle,\n"
+    "  Extraction=CompleteValue,\n"
+    "  ExtractionParams={},\n"
+    "  AttributeName=Type,\n"
+    "  ChoiceForMissingValue=Circle,\n"
+    "  CanOverride=true,\n"
+    "  OverrideAttributeName=Icon,\n"
+    "  UsingRange=false;\n"
+)
+
+
+_DATAFLOW_VERTEX_LABELS = (
+    "\n//     VertexLabels\n"
+    "  *CMD = AlterLocalPreferences, Name = VertexLabels,\n"
+    "  ~ReplaceAllParams = TRUE,\n"
+    "  Center=({SpecialColor=Black,SpecialFontName=SansSerif,Format=StandardFormat,UseSpecialFontName=false,LabelAlignment=Center,TreatBackSlashNAsNewLine=false,MaxLines=4,FontSize=10,IncludeBackground=false,SqueezeLinesTogether=true,BackgroundColor=Black,UseSpecialColor=false,AttributeName=Name,MaxWidth=100}),\n"
+    "  East=(),\n"
+    "  SouthEast=(),\n"
+    "  North=(),\n"
+    "  West=(),\n"
+    "  SouthWest=(),\n"
+    "  NorthEast=(),\n"
+    "  South=(),\n"
+    "  NorthWest=();\n"
+)
+
+
+_DATAFLOW_ATTRIBUTES = (
+    "\n// Attributes\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=SubClass,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Type,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Internal,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Name,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Address,\n"
+    "        Type=String,\n"
+    "        Category=Vertices;\n\n"
+    "*CMD=DefineAttribute,\n"
+    "        Name=Name,\n"
+    "        Type=String,\n"
+    "        Category=Edges;\n\n"
+    "*CMD=SetKeyAttribute,\n"
+    "        Category=Vertices,"
+    "        Name=Internal;\n\n"
+)
+
+
+def _get_dataflow_bounds(op) -> tuple[int, int]:
+    start = 0
+    stop = op.numInput()
+    opcode = op.code()
+    if opcode in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE, OpCode.CPUI_BRANCH, OpCode.CPUI_CALL):
+        start = 1
+    elif opcode == OpCode.CPUI_INDIRECT:
+        stop = 1
+    return start, stop
+
+
+def _print_varnode_vertex(vn, out: TextIO) -> None:
+    if vn is None or vn.isMark():
+        return
+    spc = vn.getSpace()
+    if spc is None:
+        return
+    tp = spc.getType()
+    if tp == IPTR_FSPEC or tp == IPTR_IOP:
+        return
+
+    raw = vn.printRawNoMarkup()
+    raw_text = raw[0] if isinstance(raw, tuple) else str(raw)
+    out.write(f"v{vn.getCreateIndex()} {spc.getName()} var {raw_text}")
+
+    op = vn.getDef()
+    if op is not None:
+        out.write(f" {op.getAddr().getOffset():x}")
+    elif vn.isInput():
+        out.write(" i")
+    else:
+        out.write(" <na>")
+    out.write("\n")
+    vn.setMark()
+
+
+def _print_op_vertex(op, out: TextIO) -> None:
+    if op.isBranch():
+        subclass = "branch"
+    elif op.isCall():
+        subclass = "call"
+    elif op.isMarker():
+        subclass = "marker"
+    else:
+        subclass = "basic"
+    opname = op.getOpName() if op.getOpName() else "unkop"
+    out.write(f"o{op.getTime()} {subclass} op {opname} {op.getAddr().getOffset():x}\n")
+
+
+def _dump_varnode_vertex(data, out: TextIO) -> None:
+    ops = list(data.beginOpAlive())
+    out.write(
+        "\n\n// Add Vertices\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddVertices,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=Internal, Location=1},\n"
+        "          {Name=SubClass, Location=2},\n"
+        "          {Name=Type, Location=3},\n"
+        "          {Name=Name, Location=4},\n"
+        "          {Name=Address, Location=5});\n\n"
+        "//START:varnodes\n"
+    )
+    for op in ops:
+        _print_varnode_vertex(op.getOut(), out)
+        start, stop = _get_dataflow_bounds(op)
+        for i in range(start, stop):
+            _print_varnode_vertex(op.getIn(i), out)
+    out.write("*END_COLUMNS\n")
+    for op in ops:
+        out_vn = op.getOut()
+        if out_vn is not None:
+            out_vn.clearMark()
+        for i in range(op.numInput()):
+            in_vn = op.getIn(i)
+            if in_vn is not None:
+                in_vn.clearMark()
+
+
+def _dump_op_vertex(data, out: TextIO) -> None:
+    out.write(
+        "\n\n// Add Vertices\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddVertices,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=Internal, Location=1},\n"
+        "          {Name=SubClass, Location=2},\n"
+        "          {Name=Type, Location=3},\n"
+        "          {Name=Name, Location=4},\n"
+        "          {Name=Address, Location=5});\n\n"
+        "//START:opnodes\n"
+    )
+    for op in data.beginOpAlive():
+        _print_op_vertex(op, out)
+    out.write("*END_COLUMNS\n")
+
+
+def _print_dataflow_edges(op, out: TextIO) -> None:
+    vn = op.getOut()
+    if vn is not None:
+        out.write(f"o{op.getTime()} v{vn.getCreateIndex()} output\n")
+
+    start, stop = _get_dataflow_bounds(op)
+    for i in range(start, stop):
+        vn = op.getIn(i)
+        if vn is None:
+            continue
+        spc = vn.getSpace()
+        if spc is None:
+            continue
+        tp = spc.getType()
+        if tp != IPTR_FSPEC and tp != IPTR_IOP:
+            out.write(f"v{vn.getCreateIndex()} o{op.getTime()} input\n")
+
+
+def _dump_dataflow_edges(data, out: TextIO) -> None:
+    out.write(
+        "\n\n// Add Edges\n"
+        "*CMD=*COLUMNAR_INPUT,\n"
+        "  Command=AddEdges,\n"
+        "  Parsing=WhiteSpace,\n"
+        "  Fields=({Name=*FromKey, Location=1},\n"
+        "          {Name=*ToKey, Location=2},\n"
+        "          {Name=Name, Location=3});\n\n"
+        "//START:edges\n"
+    )
+    for op in data.beginOpAlive():
+        _print_dataflow_edges(op, out)
+    out.write("*END_COLUMNS\n")
+
+
+def dump_dataflow_graph(data, out: TextIO) -> None:
+    """Serialize the data-flow graph in Renoir format.
+
+    C++ ref: ``dump_dataflow_graph``
+    """
+    out.write(f"*CMD=NewGraphWindow, WindowName={data.getName()}-dataflow;\n")
+    out.write(f"*CMD=*NEXUS,Name={data.getName()}-dataflow;\n")
+    out.write(_DATAFLOW_AUTOMATIC_ARRANGEMENT)
+    out.write(_DATAFLOW_VERTEX_COLORS)
+    out.write(_DATAFLOW_VERTEX_ICONS)
+    out.write(_DATAFLOW_VERTEX_LABELS)
+    out.write(_DATAFLOW_ATTRIBUTES)
+    _dump_varnode_vertex(data, out)
+    _dump_op_vertex(data, out)
+    _dump_dataflow_edges(data, out)
 
 
 def _print_block_vertex(block, out: TextIO) -> None:

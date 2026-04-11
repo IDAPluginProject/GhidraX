@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
 
 # ElementId constants (matching C++ override.cc)
 ELEM_DEADCODEDELAY = 218
@@ -43,12 +44,15 @@ class Override:
     RETURN = 4
 
     def __init__(self) -> None:
-        self._forcegoto: Dict[int, Address] = {}
+        self._forcegoto: Dict[Address, Address] = {}
         self._deadcodedelay: List[int] = []
-        self._indirectover: Dict[int, Address] = {}
-        self._protoover: Dict[int, object] = {}
+        self._indirectover: Dict[Address, Address] = {}
+        self._protoover: Dict[Address, object] = {}
         self._multistagejump: List[Address] = []
-        self._flowoverride: Dict[int, int] = {}
+        self._flowoverride: Dict[Address, int] = {}
+
+    def __del__(self) -> None:
+        self.clear()
 
     def clear(self) -> None:
         self._forcegoto.clear()
@@ -59,7 +63,7 @@ class Override:
         self._flowoverride.clear()
 
     def insertForceGoto(self, targetpc: Address, destpc: Address) -> None:
-        self._forcegoto[targetpc.getOffset()] = destpc
+        self._forcegoto[targetpc] = destpc
 
     @staticmethod
     def generateDeadcodeDelayMessage(index: int, glb) -> str:
@@ -67,16 +71,15 @@ class Override:
 
         C++ ref: ``Override::generateDeadcodeDelayMessage``
         """
-        spc = glb.getSpace(index) if glb is not None and hasattr(glb, 'getSpace') else None
-        name = spc.getName() if spc is not None and hasattr(spc, 'getName') else f"space_{index}"
-        return f"Restarted to delay deadcode elimination for space: {name}"
+        spc = glb.getSpace(index)
+        return f"Restarted to delay deadcode elimination for space: {spc.getName()}"
 
     def insertDeadcodeDelay(self, spc, delay: int) -> None:
         """Override the dead-code delay for a specific address space.
 
         C++ ref: ``Override::insertDeadcodeDelay``
         """
-        idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
+        idx = spc.getIndex()
         while idx >= len(self._deadcodedelay):
             self._deadcodedelay.append(-1)
         self._deadcodedelay[idx] = delay
@@ -86,45 +89,38 @@ class Override:
 
         C++ ref: ``Override::hasDeadcodeDelay``
         """
-        idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
+        idx = spc.getIndex()
         if idx >= len(self._deadcodedelay):
             return False
         val = self._deadcodedelay[idx]
         if val == -1:
             return False
-        default_delay = spc.getDeadcodeDelay() if hasattr(spc, 'getDeadcodeDelay') else 0
-        return val != default_delay
+        return val != spc.getDeadcodeDelay()
 
     def getDeadcodeDelay(self, spc) -> int:
-        idx = spc.getIndex() if hasattr(spc, 'getIndex') else 0
+        idx = spc.getIndex()
         if idx >= len(self._deadcodedelay):
             return 0
         return self._deadcodedelay[idx]
 
     def insertIndirectOverride(self, callpoint: Address, directcall: Address) -> None:
-        self._indirectover[callpoint.getOffset()] = directcall
+        self._indirectover[callpoint] = directcall
 
     def insertProtoOverride(self, callpoint: Address, proto) -> None:
         """Override the assumed function prototype at a specific call site.
 
         C++ ref: ``Override::insertProtoOverride``
         """
-        key = callpoint.getOffset()
-        # Delete pre-existing override if present
-        if key in self._protoover:
-            del self._protoover[key]
-        if hasattr(proto, 'setOverride'):
-            proto.setOverride(True)
-        self._protoover[key] = proto
+        if callpoint in self._protoover:
+            del self._protoover[callpoint]
+        proto.setOverride(True)
+        self._protoover[callpoint] = proto
 
     def insertMultistageJump(self, addr: Address) -> None:
         self._multistagejump.append(addr)
 
     def insertFlowOverride(self, addr: Address, tp: int) -> None:
-        if tp == Override.NONE:
-            self._flowoverride.pop(addr.getOffset(), None)
-        else:
-            self._flowoverride[addr.getOffset()] = tp
+        self._flowoverride[addr] = tp
 
     def queryMultistageJumptable(self, addr: Address) -> bool:
         for a in self._multistagejump:
@@ -136,16 +132,16 @@ class Override:
         return len(self._flowoverride) > 0
 
     def getFlowOverride(self, addr: Address) -> int:
-        return self._flowoverride.get(addr.getOffset(), Override.NONE)
+        return self._flowoverride.get(addr, Override.NONE)
 
     def getForceGoto(self, targetpc: Address) -> Optional[Address]:
-        return self._forcegoto.get(targetpc.getOffset())
+        return self._forcegoto.get(targetpc)
 
     def getIndirectOverride(self, callpoint: Address) -> Optional[Address]:
-        return self._indirectover.get(callpoint.getOffset())
+        return self._indirectover.get(callpoint)
 
     def getProtoOverride(self, callpoint: Address):
-        return self._protoover.get(callpoint.getOffset())
+        return self._protoover.get(callpoint)
 
     def applyPrototype(self, data, fspecs) -> None:
         """Look for and apply a function prototype override.
@@ -154,16 +150,10 @@ class Override:
         """
         if not self._protoover:
             return
-        op = fspecs.getOp() if hasattr(fspecs, 'getOp') else None
-        if op is None:
-            return
-        addr = op.getAddr()
-        proto = self._protoover.get(addr.getOffset())
+        op = fspecs.getOp()
+        proto = self._protoover.get(op.getAddr())
         if proto is not None:
-            if hasattr(fspecs, 'copy'):
-                fspecs.copy(proto)
-            elif hasattr(fspecs, 'setForcedPrototype'):
-                fspecs.setForcedPrototype(proto)
+            fspecs.copy(proto)
 
     def applyIndirect(self, data, fspecs) -> None:
         """Look for and apply destination overrides of indirect calls.
@@ -172,111 +162,99 @@ class Override:
         """
         if not self._indirectover:
             return
-        op = fspecs.getOp() if hasattr(fspecs, 'getOp') else None
-        if op is None:
-            return
-        addr = op.getAddr()
-        direct = self._indirectover.get(addr.getOffset())
+        op = fspecs.getOp()
+        direct = self._indirectover.get(op.getAddr())
         if direct is not None:
-            if hasattr(fspecs, 'setAddress'):
-                fspecs.setAddress(direct)
-            elif hasattr(fspecs, 'setDirectCall'):
-                fspecs.setDirectCall(direct)
+            fspecs.setAddress(direct)
 
     def applyDeadCodeDelay(self, data) -> None:
         """Apply any dead-code delay overrides to Heritage.
 
         C++ ref: ``Override::applyDeadCodeDelay``
         """
-        glb = data.getArch() if hasattr(data, 'getArch') else None
+        glb = data.getArch()
         for i, delay in enumerate(self._deadcodedelay):
             if delay < 0:
                 continue
-            spc = glb.getSpace(i) if glb is not None and hasattr(glb, 'getSpace') else None
-            if spc is not None and hasattr(data, 'setDeadCodeDelay'):
-                data.setDeadCodeDelay(spc, delay)
+            spc = glb.getSpace(i)
+            data.setDeadCodeDelay(spc, delay)
 
     def applyForceGoto(self, data) -> None:
         """Push all the force-goto overrides into the function.
 
         C++ ref: ``Override::applyForceGoto``
         """
-        if hasattr(data, 'forceGoto'):
-            for targetpc_off, destpc in self._forcegoto.items():
-                targetpc = Address(destpc.getSpace() if hasattr(destpc, 'getSpace') else None, targetpc_off)
-                data.forceGoto(targetpc, destpc)
+        for targetpc in sorted(self._forcegoto):
+            data.forceGoto(targetpc, self._forcegoto[targetpc])
 
-    def printRaw(self, s, glb=None) -> None:
+    def printRaw(self, s, glb) -> None:
         """Dump a description of the overrides to stream."""
-        for targetpc, destpc in self._forcegoto.items():
-            s.write(f"override forcegoto at {targetpc:#x} to {destpc}\n")
+        for targetpc in sorted(self._forcegoto):
+            s.write(f"force goto at {targetpc} jumping to {self._forcegoto[targetpc]}\n")
         for i, delay in enumerate(self._deadcodedelay):
             if delay >= 0:
-                spc_name = glb.getSpace(i).getName() if glb and hasattr(glb, 'getSpace') else f"space_{i}"
-                s.write(f"override deadcodedelay for {spc_name} to {delay}\n")
-        for callpoint, directcall in self._indirectover.items():
-            s.write(f"override indirect at {callpoint:#x} to call directly to {directcall}\n")
-        for callpoint, proto in self._protoover.items():
-            s.write(f"override prototype at {callpoint:#x}\n")
-        for addr in self._multistagejump:
-            s.write(f"multistage jump at {addr}\n")
-        for addr, tp in self._flowoverride.items():
-            s.write(f"override flow at {addr:#x} to {Override.typeToString(tp)}\n")
+                spc = glb.getSpace(i)
+                s.write(f"dead code delay on {spc.getName()} set to {delay}\n")
+        for callpoint in sorted(self._indirectover):
+            s.write(f"override indirect at {callpoint} to call directly to {self._indirectover[callpoint]}\n")
+        for callpoint in sorted(self._protoover):
+            proto = self._protoover[callpoint]
+            s.write(f"override prototype at {callpoint} to {proto.printRaw('func')}\n")
 
-    def generateOverrideMessages(self, glb=None) -> list:
+    def generateOverrideMessages(self, messagelist, glb) -> None:
         """Create warning messages that describe current overrides.
 
         C++ ref: ``Override::generateOverrideMessages``
         """
-        messagelist = []
         for i, delay in enumerate(self._deadcodedelay):
             if delay >= 0:
                 messagelist.append(Override.generateDeadcodeDelayMessage(i, glb))
-        return messagelist
 
-    def encode(self, encoder, glb=None) -> None:
+    def encode(self, encoder, glb) -> None:
         """Encode the override commands to a stream."""
         if (not self._forcegoto and not self._deadcodedelay and
                 not self._indirectover and not self._protoover and
                 not self._multistagejump and not self._flowoverride):
             return
         encoder.openElement(ELEM_OVERRIDE)
-        for targetpc, destpc in self._forcegoto.items():
+        for targetpc in sorted(self._forcegoto):
+            destpc = self._forcegoto[targetpc]
             encoder.openElement(ELEM_FORCEGOTO)
-            Address(None, targetpc).encode(encoder) if isinstance(targetpc, int) else targetpc.encode(encoder)
+            targetpc.encode(encoder)
             destpc.encode(encoder)
             encoder.closeElement(ELEM_FORCEGOTO)
         for i, delay in enumerate(self._deadcodedelay):
             if delay < 0:
                 continue
             encoder.openElement(ELEM_DEADCODEDELAY)
-            if glb and hasattr(glb, 'getSpace'):
-                encoder.writeSpace(ATTRIB_SPACE, glb.getSpace(i))
+            encoder.writeSpace(ATTRIB_SPACE, glb.getSpace(i))
             encoder.writeSignedInteger(ATTRIB_DELAY, delay)
             encoder.closeElement(ELEM_DEADCODEDELAY)
-        for callpoint, directcall in self._indirectover.items():
+        for callpoint in sorted(self._indirectover):
+            directcall = self._indirectover[callpoint]
             encoder.openElement(ELEM_INDIRECTOVERRIDE)
-            Address(None, callpoint).encode(encoder) if isinstance(callpoint, int) else callpoint.encode(encoder)
+            callpoint.encode(encoder)
             directcall.encode(encoder)
             encoder.closeElement(ELEM_INDIRECTOVERRIDE)
-        for callpoint, proto in self._protoover.items():
+        for callpoint in sorted(self._protoover):
+            proto = self._protoover[callpoint]
             encoder.openElement(ELEM_PROTOOVERRIDE)
-            Address(None, callpoint).encode(encoder) if isinstance(callpoint, int) else callpoint.encode(encoder)
-            if hasattr(proto, 'encode'):
-                proto.encode(encoder)
+            callpoint.encode(encoder)
+            proto.encode(encoder)
             encoder.closeElement(ELEM_PROTOOVERRIDE)
         for addr in self._multistagejump:
             encoder.openElement(ELEM_MULTISTAGEJUMP)
             addr.encode(encoder)
             encoder.closeElement(ELEM_MULTISTAGEJUMP)
-        for addr, tp in self._flowoverride.items():
+        for addr in sorted(self._flowoverride):
+            tp = self._flowoverride[addr]
             encoder.openElement(ELEM_FLOW)
             encoder.writeString(ATTRIB_TYPE, Override.typeToString(tp))
-            Address(None, addr).encode(encoder) if isinstance(addr, int) else addr.encode(encoder)
+            addr.encode(encoder)
             encoder.closeElement(ELEM_FLOW)
         encoder.closeElement(ELEM_OVERRIDE)
 
-    def decode(self, decoder, glb=None) -> None:
+    def decode(self, decoder, glb) -> None:
         """Decode override commands from a stream."""
         elemId = decoder.openElement(ELEM_OVERRIDE)
         while True:
@@ -291,8 +269,7 @@ class Override:
                 callpoint = Address.decode(decoder)
                 from ghidra.fspec.fspec import FuncProto
                 fp = FuncProto()
-                if glb is not None:
-                    fp.setInternal(glb.defaultfp, glb.types.getTypeVoid() if glb.types else None)
+                fp.setInternal(glb.defaultfp, glb.types.getTypeVoid())
                 fp.decode(decoder, glb)
                 self.insertProtoOverride(callpoint, fp)
             elif subId == ELEM_FORCEGOTO:
@@ -303,7 +280,7 @@ class Override:
                 delay = decoder.readSignedInteger(ATTRIB_DELAY)
                 spc = decoder.readSpace(ATTRIB_SPACE)
                 if delay < 0:
-                    raise RuntimeError("Bad deadcodedelay tag")
+                    raise LowlevelError("Bad deadcodedelay tag")
                 self.insertDeadcodeDelay(spc, delay)
             elif subId == ELEM_MULTISTAGEJUMP:
                 callpoint = Address.decode(decoder)
@@ -312,17 +289,31 @@ class Override:
                 tp = Override.stringToType(decoder.readString(ATTRIB_TYPE))
                 addr = Address.decode(decoder)
                 if tp == Override.NONE or addr.isInvalid():
-                    raise RuntimeError("Bad flowoverride tag")
+                    raise LowlevelError("Bad flowoverride tag")
                 self.insertFlowOverride(addr, tp)
             decoder.closeElement(subId)
         decoder.closeElement(elemId)
 
     @staticmethod
     def typeToString(tp: int) -> str:
-        _map = {0: "none", 1: "branch", 2: "call", 3: "callreturn", 4: "return"}
-        return _map.get(tp, "unknown")
+        if tp == Override.BRANCH:
+            return "branch"
+        if tp == Override.CALL:
+            return "call"
+        if tp == Override.CALL_RETURN:
+            return "callreturn"
+        if tp == Override.RETURN:
+            return "return"
+        return "none"
 
     @staticmethod
     def stringToType(nm: str) -> int:
-        _map = {"none": 0, "branch": 1, "call": 2, "callreturn": 3, "return": 4}
-        return _map.get(nm.lower(), 0)
+        if nm == "branch":
+            return Override.BRANCH
+        if nm == "call":
+            return Override.CALL
+        if nm == "callreturn":
+            return Override.CALL_RETURN
+        if nm == "return":
+            return Override.RETURN
+        return Override.NONE

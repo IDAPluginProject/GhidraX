@@ -109,7 +109,7 @@ class PcodeOp:
     )
 
     __slots__ = ('_opcode', '_opcode_enum', '_flags', '_addlflags',
-                 '_start', '_parent', '_output', '_inrefs')
+                 '_start', '_parent', '_output', '_inrefs', '_basiciter')
 
     def __init__(self, num_inputs: int, sq: SeqNum) -> None:
         self._opcode = None  # TypeOp reference
@@ -120,6 +120,7 @@ class PcodeOp:
         self._parent = None  # BlockBasic
         self._output: Optional[Varnode] = None
         self._inrefs: List[Optional[Varnode]] = [None] * num_inputs
+        self._basiciter = None
 
     # --- Basic accessors ---
 
@@ -585,7 +586,20 @@ class PcodeOp:
         return True
 
     def getBasicIter(self):
-        return getattr(self, '_basiciter', None)
+        it = getattr(self, '_basiciter', None)
+        if it is not None and not isinstance(it, int):
+            return it
+        parent = getattr(self, '_parent', None)
+        ops = getattr(parent, '_op', None)
+        if ops is None:
+            return iter(())
+        idx = it
+        if idx is None:
+            try:
+                idx = ops.index(self)
+            except ValueError:
+                return iter(())
+        return iter(ops[idx:])
 
     def setBasicIter(self, it):
         self._basiciter = it

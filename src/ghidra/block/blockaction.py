@@ -13,7 +13,7 @@ class FloatingEdge:
     The original FlowBlock nodes that define the end-points of the edge may get
     collapsed, but the edge may still exist between higher level components.
     """
-    def __init__(self, top=None, bottom=None):
+    def __init__(self, top, bottom):
         self.top = top
         self.bottom = bottom
 
@@ -22,12 +22,6 @@ class FloatingEdge:
 
     def getBottom(self):
         return self.bottom
-
-    def setTop(self, t) -> None:
-        self.top = t
-
-    def setBottom(self, b) -> None:
-        self.bottom = b
 
     def getCurrentEdge(self, outedge_ref: list, graph):
         """Get the current form of the edge.
@@ -40,9 +34,9 @@ class FloatingEdge:
         while self.bottom.getParent() is not graph:
             self.bottom = self.bottom.getParent()
         outedge = self.top.getOutIndex(self.bottom)
+        outedge_ref[0] = outedge
         if outedge < 0:
             return None
-        outedge_ref[0] = outedge
         return self.top
 
 
@@ -53,7 +47,7 @@ class LoopBody:
     by the head (or entry-point) and 1 or more tails, which each have a back edge
     into the head.
     """
-    def __init__(self, head=None):
+    def __init__(self, head):
         self.head = head
         self.tails: list = []
         self.depth: int = 0
@@ -437,7 +431,10 @@ class TraceDAG:
                 self.ismark = False
                 self.top = parenttrace.destnode
                 self.paths = []
-                self._createTraces()
+                self.createTraces()
+
+        def createTraces(self):
+            return self._createTraces()
 
         def _createTraces(self):
             sizeout = self.top.sizeOut()
@@ -470,6 +467,11 @@ class TraceDAG:
                     return self.top.getOut(j)
                 res += 1
             return None
+
+        def __del__(self):
+            paths = getattr(self, "paths", None)
+            if paths is not None:
+                paths.clear()
 
     class BlockTrace:
         """A trace of a single path out of a BranchPoint."""
@@ -516,6 +518,21 @@ class TraceDAG:
                 return self.distance < op2.distance
             return self.trace.top.depth < op2.trace.top.depth
 
+        def __lt__(self, op2) -> bool:
+            thisind = self.exitproto.getIndex()
+            op2ind = op2.exitproto.getIndex()
+            if thisind != op2ind:
+                return thisind < op2ind
+            tmpbl = self.trace.top.top
+            thisind = tmpbl.getIndex() if tmpbl is not None else -1
+            tmpbl = op2.trace.top.top
+            op2ind = tmpbl.getIndex() if tmpbl is not None else -1
+            if thisind != op2ind:
+                return thisind < op2ind
+            thisind = self.trace.pathout
+            op2ind = op2.trace.pathout
+            return thisind < op2ind
+
         def sortKey(self):
             topindex = self.trace.top.top.getIndex() if self.trace.top.top is not None else -1
             return (self.exitproto.getIndex(), topindex, self.trace.pathout)
@@ -535,6 +552,36 @@ class TraceDAG:
 
     def setFinishBlock(self, bl):
         self._finishblock = bl
+
+    def removeTrace(self, trace):
+        return self._removeTrace(trace)
+
+    def processExitConflict(self, start_idx, end_idx, badedgelist):
+        return self._processExitConflict(start_idx, end_idx, badedgelist)
+
+    def selectBadEdge(self):
+        return self._selectBadEdge()
+
+    def insertActive(self, trace):
+        return self._insertActive(trace)
+
+    def removeActive(self, trace):
+        return self._removeActive(trace)
+
+    def checkOpen(self, trace) -> bool:
+        return self._checkOpen(trace)
+
+    def openBranch(self, parent):
+        return self._openBranch(parent)
+
+    def checkRetirement(self, trace, exitblock_ref) -> bool:
+        return self._checkRetirement(trace, exitblock_ref)
+
+    def retireBranch(self, bp, exitblock):
+        return self._retireBranch(bp, exitblock)
+
+    def clearVisitCount(self):
+        return self._clearVisitCount()
 
     def _removeTrace(self, trace):
         """Remove the indicated BlockTrace, adding it to likelygoto."""
@@ -594,7 +641,7 @@ class TraceDAG:
             score.siblingedge = 0
             score.terminal = 1 if trace.destnode.sizeOut() == 0 else 0
             badedgelist.append(score)
-        badedgelist.sort(key=lambda s: s.sortKey())
+        badedgelist.sort()
         i = 0
         start_i = 0
         curbl = badedgelist[0].exitproto
@@ -764,7 +811,13 @@ class TraceDAG:
                 else:
                     self._missedactivecount += 1
                     self._current_activeiter += 1
-        self._clearVisitCount()
+
+    def __del__(self):
+        branchlist = getattr(self, "_branchlist", None)
+        if branchlist is not None:
+            branchlist.clear()
+        if hasattr(self, "_likelygoto"):
+            self._clearVisitCount()
 
 
 class ConditionalJoin:
@@ -809,6 +862,9 @@ class ConditionalJoin:
         self._joinblock = None
         self._mergeneed = {}
 
+    def findDups(self) -> bool:
+        return self._findDups()
+
     def _findDups(self) -> bool:
         """Search for duplicate conditional expressions."""
         from ghidra.core.opcodes import OpCode
@@ -850,6 +906,9 @@ class ConditionalJoin:
         self._mergeneed[ConditionalJoin.MergePair(vn1, vn2)] = None
         return True
 
+    def checkExitBlock(self, exit_bl, in1, in2):
+        return self._checkExitBlock(exit_bl, in1, in2)
+
     def _checkExitBlock(self, exit_bl, in1, in2):
         """Look for additional Varnode pairs in an exit block that need to be merged."""
         from ghidra.core.opcodes import OpCode
@@ -861,6 +920,9 @@ class ConditionalJoin:
                     self._mergeneed[ConditionalJoin.MergePair(vn1, vn2)] = None
             elif op.code() != OpCode.CPUI_COPY:
                 break
+
+    def cutDownMultiequals(self, exit_bl, in1, in2):
+        return self._cutDownMultiequals(exit_bl, in1, in2)
 
     def _cutDownMultiequals(self, exit_bl, in1, in2):
         """Substitute new joined Varnode in the given exit block."""
@@ -883,6 +945,9 @@ class ConditionalJoin:
             elif op.code() != OpCode.CPUI_COPY:
                 break
 
+    def setupMultiequals(self):
+        return self._setupMultiequals()
+
     def _setupMultiequals(self):
         """Create a new Varnode and its defining MULTIEQUAL for each MergePair."""
         from ghidra.core.opcodes import OpCode
@@ -898,6 +963,9 @@ class ConditionalJoin:
             self._data.opSetInput(multi, vn2, 1)
             self._mergeneed[pair] = outvn
             self._data.opInsertEnd(multi, self._joinblock)
+
+    def moveCbranch(self):
+        return self._moveCbranch()
 
     def _moveCbranch(self):
         """Remove the other CBRANCH."""
@@ -934,11 +1002,11 @@ class ConditionalJoin:
         self._b_in2 = self._block2.getOutRevIndex(1)
         self._a_in1 = self._block1.getOutRevIndex(0)
         self._b_in1 = self._block1.getOutRevIndex(1)
-        if not self._findDups():
+        if not self.findDups():
             self.clear()
             return False
-        self._checkExitBlock(self._exita, self._a_in1, self._a_in2)
-        self._checkExitBlock(self._exitb, self._b_in1, self._b_in2)
+        self.checkExitBlock(self._exita, self._a_in1, self._a_in2)
+        self.checkExitBlock(self._exitb, self._b_in1, self._b_in2)
         return True
 
     def execute(self):
@@ -947,10 +1015,10 @@ class ConditionalJoin:
             self._block1, self._block2, self._exita, self._exitb,
             self._a_in1 > self._a_in2, self._b_in1 > self._b_in2,
             self._cbranch1.getAddr())
-        self._setupMultiequals()
-        self._moveCbranch()
-        self._cutDownMultiequals(self._exita, self._a_in1, self._a_in2)
-        self._cutDownMultiequals(self._exitb, self._b_in1, self._b_in2)
+        self.setupMultiequals()
+        self.moveCbranch()
+        self.cutDownMultiequals(self._exita, self._a_in1, self._a_in2)
+        self.cutDownMultiequals(self._exitb, self._b_in1, self._b_in2)
 
     def clear(self):
         self._mergeneed.clear()
@@ -1467,7 +1535,8 @@ class CollapseStructure:
                     startbl.setGotoBranch(outedge_ref[0])
                     return startbl
         if not self.clipExtraRoots():
-            raise RuntimeError("Could not finish collapsing block structure")
+            from ghidra.core.error import LowlevelError
+            raise LowlevelError("Could not finish collapsing block structure")
         return None
 
     def labelLoops(self, looporder: list):

@@ -906,9 +906,7 @@ class ActionReturnSplit(Action):
         """
         from ghidra.block.block import FlowBlock
         for i in range(parent.sizeIn()):
-            bl = parent.getIn(i)
-            if hasattr(bl, 'getCopyMap'):
-                bl = bl.getCopyMap()
+            bl = parent.getIn(i).getCopyMap()
             while bl is not None:
                 if not bl.isMark():
                     ret = None
@@ -951,12 +949,12 @@ class ActionReturnSplit(Action):
 
     def apply(self, data):
         from ghidra.core.opcodes import OpCode
-        graph = data.getStructure() if hasattr(data, 'getStructure') else None
-        if graph is None or graph.getSize() == 0:
+        graph = data.getStructure()
+        if graph.getSize() == 0:
             return 0
         splitedge = []
         retnode = []
-        for op in list(data.beginOp(OpCode.CPUI_RETURN)):
+        for op in data.beginOp(OpCode.CPUI_RETURN):
             if op.isDead():
                 continue
             parent = op.getParent()
@@ -970,27 +968,22 @@ class ActionReturnSplit(Action):
                 continue
             splitcount = 0
             for i in range(parent.sizeIn() - 1, -1, -1):
-                bl = parent.getIn(i)
-                if hasattr(bl, 'getCopyMap'):
-                    bl = bl.getCopyMap()
+                bl = parent.getIn(i).getCopyMap()
                 while bl is not None:
-                    if hasattr(bl, 'isMark') and bl.isMark():
+                    if bl.isMark():
                         splitedge.append(i)
                         retnode.append(parent)
                         bl = None
                         splitcount += 1
                     else:
-                        bl = bl.getParent() if hasattr(bl, 'getParent') else None
+                        bl = bl.getParent()
             for gb in gotoblocks:
                 gb.clearMark()
-            if parent.sizeIn() == splitcount and splitedge:
+            if parent.sizeIn() == splitcount:
                 splitedge.pop()
                 retnode.pop()
         for i in range(len(splitedge)):
-            if retnode[i].sizeIn() <= 1:
-                continue
-            if hasattr(data, 'nodeSplit'):
-                data.nodeSplit(retnode[i], splitedge[i])
+            data.nodeSplit(retnode[i], splitedge[i])
             self._count += 1
         return 0
 
@@ -2371,11 +2364,11 @@ class ActionPrototypeWarnings(Action):
             override = data.getOverride()
             if hasattr(override, 'generateOverrideMessages'):
                 try:
-                    msgs = override.generateOverrideMessages(data.getArch())
-                    if isinstance(msgs, list):
-                        for msg in msgs:
-                            if hasattr(data, 'warningHeader'):
-                                data.warningHeader(msg)
+                    msgs = []
+                    override.generateOverrideMessages(msgs, data.getArch())
+                    for msg in msgs:
+                        if hasattr(data, 'warningHeader'):
+                            data.warningHeader(msg)
                 except TypeError:
                     pass
 
@@ -2430,8 +2423,7 @@ class ActionBlockStructure(Action):
         graph = data.getStructure()
         if graph.getSize() != 0:
             return 0
-        if hasattr(data, 'installSwitchDefaults'):
-            data.installSwitchDefaults()
+        data.installSwitchDefaults()
         graph.buildCopy(data.getBasicBlocks())
         from ghidra.block.blockaction import CollapseStructure
         collapse = CollapseStructure(graph)
@@ -2449,16 +2441,10 @@ class ActionNodeJoin(Action):
         return ActionNodeJoin(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
         graph = data.getBasicBlocks()
-        if graph is None or graph.getSize() == 0:
+        if graph.getSize() == 0:
             return 0
-        condjoin = None
-        try:
-            from ghidra.block.blockaction import ConditionalJoin
-            condjoin = ConditionalJoin(data)
-        except (ImportError, Exception):
-            pass
-        if condjoin is None:
-            return 0
+        from ghidra.block.blockaction import ConditionalJoin
+        condjoin = ConditionalJoin(data)
         for i in range(graph.getSize()):
             bb = graph.getBlock(i)
             if bb.sizeOut() != 2:
@@ -2514,25 +2500,25 @@ class ActionPreferComplement(Action):
     def clone(self, gl):
         return ActionPreferComplement(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
+        from ghidra.block.block import FlowBlock
         graph = data.getStructure()
-        if graph is None or graph.getSize() == 0:
+        if graph.getSize() == 0:
             return 0
         vec = [graph]
         pos = 0
         while pos < len(vec):
             curbl = vec[pos]
             pos += 1
-            if not hasattr(curbl, 'getSize'):
-                continue
             sz = curbl.getSize()
             for i in range(sz):
                 childbl = curbl.getBlock(i)
-                if hasattr(childbl, 'getSize'):
-                    vec.append(childbl)
-            if hasattr(curbl, 'preferComplement') and curbl.preferComplement(data):
+                bt = childbl.getType()
+                if bt == FlowBlock.t_copy or bt == FlowBlock.t_basic:
+                    continue
+                vec.append(childbl)
+            if curbl.preferComplement(data):
                 self._count += 1
-        if hasattr(data, 'clearDeadOps'):
-            data.clearDeadOps()
+        data.clearDeadOps()
         return 0
 
 class ActionStructureTransform(Action):
@@ -2544,23 +2530,7 @@ class ActionStructureTransform(Action):
     def clone(self, gl):
         return ActionStructureTransform(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
-        graph = data.getStructure()
-        if graph is None or graph.getSize() == 0:
-            return 0
-        vec = [graph]
-        pos = 0
-        while pos < len(vec):
-            curbl = vec[pos]
-            pos += 1
-            if not hasattr(curbl, 'getSize'):
-                continue
-            sz = curbl.getSize()
-            for i in range(sz):
-                childbl = curbl.getBlock(i)
-                if hasattr(childbl, 'getSize'):
-                    vec.append(childbl)
-            if hasattr(curbl, 'finalTransform') and curbl.finalTransform(data):
-                self._count += 1
+        data.getStructure().finalTransform(data)
         return 0
 
 class ActionNormalizeBranches(Action):
@@ -2585,8 +2555,7 @@ class ActionNormalizeBranches(Action):
             data.opFlipInPlaceExecute(fliplist)
             bb.flipInPlaceExecute()
             self._count += 1
-        if hasattr(data, 'clearDeadOps'):
-            data.clearDeadOps()
+        data.clearDeadOps()
         return 0
 
 class ActionFinalStructure(Action):
@@ -2599,16 +2568,9 @@ class ActionFinalStructure(Action):
         return ActionFinalStructure(self._basegroup) if gl.contains(self._basegroup) else None
     def apply(self, data):
         graph = data.getStructure()
-        if graph is None or graph.getSize() == 0:
-            return 0
-        if hasattr(graph, 'orderBlocks'):
-            graph.orderBlocks()
-        if hasattr(graph, 'finalizePrinting'):
-            graph.finalizePrinting(data)
-        if hasattr(graph, 'scopeBreak'):
-            graph.scopeBreak(-1, -1)
-        if hasattr(graph, 'markUnstructured'):
-            graph.markUnstructured()
-        if hasattr(graph, 'markLabelBumpUp'):
-            graph.markLabelBumpUp(False)
+        graph.orderBlocks()
+        graph.finalizePrinting(data)
+        graph.scopeBreak(-1, -1)
+        graph.markUnstructured()
+        graph.markLabelBumpUp(False)
         return 0

@@ -11,7 +11,10 @@ import io
 import os
 from typing import Optional, TYPE_CHECKING
 
+from ghidra.arch.loadimage import DataUnavailError, LoadImage
 from ghidra.core.error import LowlevelError
+from ghidra.core.marshal import AttributeId, ElementId
+from ghidra.core.space import AddrSpace
 from ghidra.arch.sleigh_arch import SleighArchitecture
 from ghidra.arch.architecture import ArchitectureCapability
 
@@ -19,51 +22,74 @@ if TYPE_CHECKING:
     pass
 
 
+ELEM_RAW_SAVEFILE = ElementId("raw_savefile", 237)
+ATTRIB_ADJUSTVMA = AttributeId("adjustvma", 103)
+
+
 # =========================================================================
 # RawLoadImage  (minimal — just enough to open a raw binary file)
 # =========================================================================
 
-class RawLoadImage:
-    """Minimal load-image that reads a raw binary file.
+class RawLoadImage(LoadImage):
+    """Raw-binary load image matching `loadimage.hh`.
 
-    Mirrors the C++ RawLoadImage from loadimage.hh.
+    Mirrors the native `RawLoadImage` constructor/open/loadFill semantics.
     """
 
     def __init__(self, filename: str) -> None:
-        self._filename: str = filename
-        self._data: bytes = b""
-        self._space = None
-        self._adjustvma: int = 0
+        super().__init__(filename)
+        self.vma: int = 0
+        self.thefile = None
+        self.filesize: int = 0
+        self.spaceid = None
 
     def open(self) -> None:
-        """Read the raw binary file into memory."""
-        if not os.path.isfile(self._filename):
-            raise LowlevelError(f"Unable to open raw binary file: {self._filename}")
-        with open(self._filename, "rb") as f:
-            self._data = f.read()
+        """Open the raw image file and cache its size."""
+        if self.thefile is not None:
+            raise LowlevelError("loadimage is already open")
+        try:
+            self.thefile = open(self.getFileName(), "rb")
+        except OSError as exc:
+            raise LowlevelError("Unable to open raw image file: " + self.getFileName()) from exc
+        self.thefile.seek(0, io.SEEK_END)
+        self.filesize = self.thefile.tell()
 
     def adjustVma(self, adjust: int) -> None:
-        self._adjustvma = adjust
+        self.vma += AddrSpace.addressToByte(adjust, self.spaceid.getWordSize())
 
     def attachToSpace(self, spc) -> None:
-        """Attach the default code space to this loader."""
-        self._space = spc
-
-    def getFileName(self) -> str:
-        return self._filename
+        self.spaceid = spc
 
     def getArchType(self) -> str:
-        return "raw"
+        return "unknown"
 
     def loadFill(self, buf: bytearray, size: int, addr) -> None:
-        """Load *size* bytes at *addr* into *buf*. Pad with zero if unavailable."""
-        offset = addr.getOffset() - self._adjustvma
-        for i in range(size):
-            idx = offset + i
-            if 0 <= idx < len(self._data):
-                buf[i] = self._data[idx]
-            else:
-                buf[i] = 0
+        curaddr = addr.getOffset() - self.vma
+        offset = 0
+        remaining = size
+        while remaining > 0:
+            if curaddr >= self.filesize:
+                if offset == 0:
+                    break
+                for i in range(offset, offset + remaining):
+                    buf[i] = 0
+                return
+            readsize = remaining
+            if curaddr + readsize > self.filesize:
+                readsize = self.filesize - curaddr
+            self.thefile.seek(curaddr)
+            chunk = self.thefile.read(readsize)
+            buf[offset:offset + readsize] = chunk
+            offset += readsize
+            remaining -= readsize
+            curaddr += readsize
+        if remaining > 0:
+            raise DataUnavailError(f"Unable to load {remaining} bytes at {addr.printRaw()}")
+
+    def __del__(self) -> None:
+        if self.thefile is not None:
+            self.thefile.close()
+            self.thefile = None
 
 
 # =========================================================================
@@ -77,6 +103,15 @@ class RawBinaryArchitectureCapability(ArchitectureCapability):
         super().__init__()
         self.name = "raw"
 
+    def __copy__(self):
+        raise TypeError("RawBinaryArchitectureCapability is non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("RawBinaryArchitectureCapability is non-copyable")
+
+    def __del__(self) -> None:
+        SleighArchitecture.shutdown()
+
     def buildArchitecture(self, filename: str, target: str,
                           estream: Optional[io.StringIO] = None):
         return RawBinaryArchitecture(filename, target, estream)
@@ -86,11 +121,7 @@ class RawBinaryArchitectureCapability(ArchitectureCapability):
         return True
 
     def isXmlMatch(self, doc) -> bool:
-        if doc is None:
-            return False
-        if hasattr(doc, 'tag'):
-            return doc.tag == "raw_savefile"
-        return False
+        return doc.getRoot().getName() == "raw_savefile"
 
 
 # =========================================================================
@@ -108,7 +139,7 @@ class RawBinaryArchitecture(SleighArchitecture):
         super().__init__(fname, targ, estream)
         self.adjustvma: int = 0
 
-    def buildLoader(self, store=None) -> None:
+    def buildLoader(self, store) -> None:
         """Build a RawLoadImage from the filename."""
         self.collectSpecFiles(self.errorstream)
         ldr = RawLoadImage(self.getFilename())
@@ -124,40 +155,31 @@ class RawBinaryArchitecture(SleighArchitecture):
 
     def postSpecFile(self) -> None:
         """Attach the default code space to the loader after spec loading."""
-        if hasattr(super(), 'postSpecFile'):
-            super().postSpecFile()
-        if self.loader is not None and hasattr(self.loader, 'attachToSpace'):
-            spc = self.getDefaultCodeSpace()
-            if spc is not None:
-                self.loader.attachToSpace(spc)
+        super().postSpecFile()
+        self.loader.attachToSpace(self.getDefaultCodeSpace())
 
     def encode(self, encoder) -> None:
         """Encode the raw architecture state."""
-        if hasattr(encoder, 'openElement'):
-            encoder.openElement("raw_savefile")
-        if hasattr(self, 'encodeHeader'):
-            self.encodeHeader(encoder)
-        if hasattr(encoder, 'writeUnsignedInteger'):
-            encoder.writeUnsignedInteger("adjustvma", self.adjustvma)
-        if self.types is not None and hasattr(self.types, 'encodeCoreTypes'):
-            self.types.encodeCoreTypes(encoder)
+        encoder.openElement(ELEM_RAW_SAVEFILE)
+        self.encodeHeader(encoder)
+        encoder.writeUnsignedInteger(ATTRIB_ADJUSTVMA, self.adjustvma)
+        self.types.encodeCoreTypes(encoder)
         super().encode(encoder)
-        if hasattr(encoder, 'closeElement'):
-            encoder.closeElement("raw_savefile")
+        encoder.closeElement(ELEM_RAW_SAVEFILE)
 
-    def restoreXml(self, store=None) -> None:
+    def restoreXml(self, store) -> None:
         """Restore raw architecture from XML store."""
-        if store is None:
-            return
-        el = None
-        if hasattr(store, 'getTag'):
-            el = store.getTag("raw_savefile")
+        el = store.getTag("raw_savefile")
         if el is None:
             raise LowlevelError("Could not find raw_savefile tag")
-        if hasattr(self, 'restoreXmlHeader'):
-            self.restoreXmlHeader(el)
-        adj = el.get("adjustvma", "0") if hasattr(el, 'get') else "0"
-        try:
-            self.adjustvma = int(adj, 0)
-        except (ValueError, TypeError):
-            self.adjustvma = 0
+        self.restoreXmlHeader(el)
+        self.adjustvma = int(el.getAttributeValue("adjustvma"), 0)
+        children = el.getChildren()
+        idx = 0
+        if idx < len(children) and children[idx].getName() == "coretypes":
+            store.registerTag(children[idx])
+            idx += 1
+        self.init(store)
+        if idx < len(children):
+            store.registerTag(children[idx])
+            super().restoreXml(store)

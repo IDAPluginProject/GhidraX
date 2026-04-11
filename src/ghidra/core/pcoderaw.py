@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Optional, List
 
 from ghidra.core.opcodes import OpCode
 from ghidra.core.address import Address
-from ghidra.core.marshal import Decoder, ATTRIB_SPACE, ATTRIB_OFFSET, ATTRIB_SIZE
+from ghidra.core.marshal import Decoder, ATTRIB_SPACE, ATTRIB_OFFSET, ATTRIB_SIZE, ATTRIB_NAME
 
 if TYPE_CHECKING:
     from ghidra.core.space import AddrSpace
@@ -26,12 +26,13 @@ class VarnodeData:
     size of the sequence of bytes.
     """
 
-    __slots__ = ('space', 'offset', 'size')
+    __slots__ = ('space', 'offset', 'size', '_space_ref')
 
     def __init__(self, space: Optional[AddrSpace] = None, offset: int = 0, size: int = 0) -> None:
         self.space: Optional[AddrSpace] = space
         self.offset: int = offset
         self.size: int = size
+        self._space_ref: Optional[AddrSpace] = None
 
     def __lt__(self, op2: VarnodeData) -> bool:
         if self.space is not op2.space:
@@ -63,9 +64,11 @@ class VarnodeData:
 
     def getSpaceFromConst(self) -> Optional[AddrSpace]:
         """Treat this as a constant and recover encoded address space."""
-        # In C++ this casts offset to a pointer. In Python, we need
-        # to look up via the manager. This is a placeholder.
-        return None
+        return self._space_ref
+
+    def setSpaceFromConst(self, spc: Optional[AddrSpace]) -> None:
+        """Attach the referenced address space for LOAD/STORE space operands."""
+        self._space_ref = spc
 
     def contains(self, op2: VarnodeData) -> bool:
         """Does this container another given VarnodeData?"""
@@ -82,26 +85,39 @@ class VarnodeData:
         if self.space is not lo.space:
             return False
         if self.space.isBigEndian():
-            return (self.offset + self.size) == lo.offset
+            return self.space.wrapOffset(self.offset + self.size) == lo.offset
         else:
-            return (lo.offset + lo.size) == self.offset
+            return self.space.wrapOffset(lo.offset + lo.size) == self.offset
 
     def decode(self, decoder: Decoder) -> None:
         """Recover this object from a stream."""
+        elem_id = decoder.openElement()
+        self.decodeFromAttributes(decoder)
+        decoder.closeElement(elem_id)
+
+    def decodeFromAttributes(self, decoder: Decoder) -> None:
+        """Recover this object from attributes of the current open element."""
+        self.space = None
+        self.size = 0
+        self._space_ref = None
         while True:
             attrib_id = decoder.getNextAttributeId()
             if attrib_id == 0:
                 break
             if attrib_id == ATTRIB_SPACE.id:
                 self.space = decoder.readSpace()
-            elif attrib_id == ATTRIB_OFFSET.id:
-                self.offset = decoder.readUnsignedInteger()
-            elif attrib_id == ATTRIB_SIZE.id:
-                self.size = decoder.readSignedInteger()
-
-    def decodeFromAttributes(self, decoder: Decoder) -> None:
-        """Recover this object from attributes of the current open element."""
-        self.decode(decoder)
+                decoder.rewindAttributes()
+                self.offset, self.size = self.space.decodeAttributes(decoder)
+                break
+            elif attrib_id == ATTRIB_NAME.id:
+                manage = decoder.getAddrSpaceManager()
+                trans = manage.getDefaultCodeSpace().getTrans()
+                point = trans.getRegister(decoder.readString())
+                self.space = point.space
+                self.offset = point.offset
+                self.size = point.size
+                self._space_ref = point.getSpaceFromConst()
+                break
 
     def __repr__(self) -> str:
         sname = self.space.getName() if self.space else "?"
@@ -167,5 +183,27 @@ class PcodeOpRaw:
 
         This is a simplified version of the static decode method.
         """
-        # Placeholder for full implementation
-        return OpCode.CPUI_BLANK
+        from ghidra.core.marshal import ATTRIB_CODE, ATTRIB_NAME, ELEM_SPACEID, ELEM_VOID
+        import struct
+
+        opcode = OpCode(decoder.readSignedInteger(ATTRIB_CODE))
+        sub_id = decoder.peekElement()
+        if sub_id == ELEM_VOID.id:
+            decoder.openElement()
+            decoder.closeElement(sub_id)
+            outvar[0] = None
+        else:
+            outvar[0].decode(decoder)
+        for i in range(len(invar)):
+            sub_id = decoder.peekElement()
+            if sub_id == ELEM_SPACEID.id:
+                decoder.openElement()
+                invar[i].space = decoder.getAddrSpaceManager().getConstantSpace()
+                ref_space = decoder.readSpace(ATTRIB_NAME)
+                invar[i].offset = ref_space.getIndex()
+                invar[i].size = struct.calcsize("P")
+                invar[i].setSpaceFromConst(ref_space)
+                decoder.closeElement(sub_id)
+            else:
+                invar[i].decode(decoder)
+        return opcode

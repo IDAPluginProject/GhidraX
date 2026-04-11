@@ -8,12 +8,25 @@ getSignatureSettings, setSignatureSettings.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from io import StringIO
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 from ghidra.core.error import LowlevelError
-from ghidra.core.marshal import ATTRIB_OFFSET, ATTRIB_SPACE, ATTRIB_VAL, XmlEncode
+from ghidra.core.marshal import (
+    ATTRIB_CONTENT,
+    ATTRIB_OFFSET,
+    ATTRIB_SPACE,
+    ATTRIB_VAL,
+    ElementId,
+    PackedDecode,
+    PackedEncode,
+    XmlEncode,
+)
+from ghidra.console.ghidra_process import GhidraCapability, GhidraCommand
 from ghidra.console.protocol import (
-    read_string_stream_raw, write_string_stream,
+    read_string_stream,
+    read_string_stream_raw,
+    write_string_stream,
 )
 from ghidra.analysis.signature import (
     ATTRIB_BADDATA,
@@ -26,15 +39,27 @@ from ghidra.analysis.signature import (
 )
 
 if TYPE_CHECKING:
-    from typing import BinaryIO, Dict
-    from ghidra.console.ghidra_process import GhidraCommand
+    from typing import BinaryIO
+
+
+def _get_or_create_element(name: str, id_: int) -> ElementId:
+    for element in ElementId._list:
+        if element.name == name:
+            return element
+    return ElementId(name, id_)
+
+
+ELEM_SIGSETTINGS = _get_or_create_element("sigsettings", 294)
+ELEM_MAJOR = _get_or_create_element("major", 295)
+ELEM_MINOR = _get_or_create_element("minor", 296)
+ELEM_SETTINGS = _get_or_create_element("settings", 297)
 
 
 # ---------------------------------------------------------------------------
 # SignaturesAt
 # ---------------------------------------------------------------------------
 
-class SignaturesAt:
+class SignaturesAt(GhidraCommand):
     """Command to generate a feature vector from a function.
 
     The command expects to receive the entry point address of a function.
@@ -46,22 +71,28 @@ class SignaturesAt:
     - debug=True: verbose encoding with meta-data for debugging
     """
 
-    def __init__(self, debug: bool = False) -> None:
+    def __init__(
+        self,
+        debug: bool = False,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> None:
+        super().__init__(sin, sout)
         self._debug: bool = debug
         self._addr = None
-        self._sin = None
-        self._sout = None
-        self.ghidra = None  # ArchitectureGhidra
-
-    def set_streams(self, sin, sout) -> None:
-        self._sin = sin
-        self._sout = sout
 
     def loadParameters(self) -> None:
         """Read the function address from the input stream."""
-        if self._sin is not None:
-            addr_xml = read_string_stream_raw(self._sin)
-            if self.ghidra is not None and addr_xml:
+        super().loadParameters()
+        addr_xml = read_string_stream_raw(self._sin)
+        if addr_xml:
+            from ghidra.core.address import Address
+
+            decoder = PackedDecode(self.ghidra)
+            decoder.ingestBytes(addr_xml)
+            try:
+                self._addr = Address.decode(decoder)
+            except Exception:
                 self._addr = _decode_addr(addr_xml, self.ghidra)
 
     def rawAction(self) -> None:
@@ -77,7 +108,7 @@ class SignaturesAt:
                 fd = scope.queryFunction(self._addr)
 
         if fd is None:
-            raise LowlevelError(f"Bad address for signatures: {self._addr}")
+            raise LowlevelError(_format_bad_signature_address(self._addr))
 
         if hasattr(fd, 'isProcStarted') and not fd.isProcStarted():
             if hasattr(self.ghidra, 'allacts'):
@@ -91,48 +122,46 @@ class SignaturesAt:
                 if curname != "normalize":
                     self.ghidra.allacts.setCurrent(curname)
 
-        if self._sout is not None:
-            self._sout.write(b"\x00\x00\x01\x0e")  # STRING_OPEN burst
-            if self._debug:
-                _debug_signature(fd, self._sout)
-            else:
-                _simple_signature(fd, self._sout)
-            self._sout.write(b"\x00\x00\x01\x0f")  # STRING_CLOSE burst
+        self._sout.write(b"\x00\x00\x01\x0e")
+        encoder = PackedEncode(self._sout)
+        if self._debug:
+            _encode_debug_signature(fd, encoder)
+        else:
+            _encode_simple_signature(fd, encoder)
+        self._sout.write(b"\x00\x00\x01\x0f")
 
 
 # ---------------------------------------------------------------------------
 # GetSignatureSettings
 # ---------------------------------------------------------------------------
 
-class GetSignatureSettings:
+class GetSignatureSettings(GhidraCommand):
     """Command to retrieve current signature generation settings."""
 
-    def __init__(self) -> None:
-        self._sin = None
-        self._sout = None
-        self.ghidra = None
-
-    def set_streams(self, sin, sout) -> None:
-        self._sin = sin
-        self._sout = sout
+    def __init__(
+        self,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> None:
+        super().__init__(sin, sout)
 
     def rawAction(self) -> None:
-        """Return settings as XML."""
-        if self._sout is None:
-            return
+        """Return settings as a packed encoding."""
         from ghidra.arch.architecture import ArchitectureCapability
-        major = ArchitectureCapability.majorversion if hasattr(ArchitectureCapability, 'majorversion') else 0
-        minor = ArchitectureCapability.minorversion if hasattr(ArchitectureCapability, 'minorversion') else 0
-        settings = SigManager.getSettings()
-
-        xml = (f"<sigsettings>"
-               f"<major>{major}</major>"
-               f"<minor>{minor}</minor>"
-               f"<settings>{settings}</settings>"
-               f"</sigsettings>")
 
         self._sout.write(b"\x00\x00\x01\x0e")
-        self._sout.write(xml.encode("utf-8"))
+        encoder = PackedEncode(self._sout)
+        encoder.openElement(ELEM_SIGSETTINGS)
+        encoder.openElement(ELEM_MAJOR)
+        encoder.writeSignedInteger(ATTRIB_CONTENT, ArchitectureCapability.getMajorVersion())
+        encoder.closeElement(ELEM_MAJOR)
+        encoder.openElement(ELEM_MINOR)
+        encoder.writeSignedInteger(ATTRIB_CONTENT, ArchitectureCapability.getMinorVersion())
+        encoder.closeElement(ELEM_MINOR)
+        encoder.openElement(ELEM_SETTINGS)
+        encoder.writeUnsignedInteger(ATTRIB_CONTENT, SigManager.getSettings())
+        encoder.closeElement(ELEM_SETTINGS)
+        encoder.closeElement(ELEM_SIGSETTINGS)
         self._sout.write(b"\x00\x00\x01\x0f")
 
 
@@ -140,33 +169,29 @@ class GetSignatureSettings:
 # SetSignatureSettings
 # ---------------------------------------------------------------------------
 
-class SetSignatureSettings:
+class SetSignatureSettings(GhidraCommand):
     """Command to set signature generation settings."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> None:
+        super().__init__(sin, sout)
         self._settings: int = 0
-        self._sin = None
-        self._sout = None
-        self.ghidra = None
-
-    def set_streams(self, sin, sout) -> None:
-        self._sin = sin
-        self._sout = sout
 
     def loadParameters(self) -> None:
         """Read the settings value from the input stream."""
-        if self._sin is not None:
-            setting_str = read_string_stream_raw(self._sin)
-            if setting_str:
-                try:
-                    self._settings = int(setting_str.strip(), 0)
-                except (ValueError, TypeError):
-                    self._settings = 0
+        super().loadParameters()
+        setting_str = read_string_stream(self._sin)
+        if setting_str:
+            try:
+                self._settings = int(setting_str.strip(), 0)
+            except (ValueError, TypeError):
+                self._settings = 0
 
     def rawAction(self) -> None:
         """Apply the settings."""
-        if self._sout is None:
-            return
         if GraphSigManager.testSettings(self._settings):
             SigManager.setSettings(self._settings)
             write_string_stream(self._sout, "t")
@@ -178,28 +203,47 @@ class SetSignatureSettings:
 # GhidraSignatureCapability
 # ---------------------------------------------------------------------------
 
-class GhidraSignatureCapability:
+class GhidraSignatureCapability(GhidraCapability):
     """Singleton capability that registers signature commands."""
 
-    _instance: Optional[GhidraSignatureCapability] = None
+    _instance: ClassVar[Optional[GhidraSignatureCapability]] = None
 
-    def __init__(self) -> None:
-        self.name: str = "signature"
+    def __init__(
+        self,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> None:
+        super().__init__("signature")
+        self._sin = sin
+        self._sout = sout
+
+    def __copy__(self):
+        raise TypeError("GhidraSignatureCapability is non-copyable")
+
+    def __deepcopy__(self, memo):
+        raise TypeError("GhidraSignatureCapability is non-copyable")
 
     @classmethod
-    def getInstance(cls) -> GhidraSignatureCapability:
+    def getInstance(
+        cls,
+        sin: Optional[BinaryIO] = None,
+        sout: Optional[BinaryIO] = None,
+    ) -> GhidraSignatureCapability:
         if cls._instance is None:
-            cls._instance = GhidraSignatureCapability()
+            cls._instance = cls(sin, sout)
+        else:
+            if sin is not None:
+                cls._instance._sin = sin
+            if sout is not None:
+                cls._instance._sout = sout
         return cls._instance
 
-    def initialize(self) -> dict:
-        """Return the command map entries for signature commands."""
-        return {
-            "generateSignatures": SignaturesAt(debug=False),
-            "debugSignatures": SignaturesAt(debug=True),
-            "getSignatureSettings": GetSignatureSettings(),
-            "setSignatureSettings": SetSignatureSettings(),
-        }
+    def initialize(self) -> None:
+        """Register signature commands for the Ghidra client."""
+        GhidraCapability.commandmap["generateSignatures"] = SignaturesAt(False, self._sin, self._sout)
+        GhidraCapability.commandmap["debugSignatures"] = SignaturesAt(True, self._sin, self._sout)
+        GhidraCapability.commandmap["getSignatureSettings"] = GetSignatureSettings(self._sin, self._sout)
+        GhidraCapability.commandmap["setSignatureSettings"] = SetSignatureSettings(self._sin, self._sout)
 
 
 # ---------------------------------------------------------------------------
@@ -229,15 +273,30 @@ def _decode_addr(xml_bytes, arch):
         return None
 
 
-def _simple_signature(fd, sout) -> None:
-    """Generate a streamlined feature encoding for the function."""
+def _format_bad_signature_address(addr) -> str:
+    shortcut = ""
+    get_shortcut = getattr(addr, "getShortcut", None)
+    if callable(get_shortcut):
+        shortcut = get_shortcut()
+
+    raw = ""
+    print_raw = getattr(addr, "printRaw", None)
+    if callable(print_raw):
+        try:
+            raw = print_raw()
+        except TypeError:
+            stream = StringIO()
+            print_raw(stream)
+            raw = stream.getvalue()
+    return f"Bad address for signatures: {shortcut}{raw}\n"
+
+
+def _encode_simple_signature(fd, encoder) -> None:
     mgr = GraphSigManager()
     mgr.setCurrentFunction(fd)
     mgr.generate()
     vec = []
     mgr.getSignatureVector(vec)
-
-    encoder = XmlEncode(do_format=False)
     encoder.openElement(ELEM_SIGNATURES)
     if fd.hasUnimplemented():
         encoder.writeBool(ATTRIB_UNIMPL, True)
@@ -256,15 +315,27 @@ def _simple_signature(fd, sout) -> None:
             encoder.writeUnsignedInteger(ATTRIB_OFFSET, addr.getOffset())
             encoder.closeElement(ELEM_CALL)
     encoder.closeElement(ELEM_SIGNATURES)
+
+
+def _simple_signature(fd, sout) -> None:
+    """Generate a streamlined feature encoding for the function."""
+    stream = StringIO()
+    encoder = XmlEncode(stream, do_format=False)
+    _encode_simple_signature(fd, encoder)
     sout.write(encoder.toString().encode("utf-8"))
 
 
-def _debug_signature(fd, sout) -> None:
-    """Generate a verbose feature encoding with debug info."""
+def _encode_debug_signature(fd, encoder) -> None:
     mgr = GraphSigManager()
     mgr.setCurrentFunction(fd)
     mgr.generate()
     mgr.sortByHash()
-    encoder = XmlEncode(do_format=False)
     mgr.encode(encoder)
+
+
+def _debug_signature(fd, sout) -> None:
+    """Generate a verbose feature encoding with debug info."""
+    stream = StringIO()
+    encoder = XmlEncode(stream, do_format=False)
+    _encode_debug_signature(fd, encoder)
     sout.write(encoder.toString().encode("utf-8"))

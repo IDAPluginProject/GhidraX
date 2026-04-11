@@ -3,6 +3,7 @@ Corresponds to: expression.hh / expression.cc
 functionalEquality, BooleanMatch, and related utilities.
 """
 from __future__ import annotations
+from functools import cmp_to_key
 from typing import TYPE_CHECKING, List
 from ghidra.core.opcodes import OpCode, get_booleanflip
 from ghidra.core.address import signbit_negative, calc_mask
@@ -84,21 +85,21 @@ class BooleanMatch:
     uncorrelated = 3
 
     @staticmethod
-    def _varnodeSame(a, b):
+    def varnodeSame(a, b):
         if a is b: return True
         if a.isConstant() and b.isConstant():
             return a.getOffset() == b.getOffset()
         return False
 
     @staticmethod
-    def _sameOpComplement(op1, op2):
+    def sameOpComplement(op1, op2):
         opc = op1.code()
         if opc not in (OpCode.CPUI_INT_SLESS, OpCode.CPUI_INT_LESS):
             return False
         cs = 1 if op1.getIn(1).isConstant() else 0
         if not op1.getIn(cs).isConstant(): return False
         if not op2.getIn(1-cs).isConstant(): return False
-        if not BooleanMatch._varnodeSame(op1.getIn(1-cs), op2.getIn(cs)):
+        if not BooleanMatch.varnodeSame(op1.getIn(1-cs), op2.getIn(cs)):
             return False
         v1 = op1.getIn(cs).getOffset()
         v2 = op2.getIn(1-cs).getOffset()
@@ -157,21 +158,24 @@ class BooleanMatch:
                         return BooleanMatch.complementary
         else:
             if opc1 == opc2:
-                ok = all(BooleanMatch._varnodeSame(op1.getIn(i), op2.getIn(i))
+                ok = all(BooleanMatch.varnodeSame(op1.getIn(i), op2.getIn(i))
                          for i in range(op1.numInput()))
                 if ok: return BooleanMatch.same
-                if BooleanMatch._sameOpComplement(op1, op2):
+                if BooleanMatch.sameOpComplement(op1, op2):
                     return BooleanMatch.complementary
                 return BooleanMatch.uncorrelated
             comp, reorder = get_booleanflip(opc2)
             if opc1 != comp: return BooleanMatch.uncorrelated
             s2 = 1 if reorder else 0
-            if not BooleanMatch._varnodeSame(op1.getIn(0), op2.getIn(s2)):
+            if not BooleanMatch.varnodeSame(op1.getIn(0), op2.getIn(s2)):
                 return BooleanMatch.uncorrelated
-            if not BooleanMatch._varnodeSame(op1.getIn(1), op2.getIn(1-s2)):
+            if not BooleanMatch.varnodeSame(op1.getIn(1), op2.getIn(1-s2)):
                 return BooleanMatch.uncorrelated
             return BooleanMatch.complementary
         return BooleanMatch.uncorrelated
+
+    _varnodeSame = varnodeSame
+    _sameOpComplement = sameOpComplement
 
 
 class BooleanExpressionMatch:
@@ -284,7 +288,12 @@ class TermOrder:
     def sortTerms(self) -> None:
         """Sort the terms using additiveCompare."""
         self._sorter = list(self._terms)
-        self._sorter.sort(key=lambda edge: 0 if edge.getVarnode().isConstant() else -1)
+        self._sorter.sort(
+            key=cmp_to_key(
+                lambda op1, op2: -1 if TermOrder.additiveCompare(op1, op2)
+                else (1 if TermOrder.additiveCompare(op2, op1) else 0)
+            )
+        )
 
     def getSort(self) -> List[AdditiveEdge]:
         """Get the sorted list of references."""
@@ -320,13 +329,13 @@ class AddExpression:
         self.numTerms: int = 0
         self.terms: List[AddExpression.Term] = [AddExpression.Term(), AddExpression.Term()]
 
-    def _add(self, vn, coeff: int) -> None:
+    def add(self, vn, coeff: int) -> None:
         """Add a term to the expression."""
         if self.numTerms < 2:
             self.terms[self.numTerms] = AddExpression.Term(vn, coeff)
             self.numTerms += 1
 
-    def _gather(self, vn, coeff: int, depth: int) -> None:
+    def gather(self, vn, coeff: int, depth: int) -> None:
         """Gather terms in the expression from a root point."""
         if vn.isConstant():
             self.constval = (self.constval + coeff * vn.getOffset()) & calc_mask(vn.getSize())
@@ -337,31 +346,31 @@ class AddExpression:
                 if not op.getIn(1).isConstant():
                     depth -= 1
                 if depth >= 0:
-                    self._gather(op.getIn(0), coeff, depth)
-                    self._gather(op.getIn(1), coeff, depth)
+                    self.gather(op.getIn(0), coeff, depth)
+                    self.gather(op.getIn(1), coeff, depth)
                     return
             elif op.code() == OpCode.CPUI_INT_MULT:
                 if op.getIn(1).isConstant():
                     coeff = (coeff * op.getIn(1).getOffset()) & calc_mask(vn.getSize())
-                    self._gather(op.getIn(0), coeff, depth)
+                    self.gather(op.getIn(0), coeff, depth)
                     return
-        self._add(vn, coeff)
+        self.add(vn, coeff)
 
     def gatherTwoTermsSubtract(self, a, b) -> None:
         """Walk expression given two roots being subtracted."""
         depth = 1 if (a.isConstant() or b.isConstant()) else 0
-        self._gather(a, 1, depth)
-        self._gather(b, calc_mask(b.getSize()), depth)
+        self.gather(a, 1, depth)
+        self.gather(b, calc_mask(b.getSize()), depth)
 
     def gatherTwoTermsAdd(self, a, b) -> None:
         """Walk expression given two roots being added."""
         depth = 1 if (a.isConstant() or b.isConstant()) else 0
-        self._gather(a, 1, depth)
-        self._gather(b, 1, depth)
+        self.gather(a, 1, depth)
+        self.gather(b, 1, depth)
 
     def gatherTwoTermsRoot(self, root) -> None:
         """Gather up to 2 terms given root Varnode."""
-        self._gather(root, 1, 1)
+        self.gather(root, 1, 1)
 
     def isEquivalent(self, op2: AddExpression) -> bool:
         """Determine if 2 expressions are equivalent."""
@@ -380,6 +389,9 @@ class AddExpression:
                     self.terms[1].isEquivalent(op2.terms[0])):
                 return True
         return False
+
+    _add = add
+    _gather = gather
 
 
 # =========================================================================

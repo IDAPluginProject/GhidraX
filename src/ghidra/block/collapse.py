@@ -31,8 +31,7 @@ class CollapseStructure:
             return False
         if not self._isGotoOut(bl, 0):
             return False
-        target = bl.getOut(0)
-        self._graph.newBlockGoto(bl, target)
+        self._graph.newBlockGoto(bl)
         return True
 
     # --- Rule: BlockCat (sequence) ---
@@ -61,12 +60,12 @@ class CollapseStructure:
         out1 = bl.getOut(1)
         # Check: one arm is a simple block that exits to the other arm
         if out0.sizeOut() == 1 and out0.getOut(0) is out1 and out0.sizeIn() == 1:
-            self._graph.newBlockIf(bl, out0, None)
+            self._graph.newBlockIf(bl, out0)
             return True
         if out1.sizeOut() == 1 and out1.getOut(0) is out0 and out1.sizeIn() == 1:
             # Need to swap edges so "true" branch is the body
             bl.swapEdges()
-            self._graph.newBlockIf(bl, out1, None)
+            self._graph.newBlockIf(bl, out1)
             return True
         return False
 
@@ -87,7 +86,7 @@ class CollapseStructure:
             return False
         if self._isGotoOut(out0, 0) or self._isGotoOut(out1, 0):
             return False
-        self._graph.newBlockIf(bl, out1, out0)
+        self._graph.newBlockIfElse(bl, out1, out0)
         return True
 
     # --- Rule: WhileDo ---
@@ -99,12 +98,12 @@ class CollapseStructure:
         out1 = bl.getOut(1)
         if out0 is bl and out1 is not bl:
             if not self._isGotoOut(bl, 0):
-                self._graph.newBlockWhileDo(bl)
+                self._graph.newBlockDoWhile(bl)
                 return True
         if out1 is bl and out0 is not bl:
             if not self._isGotoOut(bl, 1):
                 bl.swapEdges()
-                self._graph.newBlockWhileDo(bl)
+                self._graph.newBlockDoWhile(bl)
                 return True
         return False
 
@@ -155,11 +154,11 @@ class CollapseStructure:
         out0 = bl.getOut(0)
         out1 = bl.getOut(1)
         if out0.sizeOut() == 0 and out0.sizeIn() == 1 and not self._isGotoOut(bl, 0):
-            self._graph.newBlockIf(bl, out0, None)
+            self._graph.newBlockIf(bl, out0)
             return True
         if out1.sizeOut() == 0 and out1.sizeIn() == 1 and not self._isGotoOut(bl, 1):
             bl.swapEdges()
-            self._graph.newBlockIf(bl, out1, None)
+            self._graph.newBlockIf(bl, out1)
             return True
         return False
 

@@ -7,11 +7,11 @@ In Python we use a class-level registry list with explicit registration.
 """
 from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import ClassVar, List
 
 
-class CapabilityPoint:
+class CapabilityPoint(ABC):
     """Base class for automatically registering extension points.
 
     Subclasses override initialize() and create a singleton instance.
@@ -20,8 +20,17 @@ class CapabilityPoint:
 
     _registry: ClassVar[List[CapabilityPoint]] = []
 
+    @staticmethod
+    def getList() -> List[CapabilityPoint]:
+        """Return the live registry of capability singletons."""
+        return CapabilityPoint._registry
+
     def __init__(self) -> None:
-        CapabilityPoint._registry.append(self)
+        CapabilityPoint.getList().append(self)
+
+    def __del__(self) -> None:
+        """Mirror the native empty destructor surface."""
+        return None
 
     @abstractmethod
     def initialize(self) -> None:
@@ -31,16 +40,19 @@ class CapabilityPoint:
     @staticmethod
     def initializeAll() -> None:
         """Finish initialization for all registered extension points."""
-        for cap in list(CapabilityPoint._registry):
-            cap.initialize()
-        CapabilityPoint._registry.clear()
+        registry = CapabilityPoint.getList()
+        index = 0
+        while index < len(registry):
+            registry[index].initialize()
+            index += 1
+        registry.clear()
 
     @staticmethod
     def getRegistered() -> List[CapabilityPoint]:
         """Return the current list of registered capabilities."""
-        return list(CapabilityPoint._registry)
+        return list(CapabilityPoint.getList())
 
     @staticmethod
     def clearAll() -> None:
         """Clear all registered capabilities (for testing)."""
-        CapabilityPoint._registry.clear()
+        CapabilityPoint.getList().clear()

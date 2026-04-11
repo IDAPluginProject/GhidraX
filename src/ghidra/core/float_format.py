@@ -59,32 +59,6 @@ class FloatFormat:
             self.frac_size = 52
             self.bias = 1023
             self.jbitimplied = True
-        elif sz == 2:  # half precision
-            self.signbit_pos = 15
-            self.exp_pos = 10
-            self.exp_size = 5
-            self.frac_pos = 0
-            self.frac_size = 10
-            self.bias = 15
-            self.jbitimplied = True
-        elif sz == 16:  # quad precision (simplified)
-            self.signbit_pos = 127
-            self.exp_pos = 112
-            self.exp_size = 15
-            self.frac_pos = 0
-            self.frac_size = 112
-            self.bias = 16383
-            self.jbitimplied = True
-        else:
-            # Default to 8-byte format
-            self.signbit_pos = 63
-            self.exp_pos = 52
-            self.exp_size = 11
-            self.frac_pos = 0
-            self.frac_size = 52
-            self.bias = 1023
-            self.jbitimplied = True
-
         self.maxexponent = (1 << self.exp_size) - 1
         self._calcPrecision()
 
@@ -459,7 +433,9 @@ class FloatFormat:
         return self._fromHost(math.floor(self._toHost(a)))
 
     def opRound(self, a: int) -> int:
-        return self._fromHost(round(self._toHost(a)))
+        val = self._toHost(a)
+        rounded = math.copysign(math.floor(abs(val) + 0.5), val)
+        return self._fromHost(rounded)
 
     def opInt2Float(self, a: int, sizein: int) -> int:
         mask = calc_mask(sizein)

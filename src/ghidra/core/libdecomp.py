@@ -6,28 +6,40 @@ Provides startup and shutdown routines for the decompiler library.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, Sequence, cast
 
+from ghidra.arch.architecture import ArchitectureCapability
+from ghidra.arch.sleigh_arch import SleighArchitecture
 from ghidra.core.capability import CapabilityPoint
 from ghidra.core.filemanage import FileManage
+from ghidra.core.marshal import AttributeId, ElementId
 
 
-def startDecompilerLibrary(sleighhome: Optional[str] = None,
-                           extrapaths: Optional[List[str]] = None) -> None:
+def startDecompilerLibrary(
+    sleighhome: Optional[str | Sequence[str]] = None,
+    extrapaths: Optional[Sequence[str]] = None,
+) -> None:
     """Initialize all decompiler capabilities and register sleigh specifications.
 
     If a Ghidra root directory is provided via *sleighhome*, it is scanned
     for SLEIGH specification directories.  Additional paths can be supplied
     via *extrapaths*.
     """
+    if extrapaths is None and sleighhome is not None and not isinstance(sleighhome, str):
+        extrapaths = cast(Sequence[str], sleighhome)
+        sleighhome = None
+
+    AttributeId.initialize()
+    ElementId.initialize()
     CapabilityPoint.initializeAll()
+    ArchitectureCapability.sortCapabilities()
 
     if sleighhome is not None:
         _scanForSleighDirectories(sleighhome)
 
     if extrapaths:
         for p in extrapaths:
-            _specpaths.addDir2Path(p)
+            getSpecPaths().addDir2Path(p)
 
 
 def shutdownDecompilerLibrary() -> None:
@@ -40,12 +52,9 @@ def shutdownDecompilerLibrary() -> None:
 # static spec scanning)
 # ---------------------------------------------------------------------------
 
-_specpaths = FileManage()
-
-
 def getSpecPaths() -> FileManage:
     """Get the global specification search paths."""
-    return _specpaths
+    return SleighArchitecture.specpaths
 
 
 def _scanForSleighDirectories(rootpath: str) -> None:
@@ -60,7 +69,7 @@ def _scanForSleighDirectories(rootpath: str) -> None:
         for sd in subdirs:
             lang_dirs = FileManage.scanDirectoryRecursive("data", sd, maxdepth=2)
             for lang in lang_dirs:
-                _specpaths.addDir2Path(lang)
+                getSpecPaths().addDir2Path(lang)
             languages_dirs = FileManage.scanDirectoryRecursive("languages", sd, maxdepth=2)
             for lang in languages_dirs:
-                _specpaths.addDir2Path(lang)
+                getSpecPaths().addDir2Path(lang)

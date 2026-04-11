@@ -51,5 +51,6 @@ class PcodeEmitFd(PcodeEmit):
             var = vars_[slot]
             vn = fd.newVarnode(var.size, Address(var.space, var.offset))
             if opc in (OpCode.CPUI_LOAD, OpCode.CPUI_STORE) and slot == 0:
-                vn.setSpaceFromConst(fd.getArch().getDefaultDataSpace())
+                ref_space = var.getSpaceFromConst() if hasattr(var, "getSpaceFromConst") else None
+                vn.setSpaceFromConst(ref_space if ref_space is not None else fd.getArch().getDefaultDataSpace())
             fd.opSetInput(op, vn, slot)

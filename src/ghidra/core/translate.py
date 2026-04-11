@@ -82,6 +82,19 @@ class PcodeEmit(ABC):
         """
         ...
 
+    def decodeOp(self, addr: Address, decoder: Decoder) -> None:
+        """Decode a single <op> element and forward it to dump()."""
+        from ghidra.core.marshal import ATTRIB_SIZE, ELEM_OP
+        from ghidra.core.pcoderaw import PcodeOpRaw
+
+        elem_id = decoder.openElement(ELEM_OP)
+        isize = decoder.readSignedInteger(ATTRIB_SIZE)
+        invar = [VarnodeData() for _ in range(isize)]
+        outvar = [VarnodeData()]
+        opcode = PcodeOpRaw.decode(decoder, invar, outvar)
+        decoder.closeElement(elem_id)
+        self.dump(addr, opcode, outvar[0], invar, isize)
+
 
 # =========================================================================
 # AssemblyEmit

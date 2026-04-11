@@ -7,6 +7,8 @@ Provides IfaceStatus, IfaceCommand, IfaceCapability and basic commands
 """
 from __future__ import annotations
 
+import io
+import socket
 import sys
 from abc import ABC, abstractmethod
 from bisect import bisect_left, bisect_right
@@ -17,26 +19,126 @@ from ghidra.core.capability import CapabilityPoint
 
 # ── Exceptions ────────────────────────────────────────────────────────────
 
+
+class RemoteSocket:
+    """A wrapper around a UNIX domain socket."""
+
+    _MAX_UNIX_SOCKET_PATH = 108
+
+    def __init__(self) -> None:
+        self.fileDescriptor = 0
+        self.inbuf = None
+        self.outbuf = None
+        self.inStream = None
+        self.outStream = None
+        self.isOpen = False
+
+    def __del__(self) -> None:
+        self.close()
+
+    def open(self, filename: str) -> bool:
+        if self.isOpen:
+            return False
+        family = getattr(socket, "AF_UNIX", 1)
+        sock_type = getattr(socket, "SOCK_STREAM", 1)
+        try:
+            self.fileDescriptor = socket.socket(family, sock_type, 0)
+        except OSError as exc:
+            raise IfaceError("Could not create socket") from exc
+        if len(filename) >= self._MAX_UNIX_SOCKET_PATH:
+            raise IfaceError("Socket name too long")
+        try:
+            self.fileDescriptor.connect(filename)
+        except OSError:
+            try:
+                self.fileDescriptor.close()
+            except Exception:
+                pass
+            return False
+
+        self.inbuf = self.fileDescriptor.makefile("rb")
+        self.outbuf = self.fileDescriptor.makefile("wb")
+        self.inStream = io.TextIOWrapper(self.inbuf, encoding="utf-8", newline="")
+        self.outStream = io.TextIOWrapper(self.outbuf, encoding="utf-8", newline="")
+        self.isOpen = True
+        return True
+
+    def isSocketOpen(self) -> bool:
+        if not self.isOpen:
+            return False
+        if self.inStream is None or getattr(self.inStream, "closed", False):
+            self.close()
+            return False
+        return True
+
+    def getInputStream(self):
+        return self.inStream
+
+    def getOutputStream(self):
+        return self.outStream
+
+    def close(self) -> None:
+        if self.inStream is not None:
+            try:
+                self.inStream.close()
+            except Exception:
+                pass
+            self.inStream = None
+        if self.outStream is not None:
+            try:
+                self.outStream.close()
+            except Exception:
+                pass
+            self.outStream = None
+        if self.inbuf is not None:
+            try:
+                self.inbuf.close()
+            except Exception:
+                pass
+            self.inbuf = None
+        if self.outbuf is not None:
+            try:
+                self.outbuf.close()
+            except Exception:
+                pass
+            self.outbuf = None
+        if self.fileDescriptor not in (0, None):
+            try:
+                self.fileDescriptor.close()
+            except Exception:
+                pass
+        self.isOpen = False
+
+
 class IfaceError(Exception):
     """An exception specific to the command-line interface."""
-    pass
+
+    def __init__(self, s: str) -> None:
+        super().__init__(s)
+        self.explain = s
 
 
 class IfaceParseError(IfaceError):
     """Parsing error in a command line."""
-    pass
+
+    def __init__(self, s: str) -> None:
+        super().__init__(s)
 
 
 class IfaceExecutionError(IfaceError):
     """Error during execution of a command."""
-    pass
+
+    def __init__(self, s: str) -> None:
+        super().__init__(s)
 
 
 # ── Data / Command base classes ───────────────────────────────────────────
 
 class IfaceData:
     """Data specialized for a particular command module."""
-    pass
+
+    def __del__(self) -> None:
+        return None
 
 
 class IfaceCommand(ABC):
@@ -44,6 +146,9 @@ class IfaceCommand(ABC):
 
     def __init__(self) -> None:
         self._com: List[str] = []
+
+    def __del__(self) -> None:
+        return None
 
     @abstractmethod
     def setData(self, root: IfaceStatus, data: Optional[IfaceData]) -> None: ...
@@ -61,8 +166,7 @@ class IfaceCommand(ABC):
         self._com.append(word)
 
     def removeWord(self) -> None:
-        if self._com:
-            self._com.pop()
+        self._com.pop()
 
     def getCommandWord(self, i: int) -> str:
         return self._com[i]
@@ -169,6 +273,17 @@ class IfaceStatus(ABC):
         self._promptstack: List[str] = []
         self._flagstack: List[int] = []
 
+    def __del__(self) -> None:
+        if self.optr is not self.fileoptr:
+            try:
+                self.fileoptr.close()
+            except Exception:
+                pass
+        while self._promptstack:
+            self.popScript()
+        self._comlist.clear()
+        self._datamap.clear()
+
     @abstractmethod
     def readLine(self) -> str:
         """Read the next command line."""
@@ -183,6 +298,13 @@ class IfaceStatus(ABC):
         self._errorisdone = val
 
     def pushScript(self, filename_or_stream, newprompt: str) -> None:
+        if isinstance(filename_or_stream, str):
+            try:
+                stream = open(filename_or_stream, "r", encoding="utf-8")
+            except OSError as exc:
+                raise IfaceParseError(f"Unable to open script file: {filename_or_stream}") from exc
+            self.pushScript(stream, newprompt)
+            return
         self._promptstack.append(self._prompt)
         flags = 1 if self._errorisdone else 0
         self._flagstack.append(flags)
@@ -190,11 +312,10 @@ class IfaceStatus(ABC):
         self._prompt = newprompt
 
     def popScript(self) -> None:
-        if self._promptstack:
-            self._prompt = self._promptstack.pop()
-            flags = self._flagstack.pop()
-            self._errorisdone = (flags & 1) != 0
-            self.inerror = False
+        self._prompt = self._promptstack.pop()
+        flags = self._flagstack.pop()
+        self._errorisdone = (flags & 1) != 0
+        self.inerror = False
 
     def reset(self) -> None:
         while self._promptstack:
@@ -228,7 +349,7 @@ class IfaceStatus(ABC):
     def getData(self, nm: str) -> Optional[IfaceData]:
         return self._datamap.get(nm)
 
-    def _saveHistory(self, line: str) -> None:
+    def saveHistory(self, line: str) -> None:
         if len(self._history) < self._maxhistory:
             self._history.append(line)
         else:
@@ -236,6 +357,9 @@ class IfaceStatus(ABC):
         self._curhistory += 1
         if self._curhistory >= self._maxhistory:
             self._curhistory = 0
+
+    def _saveHistory(self, line: str) -> None:
+        self.saveHistory(line)
 
     def getHistory(self, i: int) -> str:
         if i >= len(self._history):
@@ -268,14 +392,11 @@ class IfaceStatus(ABC):
             self._comlist.sort(key=lambda c: _CmdKey(c))
             self._sorted = True
 
-    def _restrictCom(self, commands: List[IfaceCommand],
-                     first: int, last: int,
-                     words: List[str]) -> tuple[int, int]:
-        """Restrict the range of commands matching the given word list."""
+    def restrictCom(self, first: int, last: int, words: List[str]) -> tuple[int, int]:
         dummy = IfaceCommandDummy()
         dummy.addWords(words)
         dk = _CmdKey(dummy)
-        keys = [_CmdKey(c) for c in commands[first:last]]
+        keys = [_CmdKey(c) for c in self._comlist[first:last]]
         new_first = first + bisect_left(keys, dk)
 
         dummy.removeWord()
@@ -286,47 +407,109 @@ class IfaceStatus(ABC):
         new_last = first + bisect_right(keys, dk2)
         return new_first, new_last
 
+    def _restrictCom(self, commands: List[IfaceCommand],
+                     first: int, last: int,
+                     words: List[str]) -> tuple[int, int]:
+        return self.restrictCom(first, last, words)
+
+    @staticmethod
+    def _skip_whitespace(stream: io.StringIO) -> bool:
+        while True:
+            pos = stream.tell()
+            ch = stream.read(1)
+            if ch == "":
+                return True
+            if not ch.isspace():
+                stream.seek(pos)
+                return False
+
+    @staticmethod
+    def _read_token(stream: io.StringIO) -> str:
+        pieces: List[str] = []
+        while True:
+            ch = stream.read(1)
+            if ch == "" or ch.isspace():
+                break
+            pieces.append(ch)
+        return "".join(pieces)
+
+    @staticmethod
+    def _maxmatch(op1: str, op2: str) -> tuple[str, bool]:
+        prefix: List[str] = []
+        for left, right in zip(op1, op2):
+            if left == right:
+                prefix.append(left)
+            else:
+                return "".join(prefix), False
+        return "".join(prefix), True
+
+    def expandCom(
+        self,
+        expand: List[str],
+        stream: io.StringIO,
+        first: int,
+        last: int,
+    ) -> tuple[int, int, int]:
+        pos = 0
+        res = True
+        expand.clear()
+        if first == last:
+            return 0, first, last
+        while True:
+            eof = self._skip_whitespace(stream)
+            if first == (last - 1):
+                command = self._comlist[first]
+                if eof:
+                    while pos < command.numWords():
+                        expand.append(command.getCommandWord(pos))
+                        pos += 1
+                if command.numWords() == pos:
+                    return 1, first, last
+            if not res:
+                if not eof:
+                    return last - first, first, last
+                return first - last, first, last
+            if eof:
+                if not expand:
+                    return first - last, first, last
+                return last - first, first, last
+            tok = self._read_token(stream)
+            expand.append(tok)
+            first, last = self.restrictCom(first, last, expand)
+            if first == last:
+                return 0, first, last
+            tok, res = self._maxmatch(
+                self._comlist[first].getCommandWord(pos),
+                self._comlist[last - 1].getCommandWord(pos),
+            )
+            expand[-1] = tok
+            pos += 1
+
     def runCommand(self) -> bool:
         self._ensureSorted()
         line = self.readLine()
-        if not line.strip():
+        if line == "":
             return False
-        self._saveHistory(line)
-        tokens = line.split()
+        self.saveHistory(line)
+        stream = io.StringIO(line)
         first, last = 0, len(self._comlist)
         expand: List[str] = []
-
-        for i, tok in enumerate(tokens):
-            expand.append(tok)
-            if first >= last:
-                self.optr.write("ERROR: Invalid command\n")
-                return False
-            first, last = self._restrictCom(self._comlist, first, last, expand)
-            if first >= last:
-                self.optr.write("ERROR: Invalid command\n")
-                return False
-            if last - first == 1:
-                # Unique match — auto-complete remaining words
-                cmd = self._comlist[first]
-                remaining = " ".join(tokens[i + 1:])
-                cmd.execute(remaining)
-                return True
-
-        if first >= last:
+        match, first, last = self.expandCom(expand, stream, first, last)
+        if match == 0:
             self.optr.write("ERROR: Invalid command\n")
             return False
-        if last - first == 1:
-            cmd = self._comlist[first]
-            cmd.execute("")
-            return True
-        if last - first > 1:
-            cmd = self._comlist[first]
-            if cmd.numWords() == len(expand):
-                cmd.execute("")
-                return True
-            self.optr.write("ERROR: Incomplete command\n")
+        if len(expand) == 0:
             return False
-        return False
+        if match > 1:
+            cmd = self._comlist[first]
+            if cmd.numWords() != len(expand):
+                self.optr.write("ERROR: Incomplete command\n")
+                return False
+        elif match < 0:
+            self.optr.write("ERROR: Incomplete command\n")
+        remaining = stream.read()
+        self._comlist[first].execute(remaining)
+        return True
 
     @staticmethod
     def wordsToString(words: List[str]) -> str:
@@ -380,7 +563,8 @@ class IfcOpenfile(IfaceBaseCommand):
             return
         if self.status.optr is not self.status.fileoptr:
             raise IfaceExecutionError("Output file already opened")
-        filename = args.strip()
+        parts = args.split()
+        filename = parts[0] if parts else ""
         if not filename:
             raise IfaceParseError("No filename specified")
         try:
@@ -396,7 +580,8 @@ class IfcOpenfileAppend(IfaceBaseCommand):
             return
         if self.status.optr is not self.status.fileoptr:
             raise IfaceExecutionError("Output file already opened")
-        filename = args.strip()
+        parts = args.split()
+        filename = parts[0] if parts else ""
         if not filename:
             raise IfaceParseError("No filename specified")
         try:

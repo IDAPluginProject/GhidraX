@@ -13,6 +13,7 @@ import os
 from typing import TYPE_CHECKING, Optional, List, Dict, Iterator
 
 from ghidra.core.address import Address, RangeList
+from ghidra.core.compression import crc_update
 from ghidra.core.error import LowlevelError, RecovError
 from ghidra.ir.varnode import Varnode
 
@@ -665,6 +666,14 @@ class FunctionSymbol(Symbol):
         self.flags |= Varnode.namelock | Varnode.typelock
 
     def getFunction(self):
+        if self.fd is not None:
+            return self.fd
+        entry = self.getFirstWholeMap()
+        if entry is None:
+            return None
+        from ghidra.analysis.funcdata import Funcdata
+
+        self.fd = Funcdata(self.name, self.getDisplayName(), self.scope, entry.getAddr(), self)
         return self.fd
 
     def setFunction(self, fd) -> None:
@@ -753,9 +762,18 @@ class LabSymbol(Symbol):
 
     def __init__(self, scope: Optional[Scope] = None, name: str = "") -> None:
         super().__init__(scope, name)
+        self._buildType()
 
-    def getType(self) -> int:
-        return 4  # label type
+    def _buildType(self) -> None:
+        arch = self.scope.getArch() if self.scope is not None and hasattr(self.scope, "getArch") else None
+        typegrp = arch.types if arch is not None and hasattr(arch, "types") else None
+        if typegrp is not None and hasattr(typegrp, "getBase"):
+            from ghidra.types.datatype import TYPE_UNKNOWN
+
+            self.type = typegrp.getBase(1, TYPE_UNKNOWN)
+
+    def getType(self):
+        return self.type
 
     def decode(self, decoder) -> None:
         """Decode a LabSymbol from a stream.
@@ -766,6 +784,8 @@ class LabSymbol(Symbol):
         elemId = decoder.openElement(ELEM_LABELSYM)
         self.decodeHeader(decoder)
         decoder.closeElement(elemId)
+        if self.type is None:
+            self._buildType()
 
 
 # =========================================================================
@@ -779,12 +799,40 @@ class ExternRefSymbol(Symbol):
                  ref: Optional[Address] = None, name: str = "") -> None:
         super().__init__(scope, name)
         self.refaddr: Address = ref if ref is not None else Address()
+        self._buildNameType()
 
     def getRefAddr(self) -> Address:
         return self.refaddr
 
     def setRefAddr(self, addr: Address) -> None:
         self.refaddr = addr
+
+    def _buildNameType(self) -> None:
+        arch = self.scope.getArch() if self.scope is not None and hasattr(self.scope, "getArch") else None
+        typegrp = arch.types if arch is not None and hasattr(arch, "types") else None
+        if typegrp is not None and not self.refaddr.isInvalid():
+            try:
+                codetype = typegrp.getTypeCode()
+                word_size = self.refaddr.getSpace().getWordSize()
+                self.type = typegrp.getTypePointer(self.refaddr.getAddrSize(), codetype, word_size)
+            except Exception:
+                pass
+        if self.name == "":
+            shortcut = ""
+            raw = ""
+            if not self.refaddr.isInvalid():
+                try:
+                    shortcut = self.refaddr.getShortcut() if hasattr(self.refaddr, "getShortcut") else ""
+                except Exception:
+                    shortcut = ""
+                try:
+                    raw = self.refaddr.printRaw() if hasattr(self.refaddr, "printRaw") else ""
+                except Exception:
+                    raw = hex(self.refaddr.getOffset()) if hasattr(self.refaddr, "getOffset") else ""
+            self.name = f"{shortcut}{raw}_exref" if (shortcut or raw) else "exref"
+        if self.displayName == "":
+            self.displayName = self.name
+        self.flags |= Varnode.externref | Varnode.typelock
 
     def decode(self, decoder) -> None:
         """Decode an ExternRefSymbol from a stream.
@@ -802,9 +850,52 @@ class ExternRefSymbol(Symbol):
             if attribId == ATTRIB_NAME.id:
                 self.name = decoder.readString()
         self.refaddr = Address.decode(decoder)
-        if not self.displayName:
-            self.displayName = self.name
         decoder.closeElement(elemId)
+        self._buildNameType()
+
+
+# =========================================================================
+# UnionFacetSymbol
+# =========================================================================
+
+class UnionFacetSymbol(Symbol):
+    """A Symbol forcing a particular union field at a dynamic access point."""
+
+    def __init__(self, scope: Optional[Scope] = None, name: str = "",
+                 unionDt=None, fieldNum: int = -1) -> None:
+        super().__init__(scope, name, unionDt)
+        self.fieldNum: int = fieldNum
+        self.category = Symbol.union_facet
+
+    def getFieldNumber(self) -> int:
+        return self.fieldNum
+
+    def encode(self, encoder) -> None:
+        from ghidra.core.marshal import ATTRIB_FIELD, ELEM_FACETSYMBOL
+
+        encoder.openElement(ELEM_FACETSYMBOL)
+        self.encodeHeader(encoder)
+        encoder.writeSignedInteger(ATTRIB_FIELD, self.fieldNum)
+        self.encodeBody(encoder)
+        encoder.closeElement(ELEM_FACETSYMBOL)
+
+    def decode(self, decoder) -> None:
+        from ghidra.core.marshal import ATTRIB_FIELD, ELEM_FACETSYMBOL
+        from ghidra.types.datatype import TYPE_PTR, TYPE_UNION
+
+        elemId = decoder.openElement(ELEM_FACETSYMBOL)
+        self.decodeHeader(decoder)
+        self.fieldNum = decoder.readSignedInteger(ATTRIB_FIELD)
+        self.decodeBody(decoder)
+        decoder.closeElement(elemId)
+
+        testType = self.type
+        if testType is not None and testType.getMetatype() == TYPE_PTR and hasattr(testType, "getPtrTo"):
+            testType = testType.getPtrTo()
+        if testType is None or testType.getMetatype() != TYPE_UNION:
+            raise LowlevelError("<unionfacetsymbol> does not have a union type")
+        if self.fieldNum < -1 or self.fieldNum >= testType.numDepend():
+            raise LowlevelError("<unionfacetsymbol> field attribute is out of bounds")
 
 
 # =========================================================================
@@ -855,6 +946,9 @@ class Scope(ABC):
     def getDisplayName(self) -> str:
         return self.displayName
 
+    def setDisplayName(self, nm: str) -> None:
+        self.displayName = nm
+
     def getId(self) -> int:
         return self.uniqueId
 
@@ -877,10 +971,40 @@ class Scope(ABC):
         child.parent = self
         self.children[child.uniqueId] = child
 
+    @staticmethod
+    def hashScopeName(baseId: int, nm: str) -> int:
+        reg1 = (baseId >> 32) & 0xFFFFFFFF
+        reg2 = baseId & 0xFFFFFFFF
+        reg1 = crc_update(reg1, 0xA9) & 0xFFFFFFFF
+        reg2 = crc_update(reg2, reg1) & 0xFFFFFFFF
+        for ch in nm:
+            val = ord(ch) & 0xFF
+            reg1 = crc_update(reg1, val) & 0xFFFFFFFF
+            reg2 = crc_update(reg2, reg1) & 0xFFFFFFFF
+        return ((reg1 << 32) | reg2) & 0xFFFFFFFFFFFFFFFF
+
     def detachScope(self, child_id: int) -> None:
         child = self.children.pop(child_id, None)
         if child is not None:
             child.parent = None
+
+    def resolveScope(self, nm: str, strategy: bool) -> Optional["Scope"]:
+        if strategy:
+            key = Scope.hashScopeName(self.uniqueId, nm)
+            scope = self.children.get(key)
+            if scope is not None and scope.name == nm:
+                return scope
+            return None
+        if nm and "0" <= nm[0] <= "9":
+            try:
+                key = int(nm, 0)
+            except ValueError:
+                return None
+            return self.children.get(key)
+        for scope in self.children.values():
+            if scope.name == nm:
+                return scope
+        return None
 
     # --- Abstract methods ---
 
@@ -943,16 +1067,32 @@ class Scope(ABC):
         _, entry = self._stackContainer(basescope, None, addr, size, up)
         return entry
 
-    def queryFunction(self, addr: Address) -> Optional[FunctionSymbol]:
-        """Find a function starting at the given address.
+    def queryFunction(self, name_or_addr) -> Optional[FunctionSymbol]:
+        """Find a function by name or starting address.
 
         C++ ref: ``Scope::queryFunction`` in database.cc
         """
-        res = self.findFunction(addr) if hasattr(self, 'findFunction') else None
+        if isinstance(name_or_addr, str):
+            sym_list = getattr(self, "_symbolsByName", {}).get(name_or_addr)
+            if sym_list is not None:
+                for sym in sym_list:
+                    if isinstance(sym, FunctionSymbol):
+                        return sym.getFunction()
+                return None
+            sym = self.findByName(name_or_addr)
+            if sym is not None:
+                if isinstance(sym, FunctionSymbol):
+                    return sym.getFunction()
+                return None
+            if self.parent is not None:
+                return self.parent.queryFunction(name_or_addr)
+            return None
+
+        res = self.findFunction(name_or_addr) if hasattr(self, 'findFunction') else None
         if res is not None:
             return res
         if self.parent is not None:
-            return self.parent.queryFunction(addr)
+            return self.parent.queryFunction(name_or_addr)
         return None
 
     def queryExternalRefFunction(self, addr: Address) -> Optional[ExternRefSymbol]:
@@ -1030,7 +1170,7 @@ class Scope(ABC):
     def addFunction(self, addr: Address, name: str, size: int = 1) -> Optional[FunctionSymbol]:
         return None
 
-    def addEquateSymbol(self, name: str, format_: int, val: int) -> Optional[EquateSymbol]:
+    def addEquateSymbol(self, name: str, format_: int, val: int, addr: Address, hash_: int) -> Optional[EquateSymbol]:
         return None
 
     def addCodeLabel(self, addr: Address, name: str) -> Optional[LabSymbol]:
@@ -1042,7 +1182,7 @@ class Scope(ABC):
     def addExternalRef(self, addr: Address, refaddr: Address, name: str) -> Optional[ExternRefSymbol]:
         return None
 
-    def addUnionFacetSymbol(self, name: str, ct, fieldNum: int) -> Optional[Symbol]:
+    def addUnionFacetSymbol(self, name: str, ct, fieldNum: int, addr: Address, hash_: int) -> Optional[Symbol]:
         return None
 
     def addMapPoint(self, sym: Symbol, addr: Address, usepoint: Address) -> Optional[SymbolEntry]:
@@ -1071,6 +1211,8 @@ class Scope(ABC):
             sym = LabSymbol(owner)
         elif subId == ELEM_EXTERNREFSYMBOL.id:
             sym = ExternRefSymbol(owner)
+        elif subId == ELEM_FACETSYMBOL.id:
+            sym = UnionFacetSymbol(owner)
         else:
             sym = Symbol(owner)
         try:
@@ -1751,6 +1893,13 @@ class ScopeInternal(Scope):
         if entry.offset == 0 and sym.type is not None and entry.size == sym.type.getSize():
             sym.wholeCount += 1
         if not entry.isDynamic():
+            if entry.uselimit.empty():
+                sym.flags |= Varnode.addrtied
+                db = getattr(getattr(self, "glb", None), "symboltab", None)
+                if db is not None and entry.addr is not None and not entry.addr.isInvalid():
+                    sym.flags |= db.getProperty(entry.addr)
+            if self.isGlobal():
+                sym.flags |= Varnode.persist
             key = (entry.addr.getSpace().getIndex(), entry.addr.getOffset())
             if key not in self._entriesByAddr:
                 self._entriesByAddr[key] = []
@@ -1820,11 +1969,93 @@ class ScopeInternal(Scope):
 
     def addCodeLabel(self, addr: Address, name: str) -> LabSymbol:
         """Create and add a code label symbol."""
+        overlap = None
+        try:
+            overlap = self.queryContainer(addr, 1, addr)
+        except Exception:
+            overlap = None
+        if overlap is not None:
+            glb = getattr(self, "glb", None)
+            if glb is not None and hasattr(glb, "printMessage"):
+                glb.printMessage("WARNING: Codelabel " + name + " overlaps object: " + overlap.getSymbol().getName())
         lsym = LabSymbol(self, name)
-        entry = SymbolEntry(lsym, addr, 1)
         self.addSymbol(lsym)
-        self.addMapEntry(lsym, entry)
+        self.addMapPoint(lsym, addr, Address())
         return lsym
+
+    def addDynamicSymbol(self, name: str, ct, addr: Address, hash_: int) -> Symbol:
+        """Create a Symbol tied to a dynamic hash instead of fixed storage.
+
+        C++ ref: ``Scope::addDynamicSymbol`` in database.cc
+        """
+        if ct is not None and hasattr(ct, "hasStripped") and ct.hasStripped():
+            ct = ct.getStripped()
+        owner = self.owner if self.owner is not None else self
+        sym = Symbol(owner, name, ct)
+        self.addSymbol(sym)
+        rnglist = RangeList()
+        if addr is not None and not addr.isInvalid():
+            rnglist.insertRange(addr.getSpace(), addr.getOffset(), addr.getOffset())
+        size = ct.getSize() if ct is not None and hasattr(ct, "getSize") else 0
+        entry = SymbolEntry(sym, Address(), size, 0, Varnode.mapped, hash_)
+        entry.uselimit = rnglist
+        self.addMapEntry(sym, entry)
+        return sym
+
+    def addEquateSymbol(self, name: str, format_: int, val: int, addr: Address, hash_: int) -> EquateSymbol:
+        """Create a dynamic equate Symbol.
+
+        C++ ref: ``Scope::addEquateSymbol`` in database.cc
+        """
+        owner = self.owner if self.owner is not None else self
+        sym = EquateSymbol(owner, name, format_, val)
+        self.addSymbol(sym)
+        rnglist = RangeList()
+        if addr is not None and not addr.isInvalid():
+            rnglist.insertRange(addr.getSpace(), addr.getOffset(), addr.getOffset())
+        entry = SymbolEntry(sym, Address(), 1, 0, Varnode.mapped, hash_)
+        entry.uselimit = rnglist
+        self.addMapEntry(sym, entry)
+        return sym
+
+    def addExternalRef(self, addr: Address, refaddr: Address, name: str) -> ExternRefSymbol:
+        """Create an external-reference Symbol.
+
+        C++ ref: ``Scope::addExternalRef`` in database.cc
+        """
+        owner = self.owner if self.owner is not None else self
+        sym = ExternRefSymbol(owner, refaddr, name)
+        self.addSymbol(sym)
+        entry = self.addMapPoint(sym, addr, Address())
+        entry.symbol.clearFlags(Varnode.readonly)
+        return sym
+
+    def addUnionFacetSymbol(self, name: str, ct, fieldNum: int, addr: Address, hash_: int) -> Symbol:
+        """Create a dynamic Symbol that forces a union-field interpretation.
+
+        C++ ref: ``Scope::addUnionFacetSymbol`` in database.cc
+        """
+        owner = self.owner if self.owner is not None else self
+        sym = UnionFacetSymbol(owner, name, ct, fieldNum)
+        self.addSymbol(sym)
+        rnglist = RangeList()
+        if addr is not None and not addr.isInvalid():
+            rnglist.insertRange(addr.getSpace(), addr.getOffset(), addr.getOffset())
+        entry = SymbolEntry(sym, Address(), 1, 0, Varnode.mapped, hash_)
+        entry.uselimit = rnglist
+        self.addMapEntry(sym, entry)
+        return sym
+
+    def addMapPoint(self, sym: Symbol, addr: Address, usepoint: Address) -> SymbolEntry:
+        """Map an existing Symbol to a fixed address, optionally limited by a usepoint.
+
+        C++ ref: ``Scope::addMapPoint`` in database.cc
+        """
+        size = sym.getBytesConsumed() if hasattr(sym, "getBytesConsumed") else 0
+        entry = SymbolEntry(sym, addr, size)
+        if usepoint is not None and not usepoint.isInvalid():
+            entry.uselimit.insertRange(usepoint.getSpace(), usepoint.getOffset(), usepoint.getOffset())
+        return self.addMapEntry(sym, entry)
 
     def queryCodeLabel(self, addr: Address) -> Optional[LabSymbol]:
         """Find a code label symbol by exact address."""
@@ -2135,12 +2366,13 @@ class Database:
     (global, function-local, etc.).
     """
 
-    def __init__(self, glb=None) -> None:
+    def __init__(self, glb=None, idByNameHash: bool = False) -> None:
         self.glb = glb  # Architecture
         self._globalScope: Optional[ScopeInternal] = None
         self._scopeMap: Dict[int, Scope] = {}
         self._nextScopeId: int = 1
         self._flagbase: Dict = {}  # addr offset -> flags (simplified partmap)
+        self.idByNameHash: bool = idByNameHash
 
     def getGlobalScope(self) -> Optional[ScopeInternal]:
         return self._globalScope
@@ -2161,6 +2393,77 @@ class Database:
         self._scopeMap[scope.uniqueId] = scope
         parent.attachScope(scope)
         return scope
+
+    def findCreateScopeFromSymbolName(
+        self,
+        fullname: str,
+        delim: str,
+        basename: Optional[List[str]] = None,
+        start: Optional[Scope] = None,
+    ) -> Scope:
+        """Find or create nested scopes implied by a qualified symbol name.
+
+        C++ ref: ``Database::findCreateScopeFromSymbolName``
+        """
+        if start is None:
+            start = self._globalScope
+        if start is None:
+            raise LowlevelError("No global scope registered")
+
+        mark = 0
+        while True:
+            endmark = fullname.find(delim, mark)
+            if endmark == -1:
+                break
+            if not self.idByNameHash:
+                raise LowlevelError("Scope name hashes not allowed")
+            scopename = fullname[mark:endmark]
+            nameId = Scope.hashScopeName(start.uniqueId, scopename)
+            start = self.findCreateScope(nameId, scopename, start)
+            mark = endmark + len(delim)
+
+        base = fullname[mark:]
+        if basename is not None:
+            basename[:] = [base]
+        return start
+
+    def resolveScopeFromSymbolName(
+        self,
+        fullname: str,
+        delim: str,
+        basename: Optional[List[str]] = None,
+        start: Optional[Scope] = None,
+    ) -> Optional[Scope]:
+        """Resolve nested scopes implied by a qualified symbol name.
+
+        C++ ref: ``Database::resolveScopeFromSymbolName``
+        """
+        if start is None:
+            start = self._globalScope
+        if start is None:
+            if basename is not None:
+                basename[:] = [fullname]
+            return None
+
+        mark = 0
+        while True:
+            endmark = fullname.find(delim, mark)
+            if endmark == -1:
+                break
+            if endmark == 0:
+                start = self._globalScope
+            else:
+                start = start.resolveScope(fullname[mark:endmark], self.idByNameHash)
+                if start is None:
+                    if basename is not None:
+                        basename[:] = [fullname[mark:]]
+                    return None
+            mark = endmark + len(delim)
+
+        base = fullname[mark:]
+        if basename is not None:
+            basename[:] = [base]
+        return start
 
     def attachScope(self, newscope: Scope, parent: Optional[Scope]) -> None:
         """Register a scope and attach it to its parent.
@@ -2257,8 +2560,10 @@ class Database:
 
         C++ ref: ``Database::encode``
         """
-        from ghidra.core.marshal import ELEM_DB
+        from ghidra.core.marshal import ATTRIB_SCOPEIDBYNAME, ELEM_DB
         encoder.openElement(ELEM_DB)
+        if self.idByNameHash:
+            encoder.writeBool(ATTRIB_SCOPEIDBYNAME, True)
         if self._globalScope is not None:
             self._globalScope.encodeRecursive(encoder)
         encoder.closeElement(ELEM_DB)
@@ -2302,9 +2607,16 @@ class Database:
         """
         from ghidra.core.marshal import (
             ELEM_DB, ELEM_SCOPE, ELEM_PARENT, ELEM_PROPERTY_CHANGEPOINT,
-            ATTRIB_NAME, ATTRIB_ID, ATTRIB_LABEL,
+            ATTRIB_NAME, ATTRIB_ID, ATTRIB_LABEL, ATTRIB_SCOPEIDBYNAME,
         )
         elemId = decoder.openElement(ELEM_DB)
+        self.idByNameHash = False
+        for _ in range(100):
+            attribId = decoder.getNextAttributeId()
+            if attribId == 0:
+                break
+            if attribId == ATTRIB_SCOPEIDBYNAME.id:
+                self.idByNameHash = decoder.readBool()
         # Skip property changepoints
         while True:
             subId = decoder.peekElement()
@@ -2389,12 +2701,17 @@ class Database:
         res = self._scopeMap.get(id_)
         if res is not None:
             return res
-        newscope = ScopeInternal(id_, name, self.glb)
-        self._scopeMap[newscope.uniqueId] = newscope
+        if self._globalScope is not None and hasattr(self._globalScope, "buildSubScope"):
+            newscope = self._globalScope.buildSubScope(id_, name)
+        else:
+            newscope = ScopeInternal(id_, name, self.glb)
         if parent is not None:
-            parent.attachScope(newscope)
+            self.attachScope(newscope, parent)
         elif self._globalScope is None:
             self._globalScope = newscope
+            self._scopeMap[newscope.uniqueId] = newscope
+        else:
+            self._scopeMap[newscope.uniqueId] = newscope
         return newscope
 
     def addRange(self, scope, spc, first: int, last: int) -> None:
@@ -2463,6 +2780,58 @@ class Database:
         key = (id(spc), addr.getOffset())
         return self._flagbase.get(key, 0)
 
+    def getProperties(self):
+        """Return a snapshot of the current property map.
+
+        C++ ref: ``Database::getProperties``
+        """
+        return dict(self._flagbase)
+
+    def setProperties(self, newflags) -> None:
+        """Replace the complete property map.
+
+        C++ ref: ``Database::setProperties``
+        """
+        self._flagbase = dict(newflags)
+
+    def decodeScopePath(self, decoder):
+        """Decode a namespace path and create any missing scopes.
+
+        C++ ref: ``Database::decodeScopePath``
+        """
+        from ghidra.core.error import DecoderError
+        from ghidra.core.marshal import ELEM_PARENT, ELEM_VAL, ATTRIB_ID, ATTRIB_LABEL, ATTRIB_CONTENT
+
+        curscope = self.getGlobalScope()
+        if curscope is None:
+            raise LowlevelError("No global scope registered")
+        elemId = decoder.openElement(ELEM_PARENT)
+        subId = decoder.openElement()
+        decoder.closeElementSkipping(subId)
+        while True:
+            subId = decoder.openElement()
+            if subId != ELEM_VAL.id:
+                break
+            displayName = ""
+            scopeId = 0
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_ID.id:
+                    scopeId = decoder.readUnsignedInteger()
+                elif attribId == ATTRIB_LABEL.id:
+                    displayName = decoder.readString()
+            name = decoder.readString(ATTRIB_CONTENT)
+            if scopeId == 0:
+                raise DecoderError("Missing name and id in scope")
+            curscope = self.findCreateScope(scopeId, name, curscope)
+            if displayName:
+                curscope.setDisplayName(displayName)
+            decoder.closeElement(subId)
+        decoder.closeElement(elemId)
+        return curscope
+
     def setPropertyRange(self, flags: int, rng) -> None:
         """Set boolean properties on an address range.
 
@@ -2471,6 +2840,16 @@ class Database:
         if hasattr(rng, 'getFirstAddr') and hasattr(rng, 'getLastAddr'):
             first = rng.getFirstAddr()
             last = rng.getLastAddr()
+        elif hasattr(rng, 'getFirst') and hasattr(rng, 'getLast') and hasattr(rng, 'getSpace'):
+            spc = rng.getSpace()
+            if spc is None:
+                return
+            start = rng.getFirst()
+            end = rng.getLast()
+            for off in range(start, end + 1):
+                key = (id(spc), off)
+                self._flagbase[key] = self._flagbase.get(key, 0) | flags
+            return
         elif hasattr(rng, 'getSpace'):
             first = rng
             last = rng
@@ -2493,6 +2872,18 @@ class Database:
         if hasattr(rng, 'getFirstAddr') and hasattr(rng, 'getLastAddr'):
             first = rng.getFirstAddr()
             last = rng.getLastAddr()
+        elif hasattr(rng, 'getFirst') and hasattr(rng, 'getLast') and hasattr(rng, 'getSpace'):
+            spc = rng.getSpace()
+            if spc is None:
+                return
+            start = rng.getFirst()
+            end = rng.getLast()
+            mask = ~flags & 0xFFFFFFFF
+            for off in range(start, end + 1):
+                key = (id(spc), off)
+                if key in self._flagbase:
+                    self._flagbase[key] &= mask
+            return
         elif hasattr(rng, 'getSpace'):
             first = rng
             last = rng

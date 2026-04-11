@@ -146,6 +146,44 @@ def read_string_stream_raw(sin: BinaryIO) -> bytes:
     raise JavaError("alignment", "Expecting string terminator")
 
 
+def read_string_stream_decoder(sin: BinaryIO, decoder) -> bool:
+    """Read a string stream directly into a decoder.
+
+    C++ ref: ``ArchitectureGhidra::readStringStream(istream&, Decoder&)``
+    """
+    burst = read_to_any_burst(sin)
+    if burst == BURST_STRING_OPEN:
+        payload = read_string_stream_raw_body(sin)
+        ingest_bytes = getattr(decoder, "ingestBytes", None)
+        if ingest_bytes is not None:
+            ingest_bytes(payload)
+        else:
+            decoder.ingestStream(payload)
+        return True
+    if (burst & 1) == 1:
+        return False
+    raise JavaError("alignment", "Expecting string or end of query response")
+
+
+def read_string_stream_raw_body(sin: BinaryIO) -> bytes:
+    """Read the payload/body of an already-open string stream."""
+    parts: list[bytes] = []
+    c = _read_byte(sin)
+    while c > 0:
+        parts.append(bytes([c]))
+        c = _read_byte(sin)
+    while c == 0:
+        c = _read_byte(sin)
+    if c == 1:
+        code = _read_byte(sin)
+        if code == BURST_STRING_CLOSE:
+            return b"".join(parts)
+        raise JavaError("alignment", "Expecting XML string end")
+    if c < 0:
+        sys.exit(1)
+    raise JavaError("alignment", "Expecting string terminator")
+
+
 def read_bool_stream(sin: BinaryIO) -> bool:
     """Read a boolean ('t' or 'f') from a string stream.
 
@@ -240,6 +278,18 @@ def read_all_response(sin: BinaryIO) -> Optional[bytes]:
         # Odd burst = close, meaning empty response
         return None
     raise JavaError("alignment", "Expecting string or end of query response")
+
+
+def read_all(sin: BinaryIO, decoder) -> bool:
+    """Read a full query response directly into a decoder.
+
+    C++ ref: ``ArchitectureGhidra::readAll``
+    """
+    read_to_response(sin)
+    if read_string_stream_decoder(sin, decoder):
+        read_response_end(sin)
+        return True
+    return False
 
 
 def pass_java_exception(sout: BinaryIO, tp: str, msg: str) -> None:

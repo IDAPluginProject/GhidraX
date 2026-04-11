@@ -10,6 +10,7 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
 from ghidra.core.space import AddrSpace
 
 
@@ -34,7 +35,7 @@ class LoadImageSection:
         self.flags = flags
 
 
-class DataUnavailError(Exception):
+class DataUnavailError(LowlevelError):
     """Exception indicating data was not available."""
     pass
 
@@ -61,9 +62,10 @@ class LoadImage(ABC):
         """Get a string describing the architecture type."""
         ...
 
+    @abstractmethod
     def adjustVma(self, adjust: int) -> None:
         """Adjust load addresses by a given amount."""
-        pass
+        ...
 
     def openSymbols(self) -> None:
         """Prepare to read symbols."""
@@ -123,6 +125,9 @@ class LoadImageBytes(LoadImage):
 
     def getArchType(self) -> str:
         return "raw-bytes"
+
+    def adjustVma(self, adjust: int) -> None:
+        self._base = Address(self._base.getSpace(), self._base.getOffset() + adjust)
 
     def getData(self) -> bytes:
         return self._data

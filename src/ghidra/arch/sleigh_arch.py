@@ -13,10 +13,28 @@ import xml.etree.ElementTree as ET
 from typing import Optional, List, TYPE_CHECKING
 
 from ghidra.core.error import LowlevelError
+from ghidra.core.marshal import AttributeId, ElementId
 from ghidra.arch.architecture import Architecture, ArchitectureCapability
+from ghidra.core.translate import TruncationTag
 
 if TYPE_CHECKING:
     pass
+
+
+ATTRIB_DEPRECATED = AttributeId("deprecated", 136)
+ATTRIB_ENDIAN = AttributeId("endian", 137)
+ATTRIB_PROCESSOR = AttributeId("processor", 138)
+ATTRIB_PROCESSORSPEC = AttributeId("processorspec", 139)
+ATTRIB_SLAFILE = AttributeId("slafile", 140)
+ATTRIB_SPEC = AttributeId("spec", 141)
+ATTRIB_TARGET = AttributeId("target", 142)
+ATTRIB_VARIANT = AttributeId("variant", 143)
+ATTRIB_VERSION = AttributeId("version", 144)
+
+ELEM_COMPILER = ElementId("compiler", 232)
+ELEM_DESCRIPTION = ElementId("description", 233)
+ELEM_LANGUAGE = ElementId("language", 234)
+ELEM_LANGUAGE_DEFINITIONS = ElementId("language_definitions", 235)
 
 
 # =========================================================================
@@ -36,10 +54,20 @@ class CompilerTag:
         self.id: str = ""
 
     def decode(self, el: ET.Element) -> None:
-        """Restore the record from an XML element."""
-        self.name = el.get("name", "")
-        self.spec = el.get("spec", "")
-        self.id = el.get("id", "")
+        """Restore the record from an XML element or Decoder."""
+        from ghidra.core.marshal import ATTRIB_ID, ATTRIB_NAME
+
+        if hasattr(el, "tag"):
+            self.name = el.get("name", "")
+            self.spec = el.get("spec", "")
+            self.id = el.get("id", "")
+            return
+
+        elem_id = el.openElement(ELEM_COMPILER)
+        self.name = el.readString(ATTRIB_NAME)
+        self.spec = el.readString(ATTRIB_SPEC)
+        self.id = el.readString(ATTRIB_ID)
+        el.closeElement(elem_id)
 
     def getName(self) -> str:
         return self.name
@@ -77,33 +105,85 @@ class LanguageDescription:
         self.description: str = ""
         self.deprecated: bool = False
         self.compilers: List[CompilerTag] = []
-        self.truncations: list = []
+        self.truncations: List[TruncationTag] = []
 
     def decode(self, el: ET.Element) -> None:
-        """Parse this description from an XML <language> element."""
-        self.processor = el.get("processor", "")
-        self.isbigendian = (el.get("endian", "") == "big")
-        self.size = int(el.get("size", "0"))
-        self.variant = el.get("variant", "")
-        self.version = el.get("version", "")
-        self.slafile = el.get("slafile", "")
-        self.processorspec = el.get("processorspec", "")
-        self.id = el.get("id", "")
-        self.deprecated = el.get("deprecated", "false").lower() == "true"
+        """Parse this description from an XML <language> element or Decoder."""
+        from ghidra.core.marshal import (
+            ATTRIB_CONTENT,
+            ATTRIB_ID,
+            ATTRIB_SIZE,
+            ATTRIB_SPACE,
+            ELEM_TRUNCATE_SPACE,
+        )
 
-        for child in el:
-            tag = child.tag
-            if tag == "description":
-                self.description = (child.text or "").strip()
-            elif tag == "compiler":
-                ct = CompilerTag()
-                ct.decode(child)
-                self.compilers.append(ct)
-            elif tag == "truncate_space":
-                self.truncations.append({
-                    "space": child.get("space", ""),
-                    "size": int(child.get("size", "0")),
-                })
+        if hasattr(el, "tag"):
+            self.processor = el.get("processor", "")
+            self.isbigendian = (el.get("endian", "") == "big")
+            self.size = int(el.get("size", "0"))
+            self.variant = el.get("variant", "")
+            self.version = el.get("version", "")
+            self.slafile = el.get("slafile", "")
+            self.processorspec = el.get("processorspec", "")
+            self.id = el.get("id", "")
+            self.deprecated = el.get("deprecated", "false").lower() == "true"
+
+            for child in el:
+                tag = child.tag
+                if tag == ELEM_DESCRIPTION.name:
+                    self.description = child.get("content", child.text or "")
+                elif tag == ELEM_COMPILER.name:
+                    ct = CompilerTag()
+                    ct.decode(child)
+                    self.compilers.append(ct)
+                elif tag == ELEM_TRUNCATE_SPACE.name:
+                    trunc = TruncationTag()
+                    trunc.spaceName = child.get("space", "")
+                    trunc.size = int(child.get("size", "0"))
+                    self.truncations.append(trunc)
+            return
+
+        decoder = el
+        elem_id = decoder.openElement(ELEM_LANGUAGE)
+        self.processor = decoder.readString(ATTRIB_PROCESSOR)
+        self.isbigendian = (decoder.readString(ATTRIB_ENDIAN) == "big")
+        self.size = decoder.readSignedInteger(ATTRIB_SIZE)
+        self.variant = decoder.readString(ATTRIB_VARIANT)
+        self.version = decoder.readString(ATTRIB_VERSION)
+        self.slafile = decoder.readString(ATTRIB_SLAFILE)
+        self.processorspec = decoder.readString(ATTRIB_PROCESSORSPEC)
+        self.id = decoder.readString(ATTRIB_ID)
+        self.deprecated = False
+        while True:
+            attrib_id = decoder.getNextAttributeId()
+            if attrib_id == 0:
+                break
+            if attrib_id == ATTRIB_DEPRECATED.id:
+                self.deprecated = decoder.readBool()
+
+        while True:
+            sub_id = decoder.peekElement()
+            if sub_id == 0:
+                break
+            if sub_id == ELEM_DESCRIPTION.id:
+                opened = decoder.openElement()
+                self.description = decoder.readString(ATTRIB_CONTENT)
+                decoder.closeElement(opened)
+            elif sub_id == ELEM_COMPILER.id:
+                compiler = CompilerTag()
+                compiler.decode(decoder)
+                self.compilers.append(compiler)
+            elif sub_id == ELEM_TRUNCATE_SPACE.id:
+                opened = decoder.openElement()
+                trunc = TruncationTag()
+                trunc.spaceName = decoder.readString(ATTRIB_SPACE)
+                trunc.size = decoder.readUnsignedInteger(ATTRIB_SIZE)
+                self.truncations.append(trunc)
+                decoder.closeElement(opened)
+            else:
+                opened = decoder.openElement()
+                decoder.closeElementSkipping(opened)
+        decoder.closeElement(elem_id)
 
     def getProcessor(self) -> str:
         return self.processor
@@ -135,11 +215,14 @@ class LanguageDescription:
     def isDeprecated(self) -> bool:
         return self.deprecated
 
-    def getCompiler(self, nm: str) -> CompilerTag:
+    def getCompiler(self, nm: str | int) -> CompilerTag:
         """Get compiler specification of the given name.
 
         If no exact match, returns 'default' compiler or first compiler.
         """
+        if isinstance(nm, int):
+            return self.compilers[nm]
+
         default_idx = -1
         for i, ct in enumerate(self.compilers):
             if ct.getId() == nm:
@@ -148,20 +231,18 @@ class LanguageDescription:
                 default_idx = i
         if default_idx != -1:
             return self.compilers[default_idx]
-        if self.compilers:
-            return self.compilers[0]
-        raise LowlevelError("No compiler specifications for language " + self.id)
+        return self.compilers[0]
 
     def numCompilers(self) -> int:
         return len(self.compilers)
 
     def getCompilerByIndex(self, i: int) -> CompilerTag:
-        return self.compilers[i]
+        return self.getCompiler(i)
 
     def numTruncations(self) -> int:
         return len(self.truncations)
 
-    def getTruncation(self, i: int) -> dict:
+    def getTruncation(self, i: int) -> TruncationTag:
         return self.truncations[i]
 
     def __repr__(self) -> str:
@@ -267,17 +348,17 @@ class SleighArchitecture(Architecture):
     """
 
     # Class-level state (mirrors C++ static members)
+    _translators: dict[int, object] = {}
     _descriptions: List[LanguageDescription] = []
-    _descriptions_loaded: bool = False
     specpaths: FileManage = FileManage()
 
-    def __init__(self, fname: str = "", targ: str = "",
-                 estream: Optional[io.StringIO] = None) -> None:
+    def __init__(self, fname: str, targ: str, estream) -> None:
         super().__init__()
         self.filename: str = fname
         self.target: str = targ
-        self.errorstream: io.StringIO = estream if estream is not None else io.StringIO()
+        self.errorstream = estream
         self._languageindex: int = -1
+        self._translators = SleighArchitecture._translators
 
     # --- Accessors ---
 
@@ -288,26 +369,54 @@ class SleighArchitecture(Architecture):
         return self.target
 
     def getDescription(self) -> str:
-        if 0 <= self._languageindex < len(SleighArchitecture._descriptions):
-            return SleighArchitecture._descriptions[self._languageindex].getDescription()
-        return self.archid
+        return SleighArchitecture._descriptions[self._languageindex].getDescription()
 
     def printMessage(self, message: str) -> None:
         self.errorstream.write(message + "\n")
 
+    def __del__(self) -> None:
+        self.translate = None
+        super().__del__()
+
     # --- Build overrides ---
 
-    def buildTypegrp(self, store=None) -> None:
-        from ghidra.types.datatype import TypeFactory
-        self.types = TypeFactory()
+    def isTranslateReused(self) -> bool:
+        return self._languageindex in SleighArchitecture._translators
 
-    def buildCoreTypes(self, store=None) -> None:
+    def buildTranslator(self, store):
+        from ghidra.sleigh.sleigh import Sleigh
+
+        translator = SleighArchitecture._translators.get(self._languageindex)
+        if translator is not None:
+            translator.reset(self.loader, self.context)
+            return translator
+
+        translator = Sleigh(self.loader, self.context)
+        SleighArchitecture._translators[self._languageindex] = translator
+        return translator
+
+    def buildPcodeInjectLibrary(self):
+        from ghidra.arch.inject_sleigh import PcodeInjectLibrarySleigh
+
+        return PcodeInjectLibrarySleigh(self)
+
+    def buildTypegrp(self, store) -> None:
+        from ghidra.types.datatype import TypeFactory
+        self.types = TypeFactory(self)
+
+    def buildCoreTypes(self, store) -> None:
+        el = store.getTag("coretypes")
+        if el is not None:
+            from ghidra.core.marshal import XmlDecode
+
+            decoder = XmlDecode(self, el)
+            self.types.decodeCoreTypes(decoder)
+            return
+
         from ghidra.types.datatype import (
             TYPE_VOID, TYPE_BOOL, TYPE_UINT, TYPE_INT, TYPE_FLOAT,
             TYPE_UNKNOWN, TYPE_CODE,
         )
-        if self.types is None:
-            return
         self.types.setCoreType("void", 1, TYPE_VOID, False)
         self.types.setCoreType("bool", 1, TYPE_BOOL, False)
         self.types.setCoreType("uint1", 1, TYPE_UINT, False)
@@ -330,38 +439,92 @@ class SleighArchitecture(Architecture):
         self.types.setCoreType("char", 1, TYPE_INT, True)
         self.types.setCoreType("wchar2", 2, TYPE_INT, True)
         self.types.setCoreType("wchar4", 4, TYPE_INT, True)
-        if hasattr(self.types, 'cacheCoreTypes'):
-            self.types.cacheCoreTypes()
+        self.types.cacheCoreTypes()
 
-    def buildCommentDB(self, store=None) -> None:
+    def buildCommentDB(self, store) -> None:
         from ghidra.database.comment import CommentDatabaseInternal
         self.commentdb = CommentDatabaseInternal()
 
-    def buildStringManager(self, store=None) -> None:
+    def buildStringManager(self, store) -> None:
         from ghidra.database.stringmanage import StringManagerUnicode
         self.stringManager = StringManagerUnicode(self, 2048)
 
-    def buildConstantPool(self, store=None) -> None:
+    def buildConstantPool(self, store) -> None:
         from ghidra.database.cpool import ConstantPoolInternal
         self.cpool = ConstantPoolInternal()
 
-    def buildContext(self, store=None) -> None:
+    def buildContext(self, store) -> None:
         from ghidra.core.globalcontext import ContextInternal
         self.context = ContextInternal()
 
-    def buildSymbols(self, store=None) -> None:
-        # In the C++ version this reads <default_symbols> from store.
-        # For now this is a no-op unless store provides symbol data.
-        pass
+    def buildSymbols(self, store) -> None:
+        from ghidra.core.address import Address, Range
+        from ghidra.core.marshal import (
+            ATTRIB_ADDRESS,
+            ATTRIB_NAME,
+            ATTRIB_SIZE,
+            ATTRIB_VOLATILE,
+            ELEM_DEFAULT_SYMBOLS,
+            ELEM_SYMBOL,
+            XmlDecode,
+        )
+        from ghidra.ir.varnode import Varnode
+        from ghidra.types.datatype import TYPE_UNKNOWN
+
+        symtag = store.getTag(ELEM_DEFAULT_SYMBOLS.getName())
+        if symtag is None:
+            return
+        decoder = XmlDecode(self, symtag)
+        el = decoder.openElement(ELEM_DEFAULT_SYMBOLS)
+        lastAddr = Address()
+        lastSize = -1
+        while decoder.peekElement() != 0:
+            subel = decoder.openElement(ELEM_SYMBOL)
+            addr = Address()
+            name = ""
+            size = 0
+            volatileState = -1
+            while True:
+                attribId = decoder.getNextAttributeId()
+                if attribId == 0:
+                    break
+                if attribId == ATTRIB_NAME:
+                    name = decoder.readString()
+                elif attribId == ATTRIB_ADDRESS:
+                    addrString = decoder.readString()
+                    if addrString == "next" and lastSize != -1:
+                        addr = lastAddr + lastSize
+                    else:
+                        addr = self.parseAddressSimple(addrString)
+                elif attribId == ATTRIB_VOLATILE:
+                    volatileState = 1 if decoder.readBool() else 0
+                elif attribId == ATTRIB_SIZE:
+                    size = decoder.readSignedInteger()
+            decoder.closeElement(subel)
+            if len(name) == 0:
+                raise LowlevelError("Missing name attribute in <symbol> element")
+            if addr.isInvalid():
+                raise LowlevelError("Missing address attribute in <symbol> element")
+            if size == 0:
+                size = addr.getSpace().getWordSize()
+            if volatileState >= 0:
+                range_ = Range(addr.getSpace(), addr.getOffset(), addr.getOffset() + (size - 1))
+                if volatileState == 0:
+                    self.symboltab.clearPropertyRange(Varnode.volatil, range_)
+                else:
+                    self.symboltab.setPropertyRange(Varnode.volatil, range_)
+            ct = self.types.getBase(size, TYPE_UNKNOWN)
+            usepoint = Address()
+            self.symboltab.getGlobalScope().addSymbol(name, ct, addr, usepoint)
+            lastAddr = addr
+            lastSize = size
+        decoder.closeElement(el)
 
     def resolveArchitecture(self) -> None:
         """Find the best matching language description for the target."""
         if not self.archid:
             if not self.target or self.target == "default":
-                if self.loader is not None and hasattr(self.loader, 'getArchType'):
-                    self.archid = self.loader.getArchType()
-                else:
-                    self.archid = self.target
+                self.archid = self.loader.getArchType()
             else:
                 self.archid = self.target
 
@@ -384,57 +547,90 @@ class SleighArchitecture(Architecture):
         if self._languageindex == -1:
             raise LowlevelError("No sleigh specification for " + baseid)
 
-    def buildSpecFile(self, store=None) -> None:
+    def buildSpecFile(self, store) -> None:
         """Given a specific language, make sure relevant spec files are loaded."""
-        if self._languageindex < 0 or self._languageindex >= len(SleighArchitecture._descriptions):
-            return
+        from ghidra.arch.pcodecompile import SleighError
+
         language = SleighArchitecture._descriptions[self._languageindex]
+        language_reuse = self.isTranslateReused()
         compiler = self.archid[self.archid.rfind(':') + 1:]
         compilertag = language.getCompiler(compiler)
 
-        processorfile = SleighArchitecture.specpaths.findFile(language.getProcessorSpec())
-        compilerfile = SleighArchitecture.specpaths.findFile(compilertag.getSpec())
+        processorfile = SleighArchitecture.specpaths.findFile(language.getProcessorSpec()) or ""
+        compilerfile = SleighArchitecture.specpaths.findFile(compilertag.getSpec()) or ""
+        slafile = ""
+        if not language_reuse:
+            slafile = SleighArchitecture.specpaths.findFile(language.getSlaFile()) or ""
+            if len(slafile) == 0:
+                raise SleighError("Could not find .sla file for " + self.archid)
 
-        if store is not None:
-            if processorfile and hasattr(store, 'registerTag'):
-                try:
-                    tree = ET.parse(processorfile)
-                    store.registerTag(tree.getroot())
-                except Exception as e:
-                    raise LowlevelError(
-                        f"Error parsing processor specification: {processorfile}\n {e}") from e
-            if compilerfile and hasattr(store, 'registerTag'):
-                try:
-                    tree = ET.parse(compilerfile)
-                    store.registerTag(tree.getroot())
-                except Exception as e:
-                    raise LowlevelError(
-                        f"Error parsing compiler specification: {compilerfile}\n {e}") from e
+        from ghidra.core.error import DecoderError
 
-    def modifySpaces(self, trans=None) -> None:
+        try:
+            doc = store.openDocument(processorfile)
+            store.registerTag(doc.getRoot())
+        except DecoderError as err:
+            raise SleighError(
+                "XML error parsing processor specification: "
+                + processorfile
+                + "\n "
+                + err.explain
+            ) from err
+        except LowlevelError as err:
+            raise SleighError(
+                "Error reading processor specification: "
+                + processorfile
+                + "\n "
+                + err.explain
+            ) from err
+
+        try:
+            doc = store.openDocument(compilerfile)
+            store.registerTag(doc.getRoot())
+        except DecoderError as err:
+            raise SleighError(
+                "XML error parsing compiler specification: "
+                + compilerfile
+                + "\n "
+                + err.explain
+            ) from err
+        except LowlevelError as err:
+            raise SleighError(
+                "Error reading compiler specification: "
+                + compilerfile
+                + "\n "
+                + err.explain
+            ) from err
+
+        if not language_reuse:
+            try:
+                doc = store.parseDocument("<sleigh>" + slafile + "</sleigh>")
+                store.registerTag(doc.getRoot())
+            except LowlevelError as err:
+                raise SleighError(
+                    "Error reading SLEIGH file: "
+                    + slafile
+                    + "\n "
+                    + err.explain
+                ) from err
+
+    def modifySpaces(self, trans) -> None:
         """Apply address space truncations required by this processor."""
-        if self._languageindex < 0 or self._languageindex >= len(SleighArchitecture._descriptions):
-            return
         language = SleighArchitecture._descriptions[self._languageindex]
         for i in range(language.numTruncations()):
-            trunc = language.getTruncation(i)
-            if trans is not None and hasattr(trans, 'truncateSpace'):
-                trans.truncateSpace(trunc)
+            trans.truncateSpace(language.getTruncation(i))
 
     def encodeHeader(self, encoder) -> None:
         """Encode basic attributes of the active executable."""
-        if hasattr(encoder, 'writeString'):
-            encoder.writeString("name", self.filename)
-            encoder.writeString("target", self.target)
+        from ghidra.core.marshal import ATTRIB_NAME
+
+        encoder.writeString(ATTRIB_NAME, self.filename)
+        encoder.writeString(ATTRIB_TARGET, self.target)
 
     def restoreXmlHeader(self, el) -> None:
         """Restore from basic attributes of an executable."""
-        if hasattr(el, 'get'):
-            self.filename = el.get("name", "")
-            self.target = el.get("target", "")
-        elif hasattr(el, 'getAttributeValue'):
-            self.filename = el.getAttributeValue("name")
-            self.target = el.getAttributeValue("target")
+        self.filename = el.getAttributeValue("name")
+        self.target = el.getAttributeValue("target")
 
     # --- Static normalization helpers ---
 
@@ -525,10 +721,15 @@ class SleighArchitecture(Architecture):
         Any <language> tags are added to the LanguageDescription array.
         """
         try:
-            tree = ET.parse(specfile)
-        except (ET.ParseError, OSError):
+            stream = open(specfile, "rb")
+        except OSError:
+            return
+        try:
+            with stream:
+                tree = ET.parse(stream)
+        except ET.ParseError:
             if errs is not None:
-                errs.write(f"WARNING: Unable to parse sleigh specfile: {specfile}\n")
+                errs.write(f"WARNING: Unable to parse sleigh specfile: {specfile}")
             return
 
         root = tree.getroot()
@@ -541,10 +742,9 @@ class SleighArchitecture(Architecture):
     @staticmethod
     def collectSpecFiles(errs: Optional[io.StringIO] = None) -> None:
         """Parse all .ldefs files in the spec paths."""
-        if SleighArchitecture._descriptions_loaded:
+        if SleighArchitecture._descriptions:
             return
-        SleighArchitecture._descriptions_loaded = True
-        ldefs_files = SleighArchitecture.specpaths.matchList(".ldefs", recursive=False)
+        ldefs_files = SleighArchitecture.specpaths.matchList(".ldefs", recursive=True)
         for f in ldefs_files:
             SleighArchitecture.loadLanguageDescription(f, errs)
 
@@ -561,8 +761,7 @@ class SleighArchitecture(Architecture):
     @staticmethod
     def shutdown() -> None:
         """Free global resources."""
-        SleighArchitecture._descriptions.clear()
-        SleighArchitecture._descriptions_loaded = False
+        pass
 
     def __repr__(self) -> str:
         return f"SleighArchitecture(file={self.filename!r}, target={self.target!r})"

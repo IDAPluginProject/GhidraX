@@ -311,6 +311,9 @@ class _TranslateShim:
         except Exception:
             return ""
 
+    def getUserOpNames(self) -> list[str]:
+        return []
+
     def oneInstruction(self, emit, addr: Address) -> int:
         """Decode one instruction and stream its p-code to *emit*."""
         if self._native is None:
@@ -345,6 +348,8 @@ class ArchitectureStandalone:
 
     def __init__(self, spc_mgr, target: str | None = None, sla_path: str | None = None) -> None:
         self._spc_mgr = spc_mgr
+        self.target = target or ""
+        self.sla_path = sla_path or ""
         self.context = None  # No tracked context by default
         self.types = _build_shim_type_factory(spc_mgr)
         self.types.glb = self
@@ -464,6 +469,13 @@ class ArchitectureStandalone:
 
     def getJoinSpace(self):
         return getattr(self._spc_mgr, '_joinSpace', None)
+
+    def collectBehaviors(self, behave) -> None:
+        behave[:] = [None] * len(self.inst)
+        for i, op in enumerate(self.inst):
+            if op is None:
+                continue
+            behave[i] = op.getBehavior()
 
     def getIopSpace(self):
         return getattr(self._spc_mgr, '_iopSpace', None)
