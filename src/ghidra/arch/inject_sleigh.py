@@ -15,6 +15,7 @@ from typing import Optional, List, Dict, TYPE_CHECKING
 from ghidra.core.error import LowlevelError
 from ghidra.core.address import Address
 from ghidra.core.pcoderaw import VarnodeData
+from ghidra.core.translate import UniqueLayout
 from ghidra.arch.inject import (
     InjectParameter, InjectPayload, InjectPayloadSleigh, InjectContext, PcodeInjectLibrary,
 )
@@ -434,7 +435,14 @@ class PcodeInjectLibrarySleigh(PcodeInjectLibrary):
 
     def __init__(self, glb: Optional[Architecture] = None) -> None:
         tmpbase = 0
-        if glb is not None and hasattr(glb, "getUniqueBase"):
+        if (
+            glb is not None
+            and hasattr(glb, "translate")
+            and glb.translate is not None
+            and hasattr(glb.translate, "getUniqueStart")
+        ):
+            tmpbase = glb.translate.getUniqueStart(UniqueLayout.INJECT)
+        elif glb is not None and hasattr(glb, "getUniqueBase"):
             tmpbase = glb.getUniqueBase()
         super().__init__(glb, tmpbase)
         self._glb = self.glb
@@ -444,9 +452,6 @@ class PcodeInjectLibrarySleigh(PcodeInjectLibrary):
         self._contextCache = InjectContextSleigh()
         if self._glb is not None:
             self._contextCache.glb = self._glb
-            if self._tempbase == 0 and hasattr(self._glb, "translate") and self._glb.translate is not None and hasattr(self._glb.translate, "getUniqueStart"):
-                self._tempbase = self._glb.translate.getUniqueStart()
-                self.tempbase = self._tempbase
             if hasattr(self._glb, 'translate') and self._glb.translate is not None:
                 self._slgh = self._glb.translate
 

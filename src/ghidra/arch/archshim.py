@@ -16,6 +16,7 @@ import xml.etree.ElementTree as ET
 from typing import Callable, List, Optional
 
 from ghidra.core.address import Address, RangeList
+from ghidra.core.translate import UniqueLayout
 from ghidra.arch.userop import UserOpManage
 from ghidra.ir.typeop import registerTypeOps
 from ghidra.output.printlanguage import PrintLanguageCapability
@@ -298,9 +299,10 @@ def _build_default_proto_model(spc_mgr, glb, target: str | None = None) -> 'Prot
 class _TranslateShim:
     """Minimal Translate-like shim backed by the native SLEIGH binding."""
 
-    def __init__(self, spc_mgr) -> None:
+    def __init__(self, spc_mgr, unique_base: int = 0x10000000) -> None:
         self._spc_mgr = spc_mgr
         self._native = getattr(spc_mgr, '_native', None)
+        self._unique_base = unique_base
 
     def getRegisterName(self, base, off: int, size: int) -> str:
         if self._native is None:
@@ -313,6 +315,18 @@ class _TranslateShim:
 
     def getUserOpNames(self) -> list[str]:
         return []
+
+    def getUniqueBase(self) -> int:
+        return self._unique_base
+
+    def setUniqueBase(self, val: int) -> None:
+        if val > self._unique_base:
+            self._unique_base = val
+
+    def getUniqueStart(self, layout: int) -> int:
+        if layout != UniqueLayout.ANALYSIS:
+            return int(layout) + self._unique_base
+        return int(layout)
 
     def oneInstruction(self, emit, addr: Address) -> int:
         """Decode one instruction and stream its p-code to *emit*."""
@@ -375,7 +389,7 @@ class ArchitectureStandalone:
         self.allacts = ActionDatabase()
         self.userops = UserOpManage()
         self.print_ = PrintLanguageCapability.getDefault().buildLanguage(self)
-        self.translate = _TranslateShim(spc_mgr)
+        self.translate = _TranslateShim(spc_mgr, self._unique_base)
         self._restart_rebuilder: Optional[Callable] = None
         self.inst = registerTypeOps(self.types, self.translate)
         self._load_laned_registers(sla_path)
@@ -454,6 +468,8 @@ class ArchitectureStandalone:
     def setUniqueBase(self, val: int) -> None:
         if val > self._unique_base:
             self._unique_base = val
+            if hasattr(self.translate, "setUniqueBase"):
+                self.translate.setUniqueBase(val)
 
     def getSpaceByName(self, name: str):
         return self._spc_mgr.getSpaceByName(name)

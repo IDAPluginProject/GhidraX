@@ -13,6 +13,7 @@ from ghidra.core.address import Address, calc_mask
 from ghidra.core.error import LowlevelError
 from ghidra.core.space import AddrSpace, IPTR_CONSTANT, IPTR_JOIN, IPTR_FSPEC, IPTR_IOP, IPTR_INTERNAL, IPTR_PROCESSOR, IPTR_SPACEBASE
 from ghidra.core.pcoderaw import VarnodeData
+from ghidra.core.translate import UniqueLayout
 from ghidra.core.opcodes import OpCode as _OpCode
 _VN_WRITTEN  = 0x10   # Varnode.written flag bit
 _CPUI_COPY   = 1      # OpCode.CPUI_COPY integer value
@@ -1389,7 +1390,7 @@ class VarnodeBank:
             if self._uniq_space is not None and hasattr(self._uniq_space, 'getTrans'):
                 trans = self._uniq_space.getTrans()
                 if hasattr(trans, 'getUniqueStart'):
-                    self._uniqbase = trans.getUniqueStart(0)  # ANALYSIS=0
+                    self._uniqbase = trans.getUniqueStart(UniqueLayout.ANALYSIS)
             self._uniq_id = self._uniqbase
 
     @staticmethod
@@ -1537,7 +1538,7 @@ class VarnodeBank:
             elif space is not None and hasattr(space, 'getTrans'):
                 trans = space.getTrans()
                 if hasattr(trans, 'getUniqueStart'):
-                    self._uniq_id = trans.getUniqueStart(0)
+                    self._uniq_id = trans.getUniqueStart(UniqueLayout.ANALYSIS)
         addr = Addr(space, self._uniq_id)
         self._uniq_id += s
         return self.create(s, addr, dt)
@@ -1555,7 +1556,7 @@ class VarnodeBank:
             elif space is not None and hasattr(space, 'getTrans'):
                 trans = space.getTrans()
                 if hasattr(trans, 'getUniqueStart'):
-                    self._uniq_id = trans.getUniqueStart(0)
+                    self._uniq_id = trans.getUniqueStart(UniqueLayout.ANALYSIS)
         addr = Addr(space, self._uniq_id)
         self._uniq_id += s
         return self.createDef(s, addr, dt, op)

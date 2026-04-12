@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Optional, Set
 from ghidra.core.error import LowlevelError
 from ghidra.core.space import (
     AddrSpace, AddrSpaceManager, SpaceType,
-    IPTR_CONSTANT, IPTR_JOIN,
+    IPTR_CONSTANT, IPTR_JOIN, _SPACE_ORDER_MAX,
 )
 from ghidra.core.marshal import (
     Encoder, Decoder, AttributeId, ElementId,
@@ -255,6 +255,9 @@ class Address:
             else:
                 self.base = _ADDR_MAX_SENTINEL  # type: ignore[assignment]
                 self.offset = 0xFFFFFFFFFFFFFFFF
+        elif base is _SPACE_ORDER_MAX:
+            self.base = _ADDR_MAX_SENTINEL  # type: ignore[assignment]
+            self.offset = 0xFFFFFFFFFFFFFFFF
         else:
             self.base = base
             self.offset = offset

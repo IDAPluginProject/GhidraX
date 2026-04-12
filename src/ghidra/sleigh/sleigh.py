@@ -144,6 +144,17 @@ class Sleigh(SleighBase):
         """
         pass
 
+    def registerContext(self, name: str, sbit: int, ebit: int) -> None:
+        if self._context_db is not None:
+            self._context_db.registerVariable(name, sbit, ebit)
+
+    def setContextDefault(self, name: str, val: int) -> None:
+        if self._context_db is not None:
+            self._context_db.setVariableDefault(name, val)
+
+    def instructionLength(self, baseaddr: Address) -> int:
+        return self._discache.getLength(baseaddr.getOffset())
+
     def oneInstruction(self, emit: PcodeEmit, addr: Address) -> int:
         """Translate a single machine instruction into p-code.
 
@@ -173,7 +184,8 @@ class Sleigh(SleighBase):
 
     def allowContextSet(self, val: bool) -> None:
         """Toggle whether context changes are allowed during translation."""
-        pass
+        if hasattr(self._cache, "allowSet"):
+            self._cache.allowSet(val)
 
     def __repr__(self) -> str:
         init = "initialized" if self.isInitialized() else "uninitialized"

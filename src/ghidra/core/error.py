@@ -50,7 +50,7 @@ class UnimplError(LowlevelError):
     doesn't know how to represent it in pcode.
     """
 
-    def __init__(self, s: str = "", instruction_length: int = 0) -> None:
+    def __init__(self, s: str, instruction_length: int) -> None:
         super().__init__(s)
         self.instruction_length: int = instruction_length
 
@@ -60,7 +60,8 @@ class BadDataError(LowlevelError):
 
     The system cannot decode data for a particular instruction.
     """
-    pass
+    def __init__(self, s: str) -> None:
+        super().__init__(s)
 
 
 class IfaceError(LowlevelError):

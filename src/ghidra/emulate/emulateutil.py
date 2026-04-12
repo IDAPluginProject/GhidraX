@@ -269,7 +269,7 @@ class PcodeEmitCache(PcodeEmit):
         self.inst: List[Optional[OpBehavior]] = inst
         self.uniq: int = uniqReserve
 
-    def _createVarnode(self, var: VarnodeData) -> VarnodeData:
+    def createVarnode(self, var: VarnodeData) -> VarnodeData:
         res = VarnodeData()
         res.space = var.space
         res.offset = var.offset
@@ -277,20 +277,22 @@ class PcodeEmitCache(PcodeEmit):
         self.varcache.append(res)
         return res
 
+    def _createVarnode(self, var: VarnodeData) -> VarnodeData:
+        return self.createVarnode(var)
+
     def dump(self, addr: Address, opc: OpCode,
              outvar: Optional[VarnodeData],
              vars_: List[VarnodeData], isize: int) -> None:
         op = PcodeOpRaw()
         op.setSeqNum(addr, self.uniq)
         self.opcache.append(op)
-        behave = self.inst[int(opc)] if int(opc) < len(self.inst) else None
-        op.setBehavior(behave)
+        op.setBehavior(self.inst[int(opc)])
         self.uniq += 1
         if outvar is not None:
-            outvn = self._createVarnode(outvar)
+            outvn = self.createVarnode(outvar)
             op.setOutput(outvn)
         for i in range(isize):
-            invn = self._createVarnode(vars_[i])
+            invn = self.createVarnode(vars_[i])
             op.addInput(invn)
 
 

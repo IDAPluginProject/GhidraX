@@ -59,27 +59,74 @@ class SleighBase(Translate):
     def isInitialized(self) -> bool:
         return self._root is not None
 
+    def _sortedRegisterXrefs(self) -> List[tuple[VarnodeData, str]]:
+        result: List[tuple[VarnodeData, str]] = []
+        for (space_index, offset, size), name in self._varnode_xref.items():
+            space = self.getSpaceByIndex(space_index)
+            if space is None:
+                continue
+            result.append((VarnodeData(space, offset, size), name))
+        result.sort(key=lambda item: item[0])
+        return result
+
     def getRegisterName(self, base: AddrSpace, off: int, size: int) -> str:
-        key = (base.getIndex(), off, size)
-        return self._varnode_xref.get(key, "")
+        sym = VarnodeData(base, off, size)
+        reglist = self._sortedRegisterXrefs()
+        if not reglist:
+            return ""
+
+        lo = 0
+        hi = len(reglist)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if sym < reglist[mid][0]:
+                hi = mid
+            else:
+                lo = mid + 1
+
+        if lo == 0:
+            return ""
+
+        index = lo - 1
+        point, name = reglist[index]
+        if point.space is not base:
+            return ""
+
+        offbase = point.offset
+        if point.offset + point.size >= off + size:
+            return name
+
+        while index != 0:
+            index -= 1
+            point, name = reglist[index]
+            if point.space is not base or point.offset != offbase:
+                return ""
+            if point.offset + point.size >= off + size:
+                return name
+        return ""
 
     def getRegister(self, nm: str) -> VarnodeData:
-        sym = self._symtab.findSymbol(nm)
-        if sym is not None and hasattr(sym, 'getFixedVarnode'):
-            return sym.getFixedVarnode()
-        from ghidra.core.error import LowlevelError
-        raise LowlevelError(f"No register named: {nm}")
+        from ghidra.core.globalcontext import SleighError
 
-    def getAllRegisters(self) -> Dict[str, VarnodeData]:
-        result = {}
-        for key, name in self._varnode_xref.items():
-            vd = VarnodeData()
-            spc = self.getSpaceByIndex(key[0])
-            if spc is not None:
-                vd.space = spc
-                vd.offset = key[1]
-                vd.size = key[2]
-                result[name] = vd
+        sym = self._symtab.findSymbol(nm)
+        if sym is None:
+            raise SleighError("Unknown register name: " + nm)
+        if sym.getType() != SleighSymbol.varnode_symbol:
+            raise SleighError("Symbol is not a register: " + nm)
+        return sym.getFixedVarnode()
+
+    def getExactRegisterName(self, base: AddrSpace, off: int, size: int) -> str:
+        if base is None:
+            return ""
+        return self._varnode_xref.get((base.getIndex(), off, size), "")
+
+    def getAllRegisters(self) -> Dict[VarnodeData, str]:
+        result: Dict[VarnodeData, str] = {}
+        for (space_index, offset, size), name in self._varnode_xref.items():
+            space = self.getSpaceByIndex(space_index)
+            if space is None:
+                continue
+            result[VarnodeData(space, offset, size)] = name
         return result
 
     def getUserOpNames(self) -> List[str]:

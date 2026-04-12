@@ -50,7 +50,7 @@ from ghidra.core.space import (
 from ghidra.core.translate import TruncationTag
 from ghidra.database.comment import Comment, CommentDatabaseInternal
 from ghidra.database.stringmanage import StringData, StringManager
-from ghidra.database.cpool import ConstantPoolInternal, CPoolRecord
+from ghidra.database.cpool import ConstantPool, ConstantPoolInternal, CPoolRecord
 from ghidra.database.database import (
     Scope, ScopeInternal, SymbolEntry, Symbol,
     ExternRefSymbol, LabSymbol, FunctionSymbol,
@@ -608,8 +608,28 @@ class ScopeGhidra(ScopeInternal):
     def removeRange(self, spc, first: int, last: int) -> None:
         raise LowlevelError("remove_range should not be performed on ghidra scope")
 
+    def _addSymbolDirect(self, sym: Symbol) -> None:
+        self._assignSymbolId(sym)
+        if not sym.name:
+            sym.name = self.buildUndefinedName()
+            sym.displayName = sym.name
+        sym.scope = self
+        self._symbolsById[sym.symbolId] = sym
+        if sym.name not in self._symbolsByName:
+            self._symbolsByName[sym.name] = []
+        self._symbolsByName[sym.name].append(sym)
+        if sym.category >= 0:
+            if sym.category not in self._categoryMap:
+                self._categoryMap[sym.category] = []
+            lst = self._categoryMap[sym.category]
+            if sym.category > 0:
+                sym.catindex = len(lst)
+            while len(lst) <= sym.catindex:
+                lst.append(None)
+            lst[sym.catindex] = sym
+
     def addSymbolInternal(self, sym: Symbol) -> None:
-        raise LowlevelError("add_symbol_internal unimplemented")
+        self._addSymbolDirect(sym)
 
     def addMapInternal(self, sym: Symbol, exfl: int, addr: Address, off: int, sz: int, uselim) -> SymbolEntry:
         raise LowlevelError("addMap unimplemented")
@@ -797,24 +817,24 @@ class GhidraStringManager(StringManager):
     def __del__(self) -> None:
         self.testBuffer = None
 
-    def getStringData(self, addr: Address, charType: Datatype) -> tuple[bytes, bool]:
+    def getStringData(self, addr: Address, charType: Datatype, isTrunc=None):
         cached = self._stringMap.get(addr)
         if cached is not None:
-            return cached.byteData, cached.isTruncated
+            return self._format_get_string_data_result(cached.byteData, cached.isTruncated, isTrunc)
 
         string_data = StringData()
         resp = self.glb.getStringData(addr, charType, self.maximumChars)
         if resp is not None:
             string_data.byteData, string_data.isTruncated = resp
         self._stringMap[addr] = string_data
-        return string_data.byteData, string_data.isTruncated
+        return self._format_get_string_data_result(string_data.byteData, string_data.isTruncated, isTrunc)
 
 
 # =========================================================================
 # ConstantPoolGhidra
 # =========================================================================
 
-class ConstantPoolGhidra(ConstantPoolInternal):
+class ConstantPoolGhidra(ConstantPool):
     """ConstantPool backed by a Ghidra client.
 
     C++ ref: ``cpool_ghidra.hh``
@@ -823,12 +843,14 @@ class ConstantPoolGhidra(ConstantPoolInternal):
     def __init__(self, glb: ArchitectureGhidra) -> None:
         super().__init__()
         self._ghidra: ArchitectureGhidra = glb
+        self.cache: ConstantPoolInternal = ConstantPoolInternal()
+        self._pool = self.cache._pool
 
     def createRecord(self, refs: List[int]) -> CPoolRecord:
         raise LowlevelError("Cannot access constant pool with this method")
 
     def getRecord(self, refs: List[int]) -> Optional[CPoolRecord]:
-        cached = super().getRecord(refs)
+        cached = self.cache.getRecord(refs)
         if cached is not None:
             return cached
         decoder = PackedDecode(self._ghidra)
@@ -841,7 +863,9 @@ class ConstantPoolGhidra(ConstantPoolInternal):
         if not success:
             raise LowlevelError(f"Could not retrieve constant pool record for reference: 0x{refs[0]:x}")
         try:
-            return self.decodeRecord(refs, decoder, self._ghidra.types)
+            rec = self.decodeRecord(refs, decoder, self._ghidra.types)
+            self._pool = self.cache._pool
+            return rec
         except DecoderError as err:
             raise LowlevelError("Error in constant pool record encoding: " + err.explain) from err
 
@@ -849,7 +873,15 @@ class ConstantPoolGhidra(ConstantPoolInternal):
         return False
 
     def clear(self) -> None:
-        super().clear()
+        self.cache.clear()
+        self._pool = self.cache._pool
+
+    def decodeRecord(self, refs: List[int], decoder, typegrp) -> Optional[CPoolRecord]:
+        return self.cache.decodeRecord(refs, decoder, typegrp)
+
+    def storeRecord(self, refs: List[int], rec: CPoolRecord) -> None:
+        self.cache.storeRecord(refs, rec)
+        self._pool = self.cache._pool
 
     def encode(self, encoder) -> None:
         raise LowlevelError("Cannot access constant pool with this method")

@@ -9,6 +9,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Optional, List, Dict, Tuple
 
+from ghidra.core.error import LowlevelError
 from ghidra.types.datatype import Datatype
 
 
@@ -36,6 +37,11 @@ class CPoolRecord:
         self.value: int = 0
         self.type: Optional[Datatype] = None
         self.byteData: Optional[bytes] = None
+        self.byteDataLen: int = 0
+
+    def __del__(self) -> None:
+        self.byteData = None
+        self.byteDataLen = 0
 
     def getTag(self) -> int:
         return self.tag
@@ -47,7 +53,7 @@ class CPoolRecord:
         return self.byteData
 
     def getByteDataLength(self) -> int:
-        return len(self.byteData) if self.byteData else 0
+        return self.byteDataLen
 
     def getType(self) -> Optional[Datatype]:
         return self.type
@@ -95,19 +101,26 @@ class CPoolRecord:
             encoder.closeElement(ELEM_VALUE)
         if self.byteData is not None:
             encoder.openElement(ELEM_DATA)
-            encoder.writeSignedInteger(ATTRIB_LENGTH, len(self.byteData))
-            hex_str = ' '.join(f'{b:02x}' for b in self.byteData)
+            encoder.writeSignedInteger(ATTRIB_LENGTH, self.byteDataLen)
+            wrap = 0
+            pieces: list[str] = []
+            for i in range(self.byteDataLen):
+                pieces.append(f"{self.byteData[i]:02x} ")
+                wrap += 1
+                if wrap > 15:
+                    pieces.append("\n")
+                    wrap = 0
+            hex_str = "".join(pieces)
             encoder.writeString(ATTRIB_CONTENT, hex_str)
             encoder.closeElement(ELEM_DATA)
         else:
             encoder.openElement(ELEM_TOKEN)
             encoder.writeString(ATTRIB_CONTENT, self.token)
             encoder.closeElement(ELEM_TOKEN)
-        if self.type is not None and hasattr(self.type, 'encodeRef'):
-            self.type.encodeRef(encoder)
+        self.type.encodeRef(encoder)
         encoder.closeElement(ELEM_CPOOLREC)
 
-    def decode(self, decoder, typegrp=None) -> None:
+    def decode(self, decoder, typegrp) -> None:
         """Decode a CPoolRecord from a <cpoolrec> element.
 
         C++ ref: ``CPoolRecord::decode``
@@ -120,6 +133,10 @@ class CPoolRecord:
         self.tag = CPoolRecord.primitive
         self.value = 0
         self.flags = 0
+        self.token = ""
+        self.type = None
+        self.byteData = None
+        self.byteDataLen = 0
         elemId = decoder.openElement(ELEM_CPOOLREC)
         while True:
             attribId = decoder.getNextAttributeId()
@@ -153,34 +170,33 @@ class CPoolRecord:
         if subId == ELEM_TOKEN.id:
             self.token = decoder.readString(ATTRIB_CONTENT)
         else:
-            # <data> element with byte content
-            try:
-                length = decoder.readSignedInteger(ATTRIB_LENGTH)
-                content_str = decoder.readString(ATTRIB_CONTENT)
-                parts = content_str.split()
-                self.byteData = bytes(int(p, 16) for p in parts[:length])
-            except Exception:
-                self.byteData = b""
+            self.byteDataLen = decoder.readSignedInteger(ATTRIB_LENGTH)
+            content_str = decoder.readString(ATTRIB_CONTENT)
+            parts = content_str.split()
+            data = bytearray()
+            for i in range(self.byteDataLen):
+                data.append(int(parts[i], 16))
+            self.byteData = bytes(data)
         decoder.closeElement(subId)
-        # Decode type reference if present
-        if typegrp is not None:
-            try:
-                if self.flags != 0:
-                    is_con = (self.flags & CPoolRecord.is_constructor) != 0
-                    is_des = (self.flags & CPoolRecord.is_destructor) != 0
-                    if hasattr(typegrp, 'decodeTypeWithCodeFlags'):
-                        self.type = typegrp.decodeTypeWithCodeFlags(decoder, is_con, is_des)
-                    else:
-                        self.type = typegrp.decodeType(decoder)
-                else:
-                    self.type = typegrp.decodeType(decoder)
-            except Exception:
-                pass
+        if self.tag == CPoolRecord.string_literal and self.byteData is None:
+            raise LowlevelError("Bad constant pool record: missing <data>")
+        if self.flags != 0:
+            is_con = (self.flags & CPoolRecord.is_constructor) != 0
+            is_des = (self.flags & CPoolRecord.is_destructor) != 0
+            self.type = typegrp.decodeTypeWithCodeFlags(decoder, is_con, is_des)
+        else:
+            self.type = typegrp.decodeType(decoder)
         decoder.closeElement(elemId)
 
 
 class ConstantPool(ABC):
     """An interface to the pool of constant objects for byte-code languages."""
+
+    @abstractmethod
+    def createRecord(self, refs: List[int]) -> Optional[CPoolRecord]: ...
+
+    def __del__(self) -> None:
+        return None
 
     @abstractmethod
     def getRecord(self, refs: List[int]) -> Optional[CPoolRecord]: ...
@@ -191,41 +207,80 @@ class ConstantPool(ABC):
     @abstractmethod
     def clear(self) -> None: ...
 
+    @abstractmethod
+    def encode(self, encoder) -> None: ...
+
+    @abstractmethod
+    def decode(self, decoder, typegrp) -> None: ...
+
     def putRecord(self, refs: List[int], tag: int, tok: str, ct: Optional[Datatype]) -> None:
-        rec = self._createRecord(refs)
-        if rec is not None:
-            rec.tag = tag
-            rec.token = tok
-            rec.type = ct
+        rec = self.createRecord(refs)
+        rec.tag = tag
+        rec.token = tok
+        rec.type = ct
 
     def decodeRecord(self, refs: List[int], decoder, typegrp) -> Optional[CPoolRecord]:
         """Decode a CPoolRecord from the stream and store it.
 
         C++ ref: ``ConstantPool::decodeRecord``
         """
-        rec = self._createRecord(refs)
-        if rec is not None:
-            rec.decode(decoder, typegrp)
+        rec = self.createRecord(refs)
+        rec.decode(decoder, typegrp)
         return rec
 
     def storeRecord(self, refs: List[int], rec: CPoolRecord) -> None:
         """Store a pre-decoded CPoolRecord directly into the pool."""
         # Base implementation is a no-op; subclasses override
 
-    @abstractmethod
-    def _createRecord(self, refs: List[int]) -> Optional[CPoolRecord]: ...
-
 
 class ConstantPoolInternal(ConstantPool):
     """In-memory ConstantPool implementation."""
 
+    class CheapSorter:
+        def __init__(self, refs=None) -> None:
+            if isinstance(refs, ConstantPoolInternal.CheapSorter):
+                self.a = refs.a
+                self.b = refs.b
+            elif refs is None:
+                self.a = 0
+                self.b = 0
+            else:
+                self.a = refs[0]
+                self.b = refs[1] if len(refs) > 1 else 0
+
+        def __lt__(self, op2: ConstantPoolInternal.CheapSorter) -> bool:
+            if self.a != op2.a:
+                return self.a < op2.a
+            return self.b < op2.b
+
+        def apply(self, refs: List[int]) -> None:
+            refs.append(self.a)
+            refs.append(self.b)
+
+        def encode(self, encoder) -> None:
+            from ghidra.core.marshal import ELEM_REF, ATTRIB_A, ATTRIB_B
+
+            encoder.openElement(ELEM_REF)
+            encoder.writeUnsignedInteger(ATTRIB_A, self.a)
+            encoder.writeUnsignedInteger(ATTRIB_B, self.b)
+            encoder.closeElement(ELEM_REF)
+
+        def decode(self, decoder) -> None:
+            from ghidra.core.marshal import ELEM_REF, ATTRIB_A, ATTRIB_B
+
+            elemId = decoder.openElement(ELEM_REF)
+            self.a = decoder.readUnsignedInteger(ATTRIB_A)
+            self.b = decoder.readUnsignedInteger(ATTRIB_B)
+            decoder.closeElement(elemId)
+
     def __init__(self) -> None:
         self._pool: Dict[Tuple[int, ...], CPoolRecord] = {}
 
-    def _createRecord(self, refs: List[int]) -> Optional[CPoolRecord]:
-        key = tuple(refs)
+    def createRecord(self, refs: List[int]) -> Optional[CPoolRecord]:
+        sorter = ConstantPoolInternal.CheapSorter(refs)
+        key = (sorter.a, sorter.b)
         if key in self._pool:
-            return self._pool[key]
+            raise LowlevelError("Creating duplicate entry in constant pool: " + self._pool[key].getToken())
         rec = CPoolRecord()
         self._pool[key] = rec
         return rec
@@ -248,35 +303,28 @@ class ConstantPoolInternal(ConstantPool):
 
         C++ ref: ``ConstantPoolInternal::encode``
         """
-        from ghidra.core.marshal import ELEM_CONSTANTPOOL, ELEM_REF, ATTRIB_A, ATTRIB_B
+        from ghidra.core.marshal import ELEM_CONSTANTPOOL
         encoder.openElement(ELEM_CONSTANTPOOL)
-        for key, rec in self._pool.items():
-            # Encode reference key as <ref> element
-            a = key[0] if len(key) > 0 else 0
-            b = key[1] if len(key) > 1 else 0
-            encoder.openElement(ELEM_REF)
-            encoder.writeUnsignedInteger(ATTRIB_A, a)
-            encoder.writeUnsignedInteger(ATTRIB_B, b)
-            encoder.closeElement(ELEM_REF)
+        for key in sorted(self._pool):
+            rec = self._pool[key]
+            ConstantPoolInternal.CheapSorter(key).encode(encoder)
             rec.encode(encoder)
         encoder.closeElement(ELEM_CONSTANTPOOL)
 
-    def decode(self, decoder, typegrp=None) -> None:
+    def decode(self, decoder, typegrp) -> None:
         """Decode the entire constant pool.
 
         C++ ref: ``ConstantPoolInternal::decode``
         """
-        from ghidra.core.marshal import ELEM_CONSTANTPOOL, ELEM_REF, ATTRIB_A, ATTRIB_B
+        from ghidra.core.marshal import ELEM_CONSTANTPOOL
         elemId = decoder.openElement(ELEM_CONSTANTPOOL)
         while decoder.peekElement() != 0:
-            refId = decoder.openElement(ELEM_REF)
-            a = decoder.readUnsignedInteger(ATTRIB_A)
-            b = decoder.readUnsignedInteger(ATTRIB_B)
-            decoder.closeElement(refId)
-            refs = [a, b]
-            rec = self._createRecord(refs)
-            if rec is not None:
-                rec.decode(decoder, typegrp)
+            sorter = ConstantPoolInternal.CheapSorter()
+            sorter.decode(decoder)
+            refs: List[int] = []
+            sorter.apply(refs)
+            rec = self.createRecord(refs)
+            rec.decode(decoder, typegrp)
         decoder.closeElement(elemId)
 
     def size(self) -> int:

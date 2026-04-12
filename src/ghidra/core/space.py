@@ -15,9 +15,9 @@ from ghidra.core.marshal import (
     AttributeId, ElementId, Encoder, Decoder,
     ATTRIB_NAME, ATTRIB_INDEX, ATTRIB_SIZE, ATTRIB_WORDSIZE,
     ATTRIB_BIGENDIAN, ATTRIB_DELAY, ATTRIB_PHYSICAL,
-    ATTRIB_CONTAIN,
+    ATTRIB_CONTAIN, ATTRIB_DEFAULTSPACE,
     ATTRIB_BASE, ATTRIB_DEADCODEDELAY, ATTRIB_LOGICALSIZE,
-    ATTRIB_PIECE, ATTRIB_SPACE, ATTRIB_OFFSET,
+    ATTRIB_PIECE, ATTRIB_SPACE, ATTRIB_OFFSET, ATTRIB_UNKNOWN,
     ELEM_SPACE, ELEM_SPACE_BASE, ELEM_SPACE_UNIQUE, ELEM_SPACE_OTHER,
     ELEM_SPACE_OVERLAY, ELEM_SPACES,
 )
@@ -52,6 +52,7 @@ IPTR_JOIN = SpaceType.IPTR_JOIN
 
 
 _ADDRSPACE_CTOR_UNSET = object()
+_SPACE_ORDER_MAX = object()
 
 
 # =========================================================================
@@ -280,7 +281,7 @@ class AddrSpace:
 
     def encodeAttributes(self, encoder: Encoder, offset: int, size: int = -1) -> None:
         """Encode address attributes to a stream."""
-        encoder.writeString(ATTRIB_SPACE, self._name)
+        encoder.writeSpace(ATTRIB_SPACE, self)
         encoder.writeUnsignedInteger(ATTRIB_OFFSET, offset)
         if size >= 0:
             encoder.writeSignedInteger(ATTRIB_SIZE, size)
@@ -289,27 +290,79 @@ class AddrSpace:
         """Recover an offset and size. Returns (offset, size)."""
         offset = 0
         size = 0
+        found_offset = False
         while True:
             attrib_id = decoder.getNextAttributeId()
             if attrib_id == 0:
                 break
             if attrib_id == ATTRIB_OFFSET.id:
+                found_offset = True
                 offset = decoder.readUnsignedInteger()
             elif attrib_id == ATTRIB_SIZE.id:
-                size = decoder.readUnsignedInteger()
+                size = decoder.readSignedInteger()
+        if not found_offset:
+            raise LowlevelError("Address is missing offset")
         return offset, size
 
     def printRaw(self, offset: int) -> str:
         """Return a raw version of the address as a string."""
-        return f"{self._shortcut}{offset:#x}"
+        sz = self.getAddrSize()
+        if sz > 4:
+            if (offset >> 32) == 0:
+                sz = 4
+            elif (offset >> 48) == 0:
+                sz = 6
+        res = f"0x{self.byteToAddress(offset, self._wordsize):0{2 * sz}x}"
+        if self._wordsize > 1:
+            cut = offset % self._wordsize
+            if cut != 0:
+                res += f"+{cut}"
+        return res
 
     def printOffset(self, offset: int) -> str:
         """Write an address offset as a string."""
-        return f"0x{offset:0{self._addressSize * 2}x}"
+        return f"0x{offset:x}"
 
     def read(self, s: str) -> tuple[int, int]:
         """Read in an address (and possible size) from a string. Returns (offset, size)."""
-        return int(s, 0), 0
+        def get_offset_size(ptr: str, offset: int) -> tuple[int, int]:
+            size = -1
+            val = 0
+            if ptr.startswith(':'):
+                rest = ptr[1:]
+                plus_pos = rest.find('+')
+                if plus_pos == -1:
+                    size = int(rest, 0)
+                else:
+                    size = int(rest[:plus_pos], 0)
+                    val = int(rest[plus_pos + 1:], 0)
+            elif ptr.startswith('+'):
+                val = int(ptr[1:], 0)
+            return size, offset + val
+
+        append = min((pos for pos in (s.find(':'), s.find('+')) if pos != -1), default=-1)
+        try:
+            if self._trans is None:
+                raise LowlevelError("No translator available")
+            if append == -1:
+                point = self._trans.getRegister(s)
+            else:
+                point = self._trans.getRegister(s[:append])
+            offset = point.offset
+            size = point.size
+        except LowlevelError:
+            if self._manage is None:
+                raise
+            offset = self.addressToByte(int(s if append == -1 else s[:append], 0), self._wordsize)
+            size = self._manage.getDefaultCodeSpace().getAddrSize()
+            if append == -1:
+                return offset, size
+
+        if append != -1:
+            explicit_size, offset = get_offset_size(s[append:], offset)
+            if explicit_size != -1:
+                size = explicit_size
+        return offset, size
 
     def decode(self, decoder: Decoder) -> None:
         """Recover the details of this space from a stream."""
@@ -362,7 +415,8 @@ class AddrSpace:
 
     @staticmethod
     def byteToAddressInt(val: int, ws: int) -> int:
-        return val // ws
+        # C++ signed integer division truncates toward zero; Python // floors.
+        return val // ws if val >= 0 else -((-val) // ws)
 
     @staticmethod
     def compareByIndex(a: AddrSpace, b: AddrSpace) -> bool:
@@ -370,6 +424,106 @@ class AddrSpace:
 
     def __repr__(self) -> str:
         return f"AddrSpace({self._name!r}, index={self._index}, type={self._type.name})"
+
+
+class JoinRecord:
+    """Describe how a logical value is split across multiple physical pieces."""
+
+    __slots__ = ("_pieces", "_unified")
+
+    def __init__(self, pieces=None, unified=None) -> None:
+        self._pieces = [] if pieces is None else pieces
+        self._unified = unified
+
+    def numPieces(self) -> int:
+        return len(self._pieces)
+
+    def isFloatExtension(self) -> bool:
+        return len(self._pieces) == 1
+
+    def getPiece(self, i: int):
+        return self._pieces[i]
+
+    def getUnified(self):
+        return self._unified
+
+    def __lt__(self, other) -> bool:
+        if not isinstance(other, JoinRecord):
+            return NotImplemented
+        if self._unified.size != other._unified.size:
+            return self._unified.size < other._unified.size
+        i = 0
+        while True:
+            if len(self._pieces) == i:
+                return len(other._pieces) > i
+            if len(other._pieces) == i:
+                return False
+            if self._pieces[i] != other._pieces[i]:
+                return self._pieces[i] < other._pieces[i]
+            i += 1
+
+    def getEquivalentAddress(self, offset: int):
+        from ghidra.core.address import Address
+
+        if self._unified is None or offset < self._unified.offset:
+            return Address(), -1
+        small_off = int(offset - self._unified.offset)
+        if self._pieces[0].space.isBigEndian():
+            pos = 0
+            while pos < len(self._pieces):
+                piece_size = self._pieces[pos].size
+                if small_off < piece_size:
+                    break
+                small_off -= piece_size
+                pos += 1
+            if pos == len(self._pieces):
+                return Address(), -1
+        else:
+            pos = len(self._pieces) - 1
+            while pos >= 0:
+                piece_size = self._pieces[pos].size
+                if small_off < piece_size:
+                    break
+                small_off -= piece_size
+                pos -= 1
+            if pos < 0:
+                return Address(), -1
+        piece = self._pieces[pos]
+        return Address(piece.space, piece.offset + small_off), pos
+
+    @staticmethod
+    def mergeSequence(seq, trans: Translate) -> None:
+        from ghidra.core.pcoderaw import VarnodeData
+
+        i = 1
+        while i < len(seq):
+            hi = seq[i - 1]
+            lo = seq[i]
+            if hi.isContiguous(lo):
+                break
+            i += 1
+        if i >= len(seq):
+            return
+
+        res = [VarnodeData(seq[0].space, seq[0].offset, seq[0].size)]
+        i = 1
+        last_is_informal = False
+        while i < len(seq):
+            hi = res[-1]
+            lo = seq[i]
+            if hi.isContiguous(lo):
+                hi.offset = hi.offset if hi.space.isBigEndian() else lo.offset
+                hi.size += lo.size
+                if hi.space.getType() != IPTR_SPACEBASE:
+                    last_is_informal = len(trans.getExactRegisterName(hi.space, hi.offset, hi.size)) == 0
+            else:
+                if last_is_informal:
+                    break
+                res.append(VarnodeData(lo.space, lo.offset, lo.size))
+            i += 1
+        if last_is_informal:
+            return
+        seq[:] = res
 
 
 # =========================================================================
@@ -395,10 +549,10 @@ class ConstantSpace(AddrSpace):
         return -1
 
     def printRaw(self, offset: int) -> str:
-        return f"#{offset:#x}"
+        return f"0x{offset:x}"
 
     def decode(self, decoder: Decoder) -> None:
-        pass
+        raise LowlevelError("Should never decode the constant space")
 
 
 # =========================================================================
@@ -413,16 +567,18 @@ class OtherSpace(AddrSpace):
 
     def __init__(self, manager: Optional[AddrSpaceManager] = None,
                  trans: Optional[Translate] = None,
-                 ind: int = -1) -> None:
-        idx = ind if ind >= 0 else OtherSpace.INDEX
-        super().__init__(manager, trans, IPTR_PROCESSOR, OtherSpace.NAME,
-                         False, 8, 1, idx, 0, 0, 0)
+                 ind: int | object = _ADDRSPACE_CTOR_UNSET) -> None:
+        if ind is _ADDRSPACE_CTOR_UNSET:
+            super().__init__(manager, trans, IPTR_PROCESSOR)
+        else:
+            super().__init__(manager, trans, IPTR_PROCESSOR, OtherSpace.NAME,
+                             False, 8, 1, OtherSpace.INDEX, 0, 0, 0)
         self.clearFlags(AddrSpace.heritaged | AddrSpace.does_deadcode)
         self.setFlags(AddrSpace.is_otherspace)
         self._shortcut = 'o'
 
     def printRaw(self, offset: int) -> str:
-        return f"o{offset:#x}"
+        return f"0x{offset:x}"
 
 
 # =========================================================================
@@ -437,10 +593,16 @@ class UniqueSpace(AddrSpace):
 
     def __init__(self, manager: Optional[AddrSpaceManager] = None,
                  trans: Optional[Translate] = None,
-                 ind: int = 0,
-                 fl: int = 0) -> None:
-        super().__init__(manager, trans, IPTR_INTERNAL, UniqueSpace.NAME,
-                         False, UniqueSpace.SIZE, 1, ind, fl, 0, 0)
+                 ind: int | object = _ADDRSPACE_CTOR_UNSET,
+                 fl: int | object = _ADDRSPACE_CTOR_UNSET) -> None:
+        if ind is _ADDRSPACE_CTOR_UNSET and fl is _ADDRSPACE_CTOR_UNSET:
+            super().__init__(manager, trans, IPTR_INTERNAL)
+        else:
+            ind_val = 0 if ind is _ADDRSPACE_CTOR_UNSET else ind
+            fl_val = 0 if fl is _ADDRSPACE_CTOR_UNSET else fl
+            big_end = trans.isBigEndian() if trans is not None and hasattr(trans, "isBigEndian") else False
+            super().__init__(manager, trans, IPTR_INTERNAL, UniqueSpace.NAME,
+                             big_end, UniqueSpace.SIZE, 1, ind_val, fl_val, 0, 0)
         self.setFlags(AddrSpace.hasphysical)
         self._shortcut = 'u'
 
@@ -458,13 +620,156 @@ class JoinSpace(AddrSpace):
     def __init__(self, manager: Optional[AddrSpaceManager] = None,
                  trans: Optional[Translate] = None,
                  ind: int = 0) -> None:
+        big_end = trans.isBigEndian() if trans is not None and hasattr(trans, "isBigEndian") else False
         super().__init__(manager, trans, IPTR_JOIN, JoinSpace.NAME,
-                         False, 8, 1, ind, 0, 0, 0)
+                         big_end, 8, 1, ind, 0, 0, 0)
         self.clearFlags(AddrSpace.heritaged)
         self._shortcut = 'j'
 
     def printRaw(self, offset: int) -> str:
-        return f"j{offset:#x}"
+        rec = self.getManager().findJoin(offset)
+        szsum = 0
+        pieces = []
+        for i in range(rec.numPieces()):
+            vdat = rec.getPiece(i)
+            szsum += vdat.size
+            pieces.append(vdat.space.printRaw(vdat.offset))
+        if rec.numPieces() == 1:
+            szsum = rec.getUnified().size
+            return "{" + ",".join(pieces) + f":{szsum}" + "}"
+        return "{" + ",".join(pieces) + "}"
+
+    def encodeAttributes(self, encoder: Encoder, offset: int, size: int = -1) -> None:
+        rec = self.getManager().findJoin(offset)
+        encoder.writeSpace(ATTRIB_SPACE, self)
+        num = rec.numPieces()
+        if num > JoinSpace.MAX_PIECES:
+            raise LowlevelError("Exceeded maximum pieces in one join address")
+        for i in range(num):
+            vdata = rec.getPiece(i)
+            encoder.writeStringIndexed(
+                ATTRIB_PIECE,
+                i,
+                f"{vdata.space.getName()}:0x{vdata.offset:x}:{vdata.size}",
+            )
+        if num == 1:
+            encoder.writeUnsignedInteger(ATTRIB_LOGICALSIZE, rec.getUnified().size)
+
+    def overlapJoin(self, offset: int, size: int,
+                    point_space: Optional[AddrSpace], point_off: int, point_skip: int) -> int:
+        if point_space is self:
+            piece_record = self.getManager().findJoin(point_off)
+            addr, _ = piece_record.getEquivalentAddress(point_off + point_skip)
+            point_space = addr.getSpace()
+            point_off = addr.getOffset()
+        else:
+            if point_space.getType() == IPTR_CONSTANT:
+                return -1
+            point_off = point_space.wrapOffset(point_off + point_skip)
+
+        join_record = self.getManager().findJoin(offset)
+        if self.isBigEndian():
+            start_piece = 0
+            end_piece = join_record.numPieces()
+            direction = 1
+        else:
+            start_piece = join_record.numPieces() - 1
+            end_piece = -1
+            direction = -1
+
+        bytes_accum = 0
+        for i in range(start_piece, end_piece, direction):
+            vdata = join_record.getPiece(i)
+            if (
+                vdata.space is point_space
+                and point_off >= vdata.offset
+                and point_off <= vdata.offset + (vdata.size - 1)
+            ):
+                res = int(point_off - vdata.offset) + bytes_accum
+                if res >= size:
+                    return -1
+                return res
+            bytes_accum += vdata.size
+        return -1
+
+    def decodeAttributes(self, decoder: Decoder) -> tuple[int, int]:
+        from ghidra.core.pcoderaw import VarnodeData
+
+        pieces: list[VarnodeData] = []
+        sizesum = 0
+        logicalsize = 0
+        while True:
+            attrib_id = decoder.getNextAttributeId()
+            if attrib_id == 0:
+                break
+            if attrib_id == ATTRIB_LOGICALSIZE.id:
+                logicalsize = decoder.readUnsignedInteger()
+                continue
+            if attrib_id == ATTRIB_UNKNOWN.id:
+                attrib_id = decoder.getIndexedAttributeId(ATTRIB_PIECE)
+            if attrib_id < ATTRIB_PIECE.getId():
+                continue
+            pos = int(attrib_id - ATTRIB_PIECE.getId())
+            if pos > JoinSpace.MAX_PIECES:
+                continue
+            while len(pieces) <= pos:
+                pieces.append(VarnodeData())
+            vdat = pieces[pos]
+
+            attr_val = decoder.readString()
+            offpos = attr_val.find(":")
+            if offpos == -1:
+                point = self.getTrans().getRegister(attr_val)
+                copied = VarnodeData(point.space, point.offset, point.size)
+                copied.setSpaceFromConst(point.getSpaceFromConst())
+                pieces[pos] = copied
+                vdat = copied
+            else:
+                szpos = attr_val.find(":", offpos + 1)
+                if szpos == -1:
+                    raise LowlevelError("join address piece attribute is malformed")
+                spcname = attr_val[:offpos]
+                vdat.space = self.getManager().getSpaceByName(spcname)
+                vdat.offset = int(attr_val[offpos + 1:szpos], 0)
+                vdat.size = int(attr_val[szpos + 1:], 0)
+            sizesum += vdat.size
+
+        rec = self.getManager().findAddJoin(pieces, logicalsize)
+        return rec.getUnified().offset, rec.getUnified().size
+
+    def read(self, s: str) -> tuple[int, int]:
+        from ghidra.core.pcoderaw import VarnodeData
+
+        pieces: list[VarnodeData] = []
+        szsum = 0
+        i = 0
+        while i < len(s):
+            pieces.append(VarnodeData())
+            token = ""
+            while i < len(s) and s[i] != ",":
+                token += s[i]
+                i += 1
+            i += 1
+            try:
+                point = self.getTrans().getRegister(token)
+                copied = VarnodeData(point.space, point.offset, point.size)
+                copied.setSpaceFromConst(point.getSpaceFromConst())
+                pieces[-1] = copied
+            except LowlevelError:
+                try_shortcut = token[0]
+                spc = self.getManager().getSpaceByShortcut(try_shortcut)
+                if spc is None:
+                    raise LowlevelError("Could not parse join string")
+                suboff, subsize = spc.read(token[1:])
+                pieces[-1].space = spc
+                pieces[-1].offset = suboff
+                pieces[-1].size = subsize
+            szsum += pieces[-1].size
+        rec = self.getManager().findAddJoin(pieces, 0)
+        return rec.getUnified().offset, szsum
+
+    def decode(self, decoder: Decoder) -> None:
+        raise LowlevelError("Should never decode join space")
 
 
 # =========================================================================
@@ -521,10 +826,10 @@ class SpacebaseSpace(AddrSpace):
                 )
         self._hasBaseRegister = True
         self._isNegativeStack = stackGrowth
-        self._baseOrig = data
 
         from ghidra.core.pcoderaw import VarnodeData
 
+        self._baseOrig = VarnodeData(data.space, data.offset, data.size)
         baseloc = VarnodeData(data.space, data.offset, data.size)
         if truncSize != baseloc.size:
             if baseloc.space.isBigEndian():
@@ -537,12 +842,12 @@ class SpacebaseSpace(AddrSpace):
 
     def getSpacebase(self, i: int):
         if i != 0 or self._baseloc is None:
-            raise IndexError("SpacebaseSpace has no spacebase at requested index")
+            raise LowlevelError("No base register specified for space: " + self.getName())
         return self._baseloc
 
     def getSpacebaseFull(self, i: int):
         if i != 0 or self._baseOrig is None:
-            raise IndexError("SpacebaseSpace has no full spacebase at requested index")
+            raise LowlevelError("No base register specified for space: " + self.getName())
         return self._baseOrig
 
     def stackGrowsNegative(self) -> bool:
@@ -569,6 +874,7 @@ class OverlaySpace(AddrSpace):
                  trans: Optional[Translate] = None) -> None:
         super().__init__(manager, trans, IPTR_PROCESSOR)
         self._baseSpace: Optional[AddrSpace] = None
+        self.setFlags(AddrSpace.overlay)
 
     def getContain(self) -> Optional[AddrSpace]:
         return self._baseSpace
@@ -604,8 +910,10 @@ class AddrSpaceManager:
     """
 
     def __init__(self) -> None:
+        self._destroyed: bool = False
         self._spaces: List[AddrSpace] = []
         self._name2space: dict[str, AddrSpace] = {}
+        self._shortcut2Space: dict[str, AddrSpace] = {}
         self._defaultCodeSpace: Optional[AddrSpace] = None
         self._defaultDataSpace: Optional[AddrSpace] = None
         self._constantSpace: Optional[ConstantSpace] = None
@@ -615,6 +923,36 @@ class AddrSpaceManager:
         self._fspecSpace: Optional[AddrSpace] = None
         self._stackSpace: Optional[AddrSpace] = None
         self._resolvers: List[object | None] = []
+        self._joinallocate: int = 0
+        self._join_by_key: dict[tuple[object, ...], JoinRecord] = {}
+        self._splitlist: List[JoinRecord] = []
+
+    def __del__(self) -> None:
+        if getattr(self, "_destroyed", True):
+            return
+        self._destroyed = True
+
+        for spc in getattr(self, "_spaces", []):
+            if spc is None:
+                continue
+            refcount = getattr(spc, "_refcount", 0)
+            if refcount > 0:
+                spc._refcount = refcount - 1
+
+        self._spaces.clear()
+        self._name2space.clear()
+        self._shortcut2Space.clear()
+        self._resolvers.clear()
+        self._join_by_key.clear()
+        self._splitlist.clear()
+        self._constantSpace = None
+        self._defaultCodeSpace = None
+        self._defaultDataSpace = None
+        self._iopSpace = None
+        self._fspecSpace = None
+        self._joinSpace = None
+        self._stackSpace = None
+        self._uniqueSpace = None
 
     # --- Space insertion / lookup ---
 
@@ -625,11 +963,41 @@ class AddrSpaceManager:
         self._spaces[spc.getIndex()] = spc
         self._name2space[spc.getName()] = spc
 
+    def decodeSpace(self, decoder: Decoder, trans: Optional[Translate]) -> AddrSpace:
+        elem_id = decoder.peekElement()
+        if elem_id == ELEM_SPACE_BASE.id:
+            spc = SpacebaseSpace(self, trans)
+        elif elem_id == ELEM_SPACE_UNIQUE.id:
+            spc = UniqueSpace(self, trans)
+        elif elem_id == ELEM_SPACE_OTHER.id:
+            spc = OtherSpace(self, trans)
+        elif elem_id == ELEM_SPACE_OVERLAY.id:
+            spc = OverlaySpace(self, trans)
+        else:
+            spc = AddrSpace(self, trans, IPTR_PROCESSOR)
+        spc.decode(decoder)
+        return spc
+
+    def decodeSpaces(self, decoder: Decoder, trans: Optional[Translate]) -> None:
+        self.insertSpace(ConstantSpace(self, trans))
+
+        elem_id = decoder.openElement(ELEM_SPACES)
+        default_name = decoder.readString(ATTRIB_DEFAULTSPACE)
+        while decoder.peekElement() != 0:
+            self.insertSpace(self.decodeSpace(decoder, trans))
+        decoder.closeElement(elem_id)
+
+        spc = self._name2space.get(default_name)
+        if spc is None:
+            raise LowlevelError("Bad 'defaultspace' attribute: " + default_name)
+        self.setDefaultCodeSpace(spc.getIndex())
+
     def setReverseJustified(self, spc: AddrSpace) -> None:
         spc.setFlags(AddrSpace.reverse_justification)
 
     def assignShortcut(self, spc: AddrSpace) -> None:
         if spc.getShortcut() != ' ':
+            self._shortcut2Space.setdefault(spc.getShortcut(), spc)
             return
 
         tp = spc.getType()
@@ -658,8 +1026,9 @@ class AddrSpaceManager:
 
         collisionCount = 0
         while True:
-            existing = self.getSpaceByShortcut(shortcut)
-            if existing is None or existing is spc:
+            existing = self._shortcut2Space.get(shortcut)
+            if existing is None:
+                self._shortcut2Space[shortcut] = spc
                 spc._shortcut = shortcut
                 return
             collisionCount += 1
@@ -748,8 +1117,8 @@ class AddrSpaceManager:
             spc = op2.getSpace(i)
             if spc is not None:
                 self.insertSpace(spc)
-        self.setDefaultCodeSpace(op2.getDefaultCodeSpace())
-        self.setDefaultDataSpace(op2.getDefaultDataSpace())
+        self.setDefaultCodeSpace(op2.getDefaultCodeSpace().getIndex())
+        self.setDefaultDataSpace(op2.getDefaultDataSpace().getIndex())
 
     def addSpacebasePointer(self, basespace: SpacebaseSpace, ptrdata, truncSize: int,
                             stackGrowth: bool) -> None:
@@ -757,6 +1126,60 @@ class AddrSpaceManager:
 
     def setDeadcodeDelay(self, spc: AddrSpace, delaydelta: int) -> None:
         spc._deadcodedelay = delaydelta
+
+    def truncateSpace(self, tag) -> None:
+        spc = self.getSpaceByName(tag.getName())
+        if spc is None:
+            raise LowlevelError("Unknown space in <truncate_space> command: " + tag.getName())
+        spc.truncateSpace(tag.getSize())
+
+    def constructFloatExtensionAddress(self, realaddr, realsize: int, logicalsize: int):
+        from ghidra.core.pcoderaw import VarnodeData
+
+        if logicalsize == realsize:
+            return realaddr
+        pieces = [VarnodeData(realaddr.getSpace(), realaddr.getOffset(), realsize)]
+        join = self.findAddJoin(pieces, logicalsize)
+        return join.getUnified().getAddr()
+
+    def constructJoinAddress(self, translate, hiaddr, hisz: int, loaddr, losz: int):
+        from ghidra.core.pcoderaw import VarnodeData
+
+        hitp = hiaddr.getSpace().getType()
+        lotp = loaddr.getSpace().getType()
+        usejoinspace = True
+        if (
+            ((hitp != IPTR_SPACEBASE) and (hitp != IPTR_PROCESSOR))
+            or ((lotp != IPTR_SPACEBASE) and (lotp != IPTR_PROCESSOR))
+        ):
+            raise LowlevelError("Trying to join in appropriate locations")
+        if (
+            (hitp == IPTR_SPACEBASE)
+            or (lotp == IPTR_SPACEBASE)
+            or (hiaddr.getSpace() == self.getDefaultCodeSpace())
+            or (loaddr.getSpace() == self.getDefaultCodeSpace())
+        ):
+            usejoinspace = False
+        if hiaddr.isContiguous(hisz, loaddr, losz):
+            if not usejoinspace:
+                if hiaddr.isBigEndian():
+                    return hiaddr
+                return loaddr
+            if hiaddr.isBigEndian():
+                if translate.getRegisterName(hiaddr.getSpace(), hiaddr.getOffset(), hisz + losz) != "":
+                    return hiaddr
+            else:
+                if translate.getRegisterName(loaddr.getSpace(), loaddr.getOffset(), hisz + losz) != "":
+                    return loaddr
+        pieces = [VarnodeData(), VarnodeData()]
+        pieces[0].space = hiaddr.getSpace()
+        pieces[0].offset = hiaddr.getOffset()
+        pieces[0].size = hisz
+        pieces[1].space = loaddr.getSpace()
+        pieces[1].offset = loaddr.getOffset()
+        pieces[1].size = losz
+        join = self.findAddJoin(pieces, 0)
+        return join.getUnified().getAddr()
 
     def setInferPtrBounds(self, range_: Range) -> None:
         spc = range_.getSpace()
@@ -774,12 +1197,11 @@ class AddrSpaceManager:
         if spc.getMinimumPtrSize() == 0 and spc.getAddrSize() != size:
             spc._minimumPointerSize = size
 
-    def getSpaceByName(self, name: str) -> AddrSpace:
-        """Get a space by its name. Raises LowlevelError if not found."""
-        spc = self._name2space.get(name)
-        if spc is None:
-            raise LowlevelError(f"Unknown address space: {name}")
-        return spc
+    def getDefaultSize(self) -> int:
+        return self._defaultCodeSpace.getAddrSize()  # type: ignore[union-attr]
+
+    def getSpaceByName(self, name: str) -> Optional[AddrSpace]:
+        return self._name2space.get(name)
 
     def getSpaceByIndex(self, index: int) -> Optional[AddrSpace]:
         """Get a space by its integer index."""
@@ -788,48 +1210,158 @@ class AddrSpaceManager:
         return None
 
     def getSpaceByShortcut(self, sc: str) -> Optional[AddrSpace]:
-        """Get a space by its shortcut character."""
-        for spc in self._spaces:
-            if spc is not None and spc.getShortcut() == sc:
-                return spc
-        return None
+        return self._shortcut2Space.get(sc)
 
-    def numSpaces(self) -> int:
-        return len(self._spaces)
+    def getIopSpace(self) -> Optional[AddrSpace]:
+        return self._iopSpace
 
-    def getSpace(self, i: int) -> Optional[AddrSpace]:
-        if 0 <= i < len(self._spaces):
-            return self._spaces[i]
-        return None
+    def getFspecSpace(self) -> Optional[AddrSpace]:
+        return self._fspecSpace
 
-    def getConstantSpace(self) -> ConstantSpace:
-        assert self._constantSpace is not None
-        return self._constantSpace
-
-    def getDefaultCodeSpace(self) -> AddrSpace:
-        assert self._defaultCodeSpace is not None
-        return self._defaultCodeSpace
-
-    def getDefaultDataSpace(self) -> AddrSpace:
-        assert self._defaultDataSpace is not None
-        return self._defaultDataSpace
-
-    def getUniqueSpace(self) -> UniqueSpace:
-        assert self._uniqueSpace is not None
-        return self._uniqueSpace
-
-    def getJoinSpace(self) -> JoinSpace:
-        assert self._joinSpace is not None
+    def getJoinSpace(self) -> Optional[JoinSpace]:
         return self._joinSpace
 
     def getStackSpace(self) -> Optional[AddrSpace]:
         return self._stackSpace
 
-    def setDefaultCodeSpace(self, spc: AddrSpace) -> None:
-        self._defaultCodeSpace = spc
+    def getUniqueSpace(self) -> Optional[UniqueSpace]:
+        return self._uniqueSpace
 
-    def setDefaultDataSpace(self, spc: AddrSpace) -> None:
-        self._defaultDataSpace = spc
+    def getDefaultCodeSpace(self) -> Optional[AddrSpace]:
+        return self._defaultCodeSpace
+
+    def getDefaultDataSpace(self) -> Optional[AddrSpace]:
+        return self._defaultDataSpace
+
+    def getConstantSpace(self) -> Optional[ConstantSpace]:
+        return self._constantSpace
+
+    def getConstant(self, val: int):
+        from ghidra.core.address import Address
+
+        return Address(self._constantSpace, val)
+
+    def createConstFromSpace(self, spc: AddrSpace):
+        from ghidra.core.address import Address
+
+        return Address(self._constantSpace, id(spc))
+
+    def resolveConstant(self, spc: AddrSpace, val: int, sz: int, point):
+        from ghidra.core.address import Address
+
+        ind = spc.getIndex()
+        if ind < len(self._resolvers):
+            resolve = self._resolvers[ind]
+            if resolve is not None:
+                return resolve.resolve(val, sz, point)
+        fullEncoding = val
+        val = AddrSpace.addressToByte(val, spc.getWordSize())
+        val = spc.wrapOffset(val)
+        return Address(spc, val), fullEncoding
+
+    def numSpaces(self) -> int:
+        return len(self._spaces)
+
+    def getSpace(self, i: int) -> Optional[AddrSpace]:
+        if i < 0:
+            raise IndexError(i)
+        return self._spaces[i]
+
+    def findAddJoin(self, pieces, logicalsize: int):
+        from ghidra.core.pcoderaw import VarnodeData
+
+        if len(pieces) == 0:
+            raise LowlevelError("Cannot create a join without pieces")
+        if len(pieces) == 1 and logicalsize == 0:
+            raise LowlevelError("Cannot create a single piece join without a logical size")
+
+        if logicalsize != 0:
+            if len(pieces) != 1:
+                raise LowlevelError("Cannot specify logical size for multiple piece join")
+            totalsize = logicalsize
+        else:
+            totalsize = 0
+            for piece in pieces:
+                totalsize += piece.size
+            if totalsize == 0:
+                raise LowlevelError("Cannot create a zero size join")
+
+        copied_pieces = []
+        for piece in pieces:
+            copied_piece = VarnodeData(piece.space, piece.offset, piece.size)
+            copied_piece.setSpaceFromConst(piece.getSpaceFromConst())
+            copied_pieces.append(copied_piece)
+        key = (totalsize, tuple(copied_pieces))
+        existing = self._join_by_key.get(key)
+        if existing is not None:
+            return existing
+
+        assert self._joinSpace is not None
+        unified = VarnodeData(self._joinSpace, self._joinallocate, totalsize)
+        record = JoinRecord(copied_pieces, unified)
+        roundsize = (totalsize + 15) & ~0xF
+        self._joinallocate += roundsize
+        self._join_by_key[key] = record
+        self._splitlist.append(record)
+        return record
+
+    def findJoin(self, offset: int):
+        min_idx = 0
+        max_idx = len(self._splitlist) - 1
+        while min_idx <= max_idx:
+            mid = (min_idx + max_idx) // 2
+            rec = self._splitlist[mid]
+            val = rec.getUnified().offset
+            if val == offset:
+                return rec
+            if val < offset:
+                min_idx = mid + 1
+            else:
+                max_idx = mid - 1
+        raise LowlevelError("Unlinked join address")
+
+    def setDefaultCodeSpace(self, index: int) -> None:
+        if self._defaultCodeSpace is not None:
+            raise LowlevelError("Default space set multiple times")
+        if index >= len(self._spaces) or self._spaces[index] is None:
+            raise LowlevelError("Bad index for default space")
+        self._defaultCodeSpace = self._spaces[index]
+        self._defaultDataSpace = self._defaultCodeSpace
+
+    def setDefaultDataSpace(self, index: int) -> None:
+        if self._defaultCodeSpace is None:
+            raise LowlevelError("Default data space must be set after the code space")
+        if index >= len(self._spaces) or self._spaces[index] is None:
+            raise LowlevelError("Bad index for default data space")
+        self._defaultDataSpace = self._spaces[index]
+
+    def findJoinInternal(self, offset: int):
+        min_idx = 0
+        max_idx = len(self._splitlist) - 1
+        while min_idx <= max_idx:
+            mid = (min_idx + max_idx) // 2
+            rec = self._splitlist[mid]
+            val = rec.getUnified().offset
+            if val + rec.getUnified().size <= offset:
+                min_idx = mid + 1
+            elif val > offset:
+                max_idx = mid - 1
+            else:
+                return rec
+        return None
+
+    def getNextSpaceInOrder(self, spc):
+        if spc is None:
+            return self._spaces[0]
+        if spc is _SPACE_ORDER_MAX:
+            return None
+        index = spc.getIndex() + 1
+        while index < len(self._spaces):
+            res = self._spaces[index]
+            if res is not None:
+                return res
+            index += 1
+        return _SPACE_ORDER_MAX
 
     def parseAddressSimple(self, val: str):
         """Parse a hexadecimal address string with an optional space prefix."""
@@ -852,7 +1384,54 @@ class AddrSpaceManager:
 
     def renormalizeJoinAddress(self, addr, size: int) -> None:
         """Re-evaluate a join address in terms of its new offset and size."""
-        pass  # Placeholder – full implementation requires JoinRecord tracking
+        from ghidra.core.pcoderaw import VarnodeData
+
+        joinRecord = self.findJoinInternal(addr.getOffset())
+        if joinRecord is None:
+            raise LowlevelError("Join address not covered by a JoinRecord")
+        unified = joinRecord.getUnified()
+        if addr.getOffset() == unified.offset and size == unified.size:
+            return
+        addr1, pos1 = joinRecord.getEquivalentAddress(addr.getOffset())
+        addr2, pos2 = joinRecord.getEquivalentAddress(addr.getOffset() + (size - 1))
+        if addr2.isInvalid():
+            raise LowlevelError("Join address range not covered")
+        if pos1 == pos2:
+            addr.assign(addr1)
+            return
+
+        def copy_piece(piece):
+            new_piece = VarnodeData(piece.space, piece.offset, piece.size)
+            new_piece.setSpaceFromConst(piece.getSpaceFromConst())
+            return new_piece
+
+        newPieces = []
+        sizeTrunc1 = int(addr1.getOffset() - joinRecord._pieces[pos1].offset)
+        sizeTrunc2 = (
+            joinRecord._pieces[pos2].size
+            - int(addr2.getOffset() - joinRecord._pieces[pos2].offset)
+            - 1
+        )
+        if pos2 < pos1:
+            newPieces.append(copy_piece(joinRecord._pieces[pos2]))
+            pos2 += 1
+            while pos2 <= pos1:
+                newPieces.append(copy_piece(joinRecord._pieces[pos2]))
+                pos2 += 1
+            newPieces[-1].offset = addr1.getOffset()
+            newPieces[-1].size -= sizeTrunc1
+            newPieces[0].size -= sizeTrunc2
+        else:
+            newPieces.append(copy_piece(joinRecord._pieces[pos1]))
+            pos1 += 1
+            while pos1 <= pos2:
+                newPieces.append(copy_piece(joinRecord._pieces[pos1]))
+                pos1 += 1
+            newPieces[0].offset = addr1.getOffset()
+            newPieces[0].size -= sizeTrunc1
+            newPieces[-1].size -= sizeTrunc2
+        newJoinRecord = self.findAddJoin(newPieces, 0)
+        addr.assign(newJoinRecord.getUnified().getAddr())
 
     def __repr__(self) -> str:
         names = [s.getName() for s in self._spaces if s is not None]

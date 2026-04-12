@@ -6,6 +6,7 @@ P-code emulator: executes raw p-code operations on a MemoryState.
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Dict, Optional, List
 
 from ghidra.core.opcodes import OpCode
@@ -31,6 +32,7 @@ class BreakCallBack:
     """
 
     def __init__(self) -> None:
+        """C++ ref: BreakCallBack::BreakCallBack"""
         self._emulate: Optional[Emulate] = None
 
     def setEmulate(self, emu: Emulate) -> None:
@@ -45,20 +47,26 @@ class BreakCallBack:
         return True
 
 
-class BreakTable:
+class BreakTable(ABC):
     """Abstract collection of breakpoints for an emulator.
 
     C++ ref: BreakTable
     """
 
+    def __del__(self) -> None:
+        return None
+
+    @abstractmethod
     def setEmulate(self, emu: Emulate) -> None:
-        pass
+        raise NotImplementedError
 
+    @abstractmethod
     def doPcodeOpBreak(self, op: PcodeOpRaw) -> bool:
-        return False
+        raise NotImplementedError
 
+    @abstractmethod
     def doAddressBreak(self, addr: Address) -> bool:
-        return False
+        raise NotImplementedError
 
 
 class BreakTableCallBack(BreakTable):
@@ -80,8 +88,7 @@ class BreakTableCallBack(BreakTable):
         """
         func.setEmulate(self._emulate)
         userops: List[str] = []
-        if hasattr(self._trans, 'getUserOpNames'):
-            self._trans.getUserOpNames(userops)
+        self._trans.getUserOpNames(userops)
         for i, opname in enumerate(userops):
             if opname == name:
                 self._pcodecallback[i] = func
@@ -124,7 +131,7 @@ class BreakTableCallBack(BreakTable):
 # Emulate base (abstract dispatch loop)
 # =========================================================================
 
-class Emulate:
+class Emulate(ABC):
     """Abstract base for P-code emulators.
 
     C++ ref: Emulate
@@ -136,6 +143,9 @@ class Emulate:
         self.currentBehave: Optional[OpBehavior] = None
         self.emu_halted: bool = True
 
+    def __del__(self) -> None:
+        return None
+
     def setHalt(self, val: bool) -> None:
         self.emu_halted = val
 
@@ -144,57 +154,75 @@ class Emulate:
 
     # -- abstract interface (subclasses must implement) --
 
+    @abstractmethod
     def setExecuteAddress(self, addr: Address) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def getExecuteAddress(self) -> Address:
         raise NotImplementedError
 
+    @abstractmethod
     def executeUnary(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeBinary(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeLoad(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeStore(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeBranch(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeCbranch(self) -> bool:
         raise NotImplementedError
 
+    @abstractmethod
     def executeBranchind(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeCall(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeCallind(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeCallother(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeMultiequal(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeIndirect(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeSegmentOp(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeCpoolRef(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def executeNew(self) -> None:
         raise NotImplementedError
 
+    @abstractmethod
     def fallthruOp(self) -> None:
         raise NotImplementedError
 
@@ -269,6 +297,7 @@ class EmulateMemory(Emulate):
     def __init__(self, memstate: MemoryState) -> None:
         super().__init__()
         self.memstate: MemoryState = memstate
+        self.currentOp: Optional[PcodeOpRaw] = None
 
     def getMemoryState(self) -> MemoryState:
         return self.memstate
@@ -398,7 +427,8 @@ class EmulatePcodeCache(EmulateMemory):
                  breaktable: BreakTable) -> None:
         super().__init__(memstate)
         self._trans: Translate = trans
-        self._inst: List[Optional[OpBehavior]] = OpBehavior.registerInstructions(trans)
+        self._inst: List[Optional[OpBehavior]] = []
+        OpBehavior.registerInstructions(self._inst, trans)
         self._breaktable: BreakTable = breaktable
         self._breaktable.setEmulate(self)
         self._opcache: List[PcodeOpRaw] = []
@@ -408,8 +438,24 @@ class EmulatePcodeCache(EmulateMemory):
         self._instruction_length: int = 0
         self._instruction_start: bool = True
 
+    def __del__(self) -> None:
+        """C++ ref: EmulatePcodeCache::~EmulatePcodeCache"""
+        self.clearCache()
+        for i in range(len(self._inst)):
+            if self._inst[i] is not None:
+                self._inst[i] = None
+        self._inst.clear()
+
     def clearCache(self) -> None:
         """C++ ref: EmulatePcodeCache::clearCache"""
+        for op in self._opcache:
+            clear_inputs = getattr(op, "clearInputs", None)
+            if callable(clear_inputs):
+                clear_inputs()
+
+            set_output = getattr(op, "setOutput", None)
+            if callable(set_output):
+                set_output(None)
         self._opcache.clear()
         self._varcache.clear()
 
@@ -445,9 +491,7 @@ class EmulatePcodeCache(EmulateMemory):
         self._instruction_start = False
         self._current_op += 1
         if self._current_op >= len(self._opcache):
-            self._current_address = Address(
-                self._current_address.getSpace(),
-                self._current_address.getOffset() + self._instruction_length)
+            self._current_address = self._current_address + self._instruction_length
             self.createInstruction(self._current_address)
         self.establishOp()
 
@@ -458,10 +502,9 @@ class EmulatePcodeCache(EmulateMemory):
         """
         destaddr = self.currentOp.getInput(0).getAddr()
         if destaddr.isConstant():
-            rel = destaddr.getOffset()
-            if rel >= 0x80000000:
-                rel -= 0x100000000
-            idx = self._current_op + int(rel)
+            idx = (destaddr.getOffset() + self._current_op) & 0xFFFFFFFF
+            if idx >= 0x80000000:
+                idx -= 0x100000000
             self._current_op = idx
             if self._current_op == len(self._opcache):
                 self.fallthruOp()
@@ -489,6 +532,22 @@ class EmulatePcodeCache(EmulateMemory):
 
     def getExecuteAddress(self) -> Address:
         return self._current_address
+
+    def isInstructionStart(self) -> bool:
+        """C++ ref: EmulatePcodeCache::isInstructionStart"""
+        return self._instruction_start
+
+    def numCurrentOps(self) -> int:
+        """C++ ref: EmulatePcodeCache::numCurrentOps"""
+        return len(self._opcache)
+
+    def getCurrentOpIndex(self) -> int:
+        """C++ ref: EmulatePcodeCache::getCurrentOpIndex"""
+        return self._current_op
+
+    def getOpByIndex(self, i: int) -> PcodeOpRaw:
+        """C++ ref: EmulatePcodeCache::getOpByIndex"""
+        return self._opcache[i]
 
     def executeInstruction(self) -> None:
         """Execute a full machine instruction (like a debugger step).

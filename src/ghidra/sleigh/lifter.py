@@ -139,8 +139,8 @@ class Lifter:
                 spc = AddrSpace(self._spc_mgr, None, tp, name, False, sz, 1, idx, flags, dl, dl)
                 self._spc_mgr._insertSpace(spc)
                 if name == code_space_name:
-                    self._spc_mgr.setDefaultCodeSpace(spc)
-                    self._spc_mgr.setDefaultDataSpace(spc)
+                    self._spc_mgr.setDefaultCodeSpace(spc.getIndex())
+                    self._spc_mgr.setDefaultDataSpace(spc.getIndex())
             self._spaces[name] = spc
             idx += 1
 

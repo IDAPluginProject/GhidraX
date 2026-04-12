@@ -10,6 +10,7 @@ import inspect
 import os
 from typing import List
 from ghidra.core.address import Address, AddrSpace, calc_mask, sign_extend
+from ghidra.core.error import LowlevelError
 from ghidra.core.opcodes import OpCode
 from ghidra.core.marshal import AttributeId, ElementId
 from ghidra.database.database import ScopeInternal, Symbol
@@ -307,15 +308,17 @@ class RangeHint:
     typelock = 1
     copy_constant = 2
 
-    def __init__(self, st: int = 0, sz: int = 0, sst: int = 0,
-                 ct=None, fl: int = 0, rt: int = 0, hi: int = 0) -> None:
-        self.start: int = st
-        self.size: int = sz
-        self.sstart: int = sst
+    def __init__(self, st: int | None = None, sz: int | None = None, sst: int | None = None,
+                 ct=None, fl: int | None = None, rt: int | None = None, hi: int | None = None) -> None:
+        if st is None and sz is None and sst is None and ct is None and fl is None and rt is None and hi is None:
+            return
+        self.start: int = 0 if st is None else st
+        self.size: int = 0 if sz is None else sz
+        self.sstart: int = 0 if sst is None else sst
         self.type = ct
-        self.flags: int = fl
-        self.rangeType: int = rt
-        self.highind: int = hi
+        self.flags: int = 0 if fl is None else fl
+        self.rangeType: int = 0 if rt is None else rt
+        self.highind: int = 0 if hi is None else hi
 
     def isTypeLock(self) -> bool:
         return (self.flags & RangeHint.typelock) != 0
@@ -486,8 +489,8 @@ class RangeHint:
         if not didReconcile:
             if self.isTypeLock():
                 if b.isTypeLock():
-                    raise RuntimeError("Overlapping forced variable types : " +
-                                       self.type.getName() + "   " + b.type.getName())
+                    raise LowlevelError("Overlapping forced variable types : " +
+                                        self.type.getName() + "   " + b.type.getName())
                 if self.start != b.start:
                     return False
         if resType == 0:
@@ -765,6 +768,8 @@ class MapState:
         self._iter: int = 0
         self._defaultType = dt
         self._checker: AliasChecker = AliasChecker()
+        self._debugon: bool = False
+        self._glb = None
         # Remove parameter ranges from the analysis range
         if pm is not None:
             for r in pm:
@@ -773,7 +778,7 @@ class MapState:
                 last = r.getLast()
                 self._range.removeRange(pmSpc, first, last)
 
-    def _addGuard(self, guard, opc, typeFactory) -> None:
+    def addGuard(self, guard, opc, typeFactory) -> None:
         if not guard.isValid(opc):
             return
         step = guard.getStep()
@@ -802,6 +807,9 @@ class MapState:
         else:
             self.addRange(guard.getMinimum(), ct, 0, RangeHint.open, 3)
 
+    def _addGuard(self, guard, opc, typeFactory) -> None:
+        self.addGuard(guard, opc, typeFactory)
+
     def addRange(self, st: int, ct, fl: int, rt: int, hi: int) -> None:
         if ct is None or ct.getSize() == 0:
             ct = self._defaultType
@@ -821,7 +829,7 @@ class MapState:
         if _range_hint_debug_covers(newRange, _MAPSTATE_DEBUG_ADDRS):
             _mapstate_debug_log(f"addRange {_range_hint_debug_desc(newRange)}")
 
-    def _addFixedType(self, start: int, ct, flags: int, types) -> None:
+    def addFixedType(self, start: int, ct, flags: int, types) -> None:
         if ct is None:
             return
         if ct.getMetatype() == 'partialstruct':
@@ -841,7 +849,10 @@ class MapState:
         else:
             self.addRange(start, ct, flags, RangeHint.fixed, -1)
 
-    def _reconcileDatatypes(self) -> None:
+    def _addFixedType(self, start: int, ct, flags: int, types) -> None:
+        self.addFixedType(start, ct, flags, types)
+
+    def reconcileDatatypes(self) -> None:
         newList: List[RangeHint] = []
         startPos = 0
         startHint = self._maplist[0]
@@ -870,6 +881,19 @@ class MapState:
             startPos += 1
         self._maplist = newList
 
+    def _reconcileDatatypes(self) -> None:
+        self.reconcileDatatypes()
+
+    def turnOnDebug(self, g) -> None:
+        self._debugon = True
+        self._glb = g
+
+    def turnOffDebug(self) -> None:
+        self._debugon = False
+
+    def __del__(self) -> None:
+        self._maplist.clear()
+
     def initialize(self) -> bool:
         lastrange = self._range.getLastSignedRange(self._spaceid)
         if lastrange is None:
@@ -883,7 +907,7 @@ class MapState:
         termRange = RangeHint(high, 1, sst, self._defaultType, 0, RangeHint.endpoint, -2)
         self._maplist.append(termRange)
         self._maplist.sort(key=lambda a: (a.sstart, a.size, a.rangeType, a.flags, a.highind))
-        self._reconcileDatatypes()
+        self.reconcileDatatypes()
         self._iter = 0
         return True
 
@@ -911,15 +935,15 @@ class MapState:
             if vn.isFree():
                 continue
             if not vn.isWritten():
-                if MapState._isReadActive(vn):
-                    self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                if MapState.isReadActive(vn):
+                    self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
                 continue
             op = vn.getDef()
             opc = op.code()
             if opc == OpCode.CPUI_INDIRECT:
                 invn = op.getIn(0)
-                if vn.getAddr() != invn.getAddr() or MapState._isReadActive(vn):
-                    self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                if vn.getAddr() != invn.getAddr() or MapState.isReadActive(vn):
+                    self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
             elif opc == OpCode.CPUI_MULTIEQUAL:
                 found = False
                 for i in range(op.numInput()):
@@ -927,20 +951,20 @@ class MapState:
                     if vn.getAddr() != invn.getAddr():
                         found = True
                         break
-                if found or MapState._isReadActive(vn):
-                    self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                if found or MapState.isReadActive(vn):
+                    self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
             elif opc == OpCode.CPUI_PIECE:
                 addr = vn.getAddr()
                 slot = 0 if addr.isBigEndian() else 1
                 inFirst = op.getIn(slot)
                 if inFirst.getAddr() != addr:
-                    self._addFixedType(addr.getOffset(), inFirst.getType(), 0, types)
+                    self.addFixedType(addr.getOffset(), inFirst.getType(), 0, types)
                 addr2 = addr + inFirst.getSize()
                 inSecond = op.getIn(1 - slot)
                 if inSecond.getAddr() != addr2:
-                    self._addFixedType(addr2.getOffset(), inSecond.getType(), 0, types)
-                if MapState._isReadActive(vn):
-                    self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                    self.addFixedType(addr2.getOffset(), inSecond.getType(), 0, types)
+                if MapState.isReadActive(vn):
+                    self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
             elif opc == OpCode.CPUI_SUBPIECE:
                 addr = op.getIn(0).getAddr()
                 if addr.isBigEndian():
@@ -948,13 +972,13 @@ class MapState:
                 else:
                     trunc = op.getIn(1).getOffset()
                 addr2 = addr + trunc
-                if addr2 != vn.getAddr() or MapState._isReadActive(vn):
-                    self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                if addr2 != vn.getAddr() or MapState.isReadActive(vn):
+                    self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
             elif opc == OpCode.CPUI_COPY:
                 fl = RangeHint.copy_constant if op.getIn(0).isConstant() else 0
-                self._addFixedType(vn.getOffset(), vn.getType(), fl, types)
+                self.addFixedType(vn.getOffset(), vn.getType(), fl, types)
             else:
-                self._addFixedType(vn.getOffset(), vn.getType(), 0, types)
+                self.addFixedType(vn.getOffset(), vn.getType(), 0, types)
 
     def gatherOpen(self, fd) -> None:
         self._checker.gather(fd, self._spaceid, False)
@@ -976,9 +1000,9 @@ class MapState:
             self.addRange(offset, ct, 0, RangeHint.open, minItems)
         typeFactory = fd.getArch().types
         for guard in fd.getLoadGuards():
-            self._addGuard(guard, OpCode.CPUI_LOAD, typeFactory)
+            self.addGuard(guard, OpCode.CPUI_LOAD, typeFactory)
         for guard in fd.getStoreGuards():
-            self._addGuard(guard, OpCode.CPUI_STORE, typeFactory)
+            self.addGuard(guard, OpCode.CPUI_STORE, typeFactory)
 
     def next(self) -> RangeHint:
         return self._maplist[self._iter]
@@ -988,7 +1012,7 @@ class MapState:
         return self._iter < len(self._maplist)
 
     @staticmethod
-    def _isReadActive(vn) -> bool:
+    def isReadActive(vn) -> bool:
         for op in vn.getDescendants():
             if op.isMarker():
                 if vn.getAddr() != op.getOut().getAddr():
@@ -1007,6 +1031,9 @@ class MapState:
                 else:
                     return True
         return False
+
+    def _isReadActive(vn) -> bool:
+        return MapState.isReadActive(vn)
 
 
 # =========================================================================
@@ -1107,7 +1134,7 @@ class ScopeLocal(ScopeInternal):
 
     def decode(self, decoder) -> None:
         super().decode(decoder)
-        self._collectNameRecs()
+        self.collectNameRecs()
 
     def decodeWrappingAttributes(self, decoder) -> None:
         self._rangeLocked = False
@@ -1125,7 +1152,7 @@ class ScopeLocal(ScopeInternal):
                 if self._stackGrowsNegative:
                     start = -start
                 buf = []
-                if ct is not None and hasattr(ct, 'printNameBase'):
+                if ct is not None:
                     ct.printNameBase(buf)
                 s = "".join(buf)
                 spacename = addr.getSpace().getName()
@@ -1157,30 +1184,30 @@ class ScopeLocal(ScopeInternal):
             newrange.insertRange(r.getSpace(), r.getFirst(), r.getLast())
         for r in paramrange:
             newrange.insertRange(r.getSpace(), r.getFirst(), r.getLast())
-        symboltab = getattr(self.glb, 'symboltab', None)
-        if symboltab is not None and hasattr(symboltab, 'setRange'):
-            symboltab.setRange(self, newrange)
+        self.glb.symboltab.setRange(self, newrange)
 
     def restructureVarnode(self, aliasyes: bool) -> None:
         self.clearUnlockedCategory(-1)
         state = MapState(self._space, self.getRangeTree(),
                          self._fd.getFuncProto().getParamRange(),
                          self.glb.types.getBase(1, 'unknown'))
+        if self.debugon:
+            state.turnOnDebug(self.glb)
         state.gatherVarnodes(self._fd)
         state.gatherOpen(self._fd)
         state.gatherSymbols(self._getMapTable(self._space))
-        self._overlapProblems = self._restructure(state)
+        self._overlapProblems = self.restructure(state)
         self.clearUnlockedCategory(Symbol.function_parameter)
         self.clearCategory(Symbol.fake_input)
-        self._fakeInputSymbols()
+        self.fakeInputSymbols()
         state.sortAlias()
         if aliasyes:
-            self._markUnaliased(state.getAlias())
-            self._checkUnaliasedReturn(state.getAlias())
+            self.markUnaliased(state.getAlias())
+            self.checkUnaliasedReturn(state.getAlias())
         if state.getAlias() and state.getAlias()[0] == 0:
-            self._annotateRawStackPtr()
+            self.annotateRawStackPtr()
 
-    def _restructure(self, state: MapState) -> bool:
+    def restructure(self, state: MapState) -> bool:
         overlapProblems = False
         if not state.initialize():
             return overlapProblems
@@ -1215,13 +1242,16 @@ class ScopeLocal(ScopeInternal):
                             _mapstate_debug_log(
                                 f"truncate_open result={_range_hint_debug_desc(cur)}"
                             )
-                    if self._adjustFit(cur):
-                        self._createEntry(cur)
+                    if self.adjustFit(cur):
+                        self.createEntry(cur)
                     cur = RangeHint()
                     cur.__dict__.update(nxt.__dict__)
         return overlapProblems
 
-    def _adjustFit(self, a: RangeHint) -> bool:
+    def _restructure(self, state: MapState) -> bool:
+        return self.restructure(state)
+
+    def adjustFit(self, a: RangeHint) -> bool:
         if a.size == 0:
             return False
         if a.isTypeLock():
@@ -1245,7 +1275,10 @@ class ScopeLocal(ScopeInternal):
         a.size = maxsize
         return True
 
-    def _createEntry(self, a: RangeHint) -> None:
+    def _adjustFit(self, a: RangeHint) -> bool:
+        return self.adjustFit(a)
+
+    def createEntry(self, a: RangeHint) -> None:
         addr = Address(self._space, a.start)
         usepoint = Address()
         ct = self.glb.types.concretize(a.type)
@@ -1262,7 +1295,10 @@ class ScopeLocal(ScopeInternal):
             )
         self.addSymbol("", ct, addr, usepoint)
 
-    def _collectNameRecs(self) -> None:
+    def _createEntry(self, a: RangeHint) -> None:
+        self.createEntry(a)
+
+    def collectNameRecs(self) -> None:
         self._nameRecommend.clear()
         self._dynRecommend.clear()
         for sym in list(self.iterSymbols()):
@@ -1273,9 +1309,12 @@ class ScopeLocal(ScopeInternal):
                         if dt.getPtrTo().getMetatype() == 'struct':
                             entry = sym.getFirstWholeMap()
                             self.addTypeRecommendation(entry.getAddr(), dt)
-                self._addRecommendName(sym)
+                self.addRecommendName(sym)
 
-    def _addRecommendName(self, sym) -> None:
+    def _collectNameRecs(self) -> None:
+        self.collectNameRecs()
+
+    def addRecommendName(self, sym) -> None:
         entry = sym.getFirstWholeMap()
         if entry is None:
             return
@@ -1292,7 +1331,10 @@ class ScopeLocal(ScopeInternal):
         if sym.getCategory() < 0:
             self.removeSymbol(sym)
 
-    def _annotateRawStackPtr(self) -> None:
+    def _addRecommendName(self, sym) -> None:
+        self.addRecommendName(sym)
+
+    def annotateRawStackPtr(self) -> None:
         if not self._fd.hasTypeRecoveryStarted():
             return
         spVn = self._fd.findSpacebaseInput(self._space)
@@ -1312,7 +1354,10 @@ class ScopeLocal(ScopeInternal):
                                           self._fd.newConstant(spVn.getSize(), 0))
             self._fd.opSetInput(op, ptrsub.getOut(), slot)
 
-    def _checkUnaliasedReturn(self, alias: List[int]) -> None:
+    def _annotateRawStackPtr(self) -> None:
+        self.annotateRawStackPtr()
+
+    def checkUnaliasedReturn(self, alias: List[int]) -> None:
         retOp = self._fd.getFirstReturnOp()
         if retOp is None or retOp.numInput() < 2:
             return
@@ -1325,7 +1370,10 @@ class ScopeLocal(ScopeInternal):
                 return
         self.markNotMapped(self._space, vn.getOffset(), vn.getSize(), False)
 
-    def _markUnaliased(self, alias: List[int]) -> None:
+    def _checkUnaliasedReturn(self, alias: List[int]) -> None:
+        self.checkUnaliasedReturn(alias)
+
+    def markUnaliased(self, alias: List[int]) -> None:
         from ghidra.ir.varnode import Varnode
         from ghidra.types.datatype import TYPE_ARRAY, TYPE_STRUCT
 
@@ -1394,7 +1442,10 @@ class ScopeLocal(ScopeInternal):
                     elif meta == TYPE_ARRAY and alias_block_level > 1:
                         aliason = False
 
-    def _fakeInputSymbols(self) -> None:
+    def _markUnaliased(self, alias: List[int]) -> None:
+        self.markUnaliased(alias)
+
+    def fakeInputSymbols(self) -> None:
         from ghidra.ir.varnode import Varnode
 
         lockedinputs = self.getCategorySize(0)  # Symbol.function_parameter
@@ -1478,13 +1529,13 @@ class ScopeLocal(ScopeInternal):
                         size,
                         f"created sym={sym.getName()} category={sym.getCategory()}",
                     )
-                except RuntimeError as err:
+                except LowlevelError as err:
                     _fake_input_debug_log(
                         addr.getOffset(),
                         size,
-                        f"addSymbol_error={err}",
+                        f"addSymbol_error={err.explain}",
                     )
-                    self._fd.warningHeader(str(err))
+                    self._fd.warningHeader(err.explain)
             else:
                 _fake_input_debug_log(
                     addr.getOffset(),
@@ -1492,7 +1543,12 @@ class ScopeLocal(ScopeInternal):
                     "skip_locked",
                 )
 
+    def _fakeInputSymbols(self) -> None:
+        self.fakeInputSymbols()
+
     def remapSymbol(self, sym, addr, usepoint):
+        from ghidra.ir.varnode import Varnode
+
         entry = sym.getFirstWholeMap()
         size = entry.getSize()
         if not entry.isDynamic():
@@ -1506,9 +1562,11 @@ class ScopeLocal(ScopeInternal):
         rnglist = RangeList()
         if not usepoint.isInvalid():
             rnglist.insertRange(usepoint.getSpace(), usepoint.getOffset(), usepoint.getOffset())
-        return self.addMapInternal(sym, 0x8, addr, 0, size, rnglist)  # Varnode.mapped
+        return self.addMapInternal(sym, Varnode.mapped, addr, 0, size, rnglist)
 
     def remapSymbolDynamic(self, sym, hashval: int, usepoint):
+        from ghidra.ir.varnode import Varnode
+
         entry = sym.getFirstWholeMap()
         size = entry.getSize()
         if entry.isDynamic():
@@ -1519,9 +1577,11 @@ class ScopeLocal(ScopeInternal):
         rnglist = RangeList()
         if not usepoint.isInvalid():
             rnglist.insertRange(usepoint.getSpace(), usepoint.getOffset(), usepoint.getOffset())
-        return self.addDynamicMapInternal(sym, 0x8, hashval, 0, size, rnglist)  # Varnode.mapped
+        return self.addDynamicMapInternal(sym, Varnode.mapped, hashval, 0, size, rnglist)
 
     def recoverNameRecommendationsForSymbols(self) -> None:
+        from ghidra.ir.varnode import Varnode
+
         param_usepoint = self._fd.getAddress() - 1
         for rec in self._nameRecommend:
             addr = rec.getAddr()
@@ -1557,7 +1617,7 @@ class ScopeLocal(ScopeInternal):
                 continue
             self.renameSymbol(sym, self.makeNameUnique(rec.getName()))
             self.setSymbolId(sym, rec.getSymbolId())
-            self.setAttribute(sym, 0x80)  # Varnode.namelock
+            self.setAttribute(sym, Varnode.namelock)
             if vn is not None:
                 self._fd.remapVarnode(vn, sym, usepoint)
         if not self._dynRecommend:
@@ -1576,7 +1636,7 @@ class ScopeLocal(ScopeInternal):
             if not sym.isNameUndefined():
                 continue
             self.renameSymbol(sym, self.makeNameUnique(dynEntry.getName()))
-            self.setAttribute(sym, 0x80)  # Varnode.namelock
+            self.setAttribute(sym, Varnode.namelock)
             self.setSymbolId(sym, dynEntry.getSymbolId())
             self._fd.remapDynamicVarnode(vn, sym, dynEntry.getAddress(), dynEntry.getHash())
 

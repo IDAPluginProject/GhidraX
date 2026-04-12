@@ -156,10 +156,45 @@ class PrototypePieces:
 class ParameterBasic:
     """A stand-alone parameter with no backing symbol."""
     def __init__(self, nm: str = "", addr=None, tp=None, fl: int = 0) -> None:
+        if addr is None and tp is None and fl == 0 and nm is not None and not isinstance(nm, str):
+            tp = nm
+            nm = ""
         self._name: str = nm
         self._addr = addr if addr is not None else Address()
         self._type = tp
         self._flags: int = fl
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @name.setter
+    def name(self, nm: str) -> None:
+        self._name = nm
+
+    @property
+    def addr(self):
+        return self._addr
+
+    @addr.setter
+    def addr(self, addr: Address) -> None:
+        self._addr = addr
+
+    @property
+    def type(self):
+        return self._type
+
+    @type.setter
+    def type(self, tp) -> None:
+        self._type = tp
+
+    @property
+    def flags(self) -> int:
+        return self._flags
+
+    @flags.setter
+    def flags(self, fl: int) -> None:
+        self._flags = fl
 
     def getName(self) -> str:
         return self._name
@@ -197,8 +232,10 @@ class ParameterBasic:
     def setTypeLock(self, val: bool) -> None:
         if val:
             self._flags |= ParameterPieces.typelock
+            if self._type is not None and self._type.getMetatype() == TYPE_UNKNOWN:
+                self._flags |= ParameterPieces.sizelock
         else:
-            self._flags &= ~ParameterPieces.typelock
+            self._flags &= ~(ParameterPieces.typelock | ParameterPieces.sizelock)
 
     def setNameLock(self, val: bool) -> None:
         if val:
@@ -212,8 +249,52 @@ class ParameterBasic:
         else:
             self._flags &= ~ParameterPieces.isthis
 
+    def setName(self, nm: str) -> None:
+        self._name = nm
+
+    def setType(self, tp) -> None:
+        self._type = tp
+
+    def setAddress(self, addr: Address) -> None:
+        self._addr = addr
+
+    def setSize(self, sz: int) -> None:
+        # ParameterBasic derives size from type, but keep this no-op setter for compatibility.
+        if self._type is None and sz == 0:
+            return
+        if self._type is None:
+            raise LowlevelError("Cannot set size without a data-type")
+
+    def overrideSizeLockType(self, ct) -> None:
+        if self._type.getSize() == ct.getSize():
+            if not self.isSizeTypeLocked():
+                raise LowlevelError("Overriding parameter that is not size locked")
+            self._type = ct
+            return
+        raise LowlevelError("Overriding parameter with different type size")
+
+    def resetSizeLockType(self, factory) -> None:
+        if self._type.getMetatype() == TYPE_UNKNOWN:
+            return
+        size = self._type.getSize()
+        self._type = factory.getBase(size, TYPE_UNKNOWN)
+
+    def getSymbol(self):
+        raise LowlevelError("Parameter is not a real symbol")
+
     def clone(self):
         return ParameterBasic(self._name, self._addr, self._type, self._flags)
+
+    def __eq__(self, other) -> bool:
+        if not hasattr(other, "getAddress") or not hasattr(other, "getType"):
+            return NotImplemented
+        return self.getAddress() == other.getAddress() and self.getType() == other.getType()
+
+    def __ne__(self, other) -> bool:
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return NotImplemented
+        return not eq
 
 
 class ProtoStore:
@@ -2810,66 +2891,101 @@ class PrototypePieces:
 # ProtoParameter
 # =========================================================================
 
-class ProtoParameter:
-    """A single parameter in a function prototype."""
+class ProtoParameter(ABC):
+    """A function parameter viewed as a name, data-type, and storage address."""
 
-    def __init__(self, name: str = "", tp: Optional[Datatype] = None,
-                 addr: Optional[Address] = None, sz: int = 0) -> None:
-        self.name: str = name
-        self.type: Optional[Datatype] = tp
-        self.addr: Address = addr if addr is not None else Address()
-        self.size: int = sz
-        self.flags: int = 0
+    def __init__(self) -> None:
+        pass
 
+    @abstractmethod
     def getName(self) -> str:
-        return self.name
+        raise NotImplementedError
 
+    @abstractmethod
     def getType(self) -> Optional[Datatype]:
-        return self.type
+        raise NotImplementedError
 
+    @abstractmethod
     def getAddress(self) -> Address:
-        return self.addr
+        raise NotImplementedError
 
+    @abstractmethod
     def getSize(self) -> int:
-        return self.size
+        raise NotImplementedError
 
+    @abstractmethod
     def isTypeLocked(self) -> bool:
-        return (self.flags & ParameterPieces.typelock) != 0
+        raise NotImplementedError
 
+    @abstractmethod
     def isNameLocked(self) -> bool:
-        return (self.flags & ParameterPieces.namelock) != 0
+        raise NotImplementedError
 
+    @abstractmethod
+    def isSizeTypeLocked(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
     def isThisPointer(self) -> bool:
-        return (self.flags & ParameterPieces.isthis) != 0
+        raise NotImplementedError
 
+    @abstractmethod
     def isIndirectStorage(self) -> bool:
-        return (self.flags & ParameterPieces.indirectstorage) != 0
+        raise NotImplementedError
 
+    @abstractmethod
     def isHiddenReturn(self) -> bool:
-        return (self.flags & ParameterPieces.hiddenretparm) != 0
+        raise NotImplementedError
 
+    @abstractmethod
+    def isNameUndefined(self) -> bool:
+        raise NotImplementedError
+
+    @abstractmethod
     def setTypeLock(self, val: bool) -> None:
-        if val:
-            self.flags |= ParameterPieces.typelock
-        else:
-            self.flags &= ~ParameterPieces.typelock
+        raise NotImplementedError
 
-    def setName(self, nm: str) -> None:
-        self.name = nm
+    @abstractmethod
+    def setNameLock(self, val: bool) -> None:
+        raise NotImplementedError
 
-    def setType(self, tp) -> None:
-        self.type = tp
+    @abstractmethod
+    def setThisPointer(self, val: bool) -> None:
+        raise NotImplementedError
 
-    def setAddress(self, addr: Address) -> None:
-        self.addr = addr
+    @abstractmethod
+    def overrideSizeLockType(self, ct) -> None:
+        raise NotImplementedError
 
-    def setSize(self, sz: int) -> None:
-        self.size = sz
+    @abstractmethod
+    def resetSizeLockType(self, factory) -> None:
+        raise NotImplementedError
 
+    @abstractmethod
     def clone(self):
-        p = ProtoParameter(self.name, self.type, self.addr, self.size)
-        p.flags = self.flags
-        return p
+        raise NotImplementedError
+
+    @abstractmethod
+    def getSymbol(self):
+        raise NotImplementedError
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, ProtoParameter):
+            return NotImplemented
+        if self.getAddress() != other.getAddress():
+            return False
+        if self.getType() != other.getType():
+            return False
+        return True
+
+    def __ne__(self, other) -> bool:
+        eq = self.__eq__(other)
+        if eq is NotImplemented:
+            return NotImplemented
+        return not eq
+
+
+ProtoParameter.register(ParameterBasic)
 
 
 # =========================================================================
@@ -2942,12 +3058,37 @@ class FuncProto:
         if isinstance(p, ProtoParameter):
             self.outparam = p
             return
-        tp = p.type if p is not None and hasattr(p, "type") else None
-        addr = p.addr if p is not None and hasattr(p, "addr") else Address()
-        size = tp.getSize() if tp is not None and hasattr(tp, "getSize") else 0
-        name = p.name if p is not None and hasattr(p, "name") else ""
-        out = ProtoParameter(name, tp, addr, size)
-        out.flags = p.flags if p is not None and hasattr(p, "flags") else 0
+        tp = None
+        if p is not None:
+            if hasattr(p, "type"):
+                tp = p.type
+            elif hasattr(p, "getType"):
+                tp = p.getType()
+        addr = Address()
+        if p is not None:
+            if hasattr(p, "addr"):
+                addr = p.addr
+            elif hasattr(p, "getAddress"):
+                addr = p.getAddress()
+        name = ""
+        if p is not None:
+            if hasattr(p, "name"):
+                name = p.name
+            elif hasattr(p, "getName"):
+                name = p.getName()
+        fl = p.flags if p is not None and hasattr(p, "flags") else 0
+        if p is not None and not hasattr(p, "flags"):
+            if hasattr(p, "isTypeLocked") and p.isTypeLocked():
+                fl |= ParameterPieces.typelock
+            if hasattr(p, "isNameLocked") and p.isNameLocked():
+                fl |= ParameterPieces.namelock
+            if hasattr(p, "isThisPointer") and p.isThisPointer():
+                fl |= ParameterPieces.isthis
+            if hasattr(p, "isIndirectStorage") and p.isIndirectStorage():
+                fl |= ParameterPieces.indirectstorage
+            if hasattr(p, "isHiddenReturn") and p.isHiddenReturn():
+                fl |= ParameterPieces.hiddenretparm
+        out = ParameterBasic(name, addr, tp, fl)
         self.outparam = out
 
     def addParam(self, p: ProtoParameter) -> None:
@@ -3295,7 +3436,7 @@ class FuncProto:
                 else:
                     addr = trial.getAddress()
                     tp = vn.getHigh().getType() if hasattr(vn, 'getHigh') and vn.getHigh() is not None else None
-                p = ProtoParameter("", tp, addr, tp.getSize() if tp is not None else 0)
+                p = ParameterBasic("", addr, tp, 0)
                 self.store.append(p)
                 count += 1
                 if hasattr(vn, 'setMark'):
@@ -3334,7 +3475,7 @@ class FuncProto:
                 else:
                     addr = trial.getAddress()
                     tp = factory.getBase(vn.getSize(), TYPE_UNKNOWN) if factory else None
-                p = ProtoParameter("", tp, addr, tp.getSize() if tp is not None else 0)
+                p = ParameterBasic("", addr, tp, 0)
                 self.store.append(p)
                 count += 1
                 if hasattr(vn, 'setMark'):
@@ -3374,7 +3515,7 @@ class FuncProto:
             return
         vn = triallist[0]
         tp = vn.getHigh().getType() if hasattr(vn, 'getHigh') and vn.getHigh() is not None else None
-        self.outparam = ProtoParameter("", tp, vn.getAddr(), vn.getSize())
+        self.outparam = ParameterBasic("", vn.getAddr(), tp, 0)
 
     def updateOutputNoTypes(self, triallist: list, factory=None) -> None:
         """Update the return value based on Varnode trials, without storing data-types.
@@ -3390,7 +3531,7 @@ class FuncProto:
             return
         vn = triallist[0]
         tp = factory.getBase(vn.getSize(), TYPE_UNKNOWN) if factory is not None else None
-        self.outparam = ProtoParameter("", tp, vn.getAddr(), vn.getSize())
+        self.outparam = ParameterBasic("", vn.getAddr(), tp, 0)
 
     def _updateThisPointer(self) -> None:
         """Mark the appropriate parameter as 'this' if the model requires it.
@@ -3432,10 +3573,11 @@ class FuncProto:
             if pieces:
                 # First piece is output
                 outpiece = pieces[0]
-                self.outparam = ProtoParameter("",
-                    outpiece.type if hasattr(outpiece, 'type') else None,
+                self.outparam = ParameterBasic(
+                    "",
                     outpiece.addr if hasattr(outpiece, 'addr') else Address(),
-                    outpiece.type.getSize() if hasattr(outpiece, 'type') and outpiece.type is not None else 0)
+                    outpiece.type if hasattr(outpiece, 'type') else None,
+                    outpiece.flags if hasattr(outpiece, 'flags') else 0)
                 j = 0
                 for i in range(1, len(pieces)):
                     pc = pieces[i]
@@ -3447,9 +3589,7 @@ class FuncProto:
                         j += 1
                     tp = pc.type if hasattr(pc, 'type') else None
                     addr = pc.addr if hasattr(pc, 'addr') else Address()
-                    p = ProtoParameter(nm, tp, addr,
-                        tp.getSize() if tp is not None else 0)
-                    p.flags = fl
+                    p = ParameterBasic(nm, addr, tp, fl)
                     self.store.append(p)
         except ParamUnassignedError:
             self.flags |= FuncProto.error_inputparam
@@ -3505,8 +3645,7 @@ class FuncProto:
             outpc = pieces[0]
             tp = outpc.type if hasattr(outpc, 'type') else None
             addr = outpc.addr if hasattr(outpc, 'addr') else Address()
-            self.outparam = ProtoParameter("", tp, addr,
-                tp.getSize() if tp is not None else 0)
+            self.outparam = ParameterBasic("", addr, tp, outpc.flags if hasattr(outpc, 'flags') else 0)
             j = 0
             for i in range(1, len(pieces)):
                 pc = pieces[i]
@@ -3518,9 +3657,7 @@ class FuncProto:
                     j += 1
                 tp = pc.type if hasattr(pc, 'type') else None
                 addr = pc.addr if hasattr(pc, 'addr') else Address()
-                p = ProtoParameter(nm, tp, addr,
-                    tp.getSize() if tp is not None else 0)
-                p.flags = fl
+                p = ParameterBasic(nm, addr, tp, fl)
                 self.store.append(p)
         self.setInputLock(True)
         self.setDotdotdot(proto.firstVarArgSlot >= 0)
@@ -3740,8 +3877,7 @@ class FuncProto:
                 if glb is not None and hasattr(glb, 'types'):
                     outtype = glb.types.decodeType(decoder)
                 decoder.closeElement(subId)
-                self.outparam = ProtoParameter("", outtype, outaddr,
-                    outtype.getSize() if outtype is not None else 0)
+                self.outparam = ParameterBasic("", outaddr, outtype, 0)
                 if outputlock:
                     self.outparam.setTypeLock(True)
         # Decode remaining sub-elements (effects, inject, internal params)
@@ -3846,9 +3982,7 @@ class FuncProto:
             ptype = None
             if glb is not None and hasattr(glb, 'types'):
                 ptype = glb.types.decodeType(decoder)
-            p = ProtoParameter(nm, ptype, paddr,
-                ptype.getSize() if ptype is not None else 0)
-            p.flags = fl
+            p = ParameterBasic(nm, paddr, ptype, fl)
             if subId == ELEM_RETPARAM:
                 self.outparam = p
             else:
@@ -3996,7 +4130,7 @@ class FuncProto:
         if self.model is None:
             self.setModel(m)
         if vt is not None:
-            self.outparam = ProtoParameter("", vt, Address(), vt.getSize() if hasattr(vt, 'getSize') else 0)
+            self.outparam = ParameterBasic("", Address(), vt, 0)
 
     def setInputLock(self, val: bool) -> None:
         """Toggle the data-type lock on input parameters."""
@@ -4019,12 +4153,11 @@ class FuncProto:
     def setParam(self, i: int, name: str, piece) -> None:
         """Set parameter storage directly."""
         while len(self.store) <= i:
-            self.store.append(ProtoParameter())
+            self.store.append(ParameterBasic())
         tp = piece.type if piece is not None and hasattr(piece, "type") else None
         addr = piece.addr if piece is not None and hasattr(piece, "addr") else Address()
-        size = tp.getSize() if tp is not None and hasattr(tp, "getSize") else 0
-        p = ProtoParameter(name, tp, addr, size)
-        p.flags = piece.flags if piece is not None and hasattr(piece, "flags") else 0
+        fl = piece.flags if piece is not None and hasattr(piece, "flags") else 0
+        p = ParameterBasic(name, addr, tp, fl)
         self.store[i] = p
 
     def removeParam(self, i: int) -> None:

@@ -8,6 +8,7 @@ Includes the Translate abstract base class, PcodeEmit, and AssemblyEmit.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import IntEnum
 from typing import TYPE_CHECKING, Optional, Dict, List
 
 from ghidra.core.error import LowlevelError, UnimplError, BadDataError
@@ -21,18 +22,26 @@ from ghidra.core.space import (
 )
 from ghidra.core.marshal import (
     Encoder, Decoder, ElementId, AttributeId,
-    ATTRIB_NAME, ATTRIB_SIZE, ATTRIB_DEFAULTSPACE, ATTRIB_UNIQBASE,
+    ATTRIB_NAME, ATTRIB_SIZE, ATTRIB_SPACE, ATTRIB_DEFAULTSPACE, ATTRIB_UNIQBASE,
     ELEM_SPACE, ELEM_SPACES, ELEM_SPACE_BASE, ELEM_SPACE_UNIQUE,
     ELEM_SPACE_OTHER, ELEM_SPACE_OVERLAY, ELEM_TRUNCATE_SPACE,
 )
 
 if TYPE_CHECKING:
-    pass
+    from ghidra.core.xml import DocumentStorage
 
 
 # =========================================================================
 # TruncationTag
 # =========================================================================
+
+
+class UniqueLayout(IntEnum):
+    RUNTIME_BOOLEAN_INVERT = 0
+    RUNTIME_RETURN_LOCATION = 0x80
+    RUNTIME_BITRANGE_EA = 0x100
+    INJECT = 0x200
+    ANALYSIS = 0x10000000
 
 class TruncationTag:
     """Object for describing how a space should be truncated."""
@@ -43,14 +52,8 @@ class TruncationTag:
 
     def decode(self, decoder: Decoder) -> None:
         elem_id = decoder.openElement(ELEM_TRUNCATE_SPACE)
-        while True:
-            attrib_id = decoder.getNextAttributeId()
-            if attrib_id == 0:
-                break
-            if attrib_id == ATTRIB_NAME.id:
-                self.spaceName = decoder.readString()
-            elif attrib_id == ATTRIB_SIZE.id:
-                self.size = decoder.readSignedInteger()
+        self.spaceName = decoder.readString(ATTRIB_SPACE)
+        self.size = decoder.readUnsignedInteger(ATTRIB_SIZE)
         decoder.closeElement(elem_id)
 
     def getName(self) -> str:
@@ -129,7 +132,7 @@ class AddressResolver(ABC):
 # Translate
 # =========================================================================
 
-class Translate(AddrSpaceManager):
+class Translate(AddrSpaceManager, ABC):
     """Abstract base for translation engines (disassembler + pcode generator).
 
     Corresponds to the Translate class in translate.hh.
@@ -140,19 +143,23 @@ class Translate(AddrSpaceManager):
     def __init__(self) -> None:
         super().__init__()
         self._floatformats: Dict[int, FloatFormat] = {}
-        self._alignment: int = 0
-        self._target_endian: int = 0  # 0=little, 1=big
+        self._alignment: int = 1
+        self._target_endian: bool = False
         self._unique_base: int = 0
 
     # --- Float format management ---
 
-    def getFloatFormat(self, size: int) -> FloatFormat:
+    def setBigEndian(self, val: bool) -> None:
+        self._target_endian = val
+
+    def setDefaultFloatFormats(self) -> None:
+        if not self._floatformats:
+            self._floatformats[4] = FloatFormat(4)
+            self._floatformats[8] = FloatFormat(8)
+
+    def getFloatFormat(self, size: int) -> FloatFormat | None:
         """Get the floating-point format for a given byte size."""
-        fmt = self._floatformats.get(size)
-        if fmt is None:
-            fmt = FloatFormat(size)
-            self._floatformats[size] = fmt
-        return fmt
+        return self._floatformats.get(size)
 
     def setFloatFormat(self, size: int, fmt: FloatFormat) -> None:
         self._floatformats[size] = fmt
@@ -163,7 +170,7 @@ class Translate(AddrSpaceManager):
         return self._alignment
 
     def isBigEndian(self) -> bool:
-        return self._target_endian != 0
+        return self._target_endian
 
     def getUniqueBase(self) -> int:
         return self._unique_base
@@ -172,7 +179,67 @@ class Translate(AddrSpaceManager):
         if val > self._unique_base:
             self._unique_base = val
 
-    # --- Abstract translation methods ---
+    def getUniqueStart(self, layout: int) -> int:
+        """Get the starting offset for the unique space."""
+        if layout != UniqueLayout.ANALYSIS:
+            return int(layout) + self._unique_base
+        return int(layout)
+
+    @abstractmethod
+    def initialize(self, store: DocumentStorage) -> None:
+        """Initialize the translator from a document store."""
+        ...
+
+    def registerContext(self, name: str, sbit: int, ebit: int) -> None:
+        """Register a named context variable.
+
+        The base Translate surface matches the native default no-op.
+        """
+        return None
+
+    def setContextDefault(self, name: str, val: int) -> None:
+        """Set the default value for a context variable.
+
+        The base Translate surface matches the native default no-op.
+        """
+        return None
+
+    def allowContextSet(self, val: bool) -> None:
+        """Toggle whether translation is allowed to affect context.
+
+        The base Translate surface matches the native default no-op.
+        """
+        return None
+
+    @abstractmethod
+    def getRegister(self, nm: str) -> VarnodeData:
+        """Get the location of a register by name."""
+        ...
+
+    @abstractmethod
+    def getRegisterName(self, base: AddrSpace, off: int, size: int) -> str:
+        """Get the name of the smallest containing register."""
+        ...
+
+    @abstractmethod
+    def getExactRegisterName(self, base: AddrSpace, off: int, size: int) -> str:
+        """Get the name of a register with an exact location and size."""
+        ...
+
+    @abstractmethod
+    def getAllRegisters(self) -> Dict[VarnodeData, str]:
+        """Get all register definitions."""
+        ...
+
+    @abstractmethod
+    def getUserOpNames(self) -> List[str]:
+        """Get the list of user-defined pcode op names."""
+        ...
+
+    @abstractmethod
+    def instructionLength(self, addr: Address) -> int:
+        """Get the length of a machine instruction in bytes."""
+        ...
 
     @abstractmethod
     def oneInstruction(self, emit: PcodeEmit, addr: Address) -> int:
@@ -189,23 +256,3 @@ class Translate(AddrSpaceManager):
         Returns the length of the machine instruction in bytes.
         """
         ...
-
-    def getRegisterName(self, base: AddrSpace, off: int, size: int) -> str:
-        """Get the name of a register given its location."""
-        return ""
-
-    def getRegister(self, nm: str) -> VarnodeData:
-        """Get the location of a register by name."""
-        raise LowlevelError(f"No register named: {nm}")
-
-    def getAllRegisters(self) -> Dict[str, VarnodeData]:
-        """Get all register definitions."""
-        return {}
-
-    def getUserOpNames(self) -> List[str]:
-        """Get the list of user-defined pcode op names."""
-        return []
-
-    def getUniqueStart(self) -> int:
-        """Get the starting offset for the unique space."""
-        return self._unique_base

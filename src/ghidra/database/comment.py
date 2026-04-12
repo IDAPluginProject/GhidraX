@@ -11,6 +11,7 @@ from enum import IntEnum
 from typing import Optional, List, Dict, Tuple
 
 from ghidra.core.address import Address
+from ghidra.core.error import LowlevelError
 
 
 class Comment:
@@ -28,8 +29,8 @@ class Comment:
                  addr: Optional[Address] = None, uniq: int = 0, text: str = "") -> None:
         self.type: int = tp
         self.uniq: int = uniq
-        self.funcaddr: Address = funcaddr if funcaddr is not None else Address()
-        self.addr: Address = addr if addr is not None else Address()
+        self.funcaddr: Address = Address(funcaddr) if funcaddr is not None else Address()
+        self.addr: Address = Address(addr) if addr is not None else Address()
         self.text: str = text
         self.emitted: bool = False
 
@@ -94,24 +95,58 @@ class Comment:
 
     @staticmethod
     def encodeCommentType(name: str) -> int:
-        _map = {"user1": 1, "user2": 2, "user3": 4, "header": 8,
-                "warning": 16, "warningheader": 32}
-        return _map.get(name, 0)
+        if name == "user1":
+            return Comment.CommentType.user1
+        if name == "user2":
+            return Comment.CommentType.user2
+        if name == "user3":
+            return Comment.CommentType.user3
+        if name == "header":
+            return Comment.CommentType.header
+        if name == "warning":
+            return Comment.CommentType.warning
+        if name == "warningheader":
+            return Comment.CommentType.warningheader
+        raise LowlevelError("Unknown comment type: " + name)
 
     @staticmethod
     def decodeCommentType(val: int) -> str:
-        parts = []
-        if val & 1: parts.append("user1")
-        if val & 2: parts.append("user2")
-        if val & 4: parts.append("user3")
-        if val & 8: parts.append("header")
-        if val & 16: parts.append("warning")
-        if val & 32: parts.append("warningheader")
-        return "|".join(parts) if parts else "none"
+        if val == Comment.CommentType.user1:
+            return "user1"
+        if val == Comment.CommentType.user2:
+            return "user2"
+        if val == Comment.CommentType.user3:
+            return "user3"
+        if val == Comment.CommentType.header:
+            return "header"
+        if val == Comment.CommentType.warning:
+            return "warning"
+        if val == Comment.CommentType.warningheader:
+            return "warningheader"
+        raise LowlevelError("Unknown comment type")
+
+
+class CommentOrder:
+    """Compare comments by function address, address, then uniq."""
+
+    def __call__(self, a: Comment, b: Comment) -> bool:
+        if a.getFuncAddr() != b.getFuncAddr():
+            return a.getFuncAddr() < b.getFuncAddr()
+        if a.getAddr() != b.getAddr():
+            return a.getAddr() < b.getAddr()
+        if a.getUniq() != b.getUniq():
+            return a.getUniq() < b.getUniq()
+        return False
 
 
 class CommentDatabase(ABC):
     """An interface to a container of comments."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+    def __del__(self) -> None:
+        return None
 
     @abstractmethod
     def clear(self) -> None: ...
@@ -126,61 +161,105 @@ class CommentDatabase(ABC):
     def addCommentNoDuplicate(self, tp: int, fad: Address, ad: Address, txt: str) -> bool: ...
 
     @abstractmethod
-    def getComments(self, fad: Address) -> List[Comment]: ...
+    def deleteComment(self, com: Comment) -> None: ...
+
+    @abstractmethod
+    def beginComment(self, fad: Address): ...
+
+    @abstractmethod
+    def endComment(self, fad: Address): ...
+
+    @abstractmethod
+    def encode(self, encoder) -> None: ...
+
+    @abstractmethod
+    def decode(self, decoder) -> None: ...
+
+    def getComments(self, fad: Address) -> List[Comment]:
+        return list(self.beginComment(fad))
 
 
 class CommentDatabaseInternal(CommentDatabase):
     """In-memory implementation of CommentDatabase."""
 
     def __init__(self) -> None:
-        self._comments: Dict[Tuple[int, int], List[Comment]] = {}
-        self._uniq_counter: int = 0
+        super().__init__()
+        self._commentset: List[Comment] = []
+        self._order = CommentOrder()
 
-    def _key(self, fad: Address) -> Tuple[int, int]:
-        spc = fad.getSpace()
-        return (spc.getIndex() if spc else -1, fad.getOffset())
+    def __del__(self) -> None:
+        try:
+            self.clear()
+        except Exception:
+            pass
+
+    def _lower_bound(self, probe: Comment) -> int:
+        idx = 0
+        while idx < len(self._commentset) and self._order(self._commentset[idx], probe):
+            idx += 1
+        return idx
+
+    def _function_bounds(self, fad: Address) -> Tuple[int, int]:
+        testcommbeg = Comment(0, fad, Address(Address.m_minimal), 0, "")
+        testcommend = Comment(0, fad, Address(Address.m_maximal), 65535, "")
+        return self._lower_bound(testcommbeg), self._lower_bound(testcommend)
 
     def clear(self) -> None:
-        self._comments.clear()
-        self._uniq_counter = 0
+        self._commentset.clear()
 
     def clearType(self, fad: Address, tp: int) -> None:
-        key = self._key(fad)
-        lst = self._comments.get(key)
-        if lst:
-            self._comments[key] = [c for c in lst if (c.type & tp) == 0]
+        start, end = self._function_bounds(fad)
+        kept: List[Comment] = []
+        for idx, comment in enumerate(self._commentset):
+            if start <= idx < end and (comment.getType() & tp) != 0:
+                continue
+            kept.append(comment)
+        self._commentset = kept
 
     def addComment(self, tp: int, fad: Address, ad: Address, txt: str) -> None:
-        key = self._key(fad)
-        if key not in self._comments:
-            self._comments[key] = []
-        self._comments[key].append(Comment(tp, fad, ad, self._uniq_counter, txt))
-        self._uniq_counter += 1
+        newcom = Comment(tp, fad, ad, 65535, txt)
+        idx = self._lower_bound(newcom)
+        newcom.uniq = 0
+        if idx != 0:
+            prev = self._commentset[idx - 1]
+            if prev.getAddr() == ad and prev.getFuncAddr() == fad:
+                newcom.uniq = prev.getUniq() + 1
+        self._commentset.insert(idx, newcom)
 
     def addCommentNoDuplicate(self, tp: int, fad: Address, ad: Address, txt: str) -> bool:
-        key = self._key(fad)
-        lst = self._comments.get(key, [])
-        for c in lst:
-            if c.addr == ad and c.text == txt:
-                return False
-        self.addComment(tp, fad, ad, txt)
+        newcom = Comment(tp, fad, ad, 65535, txt)
+        idx = self._lower_bound(newcom)
+        newcom.uniq = 0
+        scan = idx
+        while scan != 0:
+            scan -= 1
+            cur = self._commentset[scan]
+            if cur.getAddr() == ad and cur.getFuncAddr() == fad:
+                if cur.getText() == txt:
+                    return False
+                if newcom.uniq == 0:
+                    newcom.uniq = cur.getUniq() + 1
+            else:
+                break
+        self._commentset.insert(idx, newcom)
         return True
 
     def getComments(self, fad: Address) -> List[Comment]:
-        return self._comments.get(self._key(fad), [])
+        start, end = self._function_bounds(fad)
+        return list(self._commentset[start:end])
 
     def deleteComment(self, com: Comment) -> None:
         """Delete a specific comment from the database.
 
         C++ ref: CommentDatabaseInternal::deleteComment
         """
-        key = self._key(com.getFuncAddr())
-        lst = self._comments.get(key)
-        if lst is not None:
-            try:
-                lst.remove(com)
-            except ValueError:
-                pass
+        idx = self._lower_bound(com)
+        if idx >= len(self._commentset):
+            return
+        cur = self._commentset[idx]
+        if self._order(cur, com) or self._order(com, cur):
+            return
+        del self._commentset[idx]
 
     def encode(self, encoder) -> None:
         """Encode the entire comment database.
@@ -189,9 +268,8 @@ class CommentDatabaseInternal(CommentDatabase):
         """
         from ghidra.core.marshal import ELEM_COMMENTDB
         encoder.openElement(ELEM_COMMENTDB)
-        for comment_list in self._comments.values():
-            for comm in comment_list:
-                comm.encode(encoder)
+        for comm in self._commentset:
+            comm.encode(encoder)
         encoder.closeElement(ELEM_COMMENTDB)
 
     def decode(self, decoder) -> None:
@@ -223,19 +301,68 @@ class CommentSorter:
     header_basic = 0
     header_unplaced = 1
 
+    class Subsort:
+        def __init__(self) -> None:
+            self.index = 0
+            self.order = 0
+            self.pos = 0
+
+        def __lt__(self, op2: CommentSorter.Subsort) -> bool:
+            if self.index == op2.index:
+                if self.order == op2.order:
+                    return self.pos < op2.pos
+                return self.order < op2.order
+            return self.index < op2.index
+
+        def setHeader(self, headerType: int) -> None:
+            self.index = -1
+            self.order = headerType
+
+        def setBlock(self, i: int, ord: int) -> None:
+            self.index = i
+            self.order = ord
+
+        def copy(self) -> CommentSorter.Subsort:
+            res = CommentSorter.Subsort()
+            res.index = self.index
+            res.order = self.order
+            res.pos = self.pos
+            return res
+
     def __init__(self) -> None:
-        self._commmap: Dict[Tuple[int, int, int], Comment] = {}
-        self._sorted_keys: List[Tuple[int, int, int]] = []
+        self._commmap: List[Tuple[CommentSorter.Subsort, Comment]] = []
         self._start_idx: int = 0
         self._stop_idx: int = 0
         self._opstop_idx: int = 0
-        self._displayUnplaced: bool = False
+        self.displayUnplacedComments: bool = False
 
-    def findPosition(self, subsort: list, comm: Comment, fd) -> bool:
+    def _lower_bound(self, subsort: CommentSorter.Subsort) -> int:
+        idx = 0
+        while idx < len(self._commmap) and self._commmap[idx][0] < subsort:
+            idx += 1
+        return idx
+
+    def _upper_bound(self, subsort: CommentSorter.Subsort) -> int:
+        idx = 0
+        while idx < len(self._commmap):
+            if subsort < self._commmap[idx][0]:
+                break
+            idx += 1
+        return idx
+
+    @staticmethod
+    def _all_ops(fd) -> List:
+        if not hasattr(fd, "beginOpAll"):
+            return []
+        opiter = fd.beginOpAll()
+        if opiter is None:
+            return []
+        return list(opiter)
+
+    def findPosition(self, subsort: CommentSorter.Subsort, comm: Comment, fd) -> bool:
         """Figure out position of given Comment and initialize its key.
 
         C++ ref: CommentSorter::findPosition
-        subsort is a mutable [index, order] list.
         Returns True if the Comment could be positioned.
         """
         if comm.getType() == 0:
@@ -243,54 +370,49 @@ class CommentSorter:
         fad = fd.getAddress()
         ctype = comm.getType()
         if (ctype & (Comment.CommentType.header | Comment.CommentType.warningheader)) != 0 and comm.getAddr() == fad:
-            subsort[0] = -1
-            subsort[1] = CommentSorter.header_basic
+            subsort.setHeader(CommentSorter.header_basic)
             return True
 
-        # Try to find block containing comment via op tree
         backupOp = None
-        op = None
-        block = None
-        if hasattr(fd, 'beginOp') and hasattr(fd, 'endOpAll'):
-            opiter = fd.beginOp(comm.getAddr())
-            if opiter is not None:
-                op = opiter
-                block = op.getParent() if hasattr(op, 'getParent') else None
-                if block is not None and hasattr(block, 'contains') and block.contains(comm.getAddr()):
-                    subsort[0] = block.getIndex()
-                    subsort[1] = op.getSeqNum().getOrder()
-                    return True
-                if comm.getAddr() == op.getAddr():
-                    backupOp = op
+        ops = self._all_ops(fd)
+        op_index = None
+        for idx, op in enumerate(ops):
+            if op.getAddr() >= comm.getAddr():
+                op_index = idx
+                break
+        if op_index is not None:
+            op = ops[op_index]
+            block = op.getParent()
+            if block is None:
+                raise LowlevelError("Dead op reaching CommentSorter")
+            if block.contains(comm.getAddr()):
+                subsort.setBlock(block.getIndex(), op.getSeqNum().getOrder())
+                return True
+            if comm.getAddr() == op.getAddr():
+                backupOp = op
 
-        # Try previous op
-        if hasattr(fd, 'getBasicBlocks'):
-            bblocks = fd.getBasicBlocks()
-            if bblocks is not None:
-                nblocks = bblocks.getSize() if hasattr(bblocks, 'getSize') else 0
-                for i in range(nblocks):
-                    bl = bblocks.getBlock(i)
-                    if hasattr(bl, 'contains') and bl.contains(comm.getAddr()):
-                        subsort[0] = bl.getIndex()
-                        subsort[1] = 0xFFFFFFFF
-                        return True
-
+        prev_index = len(ops) - 1 if op_index is None else op_index - 1
+        if prev_index >= 0:
+            op = ops[prev_index]
+            block = op.getParent()
+            if block is None:
+                raise LowlevelError("Dead op reaching CommentSorter")
+            if block.contains(comm.getAddr()):
+                subsort.setBlock(block.getIndex(), 0xFFFFFFFF)
+                return True
         if backupOp is not None:
-            parent = backupOp.getParent() if hasattr(backupOp, 'getParent') else None
-            if parent is not None:
-                subsort[0] = parent.getIndex()
-                subsort[1] = backupOp.getSeqNum().getOrder()
-                return True
+            parent = backupOp.getParent()
+            if parent is None:
+                raise LowlevelError("Dead op reaching CommentSorter")
+            subsort.setBlock(parent.getIndex(), backupOp.getSeqNum().getOrder())
+            return True
 
-        if hasattr(fd, 'beginOpAll') and hasattr(fd, 'endOpAll'):
-            if fd.beginOpAll() == fd.endOpAll():
-                subsort[0] = 0
-                subsort[1] = 0
-                return True
+        if len(ops) == 0:
+            subsort.setBlock(0, 0)
+            return True
 
-        if self._displayUnplaced:
-            subsort[0] = -1
-            subsort[1] = CommentSorter.header_unplaced
+        if self.displayUnplacedComments:
+            subsort.setHeader(CommentSorter.header_unplaced)
             return True
 
         return False
@@ -301,44 +423,37 @@ class CommentSorter:
         C++ ref: CommentSorter::setupFunctionList
         """
         self._commmap.clear()
-        self._displayUnplaced = displayUnplaced
-        if fd is None or db is None or tp == 0:
-            self._sorted_keys = []
+        self._start_idx = 0
+        self._stop_idx = 0
+        self._opstop_idx = 0
+        self.displayUnplacedComments = displayUnplaced
+        if tp == 0:
             return
-        funcaddr = fd.getAddress() if hasattr(fd, 'getAddress') else None
-        if funcaddr is None:
-            self._sorted_keys = []
-            return
+        funcaddr = fd.getAddress()
         comments = db.getComments(funcaddr)
-        subsort = [0, 0]
-        pos = 0
+        subsort = CommentSorter.Subsort()
+        subsort.pos = 0
         for comm in comments:
-            if (comm.getType() & tp) == 0:
-                continue
             if self.findPosition(subsort, comm, fd):
                 comm.setEmitted(False)
-                key = (subsort[0], subsort[1], pos)
-                self._commmap[key] = comm
-                pos += 1
-        self._sorted_keys = sorted(self._commmap.keys())
-        self._start_idx = 0
-        self._stop_idx = len(self._sorted_keys)
-        self._opstop_idx = len(self._sorted_keys)
+                self._commmap.append((subsort.copy(), comm))
+                subsort.pos += 1
+        self._commmap.sort(key=lambda item: item[0])
+        self._stop_idx = len(self._commmap)
+        self._opstop_idx = self._stop_idx
 
     def setupBlockList(self, bl) -> None:
         """Prepare to walk comments from a single basic block."""
         if bl is None:
             self._start_idx = self._stop_idx = self._opstop_idx = 0
             return
-        blockidx = bl.getIndex() if hasattr(bl, 'getIndex') else -1
-        # Find range in sorted keys for this block
-        self._start_idx = 0
-        self._stop_idx = 0
-        for i, k in enumerate(self._sorted_keys):
-            if k[0] == blockidx:
-                if self._start_idx == self._stop_idx:
-                    self._start_idx = i
-                self._stop_idx = i + 1
+        subsort = CommentSorter.Subsort()
+        subsort.setBlock(bl.getIndex(), 0)
+        subsort.pos = 0
+        self._start_idx = self._lower_bound(subsort)
+        subsort.order = 0xFFFFFFFF
+        subsort.pos = 0xFFFFFFFF
+        self._stop_idx = self._upper_bound(subsort)
         self._opstop_idx = self._stop_idx
 
     def setupOpList(self, op) -> None:
@@ -346,35 +461,25 @@ class CommentSorter:
         if op is None:
             self._opstop_idx = self._stop_idx
             return
-        # Find comments up to this op's address
-        opaddr = op.getAddr() if hasattr(op, 'getAddr') else None
-        if opaddr is None:
-            self._opstop_idx = self._stop_idx
-            return
-        self._opstop_idx = self._start_idx
-        for i in range(self._start_idx, self._stop_idx):
-            k = self._sorted_keys[i]
-            comm = self._commmap[k]
-            if comm.getAddr() <= opaddr:
-                self._opstop_idx = i + 1
-            else:
-                break
+        subsort = CommentSorter.Subsort()
+        subsort.setBlock(op.getParent().getIndex(), op.getSeqNum().getOrder())
+        subsort.pos = 0xFFFFFFFF
+        self._opstop_idx = self._upper_bound(subsort)
 
     def setupHeader(self, headerType: int) -> None:
         """Prepare to walk comments in the header."""
-        self._start_idx = 0
-        self._stop_idx = 0
-        for i, k in enumerate(self._sorted_keys):
-            if k[0] == -1 and k[1] == headerType:
-                if self._start_idx == self._stop_idx:
-                    self._start_idx = i
-                self._stop_idx = i + 1
-        self._opstop_idx = self._stop_idx
+        subsort = CommentSorter.Subsort()
+        subsort.setHeader(headerType)
+        subsort.pos = 0
+        self._start_idx = self._lower_bound(subsort)
+        subsort.pos = 0xFFFFFFFF
+        self._opstop_idx = self._upper_bound(subsort)
+        self._stop_idx = self._opstop_idx
 
     def hasNext(self) -> bool:
         return self._start_idx < self._opstop_idx
 
     def getNext(self) -> Comment:
-        k = self._sorted_keys[self._start_idx]
+        key, comment = self._commmap[self._start_idx]
         self._start_idx += 1
-        return self._commmap[k]
+        return comment
